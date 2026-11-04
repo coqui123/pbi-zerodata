@@ -1,0 +1,59 @@
+table Project
+	lineageTag: fe44d98d-3d17-40d0-b8cc-a40c49ed463f
+
+	column ProjectID
+		dataType: int64
+		formatString: 0
+		lineageTag: 5f4d096b-1d91-4e63-a918-635181b8b4aa
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [ProjectID]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Title
+		dataType: string
+		lineageTag: 7a0a0d38-10ae-4b67-bb5d-25f80c958034
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Title]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Status
+		dataType: string
+		lineageTag: e197df74-a181-4481-b8d4-34c0d6f12f7a
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Status]
+
+		annotation SummarizationSetBy = Automatic
+
+	column PlannedEnd
+		dataType: dateTime
+		formatString: Long Date
+		lineageTag: 9549028e-24a7-4ffe-8608-dc1b53bd1478
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [PlannedEnd]
+
+		annotation SummarizationSetBy = Automatic
+
+	partition Project = calculated
+		mode: import
+		source =
+				DATATABLE(
+				    "ProjectID", INTEGER,
+				    "Title", STRING,
+				    "Status", STRING,
+				    "PlannedEnd", DATETIME,
+				    {
+				        {918273, "CANARY-PROJ-918273-ALPHA", "Active", "2026-06-30"},
+				        {918274, "CANARY-PROJ-918274-BRAVO", "Closed", "2025-12-31"},
+				        {918275, "CANARY-PROJ-918275-CHARLIE", "On Hold", "2026-03-31"},
+				        {918276, "CANARY-PROJ-918276-DELTA", "Active", "2031-06-30"}
+				    }
+				)
+
+	annotation PBI_Id = a253853ef1b945738972fd0208909bb9
+

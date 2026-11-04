@@ -1,0 +1,3 @@
+# build intermediates (bin/ holds the published pbz-engine.exe; rebuild with dotnet publish, see README.md)
+build/
+obj/

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+skills/powerbi-zerodata/tools/node_modules/
+skills/powerbi-zerodata/engine/bin/
+skills/powerbi-zerodata/engine/obj/
+skills/powerbi-zerodata/tests/fixture/**/.pbi/
+*.pbz-tmp

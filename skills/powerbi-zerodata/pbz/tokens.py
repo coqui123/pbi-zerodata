@@ -1,0 +1,621 @@
+"""Reversible tokenization of sensitive literals in TMDL and PBIR text.
+
+Tokens look like «Project Info[Owner]#4» (column-bound), «lit#3», «pii#1», «num#2» or
+«payload:Table#1». The token map (DPAPI-protected, private store) records, per token, the exact
+raw text it replaced in each context, so detokenize(tokenize(x)) == x byte for byte.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+
+from . import dpapi, lexers, pbir, tmdl
+from .common import sha
+
+TOKEN_RE = re.compile(r"«[^«»\r\n]{1,300}»")
+FULL_JSON_TOKEN_RE = re.compile(r'"(«[^«»"\r\n]{1,300}»)"')
+BASE64_RE = re.compile(r"^[A-Za-z0-9+/=\s]{200,}$")
+
+COLUMN_VALUE_FUNCS = {"SELECTEDVALUE", "VALUES", "DISTINCT", "MAX", "MIN", "MAXA", "MINA", "FIRSTNONBLANK",
+                      "LASTNONBLANK", "ALLSELECTED", "FILTERS"}
+CMP_OPS = {"=", "==", "<>", "<", ">", "<=", ">="}
+SUBSTRING_FUNCS = {"CONTAINSSTRING", "CONTAINSSTRINGEXACT", "SEARCH", "FIND", "TEXT.CONTAINS",
+                   "TEXT.STARTSWITH", "TEXT.ENDSWITH", "STARTSWITH", "ENDSWITH"}
+STRUCTURAL_KEYS = {"$schema", "Entity", "Property", "Name", "Source", "visualType", "name", "id", "queryRef",
+                   "nativeQueryRef", "Hierarchy", "Level", "type", "pageBinding", "parent", "activeSectionIndex",
+                   "objectName", "dataRole", "role", "fieldType", "howCreated", "layoutOptimization",
+                   "displayOption", "version", "versionMetadata", "path", "url", "resourcePackages", "items",
+                   "themeCollection", "baseTheme", "reportVersionAtImport", "pageOrder", "activePageName"}
+
+
+# ---------------------------------------------------------------- token map
+
+class TokenMap:
+    def __init__(self, private_dir: str):
+        self.path = os.path.join(private_dir, "tokens.bin")
+        raw = dpapi.read_protected(self.path)
+        self.data = json.loads(raw.decode("utf-8")) if raw else {"version": 1, "next": {}, "tokens": {}, "keys": {}}
+        self.dirty = False
+
+    def save(self) -> None:
+        if self.dirty:
+            dpapi.write_protected(self.path, json.dumps(self.data, ensure_ascii=False).encode("utf-8"))
+            self.dirty = False
+
+    def _new(self, label: str, key: str, rec: dict) -> str:
+        existing = self.data["keys"].get(key)
+        if existing:
+            return existing
+        n = self.data["next"].get(label, 0) + 1
+        self.data["next"][label] = n
+        tok = f"«{label}#{n}»"
+        rec["label"] = label
+        self.data["tokens"][tok] = rec
+        self.data["keys"][key] = tok
+        self.dirty = True
+        return tok
+
+    def lit(self, label: str, value, vtype: str, ctx: str, raw: str) -> str:
+        # exact value, not the case-folded HMAC form: spelling variants keep their own raw text
+        key = f"lit\0{label}\0{vtype}\0{json.dumps(value, ensure_ascii=False)}"
+        tok = self._new(label, key, {"kind": "lit", "value": value, "vtype": vtype, "raws": {}})
+        raws = self.data["tokens"][tok].setdefault("raws", {})
+        if ctx not in raws:
+            raws[ctx] = raw
+            self.dirty = True
+        return tok
+
+    def raw(self, label: str, raw: str, ctx: str, value: str | None = None) -> str:
+        key = f"raw\0{label}\0{sha(raw)}\0{ctx}"
+        tok = self._new(label, key, {"kind": "raw", "value": value if value is not None else raw, "raws": {}})
+        raws = self.data["tokens"][tok].setdefault("raws", {})
+        if ctx not in raws:
+            raws[ctx] = raw
+            self.dirty = True
+        return tok
+
+    def get(self, tok: str) -> dict | None:
+        return self.data["tokens"].get(tok)
+
+    def known(self) -> set[str]:
+        return set(self.data["tokens"])
+
+    def find_by_hmac(self, key: bytes, label: str, digest: str) -> str | None:
+        for tok, rec in self.data["tokens"].items():
+            if rec.get("label") == label and rec.get("kind") == "lit" and dpapi.hmac_hex(key, rec.get("value")) == digest:
+                return tok
+        return None
+
+    def opaque(self, label: str, digest: str) -> str:
+        """Token for a group key known only by HMAC (from engine output)."""
+        return self._new(label + "@g", f"hmac\0{label}\0{digest}", {"kind": "hmac", "hmac": digest, "column": label, "raws": {}})
+
+
+def apply_edits(text: str, edits: list[tuple[int, int, str]]) -> str:
+    out, pos = [], 0
+    for s, e, rep in sorted(edits, key=lambda x: x[0]):
+        if s < pos:
+            continue  # overlapping edit: keep the first
+        out.append(text[pos:s])
+        out.append(rep)
+        pos = e
+    out.append(text[pos:])
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- DAX / M binding
+
+def _match_close(sig, i, open_="(", close=")"):
+    depth = 0
+    for j in range(i, len(sig)):
+        if sig[j].kind == "op" and sig[j].text == open_:
+            depth += 1
+        elif sig[j].kind == "op" and sig[j].text == close:
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(sig) - 1
+
+
+def _match_open(sig, j, open_="(", close=")"):
+    depth = 0
+    for i in range(j, -1, -1):
+        if sig[i].kind == "op" and sig[i].text == close:
+            depth += 1
+        elif sig[i].kind == "op" and sig[i].text == open_:
+            depth -= 1
+            if depth == 0:
+                return i
+    return 0
+
+
+def _split_args(sig, open_idx, close_idx):
+    """Top-level argument index ranges inside a call's parentheses."""
+    args, depth, start = [], 0, open_idx + 1
+    for k in range(open_idx + 1, close_idx):
+        t = sig[k]
+        if t.kind == "op" and t.text in ("(", "{", "["):
+            depth += 1
+        elif t.kind == "op" and t.text in (")", "}", "]"):
+            depth -= 1
+        elif t.kind == "op" and t.text == "," and depth == 0:
+            args.append((start, k))
+            start = k + 1
+    args.append((start, close_idx))
+    return [(a, b) for a, b in args if a < b]
+
+
+def bind_literals(sig: list, lang: str, cur_table: str | None, model) -> dict:
+    """Map index in sig -> (table, column) or 'skip' (column names in DATATABLE / #table headers)."""
+    binding: dict[int, object] = {}
+    colref: dict[int, tuple] = {}   # index of the token that *ends* a column ref -> (table, col)
+    start_of: dict[int, int] = {}   # end index -> start index of that ref
+    tables = model.tables if model else {}
+
+    def is_col(table, col):
+        return bool(model and model.column(table, col))
+
+    for i, t in enumerate(sig):
+        if t.kind != "bracket":
+            continue
+        prev = sig[i - 1] if i > 0 else None
+        if prev is not None and prev.end == t.start and prev.kind in ("table", "ident") and lang == "dax":
+            colref[i] = (prev.value, t.value)
+            start_of[i] = i - 1
+        elif cur_table and is_col(cur_table, t.value):
+            colref[i] = (cur_table, t.value)
+            start_of[i] = i
+        elif lang == "m" and cur_table:
+            colref[i] = (cur_table, t.value)
+            start_of[i] = i
+
+    var_col: dict[str, tuple] = {}
+
+    def operand_col(j):
+        """Column constrained by the operand ending at index j."""
+        if j < 0:
+            return None
+        if j in colref:
+            return colref[j]
+        t = sig[j]
+        if t.kind == "op" and t.text == ")":
+            o = _match_open(sig, j)
+            if o > 0 and sig[o - 1].kind == "ident" and sig[o - 1].text.upper() in COLUMN_VALUE_FUNCS:
+                for k in range(o + 1, j):
+                    if k in colref:
+                        return colref[k]
+            return None
+        if t.kind == "ident" and t.text in var_col:
+            return var_col[t.text]
+        return None
+
+    def bind(k, col):
+        if col and k not in binding:
+            binding[k] = col
+
+    lits = {i for i, t in enumerate(sig) if t.kind in ("str", "num")}
+
+    for i, t in enumerate(sig):
+        up = t.text.upper() if t.kind == "ident" else ""
+        # VAR x = SELECTEDVALUE('T'[C])  /  VAR x = 'T'[C]
+        if up == "VAR" and i + 2 < len(sig) and sig[i + 1].kind == "ident" and sig[i + 2].text == "=":
+            k = i + 3
+            if k < len(sig) and sig[k].kind == "ident" and sig[k].text.upper() in COLUMN_VALUE_FUNCS \
+                    and k + 1 < len(sig) and sig[k + 1].text == "(":
+                close = _match_close(sig, k + 1)
+                for m in range(k + 2, close):
+                    if m in colref:
+                        var_col[sig[i + 1].text] = colref[m]
+                        break
+            else:
+                for m in range(k, min(k + 3, len(sig))):
+                    if m in colref:
+                        var_col[sig[i + 1].text] = colref[m]
+                        break
+        # DATATABLE("A", STRING, "B", INTEGER, {{...}})
+        if up == "DATATABLE" and i + 1 < len(sig) and sig[i + 1].text == "(":
+            close = _match_close(sig, i + 1)
+            names, k = [], i + 2
+            while k < close and sig[k].text != "{":
+                if sig[k].kind == "str":
+                    names.append(sig[k].value)
+                    binding[k] = "skip"
+                k += 1
+            row, pos = 0, 0
+            depth = 0
+            for m in range(k, close):
+                tm_ = sig[m]
+                if tm_.text == "{":
+                    depth += 1
+                    if depth == 2:
+                        pos = 0
+                elif tm_.text == "}":
+                    depth -= 1
+                elif tm_.text == "," and depth == 2:
+                    pos += 1
+                elif m in lits and depth >= 2 and cur_table and pos < len(names):
+                    bind(m, (cur_table, names[pos], "row"))
+        # #table(type table [A = text], {...}) or #table({"A","B"}, {...})
+        if lang == "m" and t.kind == "op" and t.text == "#" and i + 2 < len(sig) and sig[i + 1].text == "table" \
+                and sig[i + 2].text == "(":
+            close = _match_close(sig, i + 2)
+            args = _split_args(sig, i + 2, close)
+            names = []
+            if args:
+                a0, b0 = args[0]
+                for m in range(a0, b0):
+                    if sig[m].kind == "str":
+                        names.append(sig[m].value)
+                        binding[m] = "skip"
+                    elif sig[m].kind == "bracket" and sig[m].value:
+                        names.append(sig[m].value.split("=")[0].strip())
+                    elif sig[m].kind == "ident" and m + 1 < b0 and sig[m + 1].text == "=" and sig[m - 1].text in ("[", ","):
+                        names.append(sig[m].text)
+            if len(args) > 1:
+                a1, b1 = args[1]
+                depth, pos = 0, 0
+                for m in range(a1, b1):
+                    tm_ = sig[m]
+                    if tm_.text == "{":
+                        depth += 1
+                        if depth == 2:
+                            pos = 0
+                    elif tm_.text == "}":
+                        depth -= 1
+                    elif tm_.text == "," and depth == 2:
+                        pos += 1
+                    elif m in lits and depth >= 2 and cur_table and pos < len(names):
+                        bind(m, (cur_table, names[pos], "row"))
+        # IN { ... }
+        if up == "IN" and i + 1 < len(sig) and sig[i + 1].text == "{":
+            col = operand_col(i - 1)
+            close = _match_close(sig, i + 1, "{", "}")
+            for m in range(i + 2, close):
+                if m in lits:
+                    bind(m, col)
+        # TREATAS({...}, 'T'[C], ...)
+        if up == "TREATAS" and i + 2 < len(sig) and sig[i + 1].text == "(" and sig[i + 2].text == "{":
+            close = _match_close(sig, i + 1)
+            bclose = _match_close(sig, i + 2, "{", "}")
+            cols = [colref[m] for m in range(bclose, close) if m in colref]
+            if cols:
+                depth, pos = 0, 0
+                for m in range(i + 2, bclose):
+                    tm_ = sig[m]
+                    if tm_.text == "(":
+                        depth += 1
+                        pos = 0
+                    elif tm_.text == ")":
+                        depth -= 1
+                    elif tm_.text == "," and depth == 1:
+                        pos += 1
+                    elif m in lits:
+                        bind(m, cols[min(pos, len(cols) - 1)] if depth >= 1 else cols[0])
+        # List.Contains({...}, [C])
+        if lang == "m" and up in ("LIST.CONTAINS", "LIST.CONTAINSANY") and i + 2 < len(sig) and sig[i + 1].text == "(":
+            close = _match_close(sig, i + 1)
+            cols = [colref[m] for m in range(i + 2, close) if m in colref]
+            if cols:
+                for m in range(i + 2, close):
+                    if m in lits:
+                        bind(m, cols[0])
+        # CONTAINSSTRING([C], "x"), SEARCH("x", [C]), Text.Contains([C], "x")
+        if up in SUBSTRING_FUNCS and i + 1 < len(sig) and sig[i + 1].text == "(":
+            close = _match_close(sig, i + 1)
+            cols = [colref[m] for m in range(i + 2, close) if m in colref]
+            if cols:
+                for m in range(i + 2, close):
+                    if m in lits:
+                        bind(m, cols[0])
+        # LOOKUPVALUE(result, search1, value1, ...)
+        if up == "LOOKUPVALUE" and i + 1 < len(sig) and sig[i + 1].text == "(":
+            close = _match_close(sig, i + 1)
+            args = _split_args(sig, i + 1, close)
+            for a in range(1, len(args) - 1, 2):
+                sa, sb = args[a]
+                va, vb = args[a + 1]
+                col = next((colref[m] for m in range(sa, sb) if m in colref), None)
+                for m in range(va, vb):
+                    if m in lits:
+                        bind(m, col)
+        # SWITCH('T'[C], "a", ..., "b", ...)
+        if up == "SWITCH" and i + 1 < len(sig) and sig[i + 1].text == "(":
+            close = _match_close(sig, i + 1)
+            args = _split_args(sig, i + 1, close)
+            if args:
+                a0, b0 = args[0]
+                col = operand_col(b0 - 1)
+                for a in range(1, len(args) - 1, 2):
+                    va, vb = args[a]
+                    if vb - va == 1 and va in lits:
+                        bind(va, col)
+
+    # comparisons: col op lit  /  lit op col
+    for k in lits:
+        if k in binding:
+            continue
+        p = k - 1
+        if p >= 0 and sig[p].kind == "op" and sig[p].text == "-" and p - 1 >= 0 and sig[p - 1].kind == "op":
+            p -= 1
+        if p >= 0 and sig[p].kind == "op" and sig[p].text in CMP_OPS:
+            col = operand_col(p - 1)
+            if col:
+                bind(k, col)
+                continue
+        nx = k + 1
+        if nx + 1 < len(sig) and sig[nx].kind == "op" and sig[nx].text in CMP_OPS:
+            j = nx + 1
+            end = next((e for e, s in start_of.items() if s == j), None)
+            if end is not None:
+                bind(k, colref[end])
+    return binding
+
+
+# ---------------------------------------------------------------- TMDL
+
+def _table_of(node) -> str | None:
+    n = node
+    while n is not None:
+        if n.kind == "table":
+            return n.name
+        n = n.parent
+    return None
+
+
+def _dq_map(inner: str) -> tuple[str, list[int]]:
+    """Decode doubled double-quotes inside a DAX/M string body; positions map decoded -> raw."""
+    out, pos, i = [], [], 0
+    while i < len(inner):
+        out.append(inner[i])
+        pos.append(i)
+        i += 2 if inner[i] == '"' and i + 1 < len(inner) and inner[i + 1] == '"' else 1
+    pos.append(len(inner))
+    return "".join(out), pos
+
+
+def _num_value(text: str):
+    try:
+        return int(text)
+    except ValueError:
+        try:
+            return float(text)
+        except ValueError:
+            return text
+
+
+def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
+    doc = tmdl.parse(relpath, text)
+    edits: list[tuple[int, int, str]] = []
+    for reg in doc.regions:
+        seg = text[reg.start:reg.end]
+        if reg.kind in ("dax", "m"):
+            toks = (lexers.lex_dax if reg.kind == "dax" else lexers.lex_m)(seg, reg.start)
+            sig = lexers.significant(toks)
+            cur = _table_of(reg.node)
+            binding = bind_literals(sig, reg.kind, cur, model)
+            for k, t in enumerate(sig):
+                b = binding.get(k)
+                if b == "skip":
+                    continue
+                col = b[:2] if isinstance(b, tuple) else None
+                in_row = isinstance(b, tuple) and len(b) == 3  # embedded table rows are data
+                small_ordinal = re.fullmatch(r"\d{1,3}", t.text) is not None  # sort orders, weights, flags
+                if t.kind == "num" and in_row and not small_ordinal:
+                    lab = clf.label(*col)
+                    edits.append((t.start, t.end, tm.lit(lab, _num_value(t.text), "number", "tmdl", t.text)))
+                    continue
+                if t.kind == "str":
+                    inner = t.text[1:-1] if t.text.endswith('"') and len(t.text) >= 2 else t.text[1:]
+                    if reg.kind == "m" and BASE64_RE.match(t.value or ""):
+                        edits.append((t.start + 1, t.start + 1 + len(inner),
+                                      tm.raw(f"payload:{cur or 'blob'}", inner, "tmdl")))
+                        continue
+                    label = clf.literal(t.value, "string", col)
+                    if label:
+                        edits.append((t.start + 1, t.start + 1 + len(inner),
+                                      tm.lit(label, t.value, "string", "tmdl", inner)))
+                    else:
+                        decoded, pos = _dq_map(inner)
+                        for s, e, lab in clf.free_text(decoded):
+                            rs, re_ = pos[s], pos[e]
+                            edits.append((t.start + 1 + rs, t.start + 1 + re_, tm.raw(lab, inner[rs:re_], "tmdl")))
+                elif t.kind == "num" and col:
+                    label = clf.literal(_num_value(t.text), "number", col)
+                    if label:
+                        edits.append((t.start, t.end, tm.lit(label, _num_value(t.text), "number", "tmdl", t.text)))
+            for t in toks:
+                if t.kind == "comment":
+                    for s, e, lab in clf.free_text(t.text, numbers=True):
+                        edits.append((t.start + s, t.start + e, tm.raw(lab, t.text[s:e], "tmdl")))
+        elif reg.kind == "text":
+            for s, e, lab in clf.free_text(seg, numbers=reg.prop == "description"):
+                edits.append((reg.start + s, reg.start + e, tm.raw(lab, seg[s:e], "tmdl")))
+        elif reg.kind == "member":
+            edits.append((reg.start, reg.end, tm.raw("pii", seg, "tmdl")))
+    return apply_edits(text, edits)
+
+
+def detokenize_tmdl(text: str, tm: TokenMap) -> tuple[str, list[str]]:
+    unknown: list[str] = []
+
+    def repl(m):
+        rec = tm.get(m.group(0))
+        if not rec:
+            unknown.append(m.group(0))
+            return m.group(0)
+        raw = rec.get("raws", {}).get("tmdl")
+        if raw is not None:
+            return raw
+        if rec.get("kind") == "hmac":
+            unknown.append(m.group(0))
+            return m.group(0)
+        v = rec.get("value")
+        if rec.get("vtype") in ("number", "int", "double"):
+            return str(v)
+        return str(v).replace('"', '""')
+
+    return TOKEN_RE.sub(repl, text), unknown
+
+
+# ---------------------------------------------------------------- PBIR
+
+def _decode_map(raw_inner: str) -> tuple[str, list[int]]:
+    """Decode the inside of a JSON string; positions[k] = raw offset of decoded char k."""
+    out, pos = [], []
+    i, n = 0, len(raw_inner)
+    while i < n:
+        c = raw_inner[i]
+        if c == "\\" and i + 1 < n:
+            e = raw_inner[i + 1]
+            if e == "u" and i + 5 < n:
+                cp = int(raw_inner[i + 2:i + 6], 16)
+                step = 6
+                if 0xD800 <= cp < 0xDC00 and raw_inner[i + 6:i + 8] == "\\u":
+                    lo = int(raw_inner[i + 8:i + 12], 16)
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                    step = 12
+                out.append(chr(cp))
+                pos.append(i)
+                i += step
+                continue
+            out.append({"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f"}.get(e, e))
+            pos.append(i)
+            i += 2
+            continue
+        out.append(c)
+        pos.append(i)
+        i += 1
+    pos.append(n)
+    return "".join(out), pos
+
+
+def _json_escape(s: str) -> str:
+    return json.dumps(s, ensure_ascii=False)[1:-1]
+
+
+def _deneb_values_spans(decoded: str) -> list[tuple[int, int]]:
+    """Spans (in the decoded PBIR literal string) of inline data arrays inside a Vega/Deneb spec."""
+    if not (decoded.startswith("'") and decoded.endswith("'")) or '"$schema"' not in decoded and '"data"' not in decoded:
+        return []
+    inner_pos, inner = [], []
+    i = 1
+    while i < len(decoded) - 1:
+        if decoded[i] == "'" and decoded[i + 1] == "'":
+            inner.append("'")
+            inner_pos.append(i)
+            i += 2
+            continue
+        inner.append(decoded[i])
+        inner_pos.append(i)
+        i += 1
+    inner_pos.append(len(decoded) - 1)
+    spec = "".join(inner)
+    try:
+        root = pbir.parse_json(spec)
+    except pbir.JsonError:
+        return []
+    spans = []
+
+    def visit(node):
+        if isinstance(node, pbir.JObj):
+            for k, v in node.pairs:
+                if k.value == "values" and isinstance(v, pbir.JArr) and v.items:
+                    spans.append((inner_pos[v.start], inner_pos[v.end]))
+                else:
+                    visit(v)
+        elif isinstance(node, pbir.JArr):
+            for v in node.items:
+                visit(v)
+
+    visit(root)
+    return spans
+
+
+def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
+    try:
+        root = pbir.parse_json(text)
+    except pbir.JsonError:
+        return text
+    edits: list[tuple[int, int, str]] = []
+    handled: set[int] = set()
+    for site in pbir.walk_literals(root, model):
+        handled.add(site.node.start)
+        value, vtype = pbir.decode_literal(site.raw)
+        raw_full = text[site.node.start:site.node.end]
+        if vtype == "string" and isinstance(value, str):
+            spans = _deneb_values_spans(site.raw)
+            if spans:
+                inner_raw = raw_full[1:-1]
+                decoded, pos = _decode_map(inner_raw)
+                for s, e in spans:
+                    rs, re_ = pos[s] + 1, pos[e] + 1
+                    edits.append((site.node.start + rs, site.node.start + re_,
+                                  tm.raw("payload:deneb", raw_full[rs:re_], "pbir_inner")))
+                continue
+        label = None
+        if vtype in ("string", "int", "double"):
+            label = clf.literal(value, "string" if vtype == "string" else "number", site.column)
+        if label:
+            edits.append((site.node.start, site.node.end, '"' + tm.lit(label, value, vtype, "pbir_full", raw_full) + '"'))
+        elif vtype == "string" and site.column is None and isinstance(value, str):
+            _free_text_edits(text, site.node, value, clf, tm, edits, numbers=False)
+    for key, node in pbir.string_nodes(root):
+        if node.start in handled or key in STRUCTURAL_KEYS:
+            continue
+        numbers = key == "value" and '"textRuns"' in text
+        _free_text_edits(text, node, node.value, clf, tm, edits, numbers=numbers)
+    return apply_edits(text, edits)
+
+
+def _free_text_edits(text, node, value, clf, tm, edits, numbers):
+    spans = clf.free_text(value, numbers=numbers)
+    if not spans:
+        return
+    inner_raw = text[node.start + 1:node.end - 1]
+    decoded, pos = _decode_map(inner_raw)
+    if decoded != value:
+        return
+    for s, e, lab in spans:
+        rs, re_ = pos[s], pos[e]
+        edits.append((node.start + 1 + rs, node.start + 1 + re_, tm.raw(lab, inner_raw[rs:re_], "pbir_inner", value[s:e])))
+
+
+def detokenize_pbir(text: str, tm: TokenMap) -> tuple[str, list[str]]:
+    unknown: list[str] = []
+
+    def full(m):
+        tok = m.group(1)
+        rec = tm.get(tok)
+        if not rec or rec.get("kind") == "hmac":
+            unknown.append(tok)
+            return m.group(0)
+        raws = rec.get("raws", {})
+        if "pbir_full" in raws:
+            return raws["pbir_full"]
+        if rec.get("kind") == "lit":
+            vtype = rec.get("vtype", "string")
+            vtype = {"number": "double"}.get(vtype, vtype)
+            if vtype == "double" and isinstance(rec.get("value"), int):
+                vtype = "int"
+            return json.dumps(pbir.encode_literal(rec.get("value"), vtype), ensure_ascii=False)
+        return '"' + raws.get("pbir_inner", _json_escape(str(rec.get("value", "")))) + '"'
+
+    def inner(m):
+        tok = m.group(0)
+        rec = tm.get(tok)
+        if not rec or rec.get("kind") == "hmac":
+            unknown.append(tok)
+            return tok
+        raws = rec.get("raws", {})
+        if "pbir_inner" in raws:
+            return raws["pbir_inner"]
+        return _json_escape(str(rec.get("value", "")))
+
+    text = FULL_JSON_TOKEN_RE.sub(full, text)
+    return TOKEN_RE.sub(inner, text), unknown
+
+
+def detokenize_dax(expr: str, tm: TokenMap) -> tuple[str, list[str]]:
+    """For agent-written DAX (check specs): tokens inside strings -> escaped value, else literal."""
+    return detokenize_tmdl(expr, tm)

@@ -1,0 +1,9 @@
+role 'Canary Reader'
+	modelPermission: read
+
+	member 'canary.user@example.invalid'
+
+	tablePermission Person = [Name] = "CANARY-PERSON-7f3a2"
+
+	annotation PBI_Id = 3e04efe114e743cb8e4f69fbdc4bc12c
+

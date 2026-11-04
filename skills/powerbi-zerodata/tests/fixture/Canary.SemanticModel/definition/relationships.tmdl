@@ -1,0 +1,12 @@
+relationship 5bc26069-01eb-42f0-b38c-6070d7fec725
+	fromColumn: Hours.Person
+	toColumn: Person.Name
+
+relationship 1e6250d8-1b0c-4af7-b6b7-4ff2d5a5786d
+	fromColumn: Hours.ProjectID
+	toColumn: Project.ProjectID
+
+relationship 9216ea10-0696-40e0-bb8f-3b1798cd392c
+	fromColumn: Hours.Date
+	toColumn: DimDate.Date
+

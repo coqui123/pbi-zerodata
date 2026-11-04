@@ -1,0 +1,4 @@
+{
+  "synthetic": true,
+  "note": "Development repo for powerbi-zerodata. tests/fixture holds fake canary data only."
+}

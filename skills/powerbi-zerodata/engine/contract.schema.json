@@ -1,0 +1,381 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pbz.invalid/engine/contract.schema.json",
+  "title": "pbz-engine response (contract v1 + v1.1 additions)",
+  "description": "Closed vocabulary: every string is an enum, a model object name, a caller id, a bucket, an HMAC, a log id or a scrubbed message. additionalProperties is false everywhere.",
+  "oneOf": [
+    { "$ref": "#/$defs/failure" },
+    { "$ref": "#/$defs/ping" },
+    { "$ref": "#/$defs/connect" },
+    { "$ref": "#/$defs/health" },
+    { "$ref": "#/$defs/tmdlValidate" },
+    { "$ref": "#/$defs/refresh" },
+    { "$ref": "#/$defs/compiles" },
+    { "$ref": "#/$defs/index" },
+    { "$ref": "#/$defs/check" },
+    { "$ref": "#/$defs/probe" },
+    { "$ref": "#/$defs/snapshotSave" },
+    { "$ref": "#/$defs/snapshotCompare" },
+    { "$ref": "#/$defs/smoke" }
+  ],
+  "$defs": {
+    "verb": {
+      "enum": ["ping", "connect", "health", "tmdl-validate", "refresh", "compiles", "index", "check", "probe",
+               "snapshot-save", "snapshot-compare", "smoke"]
+    },
+    "anyVerb": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_\\-]*$" },
+    "errorClass": {
+      "enum": ["SYNTAX", "UNKNOWN_OBJECT", "TYPE_MISMATCH", "CONVERSION", "CIRCULAR", "DUPLICATE_KEY", "TIMEOUT",
+               "ENGINE_UNAVAILABLE", "BAD_REQUEST", "OTHER"]
+    },
+    "logId": { "type": "string", "pattern": "^e-[0-9]{8}-[0-9]{4,}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9_.:/\\- ]{1,128}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000-\\u001f]*$" },
+    "relPath": { "type": "string", "maxLength": 260, "pattern": "^[^\\u0000-\\u001f]*$" },
+    "hmac": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "message": { "type": "string", "maxLength": 300, "pattern": "^[^\"\\u0000-\\u001f]*$" },
+    "countBucket": { "enum": ["0", "1-9", "10-99", "100-999", "1k-9k", "10k+"] },
+    "shareBucket": { "enum": ["none", "<1%", "1-10%", "10-50%", ">50%"] },
+    "mismatch": { "enum": ["NONE", "ONE", "FEW", "MANY"] },
+    "typeName": { "enum": ["string", "int64", "double", "dateTime", "decimal", "boolean", "binary", "variant", "unknown"] },
+    "textClass": { "enum": ["category", "high", "empty"] },
+    "year": { "type": "integer", "minimum": 1, "maximum": 9999 },
+    "count": { "type": "integer", "minimum": 0 },
+
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "class"],
+      "properties": {
+        "ok": { "const": false },
+        "verb": { "$ref": "#/$defs/anyVerb" },
+        "class": { "$ref": "#/$defs/errorClass" },
+        "log_id": { "$ref": "#/$defs/logId" }
+      }
+    },
+
+    "ping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "version"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "ping" },
+        "version": { "const": "1" }
+      }
+    },
+
+    "connect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "database_id", "compat_level", "tables"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "connect" },
+        "database_id": { "type": "string", "pattern": "^[A-Za-z0-9_\\-]{1,128}$" },
+        "compat_level": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "tables": { "type": "array", "items": { "$ref": "#/$defs/name" } }
+      }
+    },
+
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "objects", "errors", "unprocessed_tables"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "health" },
+        "objects": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tables", "columns", "measures", "relationships"],
+          "properties": {
+            "tables": { "$ref": "#/$defs/count" },
+            "columns": { "$ref": "#/$defs/count" },
+            "measures": { "$ref": "#/$defs/count" },
+            "relationships": { "$ref": "#/$defs/count" }
+          }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "table", "name", "class"],
+            "properties": {
+              "kind": { "enum": ["measure", "column", "partition", "hierarchy", "relationship"] },
+              "table": { "type": "string", "maxLength": 512 },
+              "name": { "$ref": "#/$defs/name" },
+              "class": { "$ref": "#/$defs/errorClass" },
+              "message": { "$ref": "#/$defs/message" }
+            },
+            "if": { "properties": { "kind": { "not": { "const": "measure" } } } },
+            "then": { "not": { "required": ["message"] } }
+          }
+        },
+        "unprocessed_tables": { "type": "array", "items": { "$ref": "#/$defs/name" } }
+      }
+    },
+
+    "tmdlValidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "valid", "errors", "missing_refs", "orphan_files"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "tmdl-validate" },
+        "valid": { "type": "boolean" },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file", "class", "message"],
+            "properties": {
+              "file": { "$ref": "#/$defs/relPath" },
+              "line": { "type": "integer", "minimum": 1 },
+              "class": { "$ref": "#/$defs/errorClass" },
+              "message": { "$ref": "#/$defs/message" }
+            }
+          }
+        },
+        "missing_refs": { "type": "array", "items": { "$ref": "#/$defs/relPath" } },
+        "orphan_files": { "type": "array", "items": { "$ref": "#/$defs/relPath" } }
+      }
+    },
+
+    "refresh": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "status"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "refresh" },
+        "status": { "enum": ["PASS", "UNSUPPORTED"] }
+      }
+    },
+
+    "compiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "items"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "compiles" },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "status"],
+            "properties": {
+              "id": { "$ref": "#/$defs/id" },
+              "status": { "enum": ["PASS", "ERROR"] },
+              "class": { "$ref": "#/$defs/errorClass" },
+              "message": { "$ref": "#/$defs/message" },
+              "log_id": { "$ref": "#/$defs/logId" }
+            },
+            "if": { "properties": { "status": { "const": "ERROR" } } },
+            "then": { "required": ["class"] },
+            "else": { "maxProperties": 2 }
+          }
+        }
+      }
+    },
+
+    "index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "tables"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "index" },
+        "tables": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["table", "columns"],
+            "properties": {
+              "table": { "$ref": "#/$defs/name" },
+              "rows_bucket": { "$ref": "#/$defs/countBucket" },
+              "columns": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["column", "type"],
+                  "properties": {
+                    "column": { "$ref": "#/$defs/name" },
+                    "type": { "$ref": "#/$defs/typeName" },
+                    "class": { "$ref": "#/$defs/textClass" },
+                    "card_bucket": { "$ref": "#/$defs/countBucket" },
+                    "blank_bucket": { "$ref": "#/$defs/shareBucket" },
+                    "year_min": { "$ref": "#/$defs/year" },
+                    "year_max": { "$ref": "#/$defs/year" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "groupKey": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["reveal"], "properties": { "reveal": { "type": "string", "maxLength": 256 } } },
+        { "type": "object", "additionalProperties": false, "required": ["hmac"], "properties": { "hmac": { "$ref": "#/$defs/hmac" } } },
+        { "type": "object", "additionalProperties": false, "required": ["blank"], "properties": { "blank": { "const": true } } }
+      ]
+    },
+
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "checks"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "check" },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "status"],
+            "properties": {
+              "id": { "$ref": "#/$defs/id" },
+              "status": { "enum": ["PASS", "FAIL", "EMPTY", "UNSUPPORTED", "ERROR"] },
+              "class": { "$ref": "#/$defs/errorClass" },
+              "log_id": { "$ref": "#/$defs/logId" },
+              "mismatch": { "$ref": "#/$defs/mismatch" },
+              "groups": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "additionalProperties": { "$ref": "#/$defs/groupKey" }
+                }
+              },
+              "offenders_bucket": { "$ref": "#/$defs/countBucket" },
+              "sign": { "enum": ["NEG", "ZERO", "POS", "BLANK"] }
+            },
+            "if": { "properties": { "status": { "const": "ERROR" } } },
+            "then": { "required": ["class"], "maxProperties": 4 },
+            "else": { "not": { "anyOf": [ { "required": ["class"] }, { "required": ["log_id"] } ] } }
+          }
+        }
+      }
+    },
+
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "table", "columns"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "probe" },
+        "table": { "$ref": "#/$defs/name" },
+        "rows_bucket": { "$ref": "#/$defs/countBucket" },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["column", "type"],
+            "properties": {
+              "column": { "$ref": "#/$defs/name" },
+              "type": { "$ref": "#/$defs/typeName" },
+              "has_blanks": { "type": "boolean" },
+              "has_negatives": { "type": "boolean" },
+              "has_future_dates": { "type": "boolean" },
+              "blank_bucket": { "$ref": "#/$defs/shareBucket" },
+              "card_bucket": { "$ref": "#/$defs/countBucket" },
+              "year_min": { "$ref": "#/$defs/year" },
+              "year_max": { "$ref": "#/$defs/year" }
+            }
+          }
+        }
+      }
+    },
+
+    "snapshotName": { "type": "string", "pattern": "^[A-Za-z0-9._\\-]{1,64}$" },
+
+    "snapshotSave": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "name", "queries"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "snapshot-save" },
+        "name": { "$ref": "#/$defs/snapshotName" },
+        "queries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "result"],
+            "properties": {
+              "id": { "$ref": "#/$defs/id" },
+              "result": { "enum": ["SAVED", "ERROR"] },
+              "class": { "$ref": "#/$defs/errorClass" },
+              "log_id": { "$ref": "#/$defs/logId" }
+            }
+          }
+        }
+      }
+    },
+
+    "snapshotCompare": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "name", "queries"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "snapshot-compare" },
+        "name": { "$ref": "#/$defs/snapshotName" },
+        "queries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "result"],
+            "properties": {
+              "id": { "$ref": "#/$defs/id" },
+              "result": { "enum": ["SAME", "DIFF", "NEW", "MISSING", "STALE_DATA", "ERROR"] },
+              "columns": { "type": "array", "items": { "type": "string", "maxLength": 128 } },
+              "mismatch": { "$ref": "#/$defs/mismatch" },
+              "class": { "$ref": "#/$defs/errorClass" },
+              "log_id": { "$ref": "#/$defs/logId" }
+            }
+          }
+        }
+      }
+    },
+
+    "smoke": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "visuals"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "smoke" },
+        "visuals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "status"],
+            "properties": {
+              "id": { "$ref": "#/$defs/id" },
+              "status": { "enum": ["OK", "EMPTY", "UNSUPPORTED", "ERROR"] },
+              "class": { "$ref": "#/$defs/errorClass" },
+              "log_id": { "$ref": "#/$defs/logId" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

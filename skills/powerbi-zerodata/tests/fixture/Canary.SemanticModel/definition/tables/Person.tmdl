@@ -1,0 +1,37 @@
+table Person
+	lineageTag: f538451a-cfcf-44f1-8bda-424b891f991a
+
+	column Name
+		dataType: string
+		lineageTag: 884610ec-4b9f-447c-85cf-aad8d0bd2b93
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Name]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Email
+		dataType: string
+		lineageTag: 7e71277b-45c0-4702-8e4d-962580cfdf3e
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Email]
+
+		annotation SummarizationSetBy = Automatic
+
+	partition Person = calculated
+		mode: import
+		source =
+				DATATABLE(
+				    "Name", STRING,
+				    "Email", STRING,
+				    {
+				        {"CANARY-PERSON-7f3a1", "canary.7f3a1@example.invalid"},
+				        {"CANARY-PERSON-7f3a2", "canary.7f3a2@example.invalid"},
+				        {"CANARY-PERSON-7f3a3", "canary.7f3a3@example.invalid"},
+				        {"CANARY-PERSON-7f3a4", "canary.7f3a2@example.invalid"}
+				    }
+				)
+
+	annotation PBI_Id = 11e670671383a4b9f7111e67067bb075
+

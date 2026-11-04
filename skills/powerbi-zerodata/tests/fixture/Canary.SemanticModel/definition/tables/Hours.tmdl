@@ -1,0 +1,89 @@
+table Hours
+	lineageTag: c7b9f468-9ee3-49b1-aad2-0a7622c77a11
+
+	measure 'Total Hours' = SUM(Hours[Hours])
+		formatString: #,0.00
+		lineageTag: d8a8c423-fee3-40e1-a3c0-73bba245ff3c
+
+	measure 'Active Hours' = CALCULATE([Total Hours], Project[Status] = "Active")
+		formatString: #,0.00
+		lineageTag: 873f917e-bdb4-4913-9592-6b8524af0f7a
+
+	measure 'Canary Person Hours' = CALCULATE([Total Hours], Person[Name] = "CANARY-PERSON-7f3a1")
+		formatString: #,0.00
+		lineageTag: 9e93c3d3-0e95-49fc-ad04-85a9141e15a1
+
+	/// Intentionally broken (expected health error): references a column that does not exist.
+	measure 'Broken Measure' = SUM(Hours[CANARY_NOCOL_4411]) + 0
+		formatString: #,0.00
+		displayFolder: Expected Errors
+		lineageTag: 1f2407d3-48d8-406b-a93d-6ab89034350c
+
+	column Person
+		dataType: string
+		lineageTag: a70006b5-b12d-45c0-adad-6eff73b665bf
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Person]
+
+		annotation SummarizationSetBy = Automatic
+
+	column ProjectID
+		dataType: int64
+		formatString: 0
+		lineageTag: 315c83b3-cc5b-4fa8-bc1b-a150338f73ea
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [ProjectID]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Date
+		dataType: dateTime
+		formatString: Long Date
+		lineageTag: ca403ca5-eccd-4e57-99ec-8a4655ee233b
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Date]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Hours
+		dataType: double
+		lineageTag: bd12bf75-344c-4c50-9427-87ac3b0a657f
+		summarizeBy: sum
+		isNameInferred
+		sourceColumn: [Hours]
+
+		annotation SummarizationSetBy = Automatic
+
+	partition Hours = calculated
+		mode: import
+		source =
+				SELECTCOLUMNS(
+				    DATATABLE(
+				        "p", STRING,
+				        "id", INTEGER,
+				        "d", DATETIME,
+				        "h", DOUBLE,
+				        {
+				            {"CANARY-PERSON-7f3a1", 918273, "2025-03-14", 918273.64},
+				            {"CANARY-PERSON-7f3a1", 918274, "2025-07-02", 7341.25},
+				            {"CANARY-PERSON-7f3a2", 918273, "2026-01-20", 4417.5},
+				            {"CANARY-PERSON-7f3a2", 918275, "2026-02-11", 2903.75},
+				            {"CANARY-PERSON-7f3a3", 918276, "2026-05-05", 1288.125},
+				            {"CANARY-PERSON-7f3a4", 918274, "2025-11-30", 655.5},
+				            {"CANARY-PERSON-7f3a3", 555001, "2026-03-03", 3141.59},
+				            {"CANARY-PERSON-7f3a4", 555002, "2025-09-09", 2718.28},
+				            {"", 918273, "2026-06-06", 1618.03},
+				            {"CANARY-PERSON-7f3a1", 918276, "2026-04-01", -42.75}
+				        }
+				    ),
+				    "Person", IF([p] = "", BLANK(), [p]),
+				    "ProjectID", [id],
+				    "Date", [d],
+				    "Hours", [h]
+				)
+
+	annotation PBI_Id = c7b9f4689ee349b1aad20a7622c77a11
+

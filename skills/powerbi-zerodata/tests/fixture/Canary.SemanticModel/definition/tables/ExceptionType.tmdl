@@ -1,0 +1,48 @@
+table ExceptionType
+	lineageTag: a0e015af-3307-423e-b919-ab5aabf94d41
+
+	column Code
+		dataType: string
+		lineageTag: 5b723888-9863-4930-9c1d-d6789506d267
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Code]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Label
+		dataType: string
+		lineageTag: 5ee75766-bd29-4eb7-b31a-922f460269ad
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Label]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Weight
+		dataType: int64
+		formatString: 0
+		lineageTag: 2d144ea0-8861-4f31-84f6-4a7bd355b991
+		summarizeBy: sum
+		isNameInferred
+		sourceColumn: [Weight]
+
+		annotation SummarizationSetBy = Automatic
+
+	partition ExceptionType = calculated
+		mode: import
+		source = ```
+				DATATABLE(
+				    "Code", STRING,
+				    "Label", STRING,
+				    "Weight", INTEGER,
+				    {
+				        {"CANARY-DT-01", "CANARY-DT-LABEL-ALPHA", 1},
+				        {"CANARY-DT-02", "CANARY-DT-LABEL-BRAVO", 2},
+				        {"CANARY-DT-03", "CANARY-DT-LABEL-CHARLIE", 3}
+				    }
+				)
+				```
+
+	annotation PBI_Id = b13cd26aed5342e5b03738863038530a
+

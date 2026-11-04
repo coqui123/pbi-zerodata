@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "Report",
+    "displayName": "Canary"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "a41a479a-49bb-4b66-8145-5cb270fe323a"
+  }
+}

@@ -1,0 +1,28 @@
+/// The only M partition in the fixture. It exists for tokenizer coverage (an M #table literal plus an Enter Data
+/// deflate blob). The engine never refreshes M partitions, so this table stays empty unless the user presses
+/// Refresh in Desktop; no test relies on its rows.
+table Notes
+	lineageTag: 6059d100-885b-43f9-a39e-3c90f90f82e9
+
+	column Note
+		dataType: string
+		lineageTag: 5af486e7-91d8-46ff-b786-fbea27a3fe38
+		summarizeBy: none
+		sourceColumn: Note
+
+		annotation SummarizationSetBy = Automatic
+
+	partition Notes = m
+		mode: import
+		source =
+				let
+				    Typed = #table(type table [Note = text], {{"CANARY-SEED-NOTE-6d2e1"}}),
+				    Blob = Table.FromRows(Json.Document(Binary.Decompress(Binary.FromText("i45Wcnb0cwyK1HX1C3EN0nVxDHHUNU2yTDFUitXBJWekFBsLAA==", BinaryEncoding.Base64), Compression.Deflate)), let _t = ((type nullable text) meta [Serialized.Text = true]) in type table [Note = _t]),
+				    Combined = Table.Combine({Typed, Blob})
+				in
+				    Combined
+
+	annotation PBI_ResultType = Table
+
+	annotation PBI_NavigationStepName = Navigation
+

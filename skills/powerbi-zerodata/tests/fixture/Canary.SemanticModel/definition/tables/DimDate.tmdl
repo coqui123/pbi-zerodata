@@ -1,0 +1,39 @@
+table DimDate
+	lineageTag: be35ce5e-9d92-49a3-baf8-8301b6b02be7
+	dataCategory: Time
+
+	column Date
+		dataType: dateTime
+		isKey
+		formatString: Long Date
+		lineageTag: 617df09f-ab91-4ab8-a8b1-950eb1de30db
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Date]
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column Year = YEAR(DimDate[Date])
+		dataType: int64
+		formatString: 0
+		lineageTag: a369cef9-02e4-4ca0-a37e-186dae940acb
+		summarizeBy: none
+
+		annotation SummarizationSetBy = Automatic
+
+	column 'Month Number' = MONTH(DimDate[Date])
+		dataType: int64
+		formatString: 0
+		lineageTag: a2094ca8-8f68-419e-ac67-54ec8017f074
+		summarizeBy: none
+
+		annotation SummarizationSetBy = Automatic
+
+	partition DimDate = calculated
+		mode: import
+		source = CALENDAR(DATE(2025, 1, 1), DATE(2026, 12, 31))
+
+	annotation PBI_Id = 28072728195c439db24a2db0e50bc981
+
