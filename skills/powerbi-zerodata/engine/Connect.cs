@@ -194,6 +194,23 @@ public sealed class Conn : IDisposable
         return Rows(text, int.MaxValue);
     }
 
+    /// <summary>
+    /// The memory verb's narrow exception to the rule above: exactly two storage DMVs, each read with a fixed column
+    /// list (storage identity plus one size). Callers cannot choose DMVs or columns. Sizes stay inside the process; the
+    /// memory verb releases fixed bands only (CONTRACT.md v1.4).
+    /// </summary>
+    static readonly Dictionary<string, string[]> StorageColumns = new(StringComparer.Ordinal)
+    {
+        ["DISCOVER_STORAGE_TABLE_COLUMNS"] = new[] { "DIMENSION_NAME", "TABLE_ID", "COLUMN_ID", "COLUMN_TYPE", "DICTIONARY_SIZE" },
+        ["DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS"] = new[] { "DIMENSION_NAME", "TABLE_ID", "COLUMN_ID", "USED_SIZE" },
+    };
+
+    public List<object?[]> StorageDmv(string dmv, int maxRows)
+    {
+        if (!StorageColumns.TryGetValue(dmv, out var columns)) throw new InvalidOperationException("storage DMV not allowed");
+        return Rows("SELECT " + string.Join(", ", columns.Select(c => "[" + c + "]")) + " FROM $SYSTEM." + dmv, maxRows);
+    }
+
     /// <summary>Runs a statement and returns rows (values stay inside the process).</summary>
     public List<object?[]> Rows(string text, int maxRows)
     {

@@ -213,6 +213,23 @@ def main() -> int:
                      ("link", "E2E Page", made["clusteredColumnChart"], "--tooltip", "E2E Tip"),
                      ("bookmark", "add", "E2E Chart Only", "--page", "E2E Page", "--hide", made["tableEx"]),
                      ("bookmark", "list"),
+                     ("copy", "page", "E2E Page", "--as", "E2E Page Copy"),
+                     ("copy", "visual", "E2E Page", made["card"], "--to-page", "E2E Tip"),
+                     ("style", "E2E Page", made["card"], "--set", "container.general.altText=Total hours card"),
+                     ("a11y", "--page", "E2E Page", "--fix-tab-order"), ("a11y",),
+                     ("mobile", "E2E Page", "all"),
+                     ("set", "[Total Hours]", "displayFolder=E2E", "description=Hours in total"),
+                     ("set", "--table", "Hours", "--kind", "column", "--match", "ID$", "isHidden=true"),
+                     ("hierarchy", "add", "DimDate", "E2E Calendar", "--level", "Year", "--level", "Month Number"),
+                     ("format-expr", "[Total Hours]", "\"#,0.0\"", "--upgrade-compat"),
+                     ("function", "add", "E2ETax", "--params", "(x : NUMERIC)", "--body", "x * 1.1", "--upgrade-compat"),
+                     ("role", "add", "E2E Role"), ("role", "ols", "E2E Role", "'Person'[Email]", "none"),
+                     ("recipe", "run", json.dumps({"recipe": "e2e", "steps": [
+                         {"verb": "set", "args": ["[Active Hours]", "displayFolder=E2E"]},
+                         {"verb": "style", "args": ["E2E Page", "--type", "gauge", "--set", "container.title.show=true"]}]})),
+                     ("review",),
+                     ("audit", "memory"), ("audit", "--coverage", "--save-baseline", "e2e"), ("audit", "--since", "e2e"),
+                     ("consolidate", "families"),
                      ("consumers", "discover", ws_dir)):
             res = r.pbz(*args)
             expect(res.get("verb") and res.get("ok") is not False, f"{' '.join(args)}: {res}")
@@ -228,7 +245,7 @@ def main() -> int:
         for args in (("culture", "add", "fr-FR"), ("translate", "fr-FR", "Hours", "--caption", "Heures"),
                      ("translate", "fr-FR", "[Total Hours]", "--caption", "Heures totales"),
                      ("perspective", "add", "E2E View"), ("perspective", "include", "E2E View", "Project", "[Total Hours]"),
-                     ("role", "add", "E2E Role"), ("role", "filter", "E2E Role", "Project", "[Status] = \"Active\""),
+                     ("role", "filter", "E2E Role", "Project", "[Status] = \"Active\""),
                      ("refresh-policy", "show"), ("synth", "build"),
                      ("consumers", "add", "--object", "[Active Hours]", "--label", "E2E pack"), ("consumers", "list"),
                      ("visual", "list"), ("visual", "roles", "kpi")):

@@ -316,6 +316,11 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
         return {"verb": "push", "project": project.name, "result": "DESKTOP_DIRTY",
                 "hint": "Desktop has unsaved changes a reload would discard: ask the user to save (then pbz pull "
                         "--rebase) or close it"}
+    if model_touched and os.path.exists(os.path.join(project.model_dir, ".pbi", "unappliedChanges.json")):
+        return {"verb": "push", "project": project.name, "result": "PENDING_PQ_CHANGES",
+                "hint": "Desktop holds Power Query edits that were never applied; applying them later would "
+                        "overwrite these model changes. Ask the user to apply or discard them in Desktop, save, "
+                        "then pbz pull --rebase"}
     tm = tokens.TokenMap(ws.private)
     new_real: dict[str, tuple[str, bytes]] = {}
     unknown_all: list[str] = []

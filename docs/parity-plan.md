@@ -129,6 +129,56 @@ Microsoft's own authoring CLI rules.
   drift reported separately (built by a parallel agent; offline and live tests pass).
 - CI: GitHub Actions runs the offline suites and the engine's offline tests on Windows for every push.
 
+## Round 7 (2026-11-05): gap list
+
+An external design review ranked the most valuable missing features
+for this setting against Tabular Editor, DAX Studio, ALM Toolkit, Bravo, pbi-tools, PBI and Fab
+Inspector, pbir-utils, semantic-link-labs, Fabric CLI and Microsoft's modeling and report tools.
+Built from that list (three pieces by parallel agents):
+- Revision-bound review packet and evidence (`review`, `.pbz/evidence.jsonl`): release classes,
+  impact, stages PARSED / BOUND / LOADED / EXECUTED / SYNTHETIC / HANDOFF / HUMAN_ACCEPTED, STALE
+  evidence, human-only acceptance.
+- Presentation properties: `set` / `get` (bulk), `hierarchy`, `format-expr` (dynamic format strings).
+- Declarative recipes with transactional rollback (`recipe run|check`).
+- `copy page|visual` with id remapping; `a11y` audit and tab-order fix; `mobile` phone layouts.
+- DAX user-defined functions (`function`), object-level security (`role ols`); compatibility levels
+  checked (1601 for dynamic formats, 1702 for functions, confirmed against TOM) with an explicit
+  `--upgrade-compat`.
+- Push refuses model changes while Desktop holds unapplied Power Query edits.
+- Synthetic edge-case fixtures and checks with visible fake counterexamples (`synth build --edge`,
+  `synth check`).
+Deferred: object-level semantic merge, verdict-only performance gates, a role-aware RLS test harness
+(needs engine work and capability tests per Desktop build), Power Query authoring with refresh
+contracts. Not building (leak or duplicate): real-data DAX debugging, raw timings or storage
+statistics, screenshot redaction, arbitrary script plugins, an unrestricted modeling MCP passthrough,
+service deployment, another PBIX extractor.
+
+## Round 8 (2026-11-05): audit, efficiency, consolidation
+
+A second design review compared VertiPaq Analyzer / VPAX, Bravo, DAX Studio, Tabular Editor and
+community rule sets, semantic-link-labs, Measure Killer, DAX Optimizer and Microsoft's guidance, and
+ranked audit features by value over effort here. Built:
+- `audit`: findings with stable fingerprints, category, severity, confidence, evidence, fix, verify and
+  blockers. Efficiency: per-row measure calls and nested iterators (through called measures), SUMMARIZE
+  extension columns, calculated columns that are only aggregated (measure candidates) or row-local
+  (Power Query candidates), unused high-cardinality columns, bidirectional high-cardinality keys, Import
+  dimensions on DirectQuery facts, Table.Buffer before filters, storage hot spots. Consolidation:
+  duplicate measures, calculation-group, filtered and parameterized families, repeated sub-expressions
+  (with a context check: helper measure vs VAR / function), duplicate tables, several date tables,
+  RELATED / plain copy columns, repeated Power Query steps. `--coverage` names the evidence each rule
+  needs and whether it ran.
+- `audit memory` (engine verb `memory`): VertiPaq storage attribution inside the broker, released as
+  fixed size and share bands plus three fixed predicates (time part, fractions, long text).
+- Baselines, waivers with expiry and a CI gate (`--since`, `--fail-on new|any|high`, exit code 1).
+- `consolidate merge` (duplicate measures, alias kept for external consumers) and `consolidate
+  calc-group` (wrapper measures keep report bindings; writes a check spec for synth and real checks).
+- Fix: a dynamic format string replaces the static one; `FORMAT_STRING_CONFLICT` lint (Desktop refuses
+  a measure with both although TOM accepts it) and `repair` fix. Desktop opened levels 1601 and 1702.
+Deferred: performance workloads from Performance Analyzer exports (needs trusted replay and latency
+bands), Power Query refresh-cost evidence, Direct Lake guardrails (needs a service adapter), automated
+moves of calculated columns to Power Query. Not building: a VPAX export, a black-box cost score
+presented as speed, fix-all for BPA, similarity-based table merges.
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,

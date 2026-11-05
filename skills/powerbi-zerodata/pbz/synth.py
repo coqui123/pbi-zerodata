@@ -191,6 +191,8 @@ def _rewrite_table(t) -> bool:
 
 
 def _fmt(value, dtype: str) -> str:
+    if value is None:  # only the edge profile plants real blanks
+        return "BLANK()"
     if dtype == "int64":
         try:
             return str(int(value))
@@ -287,6 +289,156 @@ def _generate(model, pools: _Pools, rows: int, seed: int, plan: list) -> dict:
             data.append(vals)
         out[t.name] = ([(c.name, (c.data_type or "string").lower()) for c in cols], [list(r) for r in zip(*data)])
     return out
+
+
+def _literal_table(t) -> bool:
+    """A calculated table that is only literal rows (DATATABLE / table constructor): the edge profile
+    fakes it too, so its rows can carry edge cases."""
+    if t.private or t.calc_items or not t.partitions:
+        return False
+    return all(kind == "calculated" and "nameof" not in (expr or "").lower() and
+               bool(re.search(r"(?i)\bDATATABLE\s*\(", expr or "") or (expr or "").lstrip().startswith("{"))
+               for _n, kind, expr in t.partitions)
+
+
+def _edge(model, gen: dict, seed: int, lo: dt.date, hi: dt.date) -> tuple[dict, dict]:
+    """Edge-case variant of generated rows (a copy; `gen` is untouched): keys without related rows,
+    orphan and blank foreign keys, duplicate and blank labels, zero / negative / blank amounts, blank
+    text, dates on year and month boundaries and a month with no rows. Keys of one-side columns and
+    every column that takes part in a sort-by stay as they are (Desktop rejects ambiguous sort-by)."""
+    out = {t: (cols, [list(r) for r in rows]) for t, (cols, rows) in gen.items()}
+    names = {t.lower(): t for t in out}
+    notes: dict[str, list] = {}
+
+    def note(table, text):
+        notes.setdefault(table, []).append(text)
+
+    one, many = {}, {}
+    for r in model.relationships:
+        many_card = r.node is not None and r.node.props.get("toCardinality", "").strip() == "many"
+        if not many_card:
+            one[(r.to_table.lower(), r.to_column.lower())] = (r.to_table, r.to_column)
+        many[(r.from_table.lower(), r.from_column.lower())] = (r.to_table, r.to_column)
+    sort_cols = set()
+    for c in model.all_columns():
+        if c.sort_by:
+            sort_cols |= {(c.table.lower(), c.name.lower()), (c.table.lower(), c.sort_by.lower())}
+    keys = set(one) | {(c.table.lower(), c.name.lower()) for c in model.all_columns()
+                       if c.node is not None and c.node.flag("isKey")}
+
+    def cidx(table: str, col: str) -> int | None:
+        cols = out[table][0]
+        return next((i for i, (n, _d) in enumerate(cols) if n.lower() == col.lower()), None)
+
+    # keys of a one-side table that no related row uses
+    for (dt_l, dc_l), (dtab, dcol) in one.items():
+        t = names.get(dt_l)
+        i = cidx(t, dcol) if t else None
+        if i is None or len(out[t][1]) < 6:
+            continue
+        values = [r[i] for r in out[t][1]]
+        unused, used_any = values[-2:], False
+        for (ft_l, fc_l), to in many.items():
+            ft = names.get(ft_l)
+            j = cidx(ft, fc_l) if ft else None
+            if j is None or (to[0].lower(), to[1].lower()) != (dt_l, dc_l):
+                continue
+            used_any = True
+            for r in out[ft][1]:
+                if r[j] in unused:
+                    r[j] = values[0]
+        if used_any:
+            note(t, f"2 {dcol} values with no related rows")
+    # orphan and blank foreign keys
+    for (ft_l, fc_l), (tt, tc) in many.items():
+        ft = names.get(ft_l)
+        j = cidx(ft, fc_l) if ft else None
+        if j is None or names.get(tt.lower()) is None or len(out[ft][1]) < 12:
+            continue  # only keys into a faked table can be made orphans
+        dtp = out[ft][0][j][1]
+        for k, pos in enumerate((3, 7, 11)):
+            out[ft][1][pos][j] = (f"{out[ft][0][j][0]} orphan edge {k}" if dtp == "string" else 8888000 + k if dtp in NUMERIC
+                                  else (hi + dt.timedelta(days=500 + k)).isoformat() if dtp.startswith("date") else None)
+        out[ft][1][5][j] = None
+        note(ft, f"{out[ft][0][j][0]}: 3 orphan keys, 1 blank key")
+    # other columns: blanks, zero and negative numbers, duplicate labels, boundary dates, a sparse month
+    one_tables = {k[0] for k in one}
+    for t, (cols, rows) in out.items():
+        if len(rows) < 4:
+            continue
+        for i, (cname, dtp) in enumerate(cols):
+            low = (t.lower(), cname.lower())
+            # keys into a computed date table (CALENDAR) still get boundary dates: they stay inside its range
+            into_unfaked_date = low in many and dtp.startswith("date") and names.get(many[low][0].lower()) is None
+            if low in keys or (low in many and not into_unfaked_date) or low in sort_cols:
+                continue
+            if dtp in NUMERIC:
+                base = rows[1][i] if isinstance(rows[1][i], (int, float)) and not isinstance(rows[1][i], bool) else 0
+                rows[0][i] = 0 if dtp == "int64" else 0.0
+                rows[1][i] = -(abs(int(base)) or 7) if dtp == "int64" else -(abs(float(base)) or 12.5)
+                rows[2][i] = None
+                note(t, f"{cname}: zero, negative and blank values")
+            elif dtp == "string":
+                if t.lower() in one_tables:
+                    rows[1][i] = rows[0][i]
+                    rows[2][i] = None
+                    note(t, f"{cname}: a label shared by two keys, a blank label")
+                else:
+                    rows[0][i] = None
+                    rows[1][i] = ""
+                    note(t, f"{cname}: blank and empty text")
+            elif dtp.startswith("date"):
+                marks = [lo]
+                if dt.date(lo.year, 12, 31) <= hi:
+                    marks.append(dt.date(lo.year, 12, 31))
+                if dt.date(lo.year + 1, 1, 1) <= hi:
+                    marks.append(dt.date(lo.year + 1, 1, 1))
+                feb = next((dt.date(y, 3, 1) - dt.timedelta(days=1) for y in range(lo.year, hi.year + 1)
+                            if lo <= dt.date(y, 3, 1) - dt.timedelta(days=1) <= hi), None)
+                if feb:
+                    marks.append(feb)
+                marks.append(hi)
+                taken = {d.isoformat()[:7] for d in marks}
+                gap = after = None
+                m = (lo.replace(day=1) + dt.timedelta(days=40)).replace(day=1)
+                while m <= hi:  # the first month after the start that holds no boundary date
+                    nxt = (m + dt.timedelta(days=40)).replace(day=1)
+                    if m.isoformat()[:7] not in taken and nxt <= hi:
+                        gap, after = m, nxt
+                        break
+                    m = nxt
+                for r in rows:
+                    v = r[i]
+                    if gap and isinstance(v, str) and v[:7] == gap.isoformat()[:7]:
+                        r[i] = after.isoformat()
+                for k, d in enumerate(marks):
+                    if k + 1 < len(rows):
+                        rows[k + 1][i] = d.isoformat()
+                rows[0][i] = None
+                note(t, f"{cname}: blank, first and last day, year and month boundaries"
+                        + (f", no rows in {gap.isoformat()[:7]}" if gap else ""))
+    return out, notes
+
+
+def fake_dax_tokens(model, text: str) -> str:
+    """Bare mirror tokens in a DAX expression (outside strings) become the fake numbers or dates the
+    synthetic model uses for them, so checks written against the mirror run on the synthetic copy."""
+    lo, hi = _date_range(model)
+    pools = _Pools(model, lo, hi)
+    edits = []
+    for t in lexers.lex_dax(text):
+        if t.kind != "pbztok":
+            continue
+        m = LABEL_RE.match(t.text)
+        key = pools.col(m.group(1), m.group(2)) if m else None
+        if key and pools.dtype(key).startswith("date"):
+            d = _fake_date(t.text, lo, hi)
+            edits.append((t.start, t.end, f"DATE({d.year}, {d.month}, {d.day})"))
+        elif key and pools.dtype(key) == "string":
+            edits.append((t.start, t.end, lexers.dax_string(t.text)))
+        else:
+            edits.append((t.start, t.end, str(fake_int(t.text))))
+    return apply_edits(text, edits) if edits else text
 
 
 def _pk(keys: dict, target: tuple) -> list:
@@ -434,7 +586,8 @@ def _report_edits(text: str, pools: _Pools) -> str:
     return apply_edits(text, edits) if edits else text
 
 
-def build(ws, project, rows: int = 200, seed: int = 7) -> dict:
+def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> dict:
+    """edge: the edge-case profile (see `_edge`); literal calculated tables are faked as well."""
     src = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(src):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
@@ -451,8 +604,11 @@ def build(ws, project, rows: int = 200, seed: int = 7) -> dict:
     model = tmdl.load_model(src)
     lo, hi = _date_range(model)
     pools = _collect_pools(model, project, lo, hi)
-    plan = [t for t in model.tables.values() if _rewrite_table(t)]
+    plan = [t for t in model.tables.values() if _rewrite_table(t) or (edge and _literal_table(t))]
     gen = _generate(model, pools, rows, seed, plan)
+    edge_notes: dict = {}
+    if edge:
+        gen, edge_notes = _edge(model, gen, seed, lo, hi)
     texts = _new_lineage(_rewrite_tmdl(model, pools, gen, plan))
     key = dpapi.load_key(ws.private)
     marker = marker_value(key, _table_tags(texts))
@@ -491,14 +647,18 @@ def build(ws, project, rows: int = 200, seed: int = 7) -> dict:
     rows_by_table = {t: len(r) for t, (_c, r) in gen.items()}
     with open(os.path.join(root, ".pbz", "synth.json"), "w", encoding="utf-8") as f:
         json.dump({"source_project": project.name, "built": dt.datetime.now().isoformat(timespec="seconds"),
-                   "rows": rows, "seed": seed, "tables": rows_by_table}, f, indent=1)
+                   "rows": rows, "seed": seed, "tables": rows_by_table, "profile": "edge" if edge else "standard"},
+                  f, indent=1)
     res = engine_call("tmdl-validate", {"private_dir": ws.private, "folder": os.path.join(sp.model_dir, "definition")},
                       timeout=300)
     errors = [{"file": e.get("file"), "line": e.get("line"), "class": e.get("class")} for e in res.get("errors", [])]
     errors += [{"file": f, "class": "MISSING_FILE"} for f in res.get("missing_refs", [])]
     valid = bool(res.get("ok")) and not errors
     out = {"verb": "synth-build", "project": sp.name, "root": root, "pbip": sp.pbip, "valid": valid,
-           "tables_faked": rows_by_table, "date_range": [lo.isoformat(), hi.isoformat()]}
+           "tables_faked": rows_by_table, "date_range": [lo.isoformat(), hi.isoformat()],
+           "profile": "edge" if edge else "standard"}
+    if edge:
+        out["edge_cases"] = edge_notes
     if not res.get("ok"):
         out["validation"] = res.get("class", "ENGINE_UNAVAILABLE")
     if errors:
@@ -581,7 +741,10 @@ def query(ws, project, dax: str, max_rows: int = 500) -> dict:
 
 def run(ws, project, a) -> dict:
     if a.action == "build":
-        return build(ws, project, a.rows, a.seed)
+        return build(ws, project, a.rows, a.seed, bool(getattr(a, "edge", False)))
+    if a.action == "check":  # spec from --spec, else the positional argument (JSON or a .json file)
+        from . import synthtest
+        return synthtest.check(ws, project, getattr(a, "spec", None) or a.dax)
     if a.action == "status":
         return status(ws, project)
     if a.action == "open":

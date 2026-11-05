@@ -144,6 +144,9 @@ def main(argv=None) -> int:
     p.add_argument("--spec", help="queries JSON file (compare reuses the saved spec when omitted)")
     p = sub.add_parser("smoke")
     p.add_argument("--page")
+    p = sub.add_parser("review", help="review packet: pending changes by release class, impact, revision-bound evidence, "
+                                      "coverage (writes pbz-workspace/REVIEW.md)")
+    p.add_argument("--accept", action="store_true", help="the reviewer accepts the current revision (terminal only)")
     p = sub.add_parser("handoff")
     p.add_argument("--all", action="store_true")
     p = sub.add_parser("memscrub")
@@ -182,6 +185,33 @@ def main(argv=None) -> int:
     p = sub.add_parser("similar", help="duplicate and near-duplicate measures")
     p.add_argument("--threshold", type=float, default=0.80)
     p.add_argument("--max", type=int, default=100)
+    p = sub.add_parser("audit", help="efficiency and consolidation audit (static + bucketed evidence), baselines, waivers")
+    p.add_argument("action", nargs="?", choices=["run", "waive", "memory"], default="run")
+    p.add_argument("id", nargs="?", help="waive: finding id")
+    p.add_argument("--category", choices=["efficiency", "consolidation", "design"])
+    p.add_argument("--rule", action="append", help="only these rule ids (repeatable)")
+    p.add_argument("--min-severity", choices=["high", "medium", "low", "info"])
+    p.add_argument("--since", help="compare with a saved baseline (new / persistent / resolved)")
+    p.add_argument("--save-baseline", help="save the current fingerprints under this name")
+    p.add_argument("--fail-on", choices=["new", "any", "high"], help="gate: exit 1 when findings match")
+    p.add_argument("--coverage", action="store_true", help="list every rule with its source, evidence and status")
+    p.add_argument("--max", type=int, default=400)
+    p.add_argument("--reason", help="waive: why this finding is accepted")
+    p.add_argument("--expires", help="waive: YYYY-MM-DD")
+    p.add_argument("--remove", action="store_true", help="waive: drop the waiver")
+    p.add_argument("--no-predicates", action="store_true", help="memory: skip the time-part / fraction / long-text checks")
+    p = sub.add_parser("consolidate", help="merge duplicate measures; turn measure families into a calculation group")
+    p.add_argument("action", choices=["merge", "families", "calc-group"])
+    p.add_argument("target", nargs="?", help="merge: the duplicate [Measure]")
+    p.add_argument("--into", help="merge: the measure to keep")
+    p.add_argument("--keep-alias", action="store_true", help="merge: keep the duplicate as a hidden alias")
+    p.add_argument("--force", action="store_true", help="merge: even when DAX or formats differ")
+    p.add_argument("--family", help="calc-group: family id from `pbz consolidate families`")
+    p.add_argument("--measure", action="append", help="calc-group: member measures instead of --family")
+    p.add_argument("--name", default="Calculation", help="calc-group: table name")
+    p.add_argument("--column", default="Name", help="calc-group: item column name")
+    p.add_argument("--precedence", type=int)
+    p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("changes", help="semantic diff of mirror snapshots (what changed, by object)")
     p.add_argument("--from", dest="from_", default="last", help="last (latest snapshot), previous, or a stamp")
     p.add_argument("--to", default="mirror", help="mirror (current files), last, or a stamp")
@@ -240,6 +270,61 @@ def main(argv=None) -> int:
     p.add_argument("--top", type=int, help="Top N: keep the N best items of the column")
     p.add_argument("--by", help="Top N: the measure that ranks them")
     p.add_argument("--bottom", action="store_true", help="Top N: the lowest instead")
+    p = sub.add_parser("copy", help="duplicate a report page or a visual (or group) with new ids")
+    p.add_argument("kind", choices=["page", "visual"])
+    p.add_argument("page", help="source page (display name or id)")
+    p.add_argument("visual", nargs="?", help="visual: id or layout label (a group copies its children)")
+    p.add_argument("--as", dest="as_", help="page: display name of the copy (required)")
+    p.add_argument("--after", help="page: insert after this page (default: after the source)")
+    p.add_argument("--independent-slicers", action="store_true", help="page: new sync group names for copied slicers")
+    p.add_argument("--to-page", help="visual: target page (default: same page)")
+    p.add_argument("--pos", help="visual: x,y or x,y,width,height (default: first free spot)")
+    p = sub.add_parser("a11y", help="accessibility audit: alt text, titles, tab order, font sizes, contrast, phone layout")
+    p.add_argument("--page")
+    p.add_argument("--fix-tab-order", action="store_true", help="with --page: rewrite tab order in reading order")
+    p.add_argument("--min-font", type=float, default=9.0)
+    p = sub.add_parser("mobile", help="phone layout per visual (mobile.json)")
+    p.add_argument("page")
+    p.add_argument("visual", help="visual id, layout label, or all")
+    p.add_argument("--pos", help="x,y,width,height")
+    p.add_argument("--remove", action="store_true")
+    p = sub.add_parser("hierarchy", help="add, re-level or remove a user hierarchy")
+    p.add_argument("action", choices=["add", "levels", "remove"])
+    p.add_argument("table")
+    p.add_argument("name")
+    p.add_argument("--level", action="append", default=[], help="add / levels: a column per level, top first (repeatable)")
+    p.add_argument("--names", nargs="+", help="level names, one per --level (default: column names)")
+    p.add_argument("--force", action="store_true", help="remove: even while visuals use it")
+    p = sub.add_parser("format-expr", help="dynamic format string of a measure (formatStringDefinition)")
+    p.add_argument("measure", help="[Measure]")
+    p.add_argument("dax", nargs="?", help="DAX returning a format string")
+    p.add_argument("--remove", action="store_true")
+    p.add_argument("--upgrade-compat", action="store_true", help="raise the compatibility level if needed (one way)")
+    p = sub.add_parser("function", help="DAX user-defined functions: add, update, rename, remove, list")
+    p.add_argument("action", choices=["add", "update", "rename", "remove", "list"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("--params", help="add / update: (name : TYPE, ...)")
+    p.add_argument("--body", help="add / update: the DAX body")
+    p.add_argument("--to", help="rename: new name")
+    p.add_argument("--force", action="store_true", help="remove: even while called")
+    p.add_argument("--upgrade-compat", action="store_true", help="add: raise the compatibility level to 1702 if needed")
+    p = sub.add_parser("recipe", help="run a recipe: a JSON batch of mirror edits applied as one transaction")
+    p.add_argument("action", choices=["run", "check"])
+    p.add_argument("spec", help="recipe file or JSON")
+    p.add_argument("--param", action="append", default=[], help="name=value (repeatable)")
+    for verb in ("set", "get"):
+        p = sub.add_parser(verb, help="typed model properties (description, displayFolder, formatString, isHidden, isKey, "
+                                      "dataCategory, summarizeBy, sortByColumn, isAvailableInMdx)"
+                                      + (": prop=value ..." if verb == "set" else ": show them"))
+        p.add_argument("items", nargs="*", help="an object ('T'[C], [M], Table, Table.Hierarchy)"
+                                                + (" and prop=value pairs" if verb == "set" else ""))
+        p.add_argument("--kind", choices=["table", "column", "measure", "hierarchy"], help="select by kind")
+        p.add_argument("--table", help="select objects of this table")
+        p.add_argument("--match", help="select names matching this regular expression")
+        p.add_argument("--folder", help="select objects in this display folder")
+        if verb == "set":
+            p.add_argument("--unset", action="append", default=[], help="remove a property (repeatable)")
+            p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("bookmark", help="bookmarks of a page's shown and hidden visuals (no data state): add, remove, list")
     p.add_argument("action", choices=["add", "remove", "list"])
     p.add_argument("name", nargs="?", help="add: display name; remove: name or display name")
@@ -313,7 +398,7 @@ def main(argv=None) -> int:
     p.add_argument("name")
     p.add_argument("targets", nargs="*", help="Table, 'T'[Column], [Measure] or T.Hierarchy")
     p = sub.add_parser("role", help="security roles: add, remove, filter, unfilter, member-add, member-remove")
-    p.add_argument("action", choices=["add", "remove", "filter", "unfilter", "member-add", "member-remove"])
+    p.add_argument("action", choices=["add", "remove", "filter", "unfilter", "member-add", "member-remove", "ols"])
     p.add_argument("name", help="role name")
     p.add_argument("args", nargs="*", help="filter: <table> \"<DAX>\"; unfilter: <table>; member-*: <member or token>")
     p.add_argument("--permission", default="read")
@@ -330,8 +415,11 @@ def main(argv=None) -> int:
     p.add_argument("--hybrid", action="store_true", help="set: latest period in DirectQuery (Premium)")
     sub.add_parser("mcp", help="serve pbz verbs as MCP tools over stdio (for agent hosts)")
     p = sub.add_parser("synth", help="synthetic test copy of the model with fake data (query it freely)")
-    p.add_argument("action", choices=["build", "status", "open", "close", "query", "remove"])
-    p.add_argument("dax", nargs="?", help="query: an EVALUATE statement (synthetic model only)")
+    p.add_argument("action", choices=["build", "status", "open", "close", "query", "remove", "check"])
+    p.add_argument("dax", nargs="?", help="query: an EVALUATE statement (synthetic model only); check: the spec")
+    p.add_argument("--edge", action="store_true",
+                   help="build: edge-case profile (blanks, orphans, zero/negative values, boundary dates, a month with no rows)")
+    p.add_argument("--spec", help='check: {"checks": [...]} or a .json file')
     p.add_argument("--rows", type=int, default=200, help="build: rows per fact table")
     p.add_argument("--seed", type=int, default=7, help="build: random seed")
     p.add_argument("--wait", type=int, default=480)
@@ -409,6 +497,9 @@ def main(argv=None) -> int:
             out = smoke.run(ws, project, a.page)
         elif a.cmd == "handoff":
             out = handoff.build(ws, project, a.all)
+        elif a.cmd == "review":
+            from pbz import evidence
+            out = evidence.review(ws, project, a.accept)
         elif a.cmd == "memscrub":
             out = memscrub.run(ws, project, a.dir, apply=a.apply, show=a.show)
         elif a.cmd == "unused":
@@ -439,6 +530,35 @@ def main(argv=None) -> int:
         elif a.cmd == "similar":
             from pbz import similar
             out = similar.run(ws, project, a.threshold, a.max)
+        elif a.cmd == "audit":
+            from pbz import audit
+            if a.action == "waive":
+                if not a.id:
+                    raise PbzError("BAD_REQUEST", "pbz audit waive <id> --reason ...")
+                out = audit.waive(ws, project, a.id, a.reason, a.expires, remove=a.remove,
+                                  by="human" if _is_human() else "agent")
+            elif a.action == "memory":
+                try:
+                    from pbz import memory
+                except ImportError:
+                    raise PbzError("UNSUPPORTED", "memory attribution is not installed") from None
+                out = memory.run(ws, project, predicates=not a.no_predicates)
+            else:
+                out = audit.run(ws, project, rules=a.rule, category=a.category, min_severity=a.min_severity,
+                                since=a.since, save_baseline=a.save_baseline, fail_on=a.fail_on,
+                                coverage=a.coverage, max_findings=a.max)
+        elif a.cmd == "consolidate":
+            from pbz import consolidate
+            if a.action == "merge":
+                if not a.target or not a.into:
+                    raise PbzError("BAD_REQUEST", "pbz consolidate merge \"[Duplicate]\" --into \"[Keep]\"")
+                out = consolidate.merge(ws, project, a.target, a.into, keep_alias=True if a.keep_alias else None,
+                                        force=a.force, dry_run=a.dry_run)
+            elif a.action == "families":
+                out = consolidate.families_report(ws, project)
+            else:
+                out = consolidate.calc_group(ws, project, family=a.family or a.target, measures=a.measure, name=a.name,
+                                             column=a.column, precedence=a.precedence, dry_run=a.dry_run)
         elif a.cmd == "changes":
             from pbz import changes
             out = changes.list_snapshots(ws, project) if a.list else changes.run(ws, project, a.from_, a.to)
@@ -478,6 +598,78 @@ def main(argv=None) -> int:
         elif a.cmd == "interaction":
             from pbz import filters
             out = filters.interaction(ws, project, a.page, a.source, a.target, a.mode)
+        elif a.cmd == "copy":
+            from pbz import components
+            if a.kind == "page":
+                if not a.as_:
+                    raise PbzError("BAD_REQUEST", "copy page needs --as <name>")
+                out = components.copy_page(ws, project, a.page, a.as_, a.after, a.independent_slicers)
+            else:
+                if not a.visual:
+                    raise PbzError("BAD_REQUEST", "copy visual <page> <visual>")
+                out = components.copy_visual(ws, project, a.page, a.visual, a.to_page, a.pos)
+        elif a.cmd == "a11y":
+            from pbz import a11y
+            if a.fix_tab_order:
+                if not a.page:
+                    raise PbzError("BAD_REQUEST", "--fix-tab-order needs --page")
+                out = a11y.fix_tab_order(ws, project, a.page)
+            else:
+                out = a11y.audit(ws, project, a.page, a.min_font)
+        elif a.cmd == "mobile":
+            from pbz import a11y
+            out = a11y.mobile(ws, project, a.page, a.visual, a.pos, a.remove)
+        elif a.cmd == "hierarchy":
+            from pbz import modeling
+            if a.action == "add":
+                out = modeling.hierarchy_add(ws, project, a.table, a.name, a.level, a.names)
+            elif a.action == "levels":
+                out = modeling.hierarchy_levels(ws, project, a.table, a.name, a.level, a.names)
+            else:
+                out = modeling.hierarchy_remove(ws, project, a.table, a.name, a.force)
+        elif a.cmd == "format-expr":
+            from pbz import modeling
+            if not a.remove and not a.dax:
+                raise PbzError("BAD_REQUEST", "format-expr <[Measure]> \"<DAX>\" or --remove")
+            out = modeling.format_expression(ws, project, a.measure, None if a.remove else a.dax, a.upgrade_compat)
+        elif a.cmd == "function":
+            from pbz import modeling
+            if a.action == "list":
+                out = modeling.function_list(ws, project)
+            elif not a.name:
+                raise PbzError("BAD_REQUEST", f"function {a.action} needs a name")
+            elif a.action == "add":
+                if not (a.params is not None and a.body):
+                    raise PbzError("BAD_REQUEST", "function add <name> --params \"(x : NUMERIC)\" --body \"x * 2\"")
+                out = modeling.function_add(ws, project, a.name, a.params, a.body, a.upgrade_compat)
+            elif a.action == "update":
+                out = modeling.function_update(ws, project, a.name, a.params, a.body)
+            elif a.action == "rename":
+                if not a.to:
+                    raise PbzError("BAD_REQUEST", "function rename <name> --to <new>")
+                out = modeling.function_rename(ws, project, a.name, a.to)
+            else:
+                out = modeling.function_remove(ws, project, a.name, a.force)
+        elif a.cmd == "recipe":
+            from pbz import recipes
+            params = dict(p.split("=", 1) for p in a.param if "=" in p)
+            if a.action == "check":
+                r = recipes.load(a.spec)
+                out = {"verb": "recipe", "action": "check", "recipe": r.get("recipe", "unnamed"),
+                       "steps": [s["verb"] for s in r["steps"]], "result": "VALID"}
+            else:
+                out = recipes.run(ws, project, a.spec, params)
+        elif a.cmd in ("set", "get"):
+            from pbz import props
+            assigns = [x for x in a.items if "=" in x and x.split("=", 1)[0].strip() in props.PROPS]
+            rest = [x for x in a.items if x not in assigns]
+            if len(rest) > 1:
+                raise PbzError("BAD_REQUEST", "one object at a time (or select with --kind / --table / --match / --folder)")
+            target = rest[0] if rest else None
+            if a.cmd == "get":
+                out = props.get(ws, project, target, a.kind, a.table, a.match, a.folder)
+            else:
+                out = props.run(ws, project, target, assigns, a.unset, a.kind, a.table, a.match, a.folder, a.dry_run)
         elif a.cmd == "bookmark":
             from pbz import bookmarks
             if a.action == "list":
@@ -570,6 +762,11 @@ def main(argv=None) -> int:
                     if len(a.args) != 1:
                         raise PbzError("BAD_REQUEST", "role unfilter <name> <table>")
                     out = gv.role_filter(ws, project, a.name, a.args[0], None)
+                elif a.action == "ols":
+                    if len(a.args) != 2:
+                        raise PbzError("BAD_REQUEST", "role ols <name> <Table or 'T'[C]> none|read|default")
+                    from pbz import modeling
+                    out = modeling.role_ols(ws, project, a.name, a.args[0], a.args[1])
                 else:
                     if len(a.args) != 1:
                         raise PbzError("BAD_REQUEST", "role member-add|member-remove <name> <member>")
@@ -618,8 +815,14 @@ def main(argv=None) -> int:
     except PbzError as e:
         emit({"ok": False, "error": e.code, "detail": e.detail})
         return 2
+    if project is not None:  # revision-bound evidence for `pbz review` (verdict counts and ids only)
+        from pbz import evidence
+        try:
+            evidence.record(ws, project, a.cmd, getattr(a, "action", None), out)
+        except (OSError, ValueError, PbzError):
+            pass
     emit(out)
-    return 0
+    return 1 if isinstance(out, dict) and out.get("gate") == "FAIL" else 0
 
 
 def admin(ws, a) -> dict:

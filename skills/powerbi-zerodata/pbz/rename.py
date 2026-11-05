@@ -70,23 +70,10 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         for reg in doc.regions:
             if reg.kind != "dax":
                 continue
-            cur = None
             n = reg.node
             while n is not None and n.kind != "table":
                 n = n.parent
-            cur = n.name if n else None
-            sig = lexers.significant(lexers.lex_dax(text[reg.start:reg.end], reg.start))
-            for i, t in enumerate(sig):
-                if t.kind != "bracket" or t.value.lower() != old.lower():
-                    continue
-                prev = sig[i - 1] if i else None
-                qualified = prev is not None and prev.end == t.start and prev.kind in ("table", "ident")
-                qtable = prev.value if qualified else None
-                if kind == "measure" and (not qualified or qtable.lower() == home.lower()):
-                    edits.append((t.start, t.end, _bracket(new)))
-                elif kind == "column" and ((qualified and qtable.lower() == home.lower()) or
-                                           (not qualified and cur and cur.lower() == home.lower())):
-                    edits.append((t.start, t.end, _bracket(new)))
+            edits += dax_ref_edits(text, reg.start, reg.end, kind, home, old, new, n.name if n else None)
         if kind == "column":
             for m_ in re.finditer(r"(?m)^(\t*(?:sortByColumn|column)\s*:\s*)('(?:[^']|'')*'|\S+)\s*$", text):
                 if tmdl.unquote(m_.group(2)).lower() == old.lower() and rel == model.tables[home].file:
@@ -109,20 +96,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             root = pbir.parse_json(text)
         except pbir.JsonError:
             continue
-        edits = []
-        want = "measure" if kind == "measure" else "column"
-        for ref in pbir.walk_fields(root, model):
-            k = "column" if ref.kind == "aggregation" else ref.kind
-            if k == want and ref.name.lower() == old.lower() and ref.table.lower() == home.lower() and ref.prop_node:
-                edits.append((ref.prop_node.start, ref.prop_node.end, json.dumps(new, ensure_ascii=False)))
-        for key, node in pbir.string_nodes(root):
-            if key in ("queryRef", "nativeQueryRef", "metadata") and old.lower() in node.value.lower():
-                v = node.value
-                nv = re.sub(rf"(?i)(?<![\w]){re.escape(home)}\.{re.escape(old)}(?![\w])", f"{home}.{new}", v)
-                if key == "nativeQueryRef" and v.lower() == old.lower():
-                    nv = new
-                if nv != v:
-                    edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
+        edits = pbir_ref_edits(root, model, kind, home, old, new)
         if edits:
             write_text(path, apply_edits(text, edits), bom)
             changed.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
@@ -130,6 +104,47 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
     changed += [f"{project.name}.SemanticModel/definition/{r}" for r in culture_edits_rename(mdef, kind, home, old, new)]
     return {"verb": "rename", "kind": kind, "table": home, "from": old, "to": new, "files": changed,
             "next": "pbz diff, then pbz push", **ext}
+
+
+def dax_ref_edits(text: str, start: int, end: int, kind: str, home: str, old: str, new: str,
+                  cur: str | None = None) -> list[tuple[int, int, str]]:
+    """Edits renaming every reference to measure / column `old` of table `home` inside text[start:end] (one
+    DAX expression) to `new`: 'home'[old] and home[old], and bare [old] (for a column only when `cur`, the
+    table that holds the expression, is `home`). Offsets are in `text`."""
+    edits = []
+    sig = lexers.significant(lexers.lex_dax(text[start:end], start))
+    for i, t in enumerate(sig):
+        if t.kind != "bracket" or t.value.lower() != old.lower():
+            continue
+        prev = sig[i - 1] if i else None
+        qualified = prev is not None and prev.end == t.start and prev.kind in ("table", "ident")
+        qtable = prev.value if qualified else None
+        if kind == "measure" and (not qualified or qtable.lower() == home.lower()):
+            edits.append((t.start, t.end, _bracket(new)))
+        elif kind == "column" and ((qualified and qtable.lower() == home.lower()) or
+                                   (not qualified and cur and cur.lower() == home.lower())):
+            edits.append((t.start, t.end, _bracket(new)))
+    return edits
+
+
+def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str) -> list[tuple[int, int, str]]:
+    """Edits renaming measure / column `old` of table `home` in one parsed PBIR document: every field
+    reference's Property, and queryRef / nativeQueryRef / metadata strings."""
+    edits = []
+    want = "measure" if kind == "measure" else "column"
+    for ref in pbir.walk_fields(root, model):
+        k = "column" if ref.kind == "aggregation" else ref.kind
+        if k == want and ref.name.lower() == old.lower() and ref.table.lower() == home.lower() and ref.prop_node:
+            edits.append((ref.prop_node.start, ref.prop_node.end, json.dumps(new, ensure_ascii=False)))
+    for key, node in pbir.string_nodes(root):
+        if key in ("queryRef", "nativeQueryRef", "metadata") and old.lower() in node.value.lower():
+            v = node.value
+            nv = re.sub(rf"(?i)(?<![\w]){re.escape(home)}\.{re.escape(old)}(?![\w])", f"{home}.{new}", v)
+            if key == "nativeQueryRef" and v.lower() == old.lower():
+                nv = new
+            if nv != v:
+                edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
+    return edits
 
 
 def _external_users(ws, project, kind: str, table: str, name: str) -> dict:

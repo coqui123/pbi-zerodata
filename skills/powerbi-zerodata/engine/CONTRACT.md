@@ -86,7 +86,8 @@ Response:
 ```
 Source: `$SYSTEM.TMSCHEMA_TABLES`, `TMSCHEMA_COLUMNS`, `TMSCHEMA_MEASURES`,
 `TMSCHEMA_RELATIONSHIPS`, `TMSCHEMA_PARTITIONS` (`State`, `ErrorMessage`). Only `TMSCHEMA_*` and
-`DBSCHEMA_CATALOGS` DMVs may ever be queried by any verb.
+`DBSCHEMA_CATALOGS` DMVs may ever be queried by any verb, except the fixed-column reads of `deps` (v1.2) and
+`memory` (v1.4).
 
 ### `tmdl-validate`
 Request `{"private_dir", "folder": "<...>\\X.SemanticModel\\definition"}` (no port).
@@ -178,7 +179,9 @@ Response `{"visuals": [{"id": "page/visual", "status": "OK|EMPTY|ERROR", "class"
 ## Safety rules for the implementation
 
 - Never print engine strings except scrubbed `message` fields above.
-- Never run DMVs other than `TMSCHEMA_*` / `DBSCHEMA_CATALOGS` (storage DMVs leak counts).
+- Never run DMVs other than `TMSCHEMA_*` / `DBSCHEMA_CATALOGS` (storage DMVs leak counts). The only exceptions are
+  the fixed-column reads of `deps` (v1.2) and `memory` (v1.4); `memory` keeps every size and count inside the process
+  and prints fixed bands only.
 - Default per-command timeout 60 s -> `TIMEOUT`.
 - Before any data query on `port`, `connect` logic must succeed; callers pass the same port.
 - Tests use only the synthetic fixture model. Canary strings/numbers planted there must never
@@ -237,6 +240,58 @@ regenerated for each synthetic build and `pbz push` refuses the annotation (SYNT
 so the marker cannot be moved onto a real model. Otherwise `BAD_REQUEST` and no rows. The query must pass
 the same guard as snapshot / smoke (DEFINE or EVALUATE first, no INFO.* or EVALUATEANDLOG). Rows are capped at
 500; DateTime values are `yyyy-MM-ddTHH:mm:ss` strings.
+
+## v1.4 addition: `memory`
+
+Request `{"private_dir", "port", "disclosure"?, "predicates"?: true}` (`predicates` must be a boolean). VertiPaq
+storage attributed to model objects the way VertiPaq Analyzer does, released only as fixed bands.
+
+**Sources.** The second exception to the DMV rule and the only read of storage DMVs: `Conn.StorageDmv` accepts exactly
+`$SYSTEM.DISCOVER_STORAGE_TABLE_COLUMNS` (columns `DIMENSION_NAME, TABLE_ID, COLUMN_ID, COLUMN_TYPE, DICTIONARY_SIZE`)
+and `$SYSTEM.DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` (`DIMENSION_NAME, TABLE_ID, COLUMN_ID, USED_SIZE`). Callers cannot
+choose DMVs or columns, and `Conn.Dmv` still refuses both. Sizes, row counts and segment counts never leave the process.
+Object ids, names, hierarchies, relationships and partition modes come from `TMSCHEMA_*`.
+
+**Attribution.** Storage ids embed TMSCHEMA ids: table data `T (tid)` with column `C (cid)`, attribute hierarchies
+`H$T (tid)$C (cid)`, user hierarchies `U$T (tid)$H (hid)`, relationships `R$T (tid)$R (rid)` (stored with the from
+table). Names inside storage ids are sanitized by the engine (hyphens become spaces), so objects are matched by id first,
+then by exact name, then by a letters-and-digits comparison. Per column: dictionary (`COLUMN_TYPE` `BASIC_DATA` rows
+only) + its data segments in its table's own storage + its attribute hierarchy. Per user hierarchy: its `U$` segments.
+Per relationship: its `R$` segments. Per table: its columns, its RowNumber column, its user hierarchies and the
+relationships whose from column it holds. Model: all storage. Auto date/time and other private tables (and relationships
+touching them) are not listed; together they are `auto_datetime`. Storage that cannot be attributed to a listed object
+is `other` and makes `coverage` `PARTIAL`; its storage ids (never sizes) go to the DPAPI log only. Storage ids are never
+printed: every printed name is a TMSCHEMA object name.
+
+**Bands** (fixed, lower bounds inclusive): `size_band` `"<1 MiB"`, `"1-10 MiB"`, `"10-100 MiB"`, `"100-1000 MiB"`,
+`">=1000 MiB"`; `share_band` (share of the whole model's storage) `"<1%"`, `"1-5%"`, `"5-20%"`, `">=20%"`.
+`dictionary_heavy`: the dictionary is at least half of the column's size. Everything is sorted by name (no ranking).
+VertiPaq reserves about 1 MiB of dictionary per text column, so even tiny text columns show `"1-10 MiB"`.
+
+**Predicates** (booleans; constant-free DAX written by the engine, no caller input), only on columns of imported tables
+(every partition in Import mode, directly or through the model default; never DirectQuery, Dual or DirectLake):
+`time_part` (dateTime: some non-blank value `<> TRUNC(value)`), `fractional` (double / decimal: the same test),
+`long_text` (string: some value with `LEN(value) > 100`). Every eligible column when the model is under 100 MiB, else only
+columns of at least 1 MiB; at most 500 columns (largest first) and at most 5 x `timeout_s` (30-900 s) in total. One `ROW`
+query per table; after an error, one query per column. A predicate that errors or times out is omitted (the error goes
+to the DPAPI log, never to stdout). Response `predicates`: `OFF` (request `"predicates": false`), `DONE`, or `PARTIAL`
+(some eligible column has no answer).
+
+```json
+{"ok": true, "verb": "memory", "model": {"size_band": "10-100 MiB"},
+ "tables": [{"name": "Sales", "size_band": "10-100 MiB", "share_band": ">=20%",
+   "columns": [{"name": "OrderDate", "size_band": "1-10 MiB", "share_band": "1-5%", "dictionary_heavy": false, "time_part": true}],
+   "hierarchies": [{"name": "Calendar", "size_band": "<1 MiB"}]}],
+ "relationships": [{"name": "<TOM relationship name>", "from": "Sales[DateKey]", "to": "Date[DateKey]", "size_band": "<1 MiB"}],
+ "other": {"size_band": "<1 MiB", "share_band": "<1%"},
+ "auto_datetime": {"size_band": "1-10 MiB", "share_band": "5-20%"},
+ "coverage": "FULL", "predicates": "DONE"}
+```
+
+`other` appears only when something was not attributed; `auto_datetime` only when the model has private tables.
+Strict tier: not refused; every band (`model`, `size_band`, `share_band`, `other`, `auto_datetime`) is omitted, while
+names, `dictionary_heavy`, the predicate booleans, `coverage` and `predicates` stay (booleans are allowed in both tiers,
+as in `probe`). Engine failures use the error envelope.
 
 Implementation clarifications that callers must know (response container names, the blank group
 key, optional `timeout_s`, stricter message scrubbing, query guards) are listed in

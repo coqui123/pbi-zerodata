@@ -24,6 +24,7 @@ public sealed class Req
 
     public string? Str(string name) => J.Str(Obj, name);
     public int? Int(string name) => J.Int(Obj, name);
+    public bool? Bool(string name) => J.Bool(Obj, name);
     public List<string>? StrList(string name) => J.StrList(Obj, name);
     public JsonArray? Arr(string name) => J.Arr(Obj, name);
 
@@ -65,6 +66,13 @@ public static class J
             if (v.TryGetValue<double>(out var d) && Math.Abs(d - Math.Round(d)) < 1e-9 && Math.Abs(d) < int.MaxValue) return (int)Math.Round(d);
         }
         throw new BadRequestException(name + " must be an integer");
+    }
+
+    public static bool? Bool(JsonObject o, string name)
+    {
+        if (!o.TryGetPropertyValue(name, out var n) || n == null) return null;
+        if (n is JsonValue v && v.TryGetValue<bool>(out var b)) return b;
+        throw new BadRequestException(name + " must be a boolean");
     }
 
     public static double? Num(JsonObject o, string name)

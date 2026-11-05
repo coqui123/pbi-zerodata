@@ -38,6 +38,7 @@ in step.
 | `pbz role filter <name> <table> "<DAX>"` | sets (or replaces) the table's row filter; every reference is resolved first (`UNKNOWN_REF` otherwise) |
 | `pbz role unfilter <name> <table>` | drops the filter |
 | `pbz role member-add <name> <member>` / `member-remove <name> <member or token>` | members are personal data: they appear as `«pii#n»` tokens after the next pull; remove one by its token |
+| `pbz role ols <name> <Table or 'T'[C]> none\|read\|default` | object-level security: `metadataPermission` on the table permission or a `columnPermission` (none hides the object from the role; default removes the rule) |
 
 Effective security is a data question: ask the user to test with View as role in Desktop.
 

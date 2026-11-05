@@ -21,7 +21,7 @@ deny rules, a broker CLI), not an OS security boundary.
 | DATATABLE, `#table`, Enter Data blobs, RLS members, M literals | tokenized or payload markers |
 | Figures and names in descriptions, comments, titles, text boxes | free-text scan (`«num»`, `«lit»`, `«pii»`) |
 | DAX query results, counts, distinct values | only via pbz-engine verdicts |
-| Engine / DMV statistics (`DISCOVER_STORAGE_*`, sessions, traces) | engine allows `TMSCHEMA_*` and `DBSCHEMA_CATALOGS` only |
+| Engine / DMV statistics (`DISCOVER_STORAGE_*`, sessions, traces) | engine allows `TMSCHEMA_*` and `DBSCHEMA_CATALOGS`; the one exception, `memory` (`pbz audit memory`), reads two storage DMVs with fixed columns inside the broker and releases only fixed size / share bands and three yes/no predicates, sorted by name (reference/audit.md) |
 | Error text echoing values ("duplicate value 'X'", `Details:`) | engine emits classes; raw text DPAPI-encrypted, human-only log |
 | Boolean oracle / bisection | no `between`; a ledger keeps distinct constants per target for 30 days, including literals the agent pushed into measures the target reaches; daily budgets for checks, probes, snapshot queries and smoke runs; opaque group keys |
 | Timing side channel | no durations printed |

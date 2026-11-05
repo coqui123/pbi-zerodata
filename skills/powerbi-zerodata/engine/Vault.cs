@@ -197,4 +197,27 @@ public static class Buckets
         <= 5 => "FEW",
         _ => "MANY",
     };
+
+    const long MiB = 1024L * 1024L;
+
+    /// <summary>Storage size (memory verb): &lt;1 MiB, 1-10 MiB, 10-100 MiB, 100-1000 MiB, &gt;=1000 MiB (lower bounds inclusive).</summary>
+    public static string Size(long bytes) => bytes switch
+    {
+        < MiB => "<1 MiB",
+        < 10 * MiB => "1-10 MiB",
+        < 100 * MiB => "10-100 MiB",
+        < 1000 * MiB => "100-1000 MiB",
+        _ => ">=1000 MiB",
+    };
+
+    /// <summary>Share of the whole model's storage (memory verb): &lt;1%, 1-5%, 5-20%, &gt;=20% (lower bounds inclusive).</summary>
+    public static string StorageShare(long part, long total)
+    {
+        if (part <= 0 || total <= 0) return "<1%";
+        decimal p = part, t = total;
+        if (p * 100 < t) return "<1%";
+        if (p * 20 < t) return "1-5%";
+        if (p * 5 < t) return "5-20%";
+        return ">=20%";
+    }
 }

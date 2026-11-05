@@ -28,6 +28,16 @@ without company data entering the agent's context.
   `bookmark`s and button actions (`link`): `reference/authoring.md`.
 - `synth test`: golden results on the synthetic model and SAME / DIFF after a refactor
   (`reference/synth.md`); `consumers discover` finds files connected to the model.
+- Model properties (`set` / `get`, bulk by table, kind, name pattern or folder), `hierarchy`,
+  `format-expr` (dynamic format strings), DAX user-defined `function`s, object-level security
+  (`role ols`); page and visual `copy`, `a11y` audit and tab-order fix, `mobile` phone layouts.
+- `review`: review packet by release class with revision-bound evidence (`reference/workflow.md`);
+  `recipe run`: JSON batches of mirror edits applied as one transaction with rollback.
+- `audit`: efficiency and consolidation findings (iterators, calculated columns, storage bands, relationships,
+  Power Query overlap, duplicate measures and tables, calculation-group, filtered and parameterized
+  families, repeated sub-expressions), each with evidence, fix and verification; baselines, waivers and a
+  CI gate. `audit memory` adds VertiPaq storage bands from Desktop (bands only); `consolidate merge` and
+  `consolidate calc-group` apply the consolidations with a check spec (`reference/audit.md`).
 - CI: `.github/workflows/tests.yml` runs the offline suites on every push (Desktop suites stay local).
 - `consumers`: register thin reports, PBIX, Excel workbooks, paginated reports, composite models, query
   exports or a scanner result so `unused` keeps what they use (`used_external`) and refuses removals
@@ -72,6 +82,15 @@ python skills/powerbi-zerodata/tests/test_visuals.py    # built-in catalog, cust
 python skills/powerbi-zerodata/tests/test_style.py      # visual formatting: values, selectors, bulk, checks
 python skills/powerbi-zerodata/tests/test_reportedit.py # filters, interactions, tooltip / drillthrough pages, links
 python skills/powerbi-zerodata/tests/test_synthtest.py  # synthetic regression tests (add --live to run in Desktop)
+python skills/powerbi-zerodata/tests/test_props.py      # typed model properties, bulk selection
+python skills/powerbi-zerodata/tests/test_modeling.py   # hierarchies, dynamic formats, functions, OLS (TOM)
+python skills/powerbi-zerodata/tests/test_workflow.py   # review packet, evidence, recipes, Power Query guard
+python skills/powerbi-zerodata/tests/test_components.py # page and visual copies
+python skills/powerbi-zerodata/tests/test_a11y.py       # accessibility audit, tab order, phone layout
+python skills/powerbi-zerodata/tests/test_synthedge.py  # edge-case synthetic data and checks (add --live for Desktop)
+python skills/powerbi-zerodata/tests/test_audit.py      # audit rules, evidence, baselines, waivers, gate
+python skills/powerbi-zerodata/tests/test_consolidate.py # merge duplicates, calculation-group families (add --live for Desktop)
+python skills/powerbi-zerodata/tests/test_memory.py     # storage bands (add --live for Desktop)
 python skills/powerbi-zerodata/tests/test_engine.py    # engine verbs + canary scan (needs Desktop)
 python skills/powerbi-zerodata/tests/test_e2e.py       # every verb on a fixture copy in Desktop, canary scan
 ```

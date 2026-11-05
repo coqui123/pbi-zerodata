@@ -16,6 +16,10 @@ Technical lessons only. No values.
 - A custom theme survives publish only when imported through Desktop (Themes > Browse).
 
 ## TMDL
+
+- A measure with both `formatString` and `formatStringDefinition` passes TOM validation but Desktop
+  refuses to open the model ("has both FormatString property and FormatStringDefinition property").
+  Keep one (`pbz format-expr` replaces the static format; `pbz repair` fixes old conflicts).
 - Tab indentation. A multi-line expression starts on the line after `=` and sits two levels
   deeper than the object line; properties sit one level deeper. Long or special expressions can
   use triple-backtick blocks.

@@ -18,12 +18,13 @@
     { "$ref": "#/$defs/snapshotCompare" },
     { "$ref": "#/$defs/smoke" },
     { "$ref": "#/$defs/deps" },
-    { "$ref": "#/$defs/synthQuery" }
+    { "$ref": "#/$defs/synthQuery" },
+    { "$ref": "#/$defs/memory" }
   ],
   "$defs": {
     "verb": {
       "enum": ["ping", "connect", "health", "tmdl-validate", "refresh", "compiles", "index", "check", "probe",
-               "snapshot-save", "snapshot-compare", "smoke", "deps", "synth-query"]
+               "snapshot-save", "snapshot-compare", "smoke", "deps", "synth-query", "memory"]
     },
     "anyVerb": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_\\-]*$" },
     "errorClass": {
@@ -394,6 +395,93 @@
           "items": { "type": "array", "items": { "type": ["string", "number", "boolean", "null"] } }
         },
         "truncated": { "type": "boolean" }
+      }
+    },
+    "sizeBand": { "enum": ["<1 MiB", "1-10 MiB", "10-100 MiB", "100-1000 MiB", ">=1000 MiB"] },
+    "storageShareBand": { "enum": ["<1%", "1-5%", "5-20%", ">=20%"] },
+    "memoryBands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size_band", "share_band"],
+      "properties": {
+        "size_band": { "$ref": "#/$defs/sizeBand" },
+        "share_band": { "$ref": "#/$defs/storageShareBand" }
+      }
+    },
+    "memory": {
+      "description": "VertiPaq storage per object in fixed bands (v1.4). Bands are omitted in the strict tier; names are TMSCHEMA object names only.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "tables", "relationships", "coverage", "predicates"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "memory" },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["size_band"],
+          "properties": { "size_band": { "$ref": "#/$defs/sizeBand" } }
+        },
+        "tables": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "columns", "hierarchies"],
+            "properties": {
+              "name": { "$ref": "#/$defs/name" },
+              "size_band": { "$ref": "#/$defs/sizeBand" },
+              "share_band": { "$ref": "#/$defs/storageShareBand" },
+              "columns": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "dictionary_heavy"],
+                  "properties": {
+                    "name": { "$ref": "#/$defs/name" },
+                    "size_band": { "$ref": "#/$defs/sizeBand" },
+                    "share_band": { "$ref": "#/$defs/storageShareBand" },
+                    "dictionary_heavy": { "type": "boolean" },
+                    "time_part": { "type": "boolean" },
+                    "fractional": { "type": "boolean" },
+                    "long_text": { "type": "boolean" }
+                  }
+                }
+              },
+              "hierarchies": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name"],
+                  "properties": {
+                    "name": { "$ref": "#/$defs/name" },
+                    "size_band": { "$ref": "#/$defs/sizeBand" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": { "$ref": "#/$defs/name" },
+              "from": { "type": "string", "maxLength": 1100, "pattern": "^[^\\u0000-\\u001f]+\\[[^\\u0000-\\u001f]+\\]$" },
+              "to": { "type": "string", "maxLength": 1100, "pattern": "^[^\\u0000-\\u001f]+\\[[^\\u0000-\\u001f]+\\]$" },
+              "size_band": { "$ref": "#/$defs/sizeBand" }
+            }
+          }
+        },
+        "other": { "$ref": "#/$defs/memoryBands" },
+        "auto_datetime": { "$ref": "#/$defs/memoryBands" },
+        "coverage": { "enum": ["FULL", "PARTIAL"] },
+        "predicates": { "enum": ["OFF", "DONE", "PARTIAL"] }
       }
     },
     "depsName": { "type": "string", "maxLength": 512, "pattern": "^[^\\u0000-\\u001f]*$" },

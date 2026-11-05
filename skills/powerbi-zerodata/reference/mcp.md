@@ -41,6 +41,15 @@ and `project` (when the workspace holds several `.pbip` files), plus its own arg
 | `filter` | `action` (add / remove / list, required), `target`, `report`, `page`, `visual`, `values_in`, `values_out`, `where`, `top`, `by`, `bottom` |
 | `interaction` | `page`, `source`, `target`, `mode` (all required) |
 | `bookmark` | `action` (add / remove / list, required), `name`, `page`, `hide`, `show`, `only` |
+| `evidence` (the `pbz review` packet) | none |
+| `set_props` / `get_props` | `items` (object and prop=value pairs), `kind`, `table`, `match`, `folder`, `unset`, `dry_run` |
+| `copy` | `kind` (page / visual), `page` (required), `visual`, `as`, `after`, `independent_slicers`, `to_page`, `pos` |
+| `a11y` | `page`, `fix_tab_order`, `min_font` |
+| `mobile` | `page`, `visual` (required), `pos`, `remove` |
+| `hierarchy` | `action`, `table`, `name` (required), `levels`, `names`, `force` |
+| `format_expr` | `measure` (required), `dax`, `remove`, `upgrade_compat` |
+| `function` | `action` (required), `name`, `params`, `body`, `to`, `force`, `upgrade_compat` |
+| `recipe` | `action` (run / check), `spec` (required), `params` |
 | `synth_test` | `action` (save / run / list / remove, required), `name`, `spec`, `measures`, `by`, `replace`, `tol` |
 | `visual` | `action` (list / roles / import / register, required), `target`, `as`, `roles`, `replace` |
 | `consumers` | `action` (list / add / scan / show / discover, required), `target`, `register`, `depth`, `kind`, `label`, `objects`, `model_names` |

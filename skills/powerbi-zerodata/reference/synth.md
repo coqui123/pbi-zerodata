@@ -18,6 +18,21 @@ Rebuild after you change the model (`build` replaces the previous copy; close it
 a normal PBIP folder marked synthetic, so you may also read its files and run `pbz --workspace <that
 folder> health | smoke | check` there.
 
+## Edge cases and property checks: `pbz synth build --edge`, `pbz synth check`
+
+`pbz synth build --edge` plants the cases that break measures in the fake rows: keys on the one side
+with no related rows, orphan and blank foreign keys, duplicate and blank labels, zero, negative and
+blank amounts, boundary dates (first and last day, year end, month end) and one month with no rows.
+One-side keys and sort-by columns stay intact. `pbz synth check '<spec>'` (or `--spec <file>`) runs a
+`pbz check` spec (all kinds except `between`) against the synthetic copy only and returns PASS / FAIL
+/ EMPTY / ERROR per check. Because the data are fake it also shows counterexamples: failing groups
+with both sides of a comparison, duplicate and orphan values, blank-key rows, and the total next to the
+sum of groups. For an `equal` grouped by several columns, `fails_at_single_column` names the coarsest
+grain that already breaks. Mirror tokens in the spec map to the copy's fake values. Synth tests record
+the profile, so switching between `--edge` and the standard profile is reported as drift
+(NOT_COMPARABLE). Typical loop: write the check spec you will later run on real data with `pbz check`,
+make it pass on `--edge` fake data first, then run it on the real model for verdicts only.
+
 ## Regression tests: `pbz synth test`
 
 Golden results on the synthetic copy catch logic changes in a refactor without real data.

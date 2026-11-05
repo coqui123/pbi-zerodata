@@ -63,6 +63,63 @@ questions: check them with `pbz check` (`unique`, `no_orphans`) while Desktop is
 - `pbz style` formats visuals (titles, data labels, colors, fonts, axes, legends, borders, one
   series, button states), one at a time or every visual of a type: [style.md](style.md).
 
+## Model properties: `pbz set` / `pbz get`
+
+`pbz set <object> prop=value ...` edits typed properties of one object (`'T'[C]`, `[M]`, `Table`,
+`Table.Hierarchy`), or of a selection: `pbz set --table Sales --kind measure --match "%$"
+formatString=0.0%`, `--folder <display folder>`. Properties: `description` (written as `///` lines),
+`displayFolder`, `formatString`, `isHidden`, `isKey`, `dataCategory`, `summarizeBy`, `sortByColumn`
+(same table, no loops), `isAvailableInMdx`. `--unset prop` removes one, `--dry-run` previews, and
+`pbz get <object or selection>` shows the current values. Data types, lineage tags and expressions are
+not edited here. To confirm a new sort-by on real data, check that each label maps to one sort value:
+`equal` with `COUNTROWS(SUMMARIZE('T', 'T'[Label], 'T'[Sort]))` against `DISTINCTCOUNT('T'[Label])`.
+
+## Hierarchies, dynamic formats and functions
+
+- `pbz hierarchy add <table> <name> --level Year --level Month [--names Year Month]`,
+  `pbz hierarchy levels ...` (replace the levels; a level whose name survives keeps its lineage tag),
+  `pbz hierarchy remove <table> <name> [--force]` (refused while visuals use it).
+- `pbz format-expr "[Measure]" "<DAX returning a format string>"` sets the measure's
+  formatStringDefinition, `--remove` drops it. Needs compatibility level 1601 (`--upgrade-compat`).
+  It replaces the measure's static `formatString`: Desktop refuses to open a measure that has both
+  ("Issues were found"), although TOM accepts it, so `pbz validate` reports `FORMAT_STRING_CONFLICT` and
+  `pbz repair` drops the static one. After `--remove`, set a static format again with
+  `pbz set "[Measure]" formatString=...`. The expression can return any text: try it on fake data with
+  `pbz synth query`. Raising the level is a one-way change for that model; Desktop opened both upgraded
+  levels (1601, 1702) in the end-to-end test.
+- `pbz function add <Name> --params "(amount : NUMERIC)" --body "amount * 1.1"` writes a DAX
+  user-defined function to `definition/functions.tmdl` (compatibility level 1702,
+  `--upgrade-compat`). `update` changes the parameters or body, `rename --to` fixes every call site,
+  `remove` refuses while something calls it, `list` shows parameters and call counts.
+
+## Copying pages and visuals: `pbz copy`
+
+`pbz copy page <page> --as "<name>" [--after <page>] [--independent-slicers]` duplicates a page with
+new names for the page, its visuals and groups (children re-parented). Filter names stay unique across
+the report. Tooltip and drillthrough pages get a new page binding and new parameter names, and each
+drillthrough parameter's `boundFilter` follows the renamed filter. Interactions between copied visuals
+are remapped. A button or tooltip that pointed at the copied page itself now points at the copy; links
+to other pages stay. Copied slicers keep their sync group (they stay in sync with the originals)
+unless `--independent-slicers`. Bookmarks are not copied: they name the source page and their state
+may carry data. `pbz copy visual <page> <visual> [--to-page <page>] [--pos x,y[,w,h]]` duplicates a
+visual, or a group with all its descendants, at the first free spot; interactions are not copied and a
+copied grouped visual becomes top-level. Tokens are copied as tokens. Then `pbz validate` and
+`pbz push --reload`.
+
+## Accessibility and phone layout: `pbz a11y`, `pbz mobile`
+
+`pbz a11y [--page P] [--min-font 9]` audits the mirror and reports codes and visual ids only: data
+visuals without alt text, alt text that is only a mirror token or longer than 250 characters, titles
+switched off, keyboard tab order that differs from reading order (top to bottom, then left to right,
+groups kept together), duplicate tab orders, hidden visuals that keep a tab position, font sizes below
+the threshold, WCAG contrast below 4.5:1 (3:1 for large text) where a text color and its background
+are both static hex colors, and visible pages with no phone layout. Set alt text with
+`pbz style <page> <visual> --set container.general.altText="what the visual shows and why"` (its
+purpose, never its values). `pbz a11y --page P --fix-tab-order` rewrites the tab order in reading
+order. `pbz mobile <page> <visual|all> [--pos x,y,w,h] [--remove]` writes the visual's `mobile.json`
+(phone layout); without `--pos` visuals stack full width in reading order. Metadata checks cannot
+certify screen-reader use or rendered text fit, so the user still checks in Desktop.
+
 ## Button actions and tooltips: `pbz link`
 
 `pbz link <page> <visual> --to-page <page> | --back | --bookmark <name> | --drillthrough <page> |

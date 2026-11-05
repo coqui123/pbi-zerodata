@@ -53,6 +53,12 @@ def run(model) -> list[dict]:
     dates = date_tables(model)
     names = {t.lower() for t in model.tables}
     for m in model.all_measures():
+        if m.node is not None and "formatString" in m.node.props \
+                and any(c.kind == "formatStringDefinition" for c in m.node.children):
+            # TOM accepts it, but Desktop shows "Issues were found" and does not open the model
+            out.append({"severity": "error", "code": "FORMAT_STRING_CONFLICT", "where": f"{m.table}[{m.name}]",
+                        "message": "measure has both formatString and formatStringDefinition; Desktop refuses to "
+                                   "open the model (pbz repair drops the static formatString)"})
         for fn, tab in _whole_table_calls(m.expression):
             if tab.lower() not in names:
                 continue

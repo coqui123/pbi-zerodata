@@ -1,6 +1,7 @@
 # Offline test suites on every push and pull request. Power BI Desktop is not available on hosted
 # runners, so the Desktop suites (test_e2e.py, test_engine.py live mode, test_synth.py --live,
-# test_synthtest.py --live) stay local. The engine is built so TOM validation runs in push tests.
+# test_synthtest.py --live, test_synthedge.py --live, test_memory.py --live, test_consolidate.py --live)
+# stay local. The engine is built so TOM validation runs in push tests.
 name: tests
 
 on:
@@ -46,7 +47,9 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           $suites = "guard", "mirror", "parity", "bpa", "tools", "refactor", "authoring", "selfcontained",
-                    "governance", "mcp", "synth", "consumers", "visuals", "style", "reportedit", "synthtest"
+                    "governance", "mcp", "synth", "consumers", "visuals", "style", "reportedit", "synthtest",
+                    "props", "modeling", "workflow", "components", "a11y", "synthedge", "audit",
+                    "consolidate", "memory"
           $failed = @()
           foreach ($t in $suites) {
             Write-Host "::group::test_$t"

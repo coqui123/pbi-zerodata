@@ -55,6 +55,30 @@ def _lineage(project, fix, writes) -> None:
             writes[path] = (new_text, read_text(path)[1])
 
 
+def _format_conflicts(project, fix, writes) -> None:
+    """Drop the static formatString of measures that also have a formatStringDefinition (Desktop refuses to
+    open such a model although TOM accepts it). The dynamic format already decides the format."""
+    from .props import _remove_prop
+    from .tokens import apply_edits
+    mdef = os.path.join(project.mirror_model, "definition")
+    if not os.path.isdir(mdef):
+        return
+    model = tmdl.load_model(mdef)
+    for rel in sorted(model.docs):
+        path = os.path.join(mdef, *rel.split("/"))
+        doc = tmdl.parse(rel, writes[path][0]) if path in writes else model.docs[rel]  # after --lineage edits
+        edits = []
+        for node in doc.nodes:
+            if node.kind == "measure" and "formatString" in node.props and any(
+                    c.kind == "formatStringDefinition" for c in node.children):
+                ed = _remove_prop(doc, node, "formatString")
+                if ed:
+                    edits += ed
+                    fix("FORMAT_STRING_CONFLICT", rel, f"dropped the static formatString of measure {node.name}")
+        if edits:
+            writes[path] = (apply_edits(doc.text, sorted(edits)), read_text(path)[1])
+
+
 def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool = False) -> dict:
     ddir = os.path.join(project.mirror_report, "definition")
     if not os.path.isdir(ddir):
@@ -215,6 +239,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
                 fix("BOOKMARK_STALE", f"bookmarks/{f}.bookmark.json", "removed targets of deleted pages or visuals")
     if lineage:
         _lineage(project, fix, writes)
+    _format_conflicts(project, fix, writes)
     if not dry_run:
         for path, (text, bom) in writes.items():
             write_text(path, text, bom)

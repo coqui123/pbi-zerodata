@@ -59,7 +59,9 @@ First time in a workspace: `pbz init` (policy + scan + first pull). If `status` 
    `pbz check spec.json` (assertions), `pbz smoke --page <name>` (each visual OK/EMPTY/ERROR),
    `pbz snapshot save|compare` around refactors.
 6. **Hand off**: `pbz handoff` writes `pbz-workspace\HANDOFF.md`. Give it to the user; they
-   check the real visuals and tell you what looks wrong in words.
+   check the real visuals and tell you what looks wrong in words. `pbz review` writes
+   `pbz-workspace\REVIEW.md`: changes by release class, impact, and which checks ran on which
+   revision (stale evidence is marked STALE); the user accepts with `pbz review --accept`.
 
 ## Tokens in the mirror
 
@@ -103,7 +105,12 @@ freely, use `pbz synth` instead of the real model.
 | `NO_FREE_SPACE` (add visual placement) | the page is full | pass `--pos x,y,w,h` or make room (`pbz layout`) |
 | `INCOMPLETE` (unused --remove) | a report file or a registered consumer could not be read or fully covered, so nothing is provably unused | `pbz consumers list`: fix the file or register the missing definitions, rerun |
 | `NOT_REGISTERED` / `NO_CONTRACT` (add visual) | the custom visual is not registered in report.json, or its data roles are unknown | `pbz visual import <file.pbiviz> --as public\|private`, or `pbz visual register <guid> --role ...` |
+| `PENDING_PQ_CHANGES` (push) | Desktop holds Power Query edits that were never applied | ask the user to apply or discard them in Desktop and save, then `pbz pull --rebase` |
+| `COMPAT_LEVEL` | the feature needs a newer model compatibility level (formats 1601, functions 1702) | ask the user before `--upgrade-compat` (one way) |
+| `IN_USE` (hierarchy / function remove) | visuals use the hierarchy, or DAX calls the function | rewrite the users first, or `--force` |
+| `ROLLED_BACK` (recipe) | a step failed, an expectation or limit was not met, or validation failed | read `reason`; the mirror is as before the recipe |
 | `CONFLICT` (unused --restore) | the mirror changed after the removal | restore later points first, or pull |
+| `FORMAT_STRING_CONFLICT` | a measure has both a static and a dynamic format string; Desktop shows "Issues were found" and does not open the model (TOM accepts it) | `pbz repair` drops the static one; `format-expr` already replaces it |
 | guard deny `[pbz guard] ...` | you tried a blocked path or command | follow the hint; never retry variants |
 
 ## Refactor and author (edits the mirror; then `pbz diff`, `pbz validate`, `pbz push`)
@@ -122,6 +129,12 @@ Prefer these over hand edits: they keep every cross-file reference consistent. D
 | `pbz filter add 'T'[C] --report\|--page P [--visual V] --in ... \| --not-in ... \| --where ">= 100" \| --top N --by [M]`, `remove`, `list` | report, page and visual filters (values: labels, typed values or mirror tokens) |
 | `pbz interaction <page> <source> <target\|all> filter\|highlight\|none\|default` | how one visual affects others on its page |
 | `pbz bookmark add <name> --page P [--hide v ...] [--only v ...]`, `remove`, `list` | show/hide bookmarks (never data state) for buttons |
+| `pbz copy page <p> --as <name>` / `pbz copy visual <p> <v> [--to-page P]` | duplicate pages, visuals and groups with every id remapped |
+| `pbz a11y [--page P] [--fix-tab-order]`, `pbz mobile <p> <v\|all> [--pos x,y,w,h]` | accessibility audit (alt text, titles, tab order, fonts, contrast) and phone layout |
+| `pbz set <obj> prop=value ...` / `pbz get <obj>` (or `--table/--kind/--match/--folder`) | typed model properties: description, displayFolder, formatString, isHidden, isKey, dataCategory, summarizeBy, sortByColumn, isAvailableInMdx |
+| `pbz hierarchy add\|levels\|remove`, `pbz format-expr [M] "<DAX>"`, `pbz function add\|update\|rename\|remove\|list` | hierarchies, dynamic format strings (replace the static formatString: Desktop refuses a measure with both), DAX user-defined functions |
+| `pbz consolidate merge "[Copy]" --into "[Keep]"`, `pbz consolidate families`, `pbz consolidate calc-group --family <id>` | merge duplicate measures; turn measure families into a calculation group with wrapper measures and a check spec ([reference/audit.md](reference/audit.md)) |
+| `pbz recipe run <file.json> [--param k=v]` | a JSON batch of mirror edits applied as one transaction, rolled back on any failure ([reference/workflow.md](reference/workflow.md)) |
 | `pbz visual list\|roles <type>\|import <file.pbiviz> [--as contract\|public\|private]\|register <guid> --as public\|organizational [--role NAME:kind]` | custom visuals: contracts (data roles), registration in report.json, private packages installed by push ([reference/visuals.md](reference/visuals.md)) |
 | `pbz style <page> <visual>\|--type T\|--all --set object.property=value [--series [M]] [--state hover]`, `--unset`, `--show`, `--list --type T` | visual formatting (titles, data labels, colors, fonts, axes, legends, borders) checked against Microsoft's formatting catalog ([reference/style.md](reference/style.md)) |
 | `pbz layout [--page <p>]` | text canvas map of a page plus overlap / off-canvas / z-order lint: how you "see" a page |
@@ -135,7 +148,7 @@ whether the loaded model matches the files. `push --reload` refuses while Deskto
 More editors ([reference/governance.md](reference/governance.md)):
 - `pbz culture add|remove|list|missing`, `pbz translate <code> <object> --caption ...`: translations
   (culture files are mirrored; the Q&A linguistic schema stays one opaque token).
-- `pbz perspective add|remove|include|exclude`, `pbz role add|remove|filter|unfilter|member-add|member-remove`.
+- `pbz perspective add|remove|include|exclude`, `pbz role add|remove|filter|unfilter|member-add|member-remove|ols`.
 - `pbz refresh-policy set|remove|show`: incremental refresh (parameters, filter step, windows).
 - `pbz push --only <paths>` pushes part of the pending edits; `pbz revert [paths] [--object ...]`
   discards mirror edits.
@@ -147,8 +160,11 @@ workspace, marked synthetic); `pbz synth open`, then `pbz synth query "EVALUATE 
 query results of that fake data, so you can see what a measure does. It refuses any model that is not
 its own synthetic copy. `pbz synth test save <name> --measure "[M]" --by "'T'[C]"` stores golden
 results of that fake data; after a refactor, rebuild and `pbz synth test run <name>` reports SAME / DIFF
-per query. Details: [reference/synth.md](reference/synth.md). Agent hosts that prefer typed tools can
-run `pbz mcp` (see [reference/mcp.md](reference/mcp.md)).
+per query. `pbz synth build --edge` plants blanks, orphans, zero and negative values and boundary dates;
+`pbz synth check '<check spec>'` runs a `pbz check` spec on that copy with visible fake counterexamples,
+so a spec can be debugged before it runs on real data for verdicts. Details:
+[reference/synth.md](reference/synth.md). Agent hosts that prefer typed tools can run `pbz mcp` (see
+[reference/mcp.md](reference/mcp.md)).
 
 ## Model hygiene and analysis (metadata only)
 
@@ -165,6 +181,7 @@ These read the mirror and print names, states, counts, scores and rule ids. Deta
 | `pbz suggest` | cleanup suggestions (auto date/time, unused variables, hidden pages, key columns...) |
 | `pbz bpa [model\|report] [--labels measure-killer]` | best-practice findings, score and grade |
 | `pbz similar` | identical, alias, same-shape and near-duplicate measures |
+| `pbz audit [--category efficiency\|consolidation] [--since <baseline>] [--fail-on new]`, `pbz audit memory`, `pbz audit waive <id> --reason ...` | efficiency and consolidation findings with evidence, fix and verify; storage bands from Desktop; baselines and waivers ([reference/audit.md](reference/audit.md)) |
 | `pbz changes [--from previous --to last]` | semantic diff of mirror snapshots (pending edits, or what changed between pulls) |
 | `pbz docs [--format md\|html\|json] [--dax]` | documentation into `pbz-workspace\docs\` |
 | `pbz m-lineage [table]` | Power Query steps, column origins, columns the query drops or the model lacks |

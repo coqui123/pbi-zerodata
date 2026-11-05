@@ -36,7 +36,9 @@ Source map: `Program.cs` (dispatch, envelope, watchdog), `Json.cs` (request acce
 (classes, DPAPI log), `Scrub.cs` (message scrubber + word allowlist), `Vault.cs` (DPAPI, key, HMAC,
 normalization, buckets), `Dax.cs` (quoting, column refs, query guards), `Connect.cs` (ADOMD connection,
 TMSCHEMA metadata, `connect`), `Health.cs`, `TmdlValidate.cs`, `Refresh.cs`, `Compiles.cs`,
-`ValueIndex.cs` (`index`, shared column stats), `Probe.cs`, `Checks.cs`, `Snapshots.cs`, `Smoke.cs`.
+`ValueIndex.cs` (`index`, shared column stats), `Probe.cs`, `Checks.cs`, `Snapshots.cs`, `Smoke.cs`, `Deps.cs`,
+`SynthQuery.cs`, `Memory.cs` (`memory`: storage bands from the two storage DMVs `Conn.StorageDmv` allows, see
+CONTRACT.md v1.4).
 
 ## Spike results (Desktop Store build 2.159.1231.0, Windows 11)
 
@@ -163,3 +165,7 @@ fixture's): every verb, both tiers, Python HMAC/DPAPI reproduction, forced error
 over all engine stdout/stderr, every file under the skill folder except the fixture sources, and the
 private store outside DPAPI blobs. Flags: `--offline`, `--close` (CloseMainWindow at the end),
 `--keep` (keep the temporary private_dir).
+
+`python tests\test_memory.py` covers `memory` and `pbz\memory.py` offline (envelopes, closed bands, save / load / stale,
+budget); `--live --ws <folder>` adds the live verb on a copy of the fixture already open in Desktop (run it with the same
+`PBZ_PRIVATE_ROOT` as the pbz session there): closed bands only, no numbers, no stray strings, no canaries.
