@@ -30,10 +30,11 @@ matches nothing is listed under `warnings` as `UNRESOLVED_REF`.
 | State | Meaning |
 |---|---|
 | `used` | reached from a report usage |
+| `used_external` | reached only from a registered external consumer (`consumers` names them; see [consumers.md](consumers.md)); never removed |
 | `locked` | needed by the model itself: kept relationships (both tables alive), RLS / OLS, security roles, aggregation tables, marked date table key, incremental refresh policy |
 | `used_by_unused` | only dead objects refer to it (`blocked_by` names them). Remove those first, or use `--cascade` |
 | `unused` | nothing refers to it |
-| `unknown` | a report file could not be read: nothing is called unused |
+| `unknown` | a report file or a registered consumer could not be read or fully covered: nothing is called unused |
 
 A table is unused only when nothing outside it (other than its own relationships) refers to it or
 to one of its objects. Hidden is not unused. Auto date/time tables are counted

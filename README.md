@@ -17,6 +17,12 @@ without company data entering the agent's context.
 - Refactoring and authoring verbs (mirror edits, validated on push): `rename table`, `move measure`,
   `new` (measure table, date table, calculation group, field parameter), `relationship`,
   `add page|visual`, `layout`, `format`, `repair`. Usage: `reference/authoring.md`.
+- `add visual` covers every built-in visual type (roles from Microsoft's core visual capabilities) and
+  custom visuals: `visual import|register|roles|list` for AppSource, organizational and private
+  .pbiviz visuals (`reference/visuals.md`).
+- `consumers`: register thin reports, PBIX, Excel workbooks, paginated reports, composite models, query
+  exports or a scanner result so `unused` keeps what they use (`used_external`) and refuses removals
+  while coverage is incomplete (`reference/consumers.md`).
 - Governance and refresh editors: `culture`, `translate`, `perspective`, `role`, `refresh-policy`;
   `push --only` and `revert`. Usage: `reference/governance.md`.
 - `synth`: a synthetic copy of the model with fake data that agents may query freely
@@ -52,6 +58,8 @@ python skills/powerbi-zerodata/tests/test_selfcontained.py # built-in merge and 
 python skills/powerbi-zerodata/tests/test_governance.py # cultures, perspectives, roles, refresh policy, ledger, strict
 python skills/powerbi-zerodata/tests/test_mcp.py        # MCP server over stdio
 python skills/powerbi-zerodata/tests/test_synth.py      # synthetic model (add --live to open it in Desktop)
+python skills/powerbi-zerodata/tests/test_consumers.py  # external consumers: every kind, coverage gaps, canaries
+python skills/powerbi-zerodata/tests/test_visuals.py    # built-in catalog, custom visuals, private package push
 python skills/powerbi-zerodata/tests/test_engine.py    # engine verbs + canary scan (needs Desktop)
 python skills/powerbi-zerodata/tests/test_e2e.py       # every verb on a fixture copy in Desktop, canary scan
 ```

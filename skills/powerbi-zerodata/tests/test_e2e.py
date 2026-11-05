@@ -191,16 +191,24 @@ def main() -> int:
         for vargs in (("card", "--field", "[Total Hours]", "--title", "Hours"),
                       ("clusteredColumnChart", "--field", "'Project'[Status]", "--field", "[Total Hours]"),
                       ("tableEx", "--field", "'Project'[Status]", "--field", "[Active Hours]"),
-                      ("slicer", "--field", "'Project'[Status]")):
+                      ("slicer", "--field", "'Project'[Status]"),
+                      ("kpi", "--field", "[Total Hours]", "--field", "TrendLine='Project'[Status]"),
+                      ("gauge", "--field", "[Total Hours]"), ("cardVisual", "--field", "[Active Hours]")):
             res = r.pbz("add", "visual", vargs[0], "--page", "E2E Page", *vargs[1:])
             expect(res.get("verb") == "add" and res.get("placement") == "free_spot", f"add visual {vargs[0]}: {res}")
         for args in (("culture", "add", "fr-FR"), ("translate", "fr-FR", "Hours", "--caption", "Heures"),
                      ("translate", "fr-FR", "[Total Hours]", "--caption", "Heures totales"),
                      ("perspective", "add", "E2E View"), ("perspective", "include", "E2E View", "Project", "[Total Hours]"),
                      ("role", "add", "E2E Role"), ("role", "filter", "E2E Role", "Project", "[Status] = \"Active\""),
-                     ("refresh-policy", "show"), ("synth", "build")):
+                     ("refresh-policy", "show"), ("synth", "build"),
+                     ("consumers", "add", "--object", "[Active Hours]", "--label", "E2E pack"), ("consumers", "list"),
+                     ("visual", "list"), ("visual", "roles", "kpi")):
             res = r.pbz(*args)
             expect(res.get("verb") and res.get("ok") is not False, f"{' '.join(args)}: {res}")
+        res = r.pbz("unused", "--all")
+        ah = next((o for o in res.get("objects", []) if o.get("name") == "Active Hours"), {})
+        expect(res.get("scope", {}).get("consumers") and ah.get("state") in ("used", "used_external"),
+               f"unused with a registered consumer: {ah} {res.get('scope')}")
         res = r.pbz("validate")
         expect(not [f for f in res.get("findings", []) if f.get("severity") == "error"], f"validate after authoring: {res}")
         tdir = os.path.join(ws_dir, "pbz-workspace", "Canary.SemanticModel", "definition", "tables")

@@ -34,7 +34,11 @@ and `project` (when the workspace holds several `.pbip` files), plus its own arg
 | `scan` | `dry_run` |
 | `pull` | `force`, `rebase` |
 | `diff` | `patch` |
-| `push` | `reload`, `dry_run` |
+| `push` | `reload`, `dry_run`, `only` |
+| `revert` | `paths`, `object` |
+| `visual` | `action` (list / roles / import / register, required), `target`, `as`, `roles`, `replace` |
+| `consumers` | `action` (list / add / scan / show, required), `target`, `kind`, `label`, `objects`, `model_names` |
+| `culture`, `translate`, `perspective`, `role`, `refresh_policy` | see `pbz <verb> --help` (same arguments) |
 | `describe` | `target` |
 | `values` | `column` (required) |
 | `rename` | `kind` (measure / column / table), `old`, `new` (required), `table` |

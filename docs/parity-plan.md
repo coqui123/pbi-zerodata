@@ -61,7 +61,7 @@ reviews raised, kept as roadmap items: a schema-driven allowlist tokenizer inste
 classifier, a disclosure ledger shared across sessions and query shapes for engine checks, and
 OS-level isolation in addition to the hook.
 
-## Round 3 (2026-11-05): the deferred items
+## Round 3 (2026-11-04): the deferred items
 
 - Cultures are mirrored (linguistic schema as one payload token); `culture`, `translate`; rename /
   move / remove keep translations in step (removes the earlier "manual: has translations" limit).
@@ -79,6 +79,29 @@ OS-level isolation in addition to the hook.
 - OS-level isolation is documented as a hardening tier for the machine owner
   (`reference/leak-vectors.md`); pbz does not change security settings itself.
 
+## Round 4 (2026-11-04): external consumers and custom visuals
+
+Design from multi-model design reviews plus
+Microsoft's own authoring CLI rules.
+- `consumers`: registered external consumers feed the usage graph. Kinds: thin report folders and
+  Fabric Git exports (PBIR and PBIR-Legacy), PBIX / PBIT (definition or legacy layout, never
+  DataModel), Excel (OLAP pivots by placed fields and hierarchy usage, slicers, timelines, CUBE
+  formulas with member keys cut, DAX query tables; never pivot records, shared items or values), RDL /
+  RSD, downstream composite models, query-text exports, an admin scanner result (coverage gaps), manual
+  declarations. Only names of this model's objects are cached or shown; unresolved names are counted.
+- New state `used_external`; evidence only keeps, missing coverage (missing, unreadable, opaque
+  consumers, scanned consumers without definitions) makes the analysis incomplete and blocks
+  `--remove`. Registry protected by the guard: agents add, only the user removes. `rename` warns
+  (`USED_EXTERNALLY`) when a registered consumer binds to the old name.
+- `add visual` now covers every built-in type in Microsoft's core visual capabilities (data roles,
+  kinds and mapping conditions compacted into `rules/visuals.json`, MIT) and custom visuals: `visual
+  import` (.pbiviz as an untrusted zip: contract, AppSource registration, or a private package that
+  `push` installs into `CustomVisuals/`), `visual register` (AppSource / organizational `_OrgStore` by
+  guid, optional manual roles), observed roles from existing instances. New checks: unregistered
+  visual types, missing private packages, `_OrgStore` naming, kind conflicts, unknown roles.
+- Still out of reach without service rights: calling the service APIs (scanner, getDefinition, Log
+  Analytics) from pbz. The user exports and registers the files instead (`reference/consumers.md`).
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,
@@ -88,8 +111,9 @@ OS-level isolation in addition to the hook.
   memory sizes, views and load times, Excel activity, DAX query execution.
 - Tenant / service features (workspace inventory, scanner API, capacity metrics) are out of scope
   until an account with workspace rights exists; they would be metadata APIs behind the engine.
-- Unused means "unused in the scanned reports". Every unused result carries `scope.unseen_consumers`.
-  An incomplete analysis is `unknown`, never "unused", and blocks automatic removal.
+- Unused means "unused in the scanned reports and registered consumers". Every unused result
+  carries `scope.unseen_consumers` and `scope.external_coverage`. An incomplete analysis is `unknown`,
+  never "unused", and blocks automatic removal.
 
 ## 1. Parity matrix
 

@@ -44,15 +44,16 @@ questions: check them with `pbz check` (`unique`, `no_orphans`) while Desktop is
 - `pbz add page "<name>" [--after <page>] [--hidden] [--width --height]` creates the page folder with
   a fresh 20-character id and inserts it into `pages.json`.
 - `pbz add visual <type> --page <page> --field <ref> ... [--pos x,y,w,h] [--title] [--text]` builds
-  `visual.json` with the query state for the type. Types: `card`, `multiRowCard`, `tableEx`,
-  `pivotTable` (Rows, Columns, Values), `slicer`, `textbox`, and charts (Category, Y, Series):
-  `clusteredColumnChart`, `clusteredBarChart`, `columnChart`, `barChart`, `lineChart`, `areaChart`,
-  `pieChart`, `donutChart`, `scatterChart`, `waterfallChart`, `funnel`, `lineClusteredColumnComboChart`.
-  A field without a role goes to the type's default (measures and numeric columns to values, other
-  columns to categories); `ROLE='T'[C]` picks one. Numeric columns in value roles become a Sum
-  aggregation. Without `--pos` the visual goes to the first free spot on the page
-  (`placement: NO_FREE_SPACE` when the page is full). The `$schema` versions follow the report's files.
-  New visuals carry no filters, selections or value-specific formatting.
+  `visual.json` with the query state for the type. Types: every built-in type in Microsoft's core
+  visual capabilities (cards, `kpi`, `gauge`, tables, slicers, charts, maps, `textbox`, shapes,
+  buttons; `pbz visual roles <type>` lists a type's roles) and registered custom visuals with a known
+  contract ([visuals.md](visuals.md)). A field without a role goes to the first role that fits
+  (measures and numeric columns to measure roles, other columns to grouping roles); `ROLE='T'[C]`
+  picks one. Numeric columns in measure roles become a Sum aggregation. Field counts must fit one of
+  the type's data view mapping conditions (a card takes one field). Without `--pos` the visual goes
+  to the first free spot on the page (`placement: NO_FREE_SPACE` when the page is full). The
+  `$schema` versions follow the report's files. New visuals carry no filters, selections or
+  value-specific formatting.
 
 ## Seeing a page: `pbz layout`
 

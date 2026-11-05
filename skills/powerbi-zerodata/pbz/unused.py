@@ -101,6 +101,12 @@ def report(ws, project, extra_reports=(), include_all: bool = False, impact: boo
                                               if g.state.get(e.src) in ("locked", "used")][:3] or ["needed by a locked object"]
         if st == "used_by_unused":
             rec["blocked_by"] = [g.label(b) for b in g.blocked_by.get(k, [])][:10]
+        if st == "used_external":
+            direct = sorted({u.report for u in g.ext_usages.get(k, [])})
+            if direct:
+                rec["consumers"] = direct[:10]
+            else:
+                rec["via"] = "dependency of an externally used object"
         if st == "unused":
             how, why = _removal(g, k, g.model)
             rec["remove"] = how
@@ -125,8 +131,15 @@ def report(ws, project, extra_reports=(), include_all: bool = False, impact: boo
         r.pop("file", None)
     issues = [{"code": "UNRESOLVED_REF", "object": o.label(), "refs": o.issues[:10]}
               for o in g.objects.values() if o.issues]
-    out = {"verb": "unused", "project": project.name,
-           "scope": {"reports": g.reports, "unseen_consumers": usage.UNSEEN},
+    scope = {"reports": g.reports, "unseen_consumers": usage.UNSEEN}
+    if g.consumers:
+        scope["consumers"] = g.consumers
+        scope["external_coverage"] = "incomplete" if any(
+            w.get("code", "").startswith("CONSUMER_") for w in g.warnings) else "registered consumers complete"
+        scope["unseen_consumers"] = ["consumers not registered with `pbz consumers add`"] + usage.UNSEEN
+    else:
+        scope["external_coverage"] = "none registered (`pbz consumers add <path>`)"
+    out = {"verb": "unused", "project": project.name, "scope": scope,
            "analysis": "incomplete" if g.incomplete else "complete",
            "summary": {k: summary[k] for k in KIND_ORDER if k in summary},
            "objects": objects, "report_objects": rep}
@@ -186,6 +199,12 @@ def _tree(g, k, direction, depth, path) -> dict:
                 by_page.setdefault(f"{u.report} | {u.page or '(report level)'}", set()).add(
                     f"{u.visual or '-'} ({u.via})")
             node["used_in"] = {p: sorted(v)[:20] for p, v in sorted(by_page.items())}
+        ext = g.ext_usages.get(k, [])
+        if ext:
+            by_consumer: dict = {}
+            for u in ext:
+                by_consumer.setdefault(f"{u.report} ({u.file})", set()).add(u.via)
+            node["used_externally"] = {c: sorted(v) for c, v in sorted(by_consumer.items())}
         if k in g.locks:
             node["locks"] = g.locks[k]
     if kids:
@@ -209,7 +228,8 @@ def remove(ws, project, extra_reports=(), m_step: str = "remove", cascade: bool 
         g = usage.build(ws, project, extra_reports)
         g.translated = translated(project)
         if g.incomplete:
-            raise PbzError("INCOMPLETE", "a report file could not be read; nothing removed")
+            raise PbzError("INCOMPLETE", "a report file or a registered consumer could not be read or fully "
+                                         "covered (see `pbz consumers list`); nothing removed")
         todo = []
         for k, o in g.objects.items():
             if g.state[k] != "unused" or o.private or (only and o.kind not in only):

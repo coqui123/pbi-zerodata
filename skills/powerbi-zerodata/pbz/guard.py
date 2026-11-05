@@ -115,6 +115,7 @@ REASONS = {
     "web": "Power BI service and data-source hosts are blocked.",
     "pbi_mcp": "Power BI MCP servers return model data and are blocked. Use pbz.",
     "policy": "This edit would loosen .pbz/policy.json. Only the user can do that (`pbz admin policy` in a terminal).",
+    "consumers": ".pbz/consumers.json is managed by pbz: add consumers with `pbz consumers add`; only the user removes one (`pbz admin consumer-remove <id>`).",
     "selfprotect": "Guard, skill, hook and agent-rule files are read-only from a zero-data workspace session. Edit them from a session in the pbi-zerodata repo.",
     "memory": "Memory notes must not hold data values (amounts, percentages, counts, emails). Rewrite qualitatively; keep names of tables, measures, pages and visuals.",
     "error": "pbz guard could not evaluate this call safely, so it is blocked. Retry with a simpler command or use pbz.",
@@ -574,6 +575,8 @@ def check_write(p: str, tool: str, ti: dict, session_root: str | None) -> str | 
             new = None
         if not isinstance(new, dict) or policy_loosened(load_policy(find_root(p)), new):
             return "policy"
+    if p.endswith("/.pbz/consumers.json") and active_root(p):
+        return "consumers"  # dropping a consumer would loosen protection; pbz writes this file itself
     if session_root and is_memory_path(p):
         chunk = " ".join(s for s in (ti.get("content"), ti.get("new_string")) if isinstance(s, str))
         if tool == "apply_patch":

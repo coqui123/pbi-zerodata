@@ -1,0 +1,4380 @@
+{
+ "_source": "@microsoft/powerbi-core-visual-schema 0.1.3 (MIT), data/capabilities.json",
+ "visuals": {
+  "accessibleTable": {
+   "roles": [
+    {
+     "name": "Rows",
+     "kind": "grouping"
+    },
+    {
+     "name": "Columns",
+     "kind": "grouping"
+    },
+    {
+     "name": "Values",
+     "kind": "measure"
+    }
+   ]
+  },
+  "actionButton": {
+   "roles": []
+  },
+  "advancedSlicerVisual": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "grouping",
+     "display": "Value"
+    },
+    {
+     "name": "Label",
+     "kind": "measure",
+     "display": "Highlight label"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Values": {
+       "max": 1
+      },
+      "Label": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "aiNarratives": {
+   "roles": []
+  },
+  "animatedNumber": {
+   "roles": []
+  },
+  "areaChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Y2",
+     "kind": "measure",
+     "display": "Secondary y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "min": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      },
+      "Y2": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "max": 0
+      },
+      "Y2": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      },
+      "Y2": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Y2": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Category": {
+       "min": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Category": {
+       "min": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     }
+    ]
+   ]
+  },
+  "azureMap": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Location"
+    },
+    {
+     "name": "Y",
+     "kind": "either",
+     "display": "Latitude"
+    },
+    {
+     "name": "X",
+     "kind": "either",
+     "display": "Longitude"
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Size",
+     "kind": "measure",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    },
+    {
+     "name": "PathID",
+     "kind": "grouping",
+     "display": "Path ID"
+    },
+    {
+     "name": "PointOrder",
+     "kind": "grouping",
+     "display": "Point Order"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "PathID": {
+       "max": 0
+      },
+      "PointOrder": {
+       "max": 0
+      },
+      "X": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "PathID": {
+       "max": 0
+      },
+      "PointOrder": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "PathID": {
+       "max": 0
+      },
+      "PointOrder": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "min": 1,
+       "max": 1
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "PathID": {
+       "max": 0
+      },
+      "PointOrder": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Tooltips": {
+       "min": 1
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      },
+      "PathID": {
+       "max": 0
+      },
+      "PointOrder": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "PathID": {
+       "max": 0
+      },
+      "PointOrder": {
+       "max": 0
+      },
+      "X": {
+       "max": 0
+      },
+      "Y": {
+       "max": 0
+      },
+      "Size": {
+       "max": 0
+      },
+      "Tooltips": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 1
+      },
+      "PathID": {
+       "max": 0
+      },
+      "PointOrder": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "PathID": {
+       "min": 1,
+       "max": 1
+      },
+      "PointOrder": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 1
+      },
+      "PathID": {
+       "min": 1,
+       "max": 1
+      },
+      "PointOrder": {
+       "max": 1
+      },
+      "X": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "barChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Y-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "X-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "basicShape": {
+   "roles": []
+  },
+  "bookmarkNavigator": {
+   "roles": []
+  },
+  "card": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "measure",
+     "display": "Fields"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Values": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "cardVisual": {
+   "roles": [
+    {
+     "name": "Data",
+     "kind": "measure",
+     "display": "Value"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Categories"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    },
+    {
+     "name": "TrendVisualCategory",
+     "kind": "grouping",
+     "display": "Trend axis"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "min": 0
+      },
+      "TrendVisualCategory": {
+       "max": 1
+      }
+     },
+     {
+      "Data": {
+       "min": 1
+      },
+      "TrendVisualCategory": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "clusteredBarChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Y-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "X-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "clusteredColumnChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "columnChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "dataQueryVisual": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "either"
+    }
+   ]
+  },
+  "decompositionTreeVisual": {
+   "roles": [
+    {
+     "name": "Analyze",
+     "kind": "measure",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "ExplainBy",
+     "kind": "grouping",
+     "display": "Explain by"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Analyze": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "donutChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Values",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Details"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "filledMap": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Location"
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Latitude"
+    },
+    {
+     "name": "X",
+     "kind": "measure",
+     "display": "Longitude"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Size": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 0
+      },
+      "Tooltips": {
+       "min": 1
+      }
+     },
+     {
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "X": {
+       "max": 0
+      },
+      "Y": {
+       "max": 0
+      },
+      "Size": {
+       "max": 0
+      },
+      "Tooltips": {
+       "max": 0
+      }
+     }
+    ]
+   ]
+  },
+  "filterSlicer": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "grouping",
+     "display": "Field"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Values": {
+       "min": 2
+      }
+     }
+    ],
+    [
+     {
+      "Values": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "funnel": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Values",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "ganttChart": {
+   "roles": [
+    {
+     "name": "Task",
+     "kind": "grouping",
+     "display": "Task row"
+    },
+    {
+     "name": "StartDate",
+     "kind": "measure",
+     "display": "Start",
+     "types": [
+      "dateTime"
+     ]
+    },
+    {
+     "name": "EndDate",
+     "kind": "measure",
+     "display": "End",
+     "types": [
+      "dateTime"
+     ]
+    },
+    {
+     "name": "Progress",
+     "kind": "measure",
+     "types": [
+      "numeric"
+     ]
+    },
+    {
+     "name": "Category",
+     "kind": "grouping"
+    },
+    {
+     "name": "Columns",
+     "kind": "measure"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Task": {
+       "min": 1,
+       "max": 1
+      },
+      "Category": {
+       "max": 3
+      },
+      "StartDate": {
+       "max": 1
+      },
+      "EndDate": {
+       "max": 1
+      },
+      "Progress": {
+       "max": 1
+      },
+      "Columns": {
+       "max": 20
+      }
+     }
+    ]
+   ]
+  },
+  "gauge": {
+   "roles": [
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Value",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "MinValue",
+     "kind": "measure",
+     "display": "Minimum value",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "MaxValue",
+     "kind": "measure",
+     "display": "Maximum value",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "TargetValue",
+     "kind": "measure",
+     "display": "Target value",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Y": {
+       "max": 1
+      },
+      "MinValue": {
+       "max": 1
+      },
+      "MaxValue": {
+       "max": 1
+      },
+      "TargetValue": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "heatMap": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Location"
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Y",
+     "kind": "either",
+     "display": "Latitude"
+    },
+    {
+     "name": "X",
+     "kind": "either",
+     "display": "Longitude"
+    },
+    {
+     "name": "Size",
+     "kind": "measure",
+     "display": "Bubble size",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "min": 1,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Tooltips": {
+       "min": 1
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "min": 1,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "min": 1,
+       "max": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "X": {
+       "max": 0
+      },
+      "Y": {
+       "max": 0
+      },
+      "Size": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Tooltips": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     }
+    ]
+   ]
+  },
+  "hundredPercentStackedAreaChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "min": 1
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Y2": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Category": {
+       "min": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Category": {
+       "min": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     }
+    ]
+   ]
+  },
+  "hundredPercentStackedBarChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Y-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "X-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "hundredPercentStackedColumnChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "image": {
+   "roles": []
+  },
+  "keyDriversVisual": {
+   "roles": [
+    {
+     "name": "Target",
+     "kind": "either",
+     "display": "Analyze"
+    },
+    {
+     "name": "ExplainBy",
+     "kind": "either",
+     "display": "Explain by"
+    },
+    {
+     "name": "Details",
+     "kind": "grouping",
+     "display": "Expand by"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Target": {
+       "min": 1,
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "kpi": {
+   "roles": [
+    {
+     "name": "Indicator",
+     "kind": "measure",
+     "display": "Value",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "TrendLine",
+     "kind": "grouping",
+     "display": "Trend axis"
+    },
+    {
+     "name": "Goal",
+     "kind": "measure",
+     "display": "Target",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Indicator": {
+       "max": 1
+      },
+      "TrendLine": {
+       "max": 1
+      },
+      "Goal": {
+       "max": 2
+      }
+     }
+    ]
+   ]
+  },
+  "lineChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Y2",
+     "kind": "measure",
+     "display": "Secondary y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "min": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      },
+      "Y2": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "max": 0
+      },
+      "Y2": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      },
+      "Y2": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Y2": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Category": {
+       "min": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Category": {
+       "min": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     }
+    ]
+   ]
+  },
+  "lineClusteredColumnComboChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Column y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Y2",
+     "kind": "measure",
+     "display": "Line y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Column legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Y2": {
+       "min": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Y2": {
+       "min": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "min": 1
+      }
+     }
+    ]
+   ]
+  },
+  "lineStackedColumnComboChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Column y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Y2",
+     "kind": "measure",
+     "display": "Line y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Column legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Y2": {
+       "min": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Y2": {
+       "min": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "min": 1
+      }
+     }
+    ]
+   ]
+  },
+  "listSlicer": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "grouping",
+     "display": "Value"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Values": {
+       "min": 1
+      }
+     }
+    ]
+   ]
+  },
+  "map": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Location"
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Y",
+     "kind": "either",
+     "display": "Latitude"
+    },
+    {
+     "name": "X",
+     "kind": "either",
+     "display": "Longitude"
+    },
+    {
+     "name": "Size",
+     "kind": "measure",
+     "display": "Bubble size",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "min": 1,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Tooltips": {
+       "min": 1
+      }
+     },
+     {
+      "Category": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "min": 1,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "min": 1,
+       "max": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "X": {
+       "max": 0
+      },
+      "Y": {
+       "max": 0
+      },
+      "Size": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Tooltips": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     }
+    ]
+   ]
+  },
+  "matrix": {
+   "roles": [
+    {
+     "name": "Rows",
+     "kind": "grouping"
+    },
+    {
+     "name": "Columns",
+     "kind": "grouping"
+    },
+    {
+     "name": "Values",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Columns": {
+       "max": 0
+      },
+      "Values": {
+       "min": 1
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Columns": {
+       "min": 0
+      },
+      "Values": {
+       "min": 0
+      }
+     },
+     {
+      "Rows": {
+       "min": 0
+      },
+      "Columns": {
+       "min": 1
+      },
+      "Values": {
+       "min": 0
+      }
+     }
+    ]
+   ]
+  },
+  "multiRowCard": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "either",
+     "display": "Fields"
+    }
+   ]
+  },
+  "pageNavigator": {
+   "roles": []
+  },
+  "pieChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Values",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Details"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "pivotTable": {
+   "roles": [
+    {
+     "name": "Rows",
+     "kind": "grouping"
+    },
+    {
+     "name": "Columns",
+     "kind": "grouping"
+    },
+    {
+     "name": "Values",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Columns": {
+       "max": 0
+      },
+      "Values": {
+       "min": 1
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Columns": {
+       "min": 0
+      },
+      "Values": {
+       "min": 0
+      }
+     },
+     {
+      "Rows": {
+       "min": 0
+      },
+      "Columns": {
+       "min": 1
+      },
+      "Values": {
+       "min": 0
+      }
+     }
+    ]
+   ]
+  },
+  "pythonVisual": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "either"
+    }
+   ]
+  },
+  "qnaVisual": {
+   "roles": []
+  },
+  "rdlVisual": {
+   "roles": [
+    {
+     "name": "parameterValues",
+     "kind": "either",
+     "display": "Parameters"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "parameterValues": {
+       "min": 0
+      }
+     }
+    ]
+   ]
+  },
+  "realTimeLineChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Axis",
+     "types": [
+      "dateTime",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Values",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "ribbonChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      }
+     },
+     {
+      "Rows": {
+       "min": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Y": {
+       "min": 0,
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "scatterChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Values"
+    },
+    {
+     "name": "X",
+     "kind": "either",
+     "display": "X Axis"
+    },
+    {
+     "name": "Y",
+     "kind": "either",
+     "display": "Y Axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Size",
+     "kind": "measure",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Play",
+     "kind": "grouping",
+     "display": "Play Axis"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Play": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      },
+      "Play": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Play": {
+       "min": 1,
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Play": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      },
+      "Play": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "min": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Play": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "min": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      },
+      "Play": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Play": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Size": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 1
+      },
+      "Play": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Play": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 1
+      },
+      "Play": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "max": 1
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 0
+      },
+      "Play": {
+       "max": 0
+      }
+     },
+     {
+      "Category": {
+       "max": 1
+      },
+      "Series": {
+       "max": 0
+      },
+      "X": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Size": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 1
+      },
+      "Play": {
+       "max": 0
+      }
+     }
+    ]
+   ]
+  },
+  "scorecard": {
+   "roles": []
+  },
+  "scriptVisual": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "either"
+    }
+   ]
+  },
+  "shape": {
+   "roles": []
+  },
+  "shapeMap": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "Location"
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Value",
+     "kind": "measure",
+     "display": "Color saturation",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "min": 1,
+       "max": 1
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Value": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "min": 0,
+       "max": 1
+      },
+      "Series": {
+       "min": 0,
+       "max": 1
+      },
+      "Value": {
+       "min": 0,
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "slicer": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "grouping",
+     "display": "Field"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Values": {
+       "min": 2
+      }
+     }
+    ],
+    [
+     {
+      "Values": {
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "stackedAreaChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping",
+     "display": "X-axis"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Series",
+     "kind": "grouping",
+     "display": "Legend"
+    },
+    {
+     "name": "Rows",
+     "kind": "grouping",
+     "display": "Small multiples"
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "min": 1
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Rows": {
+       "min": 1
+      }
+     }
+    ],
+    [
+     {
+      "Series": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Rows": {
+       "max": 0
+      }
+     },
+     {
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Rows": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     },
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "min": 1,
+       "max": 1
+      },
+      "Y": {
+       "max": 0
+      },
+      "Y2": {
+       "max": 1
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Category": {
+       "min": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Rows": {
+       "max": 0
+      },
+      "Series": {
+       "max": 0
+      },
+      "Category": {
+       "min": 1
+      },
+      "Y": {
+       "min": 1,
+       "max": 1
+      },
+      "Y2": {
+       "max": 0
+      }
+     }
+    ]
+   ]
+  },
+  "table": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "either",
+     "display": "Columns"
+    }
+   ]
+  },
+  "tableEx": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "either",
+     "display": "Columns"
+    }
+   ]
+  },
+  "textSlicer": {
+   "roles": [
+    {
+     "name": "Values",
+     "kind": "grouping",
+     "display": "Field",
+     "types": [
+      "integer",
+      "numeric",
+      "text"
+     ]
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Values": {
+       "min": 0,
+       "max": 1
+      }
+     }
+    ]
+   ]
+  },
+  "textbox": {
+   "roles": []
+  },
+  "treemap": {
+   "roles": [
+    {
+     "name": "Group",
+     "kind": "grouping",
+     "display": "Category"
+    },
+    {
+     "name": "Details",
+     "kind": "grouping"
+    },
+    {
+     "name": "Values",
+     "kind": "measure",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Group": {
+       "max": 1
+      },
+      "Details": {
+       "max": 0
+      },
+      "Gradient": {
+       "max": 1
+      }
+     },
+     {
+      "Group": {
+       "max": 1
+      },
+      "Details": {
+       "min": 1,
+       "max": 1
+      },
+      "Values": {
+       "max": 1
+      },
+      "Gradient": {
+       "max": 0
+      }
+     }
+    ]
+   ]
+  },
+  "waterfallChart": {
+   "roles": [
+    {
+     "name": "Category",
+     "kind": "grouping"
+    },
+    {
+     "name": "Breakdown",
+     "kind": "grouping"
+    },
+    {
+     "name": "Y",
+     "kind": "measure",
+     "display": "Y-axis",
+     "types": [
+      "integer",
+      "numeric"
+     ]
+    },
+    {
+     "name": "Tooltips",
+     "kind": "measure"
+    }
+   ],
+   "mappings": [
+    [
+     {
+      "Category": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Breakdown": {
+       "max": 0
+      }
+     }
+    ],
+    [
+     {
+      "Category": {
+       "max": 1
+      },
+      "Y": {
+       "max": 1
+      },
+      "Breakdown": {
+       "min": 1,
+       "max": 1
+      }
+     }
+    ]
+   ]
+  }
+ }
+}

@@ -153,7 +153,8 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
     findings += report_author(stage, project, scrub)
     rdir = os.path.join(stage, project.name + ".Report")
     if os.path.isdir(rdir):
-        findings += [dict(f, message=scrub(f["message"])) for f in pbircheck.run(rdir)]
+        staged_pkg = lambda n: os.path.isfile(os.path.join(rdir, "CustomVisuals", n, "package.json"))  # noqa: E731
+        findings += [dict(f, message=scrub(f["message"])) for f in pbircheck.run(rdir, has_package=staged_pkg)]
     findings += field_refs(stage, project, model, scrub)
     for cur, _dirs, files in os.walk(stage):
         for name in files:
@@ -182,5 +183,6 @@ def run_mirror(ws, project) -> list[dict]:
     out = lint.run(model) + synthetic_marker(model)
     out += field_refs(ws.mirror, project, model, ident)
     if os.path.isdir(project.mirror_report):
-        out += pbircheck.run(project.mirror_report)
+        from . import visuals
+        out += pbircheck.run(project.mirror_report, has_package=lambda n: visuals.package_present(ws, project, n))
     return out

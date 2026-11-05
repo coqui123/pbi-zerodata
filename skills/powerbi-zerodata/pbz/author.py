@@ -1,6 +1,8 @@
-"""`pbz add page|visual`: create report pages and visuals in the mirror from built-in templates, bound to
-model fields by name. New objects carry no filters, selections or value-specific formatting. The $schema
-versions follow the report's existing files. Then `pbz layout`, `pbz validate`, `pbz push`."""
+"""`pbz add page|visual`: create report pages and visuals in the mirror, bound to model fields by name.
+Visual types and their data roles come from the visual catalog (`pbz visual`): every built-in type in
+Microsoft's core visual capabilities, plus registered custom visuals with a known contract. New objects
+carry no filters, selections or value-specific formatting. The $schema versions follow the report's
+existing files. Then `pbz layout`, `pbz validate`, `pbz push`."""
 from __future__ import annotations
 
 import collections
@@ -9,26 +11,17 @@ import os
 import re
 import secrets
 
-from . import pbir, tmdl
+from . import pbir, tmdl, visuals
 from .common import PbzError, read_text, write_text
 from .tokens import TOKEN_RE
 
 SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition"
-CHARTS = {"clusteredBarChart", "clusteredColumnChart", "barChart", "columnChart", "lineChart", "areaChart",
-          "lineClusteredColumnComboChart", "pieChart", "donutChart", "scatterChart", "waterfallChart", "funnel"}
-ROLES = {  # visual type -> (roles in order, role for a column, role for a measure)
-    "card": (["Values"], "Values", "Values"),
-    "multiRowCard": (["Values"], "Values", "Values"),
-    "tableEx": (["Values"], "Values", "Values"),
-    "pivotTable": (["Rows", "Columns", "Values"], "Rows", "Values"),
-    "slicer": (["Values"], "Values", None),
-    "textbox": ([], None, None),
-}
-for _t in CHARTS:
-    ROLES[_t] = (["Category", "Y", "Series"], "Category", "Y")
-SIZES = {"card": (220, 120), "multiRowCard": (300, 160), "tableEx": (560, 320), "pivotTable": (560, 320),
-         "slicer": (220, 160), "textbox": (320, 60)}
+SIZES = {"card": (220, 120), "cardVisual": (260, 140), "multiRowCard": (300, 160), "kpi": (260, 160),
+         "gauge": (300, 200), "tableEx": (560, 320), "pivotTable": (560, 320), "slicer": (220, 160),
+         "listSlicer": (220, 220), "textSlicer": (220, 80), "advancedSlicerVisual": (300, 160), "textbox": (320, 60),
+         "actionButton": (160, 50), "shape": (160, 120), "basicShape": (160, 120)}
 NUMERIC = {"int64", "double", "decimal", "currency"}
+ACTIVE_ROLES = {"Category", "Rows", "Series"}
 
 
 def _id() -> str:
@@ -114,17 +107,31 @@ def _parse_field(model, ref: str):
     return "measure", mm.table, mm.name, ""
 
 
-def _projection(kind, table, name, dtype, role, vtype):
+def _projection(kind, table, name, dtype, role: dict):
+    """queryRef and nativeQueryRef sit next to `field`, never inside it."""
     src = {"Expression": {"SourceRef": {"Entity": table}}, "Property": name}
     if kind == "measure":
         return {"field": {"Measure": src}, "queryRef": f"{table}.{name}", "nativeQueryRef": name}
-    if role in ("Y", "Values") and vtype not in ("tableEx", "slicer", "pivotTable") and dtype in NUMERIC:
+    if role["kind"] == "measure" and dtype in NUMERIC:  # implicit sum, as Desktop does
         return {"field": {"Aggregation": {"Expression": {"Column": src}, "Function": 0}},
                 "queryRef": f"Sum({table}.{name})", "nativeQueryRef": f"Sum of {name}"}
     p = {"field": {"Column": src}, "queryRef": f"{table}.{name}", "nativeQueryRef": name}
-    if role in ("Category", "Rows", "Series"):
+    if role["kind"] != "measure" and role["name"] in ACTIVE_ROLES:
         p["active"] = True
     return p
+
+
+def _default_role(roles: list[dict], kind: str, dtype: str) -> dict | None:
+    """First role that fits the field: measures go to measure roles, numeric columns to a measure role
+    (implicit sum) unless the first grouping role takes either, other columns to grouping roles."""
+    usable = [r for r in roles if r["name"] != "Tooltips"] or roles
+    meas = [r for r in usable if r["kind"] in ("measure", "either")]
+    grp = [r for r in usable if r["kind"] in ("grouping", "either")]
+    if kind == "measure":
+        return meas[0] if meas else None
+    if dtype in NUMERIC and any(r["kind"] == "measure" for r in usable) and not (grp and grp[0]["kind"] == "either"):
+        return next(r for r in usable if r["kind"] == "measure")
+    return grp[0] if grp else (meas[0] if meas else None)
 
 
 def _free_spot(existing: list[dict], w: float, h: float, pw: float, ph: float, gap: float = 20.0):
@@ -152,30 +159,45 @@ def _lit(text: str) -> dict:
 
 def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str | None = None,
                title: str | None = None, text: str | None = None) -> dict:
-    if vtype not in ROLES:
-        raise PbzError("BAD_REQUEST", "type must be one of: " + ", ".join(sorted(ROLES)))
     for s in (title, text):
         if s and TOKEN_RE.search(s):
             raise PbzError("BAD_REQUEST", "mirror tokens cannot be used in titles or text")
+    if not os.path.isdir(project.mirror_report):
+        raise PbzError("NO_MIRROR", "run `pbz pull` first")
     mdef = os.path.join(project.mirror_model, "definition")
     model = tmdl.load_model(mdef)
     rdir = project.mirror_report
     pdir, _mp, _meta, pages = _pages(rdir)
     pid = _find_page(pages, page)
-    roles, col_role, meas_role = ROLES[vtype]
+    vtype, contract, source, notes, pending = visuals.resolve(ws, project, vtype)
+    if vtype == "image":
+        raise PbzError("BAD_REQUEST", "an image needs a registered image resource: add it in Desktop")
+    roles = contract.get("roles") or []
+    by_name = {r["name"].lower(): r for r in roles}
+    names = ", ".join(r["name"] for r in roles) or "none"
     state: dict = {}
+    counts: dict[str, int] = {}
     for f in fields:
         role, _, ref = f.partition("=") if "=" in f.split("[", 1)[0] else ("", "", f)
         kind, table, name, dtype = _parse_field(model, ref)
-        numeric_value = kind == "column" and dtype in NUMERIC and meas_role and vtype not in ("tableEx",)
-        role = role.strip() or (meas_role if kind == "measure" or numeric_value else col_role)
-        if not role or role not in roles:
-            raise PbzError("BAD_REQUEST", f"{vtype} has no role for {ref}; roles: {', '.join(roles) or 'none'}")
-        if vtype == "slicer" and kind == "measure":
-            raise PbzError("BAD_REQUEST", "a slicer needs a column")
-        state.setdefault(role, {"projections": []})["projections"].append(_projection(kind, table, name, dtype, role, vtype))
-    if vtype != "textbox" and not state:
-        raise PbzError("BAD_REQUEST", "--field is required (ROLE=ref or ref)")
+        if role.strip():
+            r = by_name.get(role.strip().lower())
+            if r is None:
+                raise PbzError("BAD_REQUEST", f"{vtype} has no role {role.strip()}; roles: {names}")
+        else:
+            r = _default_role(roles, kind, dtype)
+            if r is None:
+                raise PbzError("BAD_REQUEST", f"{vtype} has no role for {ref}; roles: {names}")
+        if kind == "measure" and r["kind"] == "grouping":
+            raise PbzError("BAD_REQUEST", f"{vtype} role {r['name']} takes columns, not measures"
+                           + (" (a slicer needs a column)" if "slicer" in vtype.lower() else ""))
+        state.setdefault(r["name"], {"projections": []})["projections"].append(_projection(kind, table, name, dtype, r))
+        counts[r["name"]] = counts.get(r["name"], 0) + 1
+    if roles and not state and vtype != "textbox":
+        raise PbzError("BAD_REQUEST", f"--field is required (ROLE=ref or ref); {vtype} roles: {names}")
+    if state and not visuals.fits(contract, counts):
+        raise PbzError("BAD_REQUEST", f"{vtype}: fields per role {counts} fit none of the allowed combinations: "
+                       + " | ".join(visuals.conditions_text(contract)))
     vdir = os.path.join(pdir, pid, "visuals")
     existing = []
     for vid in os.listdir(vdir) if os.path.isdir(vdir) else []:
@@ -199,7 +221,7 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
     vid = _id()
     visual: dict = {"visualType": vtype}
     if state:
-        visual["query"] = {"queryState": {r: state[r] for r in roles if r in state}}
+        visual["query"] = {"queryState": {r["name"]: state[r["name"]] for r in roles if r["name"] in state}}
     if vtype == "textbox":
         visual["objects"] = {"general": [{"properties": {"paragraphs": [{"textRuns": [{"value": text or ""}]}]}}]}
     visual["drillFilterOtherVisuals"] = True
@@ -209,9 +231,19 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
     container = {"$schema": f"{SCHEMA}/visualContainer/{ver}/schema.json", "name": vid,
                  "position": {"x": x, "y": y, "z": z, "height": h, "width": w, "tabOrder": tab}, "visual": visual}
     path = os.path.join(vdir, vid, "visual.json")
-    write_text(path, json.dumps(container, indent=2) + "\n")
-    return {"verb": "add", "kind": "visual", "type": vtype, "page": pages[pid].get("displayName", pid), "id": vid,
-            "box": [int(x), int(y), int(w), int(h)], "placement": placed,
-            "roles": {r: len(v["projections"]) for r, v in state.items()},
-            "files": [os.path.relpath(path, ws.mirror).replace("\\", "/")],
-            "next": "pbz layout --page <page>, pbz validate, then pbz push (--reload for report-only changes)"}
+    write_text(path, json.dumps(container, indent=2, ensure_ascii=False) + "\n")
+    note = visuals.register_pending(project, pending)  # only once the visual itself is valid
+    if note:
+        notes.append(note)
+    files = [os.path.relpath(path, ws.mirror).replace("\\", "/")]
+    if any(n.startswith("registered") for n in notes):
+        files.append(os.path.relpath(os.path.join(rdir, "definition", "report.json"), ws.mirror).replace("\\", "/"))
+    out = {"verb": "add", "kind": "visual", "type": vtype, "page": pages[pid].get("displayName", pid), "id": vid,
+           "box": [int(x), int(y), int(w), int(h)], "placement": placed,
+           "roles": {r: len(v["projections"]) for r, v in state.items()}, "files": files,
+           "next": "pbz layout --page <page>, pbz validate, then pbz push (--reload for report-only changes)"}
+    if source != "core":
+        out["custom"] = {"roles_from": source, **({"notes": notes} if notes else {})}
+        if vtype in ("deneb7E15AEF80B9E4D4F8E12924291ECE89A",) or "vega" in (contract.get("objects") or {}):
+            out["custom"]["setup"] = "spec-driven visual: write its spec in Desktop (it shows a landing page until then)"
+    return out

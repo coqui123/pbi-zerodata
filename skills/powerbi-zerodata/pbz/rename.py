@@ -49,6 +49,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         return rename_table(ws, project, model, old, new)
     else:
         raise PbzError("UNSUPPORTED", "rename supports measure, column and table")
+    ext = _external_users(ws, project, kind, home, old)
 
     changed = []
     # ---- TMDL
@@ -128,7 +129,21 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
     from .governance import culture_edits_rename
     changed += [f"{project.name}.SemanticModel/definition/{r}" for r in culture_edits_rename(mdef, kind, home, old, new)]
     return {"verb": "rename", "kind": kind, "table": home, "from": old, "to": new, "files": changed,
-            "next": "pbz diff, then pbz push"}
+            "next": "pbz diff, then pbz push", **ext}
+
+
+def _external_users(ws, project, kind: str, table: str, name: str) -> dict:
+    """Registered external consumers bind by name: a rename breaks them (warn, never block)."""
+    from .consumers import users_of
+    try:
+        ids = users_of(ws, project, kind, table, name)
+    except (PbzError, OSError, ValueError):
+        return {}
+    if not ids:
+        return {}
+    return {"warnings": [{"code": "USED_EXTERNALLY", "consumers": ids,
+                          "message": "registered external consumers use this name and break after the rename: "
+                                     "update them too (or keep the old name)"}]}
 
 
 # ---------------------------------------------------------------- tables
@@ -164,6 +179,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         raise PbzError("UNSUPPORTED", "the table has translations in cultures/ (not mirrored): rename it in Desktop")
     if any(e.lower() == old.lower() for e in model.expressions):
         raise PbzError("AMBIGUOUS", f"a shared query is also named {old}")
+    ext = _external_users(ws, project, "table", "", old)
     mdef = os.path.join(project.mirror_model, "definition")
     low = old.lower()
     changed, renamed_file = [], None
@@ -270,7 +286,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     from .governance import culture_edits_rename
     changed += [f"{project.name}.SemanticModel/definition/{r}" for r in culture_edits_rename(mdef, "table", "", old, new)]
     out = {"verb": "rename", "kind": "table", "from": old, "to": new, "files": sorted(set(changed)),
-           "next": "pbz diff, pbz validate, then pbz push"}
+           "next": "pbz diff, pbz validate, then pbz push", **ext}
     if renamed_file:
         out["file_renamed"] = {"from": renamed_file[0], "to": renamed_file[1]}
     return out

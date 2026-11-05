@@ -1,15 +1,18 @@
 """Usage graph of a PBIP project: every model and report object, what it depends on, and where the
 reports use it. Built from the sanitized mirror (names and formulas only; tokens are opaque literals).
 
-States (Measure Killer's four plus two):
+States (Measure Killer's four plus three):
 - used            reached from a report usage (visual field, filter, sort, formatting, bookmark, mobile)
+- used_external   reached only from a registered external consumer (`pbz consumers`: thin reports
+                  elsewhere, Excel, paginated reports, composite models, query exports, declarations)
 - locked          needed by the model itself (relationship keys of kept relationships, sort-by targets of
                   used columns, RLS / OLS, aggregations, marked date table key, refresh policy, roles)
 - used_by_unused  not needed, but referenced by other dead objects (remove those first)
 - unused          nothing refers to it
-- unknown         the analysis is incomplete (a report could not be read): never treated as unused
-"Unused" always means "unused in the scanned reports": service reports, Excel, paginated reports and
-composite models built on this model are not visible here.
+- unknown         the analysis is incomplete (a report or registered consumer could not be read, or a
+                  consumer's coverage is incomplete): never treated as unused
+"Unused" means "unused in the scanned reports and registered consumers": consumers nobody registered
+(service reports, Excel files, paginated reports, composite models) are not visible here.
 """
 from __future__ import annotations
 
@@ -20,7 +23,7 @@ from dataclasses import dataclass, field
 from . import deps, pbir, tmdl
 from .common import PbzError, read_text
 
-STATES = ("used", "locked", "used_by_unused", "unused", "unknown")
+STATES = ("used", "used_external", "locked", "used_by_unused", "unused", "unknown")
 UNSEEN = ["service reports", "Excel / Analyze in Excel", "paginated reports", "composite models",
           "dataflows and notebooks"]
 
@@ -82,6 +85,8 @@ class Graph:
         self.inc: dict[tuple, list[Edge]] = {}
         self.locks: dict[tuple, list[str]] = {}
         self.usages: dict[tuple, list[Usage]] = {}
+        self.ext_usages: dict[tuple, list[Usage]] = {}   # registered external consumers (report = consumer id)
+        self.consumers: list[dict] = []
         self.reports: list[str] = []
         self.report_objects: list[dict] = []
         self.warnings: list[dict] = []
@@ -109,6 +114,10 @@ class Graph:
         if k in self.objects:
             self.usages.setdefault(k, []).append(u)
 
+    def use_external(self, k: tuple, u: Usage) -> None:
+        if k in self.objects:
+            self.ext_usages.setdefault(k, []).append(u)
+
     def label(self, k: tuple) -> str:
         o = self.objects.get(k)
         return o.label() if o else k[2]
@@ -127,13 +136,14 @@ class Graph:
 
     def compute_states(self) -> None:
         used = self.closure(self.usages)
-        locked = self.closure(self.locks) - used
+        ext = self.closure(self.ext_usages) - used
+        locked = self.closure(self.locks) - used - ext
         # structural needs that depend on what survives: kept relationships keep their key columns,
         # a kept marked date table keeps its key column
         changed = True
         while changed:
             changed = False
-            alive = used | locked
+            alive = used | ext | locked
             for k, o in self.objects.items():
                 if k in alive:
                     continue
@@ -141,15 +151,17 @@ class Graph:
                     ft, tt = key("table", "", o.extra["from_table"]), key("table", "", o.extra["to_table"])
                     if ft in alive and tt in alive:
                         self.lock(k, "relationship between used tables")
-                        locked |= self.closure([k]) - used
+                        locked |= self.closure([k]) - used - ext
                         changed = True
                 elif o.kind == "column" and o.extra.get("date_key") and key("table", "", o.table) in alive:
                     self.lock(k, "date table key")
-                    locked |= self.closure([k]) - used
+                    locked |= self.closure([k]) - used - ext
                     changed = True
         for k, o in self.objects.items():
             if k in used:
                 self.state[k] = "used"
+            elif k in ext:
+                self.state[k] = "used_external"
             elif k in locked:
                 self.state[k] = "locked"
             else:
@@ -264,6 +276,9 @@ def build(ws, project, extra_reports=(), model_dir: str | None = None) -> Graph:
     for name, rdir in reports:
         g.reports.append(name)
         _report(g, model, res, name, rdir)
+    if ws is not None and model_dir is None:
+        from . import consumers
+        consumers.apply(g, ws, project, model, res)
     g.compute_states()
     return g
 

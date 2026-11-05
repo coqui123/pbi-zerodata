@@ -95,6 +95,25 @@ TOOLS = [
          pos=[("paths", D(L, "mirror files (globs or folder prefixes); default all"), False)],
          opts={"object": ("--object", D(S, "one object: measure 'Table'[Name] (also column, hierarchy, partition, "
                                            "calculationItem)"), "value")}, read_only=False, destructive=True),
+    Tool("visual", "Visual catalog: list built-in and custom visuals, show a type's data roles, import a .pbiviz "
+                   "(contract = roles only, public = AppSource guid, private = package installed by push), or "
+                   "register a custom visual by guid.", ["visual"],
+         pos=[("action", E("list", "roles", "import", "register"), True),
+              ("target", D(S, "roles: visual type; import: .pbiviz path; register: visual guid"), False)],
+         opts={"as": ("--as", E("contract", "public", "private", "organizational"), "value"),
+               "roles": ("--role", D(L, "register: NAME:grouping|measure|either"), "append"),
+               "replace": ("--replace", B, "flag")},
+         read_only=False),
+    Tool("consumers", "External consumers that keep objects used (thin reports, Excel, paginated reports, "
+                      "composite models, query exports, a scanner result, manual declarations): list, add, "
+                      "rescan or show. Removing one is human only.", ["consumers"],
+         pos=[("action", E("list", "add", "scan", "show"), True),
+              ("target", D(S, "add: file or folder path; show: consumer id"), False)],
+         opts={"kind": ("--kind", E("auto", "pbir", "pbix", "xlsx", "rdl", "model", "queries", "scan"), "value"),
+               "label": ("--label", S, "value"),
+               "objects": ("--object", D(L, "manual: [Measure] / 'T'[Column] / Table used elsewhere"), "append"),
+               "model_names": ("--model-name", D(L, "the model's name in the service"), "append")},
+         read_only=False),
     Tool("culture", "Cultures: add, remove, list, or list the objects missing a caption.", ["culture"],
          pos=[("action", E("add", "remove", "list", "missing"), True), ("code", D(S, "culture code, e.g. de-DE"), False)],
          read_only=False),
@@ -134,7 +153,8 @@ TOOLS = [
     Tool("move_measure", "Move a measure to another table (for example a measure table), fixing references.",
          ["move", "measure"], pos=[("name", D(S, "measure name"), True)],
          opts={"to": ("--to", D(S, "target table"), "value")}, need=["to"], read_only=False),
-    Tool("unused", "Usage state of every object (used / locked / used_by_unused / unused / unknown); with remove, "
+    Tool("unused", "Usage state of every object (used / used_external / locked / used_by_unused / unused / unknown; "
+                   "register external consumers with the consumers tool); with remove, "
                    "delete unused objects from the mirror (restore point kept).", ["unused"],
          opts={"all": ("--all", D(B, "also list used objects and auto date/time tables"), "flag"),
                "kinds": ("--kinds", D(L, "limit to object kinds"), "multi"),
@@ -208,9 +228,10 @@ TOOLS = [
          opts={"width": ("--width", I, "value"), "height": ("--height", I, "value"),
                "hidden": ("--hidden", B, "flag"), "after": ("--after", D(S, "insert after this page"), "value")},
          read_only=False),
-    Tool("add_visual", "Create a visual from a built-in template, bound to model fields.", ["add", "visual"],
-         pos=[("type", D(S, "card, multiRowCard, tableEx, pivotTable, slicer, textbox, clusteredColumnChart, "
-                            "clusteredBarChart, lineChart, pieChart, ..."), True)],
+    Tool("add_visual", "Create a visual bound to model fields: any built-in type (roles from Microsoft's core "
+                       "visual capabilities) or a registered custom visual with a known contract.", ["add", "visual"],
+         pos=[("type", D(S, "built-in type (card, cardVisual, kpi, gauge, tableEx, pivotTable, slicer, textbox, "
+                            "clusteredColumnChart, lineChart, ...), or a custom visual's guid or imported name"), True)],
          opts={"page": ("--page", D(S, "target page (display name or id)"), "value"),
                "fields": ("--field", D(L, "[Measure], 'T'[Column] or ROLE='T'[Column]"), "append"),
                "pos": ("--pos", D(S, "x,y,width,height"), "value"),

@@ -101,7 +101,8 @@ freely, use `pbz synth` instead of the real model.
 | `DESKTOP_DIRTY` (push --reload) | Desktop has unsaved changes a reload would discard | ask the user to save or close Desktop |
 | `AMBIGUOUS_PATH` / `TYPE_MISMATCH` / `DUPLICATE` (relationship) | the relationship would break or duplicate the model | add it `--inactive`, fix the columns, or `set` the existing one |
 | `NO_FREE_SPACE` (add visual placement) | the page is full | pass `--pos x,y,w,h` or make room (`pbz layout`) |
-| `INCOMPLETE` (unused --remove) | a report file could not be read, so nothing is provably unused | fix the file, rerun |
+| `INCOMPLETE` (unused --remove) | a report file or a registered consumer could not be read or fully covered, so nothing is provably unused | `pbz consumers list`: fix the file or register the missing definitions, rerun |
+| `NOT_REGISTERED` / `NO_CONTRACT` (add visual) | the custom visual is not registered in report.json, or its data roles are unknown | `pbz visual import <file.pbiviz> --as public\|private`, or `pbz visual register <guid> --role ...` |
 | `CONFLICT` (unused --restore) | the mirror changed after the removal | restore later points first, or pull |
 | guard deny `[pbz guard] ...` | you tried a blocked path or command | follow the hint; never retry variants |
 
@@ -116,7 +117,8 @@ Prefer these over hand edits: they keep every cross-file reference consistent. D
 | `pbz move measure <name> --to <table>` | moves a measure (for example into a measure table), fixing visuals and qualified refs |
 | `pbz new measure-table\|date-table\|calc-group\|field-parameter <name> ...` | Desktop-shaped scaffolds with fresh lineageTags (date table: `--start/--end` years, `--relate 'T'[C]`) |
 | `pbz relationship add\|remove\|set <'T'[C]> <'U'[K]> [--inactive] [--both]` | relationship edits with type, duplicate and ambiguous-path guards |
-| `pbz add page <name>` / `pbz add visual <type> --page <p> --field ...` | pages and visuals from built-in templates (card, tableEx, pivotTable, slicer, charts, textbox) |
+| `pbz add page <name>` / `pbz add visual <type> --page <p> --field ...` | pages and visuals of any built-in type (roles, kinds and field limits from Microsoft's core visual capabilities) or a registered custom visual |
+| `pbz visual list\|roles <type>\|import <file.pbiviz> [--as contract\|public\|private]\|register <guid> --as public\|organizational [--role NAME:kind]` | custom visuals: contracts (data roles), registration in report.json, private packages installed by push ([reference/visuals.md](reference/visuals.md)) |
 | `pbz layout [--page <p>]` | text canvas map of a page plus overlap / off-canvas / z-order lint: how you "see" a page |
 | `pbz format [<measure>] [--apply]` | local, token-safe DAX formatting (check by default) |
 | `pbz repair [--fields] [--lineage]` | fixes page order, names, groups, interactions, bookmark lists, stale targets, copied lineageTags |
@@ -148,7 +150,8 @@ These read the mirror and print names, states, counts, scores and rule ids. Deta
 
 | Verb | Use it for |
 |---|---|
-| `pbz unused [--all] [--report <dir>]` | state of every object: used / locked / used_by_unused / unused / unknown |
+| `pbz unused [--all] [--report <dir>]` | state of every object: used / used_external / locked / used_by_unused / unused / unknown |
+| `pbz consumers add <path> \| --object <ref> --label <l>`, `list`, `scan`, `show <id>` | register external consumers (thin reports, PBIX, Excel, RDL, composite models, query exports, a scanner result) so `unused` keeps what they use ([reference/consumers.md](reference/consumers.md)) |
 | `pbz lineage <obj> [--up]` | where-used tree (default) or what it depends on |
 | `pbz unused --remove [--dry-run] [--cascade] [--only kinds] [--m-step remove\|keep\|none]` | delete unused objects from the mirror, with a restore point |
 | `pbz unused --restore <stamp>` | undo a removal (before or after push) |
@@ -160,9 +163,13 @@ These read the mirror and print names, states, counts, scores and rule ids. Deta
 | `pbz m-lineage [table]` | Power Query steps, column origins, columns the query drops or the model lacks |
 | `pbz unused --verify-engine` | cross-check the dependency parser against the open Desktop engine |
 
-"Unused" means unused in the scanned reports and the model. Service reports, Excel, paginated
-reports and composite models built on the model are invisible here, so ask the user before a removal
-and push it like any other edit (`pbz diff`, `pbz push`).
+"Unused" means unused in the scanned reports, the model and the registered consumers. Ask the user
+which service reports, Excel files, paginated reports and composite models use the model and register
+them (`pbz consumers add <path>`; the user can export them, see reference/consumers.md). What a
+consumer uses becomes `used_external` and is never removed; an unreadable or opaque consumer makes the
+analysis incomplete. Consumers nobody registered stay invisible, so ask the user before a removal and
+push it like any other edit (`pbz diff`, `pbz push`). Only the user removes a consumer
+(`pbz admin consumer-remove <id>`).
 
 ## Memory hygiene
 
@@ -177,7 +184,7 @@ paths, patterns, gotchas, decisions. To clean old notes: `pbz memscrub --dir <me
 - [reference/gotchas.md](reference/gotchas.md): TMDL / PBIR / DAX / Desktop gotchas.
 - [reference/leak-vectors.md](reference/leak-vectors.md): what is blocked and why.
 - `pbz admin ...` is for the user in their own terminal (budget reset, allow paths, mark category
-  columns, engine raw log). Never run it yourself; the guard blocks it.
+  columns, engine raw log, consumer removal). Never run it yourself; the guard blocks it.
 - Changing this skill: open a session in your clone of the `pbi-zerodata` repo (a
   synthetic tree; the guard treats its fixtures as fake data). From a real workspace session the
   skill, hooks and agent rule files are read-only.

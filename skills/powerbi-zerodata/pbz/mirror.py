@@ -342,6 +342,11 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
             p = os.path.join(stage, *rel.split("/"))
             if os.path.exists(p):
                 os.remove(p)
+        from . import visuals  # private custom visuals imported since the last push travel with it
+        srj = os.path.join(stage, project.name + ".Report", "definition", "report.json")
+        pkgs = visuals.pending_for(ws, read_text(srj)[0]) if os.path.exists(srj) else {}
+        if pkgs:
+            visuals.install(pkgs, os.path.join(stage, project.name + ".Report"))
         findings = validate.run_stage(ws, project, stage, tm)
         errors = [f for f in findings if f["severity"] == "error"]
         summary = []
@@ -370,6 +375,8 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
             write_text(_real_path(ws, rel), rtext, bom)
         for rel in ch["deleted"]:
             os.remove(_real_path(ws, rel))
+        installed = visuals.install(pkgs, project.report_dir, backup_dir=os.path.join(backup, project.name + ".Report")) if pkgs else []
+        visuals.clear_pending(ws, installed)
         for rel in ch["changed"] + ch["added"]:
             mp = os.path.join(ws.mirror, *rel.split("/"))
             files[rel] = {"real": file_sha(_real_path(ws, rel)), "mirror": file_sha(mp)}
@@ -388,6 +395,8 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
         record_authored(ws, authored_before, authored_after)
         result = {"verb": "push", "project": project.name, "result": "PUSHED", "objects": summary,
                   "findings": findings, "backup": stamp}
+        if installed:
+            result["custom_visuals_installed"] = installed
         if held:
             result["held_back"] = held  # still pending in the mirror
         if reload and open_inst:

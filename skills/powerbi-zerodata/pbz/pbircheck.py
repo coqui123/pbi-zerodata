@@ -44,8 +44,55 @@ def _num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def run(report_dir: str, prefix: str = "") -> list[dict]:
+def _custom_visuals(add, ddir: str, report_dir: str, instances: dict, has_package) -> None:
+    """Registration of custom visuals (as Microsoft's validator reads it) and data roles of every
+    visual whose capabilities are known (built-in catalog)."""
+    from . import visuals
+    report = _load(os.path.join(ddir, "report.json")) or {}
+    reg: dict[str, str] = {}
+    for g in report.get("publicCustomVisuals") or []:
+        if isinstance(g, str) and g:
+            reg[g] = "public"
+    for p in report.get("resourcePackages") or []:
+        if not isinstance(p, dict) or not isinstance(p.get("name"), str):
+            continue
+        name, typ = p["name"], p.get("type")
+        if typ not in ("CustomVisual", "OrganizationalStoreCustomVisual"):
+            continue
+        kind = "private" if typ == "CustomVisual" else "organizational"
+        if name in reg and reg[name] != kind:
+            add("error", "PBIR_CUSTOM_VISUAL_CONFLICT", "definition/report.json",
+                f"{name} is registered as {reg[name]} and {kind}")
+        reg[name] = kind
+        if kind == "organizational" and not name.endswith(visuals.ORG):
+            add("error", "PBIR_ORGSTORE_NAME", "definition/report.json",
+                f"organizational visual package {name} must end with {visuals.ORG} (and so must its visualType)")
+        if kind == "private" and has_package is not None and not has_package(name):
+            add("error", "PBIR_PRIVATE_VISUAL_PACKAGE_MISSING", "definition/report.json",
+                f"private visual {name} has no package in CustomVisuals/{name}/ (pbz visual import --as private)")
+    core = visuals.core()
+    for vt, uses in sorted(instances.items()):
+        contract = core.get(vt)
+        if contract is None:
+            if vt not in reg:
+                hint = f" (registered as {vt[:-len(visuals.ORG)]}?)" if vt.endswith(visuals.ORG) else ""
+                add("warning", "PBIR_VISUAL_TYPE_UNREGISTERED", uses[0][0],
+                    f"visualType {vt} is neither built-in nor registered in report.json{hint}: "
+                    f"Desktop shows a placeholder ({len(uses)} visual(s))")
+            continue
+        known = {r["name"] for r in contract.get("roles") or []}
+        for vrel, roles in uses:
+            for role in sorted(roles - known):
+                add("warning", "PBIR_ROLE_UNKNOWN", vrel, f"{vt} has no data role {role}")
+
+
+def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
+    """`has_package(name)`: is the private visual package present? Defaults to the report's own
+    CustomVisuals folder when it has one (staged real files); None skips the check."""
     out: list[dict] = []
+    if has_package is None and os.path.isdir(os.path.join(report_dir, "CustomVisuals")):
+        has_package = lambda n: os.path.isfile(os.path.join(report_dir, "CustomVisuals", n, "package.json"))  # noqa: E731
+    instances: dict[str, list] = {}
 
     def add(sev, code, where, msg):
         out.append({"severity": sev, "code": code, "where": prefix + where, "message": msg})
@@ -115,6 +162,9 @@ def run(report_dir: str, prefix: str = "") -> list[dict]:
                 parents[vid] = v["parentGroupName"]
             body = v.get("visual") if isinstance(v.get("visual"), dict) else {}
             qs = ((body.get("query") or {}).get("queryState") or {}) if isinstance(body.get("query"), dict) else {}
+            if isinstance(body.get("visualType"), str) and body["visualType"]:
+                instances.setdefault(body["visualType"], []).append(
+                    (vrel, set(qs) if isinstance(qs, dict) else set()))
             fields = set()
             for role, bucket in qs.items() if isinstance(qs, dict) else []:
                 for proj in (bucket or {}).get("projections") or [] if isinstance(bucket, dict) else []:
@@ -221,4 +271,5 @@ def run(report_dir: str, prefix: str = "") -> list[dict]:
                     add("error", "DUPLICATE_REPORT_MEASURE", "definition/reportExtensions.json",
                         f"report measure {m.get('name')} defined twice")
                 seen.add(key)
+    _custom_visuals(add, ddir, report_dir, instances, has_package)
     return out

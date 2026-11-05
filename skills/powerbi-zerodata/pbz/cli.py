@@ -145,7 +145,7 @@ def main(argv=None) -> int:
     p.add_argument("--dir", required=True, help="memory folder to scrub")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--show", help="print the scrubbed text of one file")
-    p = sub.add_parser("unused", help="usage state of every object (used / locked / used_by_unused / unused)")
+    p = sub.add_parser("unused", help="usage state of every object (used / used_external / locked / used_by_unused / unused / unknown)")
     p.add_argument("--report", action="append", default=[], help="extra *.Report folder (thin report) to scan")
     p.add_argument("--all", action="store_true", help="also list used objects and auto date/time tables")
     p.add_argument("--kinds", nargs="*", help="limit to object kinds (measure column table ...)")
@@ -210,6 +210,22 @@ def main(argv=None) -> int:
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--hidden", action="store_true", help="page: hidden in view mode")
     p.add_argument("--after", help="page: insert after this page")
+    p = sub.add_parser("visual", help="visual catalog: built-in types and custom visuals (list, roles, import, register)")
+    p.add_argument("action", choices=["list", "roles", "import", "register"])
+    p.add_argument("target", nargs="?", help="roles: visual type; import: a .pbiviz file; register: the visual's guid")
+    p.add_argument("--as", dest="as_", help="import: contract (roles only, default), public or private; "
+                                            "register: public or organizational")
+    p.add_argument("--role", action="append", default=[], help="register: NAME:grouping|measure|either (repeatable)")
+    p.add_argument("--replace", action="store_true", help="import --as private: replace an existing package")
+    p = sub.add_parser("consumers", help="external consumers that keep objects used: thin reports, Excel, "
+                                         "paginated reports, composite models, query exports")
+    p.add_argument("action", choices=["list", "add", "scan", "show"])
+    p.add_argument("target", nargs="?", help="add: file or folder; show: consumer id")
+    p.add_argument("--kind", default="auto", help="add: auto | pbir | pbix | xlsx | rdl | model | queries | scan")
+    p.add_argument("--label", help="add: display label (required with --object)")
+    p.add_argument("--object", action="append", default=[], help="add: declare a used object by hand (repeatable)")
+    p.add_argument("--model-name", action="append", default=[],
+                   help="add: the model's name in the service, if it differs from the project name")
     p = sub.add_parser("relationship", help="add, remove or change a relationship (metadata-guarded)")
     p.add_argument("action", choices=["add", "remove", "set"])
     p.add_argument("from_col", help="many side, 'Table'[Column]")
@@ -271,7 +287,7 @@ def main(argv=None) -> int:
     p.add_argument("--page", help="page display name or id (draws its map)")
     p.add_argument("--no-map", action="store_true")
     p = sub.add_parser("admin")
-    p.add_argument("action", choices=["budget-reset", "allow", "category", "synthetic", "log"])
+    p.add_argument("action", choices=["budget-reset", "allow", "category", "synthetic", "log", "consumer-remove"])
     p.add_argument("value", nargs="?")
     a = ap.parse_args(argv)
     if a.cmd == "mcp":
@@ -376,6 +392,30 @@ def main(argv=None) -> int:
                 if not a.page:
                     raise PbzError("BAD_REQUEST", "--page is required for a visual")
                 out = author.add_visual(ws, project, a.name, a.page, a.field, a.pos, a.title, a.text)
+        elif a.cmd == "visual":
+            from pbz import visuals
+            if a.action != "list" and not a.target:
+                raise PbzError("BAD_REQUEST", f"visual {a.action} needs a target")
+            if a.action == "list":
+                out = visuals.list_visuals(ws, project)
+            elif a.action == "roles":
+                out = visuals.roles(ws, project, a.target)
+            elif a.action == "import":
+                out = visuals.import_pbiviz(ws, project, a.target, a.as_ or "contract", a.replace)
+            else:
+                out = visuals.register(ws, project, a.target, a.as_ or "public", a.role)
+        elif a.cmd == "consumers":
+            from pbz import consumers
+            if a.action == "list":
+                out = consumers.list_(ws, project)
+            elif a.action == "scan":
+                out = consumers.scan(ws, project)
+            elif a.action == "show":
+                if not a.target:
+                    raise PbzError("BAD_REQUEST", "consumers show <id>")
+                out = consumers.show(ws, project, a.target)
+            else:
+                out = consumers.add(ws, project, a.target, a.kind, a.label, a.object, a.model_name)
         elif a.cmd == "relationship":
             from pbz import relate
             if a.action == "add":
@@ -467,6 +507,11 @@ def admin(ws, a) -> dict:
         if os.path.exists(p):
             os.remove(p)
         return {"verb": "admin", "budget": "reset"}
+    if a.action == "consumer-remove":
+        if not a.value:
+            raise PbzError("BAD_REQUEST", "consumer id required")
+        from pbz import consumers
+        return consumers.remove(ws, a.value)
     pol = policy.load(ws)
     if a.action == "allow" and a.value:
         pol["allow"] = sorted(set(pol.get("allow", [])) | {a.value})

@@ -16,9 +16,12 @@ copyright belongs to their respective authors, as stated in each repository's LI
 | [ViciusLio/pbi-semantic-doc](https://github.com/ViciusLio/pbi-semantic-doc) | documentation sections |
 | [sql-bi/Vpax-Obfuscator](https://github.com/sql-bi/Vpax-Obfuscator), [sql-bi/VertiPaq-Analyzer](https://github.com/sql-bi/VertiPaq-Analyzer) | DAX tokenizer keyword classes; `DISCOVER_CALC_DEPENDENCY` usage |
 | [microsoft/powerquery-parser](https://github.com/microsoft/powerquery-parser) | M grammar reference for the let-step analyser |
+| [microsoft/skills-for-fabric](https://github.com/microsoft/skills-for-fabric) `@microsoft/powerbi-core-visual-schema` (Copyright (c) Microsoft Corporation) | `pbz/rules/visuals.json` is data compacted from its `data/capabilities.json` (built-in visual data roles, kinds and mapping conditions) by `install/build_visual_catalog.py` |
 
 Design references only (documentation, no code used): Microsoft's Power BI report authoring CLI
-reference in microsoft/skills-for-fabric (visual role names and PBIR pitfalls behind `pbz add`), the
+reference in microsoft/skills-for-fabric (visual role names, custom visual registration and PBIR
+pitfalls behind `pbz add` and `pbz visual`), the ECMA-376 SpreadsheetML pivot and slicer parts and the
+RDL schema (names read by `pbz consumers`), the Deneb PBIR documentation, the
 Microsoft PBIR / TMDL documentation and json-schemas repository (structure checked by `pbz validate`),
 and SQLBI's DAX formatting conventions (`pbz format`).
 
