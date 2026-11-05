@@ -86,6 +86,56 @@ def _custom_visuals(add, ddir: str, report_dir: str, instances: dict, has_packag
                 add("warning", "PBIR_ROLE_UNKNOWN", vrel, f"{vt} has no data role {role}")
 
 
+def _literal(node):
+    e = node.get("expr") if isinstance(node, dict) else None
+    return (e.get("Literal") or {}).get("Value") if isinstance(e, dict) and isinstance(e.get("Literal"), dict) else None
+
+
+def _value_ok(code, node) -> bool:
+    """Does a stored formatting value fit the catalog type? Non-literal values (field values, rules,
+    expressions) are not judged."""
+    if code == "color":
+        return isinstance(node, dict) and ("solid" in node or "expr" in node)
+    raw = _literal(node)
+    if not isinstance(raw, str):
+        return True
+    val, kind = pbir.decode_literal(raw)
+    if code == "bool":
+        return kind == "bool"
+    if code in ("numeric", "fontSize", "displayUnits", "variant", "integer"):
+        return kind in ("int", "double")
+    if code in ("text", "fontFamily", "alignment", "formatString"):
+        return kind == "string"
+    if isinstance(code, list):
+        return val in code or (isinstance(val, float) and val.is_integer() and int(val) in code)
+    return True
+
+
+def _formatting(add, items: list) -> None:
+    """Formatting objects, properties and literal value types of built-in visuals against Microsoft's
+    formatting catalog (unknown names are typos or hand edits Desktop ignores)."""
+    from . import style
+    cat = style.catalog()
+    for vrel, vt, body in items:
+        vobjs = cat["visuals"].get(vt)
+        if vobjs is None:
+            continue
+        for section, objs, label in (("objects", vobjs, ""), ("visualContainerObjects", cat["container"], "container ")):
+            sec = body.get(section)
+            for obj, entries in (sec.items() if isinstance(sec, dict) else []):
+                if obj not in objs:
+                    add("warning", "PBIR_OBJECT_UNKNOWN", vrel, f"{vt} has no {label}formatting object {obj}")
+                    continue
+                for e in entries if isinstance(entries, list) else []:
+                    for prop, val in ((e or {}).get("properties") or {}).items() if isinstance(e, dict) else []:
+                        code = objs[obj].get(prop)
+                        if code is None:
+                            add("warning", "PBIR_PROPERTY_UNKNOWN", vrel, f"{vt} {label}object {obj} has no property {prop}")
+                        elif not _value_ok(code, val):
+                            add("warning", "PBIR_PROPERTY_VALUE", vrel, f"{label}{obj}.{prop} value does not fit its type "
+                                f"({code if isinstance(code, str) else 'one of the listed values'})")
+
+
 def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
     """`has_package(name)`: is the private visual package present? Defaults to the report's own
     CustomVisuals folder when it has one (staged real files); None skips the check."""
@@ -93,6 +143,7 @@ def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
     if has_package is None and os.path.isdir(os.path.join(report_dir, "CustomVisuals")):
         has_package = lambda n: os.path.isfile(os.path.join(report_dir, "CustomVisuals", n, "package.json"))  # noqa: E731
     instances: dict[str, list] = {}
+    formatting: list = []
 
     def add(sev, code, where, msg):
         out.append({"severity": sev, "code": code, "where": prefix + where, "message": msg})
@@ -165,6 +216,7 @@ def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
             if isinstance(body.get("visualType"), str) and body["visualType"]:
                 instances.setdefault(body["visualType"], []).append(
                     (vrel, set(qs) if isinstance(qs, dict) else set()))
+                formatting.append((vrel, body["visualType"], body))
             fields = set()
             for role, bucket in qs.items() if isinstance(qs, dict) else []:
                 for proj in (bucket or {}).get("projections") or [] if isinstance(bucket, dict) else []:
@@ -272,4 +324,5 @@ def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
                         f"report measure {m.get('name')} defined twice")
                 seen.add(key)
     _custom_visuals(add, ddir, report_dir, instances, has_package)
+    _formatting(add, formatting)
     return out

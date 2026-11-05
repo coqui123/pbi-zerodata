@@ -196,6 +196,15 @@ def main() -> int:
                       ("gauge", "--field", "[Total Hours]"), ("cardVisual", "--field", "[Active Hours]")):
             res = r.pbz("add", "visual", vargs[0], "--page", "E2E Page", *vargs[1:])
             expect(res.get("verb") == "add" and res.get("placement") == "free_spot", f"add visual {vargs[0]}: {res}")
+        for args in (("style", "E2E Page", "--type", "clusteredColumnChart", "--set", "labels.show=true",
+                      "--set", "title.text=Hours by status", "--set", "dataPoint.fill=theme:2:-25",
+                      "--set", "legend.position=Top"),
+                     ("style", "E2E Page", "--all", "--set", "container.border.show=true"),
+                     ("style", "E2E Page", "--type", "card", "--set", "labels.fontSize=20", "--set", "labels.color=#118DFF"),
+                     ("style", "--list", "--type", "kpi")):
+            res = r.pbz(*args)
+            expect(res.get("verb") == "style" and res.get("ok") is not False
+                   and (res.get("changed") or res.get("action") == "list"), f"{' '.join(args)}: {res}")
         for args in (("culture", "add", "fr-FR"), ("translate", "fr-FR", "Hours", "--caption", "Heures"),
                      ("translate", "fr-FR", "[Total Hours]", "--caption", "Heures totales"),
                      ("perspective", "add", "E2E View"), ("perspective", "include", "E2E View", "Project", "[Total Hours]"),

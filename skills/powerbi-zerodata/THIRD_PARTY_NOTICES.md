@@ -16,7 +16,7 @@ copyright belongs to their respective authors, as stated in each repository's LI
 | [ViciusLio/pbi-semantic-doc](https://github.com/ViciusLio/pbi-semantic-doc) | documentation sections |
 | [sql-bi/Vpax-Obfuscator](https://github.com/sql-bi/Vpax-Obfuscator), [sql-bi/VertiPaq-Analyzer](https://github.com/sql-bi/VertiPaq-Analyzer) | DAX tokenizer keyword classes; `DISCOVER_CALC_DEPENDENCY` usage |
 | [microsoft/powerquery-parser](https://github.com/microsoft/powerquery-parser) | M grammar reference for the let-step analyser |
-| [microsoft/skills-for-fabric](https://github.com/microsoft/skills-for-fabric) `@microsoft/powerbi-core-visual-schema` (Copyright (c) Microsoft Corporation) | `pbz/rules/visuals.json` is data compacted from its `data/capabilities.json` (built-in visual data roles, kinds and mapping conditions) by `install/build_visual_catalog.py` |
+| [microsoft/skills-for-fabric](https://github.com/microsoft/skills-for-fabric) `@microsoft/powerbi-core-visual-schema` (Copyright (c) Microsoft Corporation) | `pbz/rules/visuals.json` and `pbz/rules/visual-objects.json` are data compacted from its `data/capabilities.json`, `vco-capabilities.json` and `instance-selectors.json` (built-in visual data roles, kinds, mapping conditions, formatting objects and properties with value types, container objects, instance states) by `install/build_visual_catalog.py` |
 
 Design references only (documentation, no code used): Microsoft's Power BI report authoring CLI
 reference in microsoft/skills-for-fabric (visual role names, custom visual registration and PBIR

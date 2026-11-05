@@ -20,6 +20,9 @@ without company data entering the agent's context.
 - `add visual` covers every built-in visual type (roles from Microsoft's core visual capabilities) and
   custom visuals: `visual import|register|roles|list` for AppSource, organizational and private
   .pbiviz visuals (`reference/visuals.md`).
+- `style`: visual formatting (titles, data labels, colors, fonts, axes, legends, borders, one series,
+  button states) for one visual or every visual of a type, checked against Microsoft's formatting
+  catalog (`reference/style.md`).
 - `consumers`: register thin reports, PBIX, Excel workbooks, paginated reports, composite models, query
   exports or a scanner result so `unused` keeps what they use (`used_external`) and refuses removals
   while coverage is incomplete (`reference/consumers.md`).
@@ -60,6 +63,7 @@ python skills/powerbi-zerodata/tests/test_mcp.py        # MCP server over stdio
 python skills/powerbi-zerodata/tests/test_synth.py      # synthetic model (add --live to open it in Desktop)
 python skills/powerbi-zerodata/tests/test_consumers.py  # external consumers: every kind, coverage gaps, canaries
 python skills/powerbi-zerodata/tests/test_visuals.py    # built-in catalog, custom visuals, private package push
+python skills/powerbi-zerodata/tests/test_style.py      # visual formatting: values, selectors, bulk, checks
 python skills/powerbi-zerodata/tests/test_engine.py    # engine verbs + canary scan (needs Desktop)
 python skills/powerbi-zerodata/tests/test_e2e.py       # every verb on a fixture copy in Desktop, canary scan
 ```

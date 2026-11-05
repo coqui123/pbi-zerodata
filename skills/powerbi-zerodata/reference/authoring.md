@@ -54,6 +54,8 @@ questions: check them with `pbz check` (`unique`, `no_orphans`) while Desktop is
   to the first free spot on the page (`placement: NO_FREE_SPACE` when the page is full). The
   `$schema` versions follow the report's files. New visuals carry no filters, selections or
   value-specific formatting.
+- `pbz style` formats visuals (titles, data labels, colors, fonts, axes, legends, borders, one
+  series, button states), one at a time or every visual of a type: [style.md](style.md).
 
 ## Seeing a page: `pbz layout`
 

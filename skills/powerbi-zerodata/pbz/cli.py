@@ -210,6 +210,21 @@ def main(argv=None) -> int:
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--hidden", action="store_true", help="page: hidden in view mode")
     p.add_argument("--after", help="page: insert after this page")
+    p = sub.add_parser("style", help="visual formatting (titles, labels, colors, fonts, axes, legends, ...) checked "
+                                     "against Microsoft's formatting catalog")
+    p.add_argument("page", nargs="?", help="page display name or id")
+    p.add_argument("visual", nargs="?", help="visual id or its `pbz layout` label")
+    p.add_argument("--set", dest="sets", action="append", default=[],
+                   help="[container.]object.property=value (repeatable); colors #RRGGBB, theme:<n>[:<shade %%>], "
+                        "measure:[Measure]")
+    p.add_argument("--unset", dest="unsets", action="append", default=[], help="[container.]object.property (repeatable)")
+    p.add_argument("--type", dest="vtype", help="every visual of this type (on the page, or in the whole report)")
+    p.add_argument("--all", action="store_true", help="every visual on the page")
+    p.add_argument("--series", help="format one series of the visual: [Measure] or 'T'[Column] it shows")
+    p.add_argument("--state", help="instance state of the object (hover, selected, press, ...)")
+    p.add_argument("--show", action="store_true", help="print the current formatting")
+    p.add_argument("--list", action="store_true", help="formatting objects of --type (with --object: its properties)")
+    p.add_argument("--object", help="with --list: one formatting object")
     p = sub.add_parser("visual", help="visual catalog: built-in types and custom visuals (list, roles, import, register)")
     p.add_argument("action", choices=["list", "roles", "import", "register"])
     p.add_argument("target", nargs="?", help="roles: visual type; import: a .pbiviz file; register: the visual's guid")
@@ -392,6 +407,15 @@ def main(argv=None) -> int:
                 if not a.page:
                     raise PbzError("BAD_REQUEST", "--page is required for a visual")
                 out = author.add_visual(ws, project, a.name, a.page, a.field, a.pos, a.title, a.text)
+        elif a.cmd == "style":
+            from pbz import style
+            if a.list:
+                if not a.vtype:
+                    raise PbzError("BAD_REQUEST", "--list needs --type <visual type>")
+                out = style.list_(ws, project, a.vtype, a.object)
+            else:
+                out = style.run(ws, project, a.page, a.visual, a.sets, a.unsets, a.vtype, a.all, a.state, a.series,
+                                a.show)
         elif a.cmd == "visual":
             from pbz import visuals
             if a.action != "list" and not a.target:

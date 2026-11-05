@@ -119,6 +119,7 @@ Prefer these over hand edits: they keep every cross-file reference consistent. D
 | `pbz relationship add\|remove\|set <'T'[C]> <'U'[K]> [--inactive] [--both]` | relationship edits with type, duplicate and ambiguous-path guards |
 | `pbz add page <name>` / `pbz add visual <type> --page <p> --field ...` | pages and visuals of any built-in type (roles, kinds and field limits from Microsoft's core visual capabilities) or a registered custom visual |
 | `pbz visual list\|roles <type>\|import <file.pbiviz> [--as contract\|public\|private]\|register <guid> --as public\|organizational [--role NAME:kind]` | custom visuals: contracts (data roles), registration in report.json, private packages installed by push ([reference/visuals.md](reference/visuals.md)) |
+| `pbz style <page> <visual>\|--type T\|--all --set object.property=value [--series [M]] [--state hover]`, `--unset`, `--show`, `--list --type T` | visual formatting (titles, data labels, colors, fonts, axes, legends, borders) checked against Microsoft's formatting catalog ([reference/style.md](reference/style.md)) |
 | `pbz layout [--page <p>]` | text canvas map of a page plus overlap / off-canvas / z-order lint: how you "see" a page |
 | `pbz format [<measure>] [--apply]` | local, token-safe DAX formatting (check by default) |
 | `pbz repair [--fields] [--lineage]` | fixes page order, names, groups, interactions, bookmark lists, stale targets, copied lineageTags |

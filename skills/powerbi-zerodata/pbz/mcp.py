@@ -95,6 +95,21 @@ TOOLS = [
          pos=[("paths", D(L, "mirror files (globs or folder prefixes); default all"), False)],
          opts={"object": ("--object", D(S, "one object: measure 'Table'[Name] (also column, hierarchy, partition, "
                                            "calculationItem)"), "value")}, read_only=False, destructive=True),
+    Tool("style", "Visual formatting (titles, data labels, colors, fonts, axes, legends, borders, ...) checked "
+                  "against Microsoft's formatting catalog; one visual, every visual of a type, or every visual on "
+                  "a page. Use list (with type, optionally object) to see the formatting objects.", ["style"],
+         pos=[("page", D(S, "page display name or id"), False), ("visual", D(S, "visual id or layout label"), False)],
+         opts={"set": ("--set", D(L, "[container.]object.property=value; colors #RRGGBB, theme:<n>[:<shade %>], "
+                                     "measure:[Measure]"), "append"),
+               "unset": ("--unset", D(L, "[container.]object.property"), "append"),
+               "type": ("--type", D(S, "every visual of this type"), "value"),
+               "all": ("--all", D(B, "every visual on the page"), "flag"),
+               "series": ("--series", D(S, "[Measure] or 'T'[Column] shown by the visual"), "value"),
+               "state": ("--state", D(S, "instance state: hover, selected, press, ..."), "value"),
+               "show": ("--show", D(B, "print the current formatting"), "flag"),
+               "list": ("--list", D(B, "formatting objects of type"), "flag"),
+               "object": ("--object", D(S, "with list: one object"), "value")},
+         read_only=False),
     Tool("visual", "Visual catalog: list built-in and custom visuals, show a type's data roles, import a .pbiviz "
                    "(contract = roles only, public = AppSource guid, private = package installed by push), or "
                    "register a custom visual by guid.", ["visual"],

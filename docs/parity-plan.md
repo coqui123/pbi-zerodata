@@ -102,6 +102,17 @@ Microsoft's own authoring CLI rules.
 - Still out of reach without service rights: calling the service APIs (scanner, getDefinition, Log
   Analytics) from pbz. The user exports and registers the files instead (`reference/consumers.md`).
 
+## Round 5 (2026-11-04): visual formatting
+
+- `style`: set and unset formatting on one visual, every visual of a type (page or report) or every
+  visual on a page; a series (metadata selector) or an instance state; `--show`, `--list`. Values are
+  typed by Microsoft's formatting catalog (`rules/visual-objects.json`: objects and properties of every
+  built-in visual and of the container, value types, enumeration members, states): flags, numbers,
+  integers, display units, enumerations, text, alignment, colors (hex, theme shades, field values),
+  dates. Complex values (images, rules, filters) and data-point selectors are refused.
+- New checks: `PBIR_OBJECT_UNKNOWN`, `PBIR_PROPERTY_UNKNOWN`, `PBIR_PROPERTY_VALUE` (warnings). On a
+  large Desktop-authored report every object, property and literal value matched the catalog.
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,
