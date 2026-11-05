@@ -91,6 +91,11 @@ def main(argv=None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+    argv = list(sys.argv[1:] if argv is None else argv)
+    for i in range(len(argv) - 1):  # `pbz synth test ...` is `pbz synth-test ...`
+        if argv[i] == "synth" and argv[i + 1] == "test" and not any(x.startswith("synth") for x in argv[:i]):
+            argv[i:i + 2] = ["synth-test"]
+            break
     ap = argparse.ArgumentParser(prog="pbz", description=__doc__)
     ap.add_argument("--project", help="project name when the workspace holds several .pbip files")
     ap.add_argument("--workspace", help="workspace root (default: discover from the current folder)")
@@ -206,10 +211,47 @@ def main(argv=None) -> int:
     p.add_argument("--pos", help="visual: x,y,width,height")
     p.add_argument("--title", help="visual: title text")
     p.add_argument("--text", help="textbox: text")
-    p.add_argument("--width", type=int, default=1280)
-    p.add_argument("--height", type=int, default=720)
+    p.add_argument("--width", type=int, help="page: width (default 1280, tooltip pages 320)")
+    p.add_argument("--height", type=int, help="page: height (default 720, tooltip pages 240)")
     p.add_argument("--hidden", action="store_true", help="page: hidden in view mode")
     p.add_argument("--after", help="page: insert after this page")
+    p.add_argument("--tooltip", action="store_true", help="page: a report-page tooltip (hidden, 320x240)")
+    p.add_argument("--drillthrough", action="append", default=[],
+                   help="page: a drillthrough target on this column, 'T'[C] (repeatable); adds a Back button")
+    p = sub.add_parser("link", help="button actions (page, back, bookmark, drillthrough, web link) and report-page tooltips")
+    p.add_argument("page", help="page holding the visual")
+    p.add_argument("visual", help="visual id or `pbz layout` label")
+    p.add_argument("--to-page", help="navigate to this page")
+    p.add_argument("--back", action="store_true", help="back button (drillthrough pages)")
+    p.add_argument("--bookmark", help="apply this bookmark (name or id)")
+    p.add_argument("--drillthrough", help="drill through to this drillthrough page")
+    p.add_argument("--url", help="open this http(s) link")
+    p.add_argument("--tooltip", help="show this tooltip page when hovering the visual")
+    p.add_argument("--clear", action="store_true", help="remove the button action")
+    p = sub.add_parser("filter", help="report, page and visual filters: add, remove, list")
+    p.add_argument("action", choices=["add", "remove", "list"])
+    p.add_argument("target", nargs="?", help="add: 'T'[Column] or [Measure]; remove: filter name or field")
+    p.add_argument("--report", action="store_true", help="report-level filter")
+    p.add_argument("--page", help="page-level filter (with --visual: visual-level)")
+    p.add_argument("--visual", help="visual id or `pbz layout` label")
+    p.add_argument("--in", dest="values_in", nargs="+", help="keep these values (labels, typed values or mirror tokens)")
+    p.add_argument("--not-in", dest="values_out", nargs="+", help="drop these values")
+    p.add_argument("--where", action="append", default=[], help="\">= 100\" (repeat once for AND)")
+    p.add_argument("--top", type=int, help="Top N: keep the N best items of the column")
+    p.add_argument("--by", help="Top N: the measure that ranks them")
+    p.add_argument("--bottom", action="store_true", help="Top N: the lowest instead")
+    p = sub.add_parser("bookmark", help="bookmarks of a page's shown and hidden visuals (no data state): add, remove, list")
+    p.add_argument("action", choices=["add", "remove", "list"])
+    p.add_argument("name", nargs="?", help="add: display name; remove: name or display name")
+    p.add_argument("--page", help="add: the page it opens")
+    p.add_argument("--hide", nargs="+", default=[], help="add: visuals to hide (ids or layout labels)")
+    p.add_argument("--show", nargs="+", default=[], help="add: hidden visuals to show")
+    p.add_argument("--only", nargs="+", default=[], help="add: apply to these visuals only")
+    p = sub.add_parser("interaction", help="how one visual filters or highlights others on its page")
+    p.add_argument("page")
+    p.add_argument("source", help="visual id or layout label")
+    p.add_argument("target", help="visual id, layout label, or all")
+    p.add_argument("mode", choices=["filter", "highlight", "none", "default"])
     p = sub.add_parser("style", help="visual formatting (titles, labels, colors, fonts, axes, legends, ...) checked "
                                      "against Microsoft's formatting catalog")
     p.add_argument("page", nargs="?", help="page display name or id")
@@ -234,8 +276,10 @@ def main(argv=None) -> int:
     p.add_argument("--replace", action="store_true", help="import --as private: replace an existing package")
     p = sub.add_parser("consumers", help="external consumers that keep objects used: thin reports, Excel, "
                                          "paginated reports, composite models, query exports")
-    p.add_argument("action", choices=["list", "add", "scan", "show"])
-    p.add_argument("target", nargs="?", help="add: file or folder; show: consumer id")
+    p.add_argument("action", choices=["list", "add", "scan", "show", "discover"])
+    p.add_argument("target", nargs="?", help="add: file or folder; show: consumer id; discover: folder to search")
+    p.add_argument("--register", action="store_true", help="discover: register every file bound to this model by name")
+    p.add_argument("--depth", type=int, default=6, help="discover: folder depth")
     p.add_argument("--kind", default="auto", help="add: auto | pbir | pbix | xlsx | rdl | model | queries | scan")
     p.add_argument("--label", help="add: display label (required with --object)")
     p.add_argument("--object", action="append", default=[], help="add: declare a used object by hand (repeatable)")
@@ -291,6 +335,14 @@ def main(argv=None) -> int:
     p.add_argument("--rows", type=int, default=200, help="build: rows per fact table")
     p.add_argument("--seed", type=int, default=7, help="build: random seed")
     p.add_argument("--wait", type=int, default=480)
+    p = sub.add_parser("synth-test", help="measure regression tests on the synthetic model (also: pbz synth test ...)")
+    p.add_argument("action", choices=["save", "run", "list", "remove"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("--spec", help='{"queries": [{"id", "dax", "keys"?}]} or a .json file')
+    p.add_argument("--measure", action="append", default=[], help="[Measure] (repeatable)")
+    p.add_argument("--by", action="append", default=[], help="'Table'[Column] grouping (repeatable)")
+    p.add_argument("--replace", action="store_true")
+    p.add_argument("--tol", type=float, default=1e-9, help="relative float tolerance")
     p = sub.add_parser("format", help="format DAX (measures, calculated columns, calculation items), token-safe")
     p.add_argument("target", nargs="?", help="one measure or column name (default: all)")
     p.add_argument("--apply", action="store_true", help="write the formatting (default: check only)")
@@ -402,11 +454,42 @@ def main(argv=None) -> int:
         elif a.cmd == "add":
             from pbz import author
             if a.kind == "page":
-                out = author.add_page(ws, project, a.name, a.width, a.height, a.hidden, a.after)
+                out = author.add_page(ws, project, a.name, a.width, a.height, a.hidden, a.after, a.tooltip,
+                                      a.drillthrough or None)
             else:
                 if not a.page:
                     raise PbzError("BAD_REQUEST", "--page is required for a visual")
                 out = author.add_visual(ws, project, a.name, a.page, a.field, a.pos, a.title, a.text)
+        elif a.cmd == "link":
+            from pbz import author
+            out = author.link(ws, project, a.page, a.visual, a.to_page, a.back, a.bookmark, a.drillthrough, a.url,
+                              a.tooltip, a.clear)
+        elif a.cmd == "filter":
+            from pbz import filters
+            if a.action == "list":
+                out = filters.list_(ws, project, a.page, a.visual, a.report)
+            elif not a.target:
+                raise PbzError("BAD_REQUEST", f"filter {a.action} needs a field or filter name")
+            elif a.action == "remove":
+                out = filters.remove(ws, project, a.target, a.page, a.visual, a.report)
+            else:
+                out = filters.add(ws, project, a.target, a.page, a.visual, a.report, a.values_in, a.values_out,
+                                  a.where or None, a.top, a.by, a.bottom)
+        elif a.cmd == "interaction":
+            from pbz import filters
+            out = filters.interaction(ws, project, a.page, a.source, a.target, a.mode)
+        elif a.cmd == "bookmark":
+            from pbz import bookmarks
+            if a.action == "list":
+                out = bookmarks.list_(ws, project)
+            elif not a.name:
+                raise PbzError("BAD_REQUEST", f"bookmark {a.action} needs a name")
+            elif a.action == "remove":
+                out = bookmarks.remove(ws, project, a.name)
+            else:
+                if not a.page:
+                    raise PbzError("BAD_REQUEST", "bookmark add needs --page")
+                out = bookmarks.add(ws, project, a.name, a.page, a.hide, a.show, a.only)
         elif a.cmd == "style":
             from pbz import style
             if a.list:
@@ -438,6 +521,10 @@ def main(argv=None) -> int:
                 if not a.target:
                     raise PbzError("BAD_REQUEST", "consumers show <id>")
                 out = consumers.show(ws, project, a.target)
+            elif a.action == "discover":
+                if not a.target:
+                    raise PbzError("BAD_REQUEST", "consumers discover <folder>")
+                out = consumers.discover(ws, project, a.target, a.register, a.model_name or None, a.depth)
             else:
                 out = consumers.add(ws, project, a.target, a.kind, a.label, a.object, a.model_name)
         elif a.cmd == "relationship":
@@ -503,6 +590,18 @@ def main(argv=None) -> int:
         elif a.cmd == "synth":
             from pbz import synth
             out = synth.run(ws, project, a)
+        elif a.cmd == "synth-test":
+            from pbz import synthtest
+            if a.action != "list" and not a.name:
+                raise PbzError("BAD_REQUEST", f"synth test {a.action} needs a name")
+            if a.action == "save":
+                out = synthtest.save(ws, project, a.name, a.spec, a.measure or None, a.by or None, a.replace)
+            elif a.action == "run":
+                out = synthtest.run(ws, project, a.name, a.tol)
+            elif a.action == "list":
+                out = synthtest.list_(ws)
+            else:
+                out = synthtest.remove(ws, a.name)
         elif a.cmd == "format":
             from pbz import daxfmt
             out = daxfmt.run(ws, project, apply=a.apply, target=a.target)

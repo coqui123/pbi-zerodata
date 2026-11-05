@@ -37,8 +37,13 @@ and `project` (when the workspace holds several `.pbip` files), plus its own arg
 | `push` | `reload`, `dry_run`, `only` |
 | `revert` | `paths`, `object` |
 | `style` | `page`, `visual`, `set`, `unset`, `type`, `all`, `series`, `state`, `show`, `list`, `object` |
+| `link` | `page`, `visual` (required), `to_page`, `back`, `bookmark`, `drillthrough`, `url`, `tooltip`, `clear` |
+| `filter` | `action` (add / remove / list, required), `target`, `report`, `page`, `visual`, `values_in`, `values_out`, `where`, `top`, `by`, `bottom` |
+| `interaction` | `page`, `source`, `target`, `mode` (all required) |
+| `bookmark` | `action` (add / remove / list, required), `name`, `page`, `hide`, `show`, `only` |
+| `synth_test` | `action` (save / run / list / remove, required), `name`, `spec`, `measures`, `by`, `replace`, `tol` |
 | `visual` | `action` (list / roles / import / register, required), `target`, `as`, `roles`, `replace` |
-| `consumers` | `action` (list / add / scan / show, required), `target`, `kind`, `label`, `objects`, `model_names` |
+| `consumers` | `action` (list / add / scan / show / discover, required), `target`, `register`, `depth`, `kind`, `label`, `objects`, `model_names` |
 | `culture`, `translate`, `perspective`, `role`, `refresh_policy` | see `pbz <verb> --help` (same arguments) |
 | `describe` | `target` |
 | `values` | `column` (required) |
@@ -57,7 +62,7 @@ and `project` (when the workspace holds several `.pbip` files), plus its own arg
 | `repair` | `dry_run`, `fields`, `lineage` |
 | `new` | `kind`, `name` (required), `start`, `end`, `relate`, `date`, `items`, `precedence`, `fields`, `labels` |
 | `relationship` | `action`, `from_col`, `to_col` (required), `inactive`, `active`, `both`, `single`, `many_to_many`, `force` |
-| `add_page` | `name` (required), `width`, `height`, `hidden`, `after` |
+| `add_page` | `name` (required), `width`, `height`, `hidden`, `after`, `tooltip`, `drillthrough` |
 | `add_visual` | `type`, `page` (required), `fields`, `pos`, `title`, `text` |
 | `check` | `spec` (required, the checks object) |
 | `probe` | `table` (required), `columns` |

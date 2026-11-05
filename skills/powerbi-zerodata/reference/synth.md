@@ -18,6 +18,28 @@ Rebuild after you change the model (`build` replaces the previous copy; close it
 a normal PBIP folder marked synthetic, so you may also read its files and run `pbz --workspace <that
 folder> health | smoke | check` there.
 
+## Regression tests: `pbz synth test`
+
+Golden results on the synthetic copy catch logic changes in a refactor without real data.
+
+```
+pbz synth test save <name> --measure "[Total Hours]" --by "'Project'[Status]"   # or --spec '{"queries": [...]}'
+# edit DAX, then: pbz synth build (same --seed / --rows), pbz synth open
+pbz synth test run <name> [--tol 1e-9]
+pbz synth test list | remove <name>
+```
+
+`save` runs the queries through `pbz synth query` (a spec is `{"queries": [{"id", "dax", "keys"}]}`,
+as a JSON string or file) and stores the fake results, the build's seed, rows and tables, and a hash
+of the mirror model in `.pbz/synth-tests/<name>.json`. `run` answers per query SAME, DIFF (changed
+cells, missing and added rows, keyed by the grouping columns; floats within `--tol`, relative) or
+ERROR:<class>. Drift is reported separately: `drift.model` (the mirror changed since the save:
+expected after a refactor, so review each DIFF), `drift.synth_stale` (the copy is older than the
+mirror: rebuild and reopen it first), `drift.synth` (rebuilt with another seed or row count: the
+verdict is NOT_COMPARABLE). Results over 500 rows are refused (TOO_MANY_ROWS): group by fewer columns
+or use TOPN. Only the synthetic copy ever answers: the engine checks its marker. `pbz synth-test` is
+the same verb.
+
 ## What it contains
 
 - Built from the sanitized mirror only. The real `*.SemanticModel` / `*.Report` folders are never read.

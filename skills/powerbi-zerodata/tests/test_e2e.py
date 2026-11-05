@@ -188,14 +188,34 @@ def main() -> int:
         expect(res.get("verb") == "move", f"move measure: {res}")
         res = r.pbz("add", "page", "E2E Page")
         expect(res.get("verb") == "add", f"add page: {res}")
+        made = {}
         for vargs in (("card", "--field", "[Total Hours]", "--title", "Hours"),
                       ("clusteredColumnChart", "--field", "'Project'[Status]", "--field", "[Total Hours]"),
                       ("tableEx", "--field", "'Project'[Status]", "--field", "[Active Hours]"),
                       ("slicer", "--field", "'Project'[Status]"),
                       ("kpi", "--field", "[Total Hours]", "--field", "TrendLine='Project'[Status]"),
-                      ("gauge", "--field", "[Total Hours]"), ("cardVisual", "--field", "[Active Hours]")):
+                      ("gauge", "--field", "[Total Hours]"), ("cardVisual", "--field", "[Active Hours]"),
+                      ("actionButton",)):
             res = r.pbz("add", "visual", vargs[0], "--page", "E2E Page", *vargs[1:])
             expect(res.get("verb") == "add" and res.get("placement") == "free_spot", f"add visual {vargs[0]}: {res}")
+            made[vargs[0]] = res.get("id", "?")
+        # pages, filters, interactions and links: Microsoft's validator checks them on push, Desktop on reopen
+        for args in (("add", "page", "E2E Tip", "--tooltip"),
+                     ("add", "page", "E2E Detail", "--drillthrough", "'Project'[Status]"),
+                     ("filter", "add", "'Project'[Status]", "--page", "E2E Page", "--in", "Active"),
+                     ("filter", "add", "'Hours'[Hours]", "--report", "--where", ">= 0"),
+                     ("filter", "add", "'Person'[Name]", "--page", "E2E Page", "--visual", made["tableEx"],
+                      "--top", "3", "--by", "[Total Hours]"),
+                     ("filter", "add", "[Total Hours]", "--page", "E2E Page", "--visual", made["card"], "--where", "> 0"),
+                     ("filter", "list"),
+                     ("interaction", "E2E Page", made["clusteredColumnChart"], made["tableEx"], "highlight"),
+                     ("link", "E2E Page", made["actionButton"], "--drillthrough", "E2E Detail"),
+                     ("link", "E2E Page", made["clusteredColumnChart"], "--tooltip", "E2E Tip"),
+                     ("bookmark", "add", "E2E Chart Only", "--page", "E2E Page", "--hide", made["tableEx"]),
+                     ("bookmark", "list"),
+                     ("consumers", "discover", ws_dir)):
+            res = r.pbz(*args)
+            expect(res.get("verb") and res.get("ok") is not False, f"{' '.join(args)}: {res}")
         for args in (("style", "E2E Page", "--type", "clusteredColumnChart", "--set", "labels.show=true",
                       "--set", "title.text=Hours by status", "--set", "dataPoint.fill=theme:2:-25",
                       "--set", "legend.position=Top"),
@@ -227,6 +247,14 @@ def main() -> int:
         close_desktop(r)
         res = r.pbz("push")
         expect(res.get("result") == "PUSHED", f"push: {res}")
+        # Desktop must open the authored report (new page types, filters, links, formatting) cleanly
+        res = r.pbz("desktop", "open", "--wait", "480", timeout=900)
+        expect(res.get("open") and res.get("engine") == "READY", f"desktop reopen after authoring: {res}")
+        res = r.pbz("health")
+        expect(res.get("verb") == "health" and res.get("ok") is not False, f"health after authoring: {res}")
+        res = r.pbz("smoke", "--page", "E2E Page")
+        expect(res.get("verb") == "smoke" and res.get("summary"), f"smoke on the authored page: {res}")
+        close_desktop(r)
         expect(r.pbz("handoff").get("verb") == "handoff", "handoff")
         memdir = os.path.join(tmp, "memory")
         os.makedirs(memdir)

@@ -26,6 +26,8 @@ graph of `unused`, `lineage`, `suggest`, `bpa` and `docs`.
 pbz consumers add <file or folder> [--kind auto|pbir|pbix|xlsx|rdl|model|queries|scan] [--label L]
                   [--model-name "<name in the service>"]
 pbz consumers add --object "[Measure]" --object "'Table'[Column]" --label "Board pack"   # manual
+pbz consumers discover <folder> [--register] [--depth 6] [--model-name "<name in the service>"]
+                              # files and folders connected to this model, from connection parts only
 pbz consumers list            # status, coverage, binding, objects, unresolved count, gaps
 pbz consumers scan            # re-read every consumer now (normally re-read when its file changes)
 pbz consumers show <id>       # this model's objects the consumer uses, and how (pivot, slicer, ...)
@@ -34,6 +36,13 @@ pbz admin consumer-remove <id>   # the user only: removing a consumer loosens pr
 
 The registry is `.pbz/consumers.json`; agents cannot edit it directly (guard), only add to it. The
 parsed evidence is cached in the private store and refreshed when a file or the model changes.
+
+`discover` walks a folder (OneDrive or SharePoint sync folders, a Git export, a downloads folder) and
+reads only connection parts: Excel `xl/connections.xml`, PBIX `Connections`, RDL connect strings,
+`definition.pbir` and composite model expressions. Each candidate is `model name` (connects to a
+model of this name), `dataset id (unverified)` (bound by id: check and add it yourself) or counted
+under `other`. `--register` adds every `model name` match. It skips `pbz-workspace`, `.git`, Office
+lock files and this project's own folders.
 
 ## What each kind reads
 

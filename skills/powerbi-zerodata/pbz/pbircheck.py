@@ -144,6 +144,7 @@ def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
         has_package = lambda n: os.path.isfile(os.path.join(report_dir, "CustomVisuals", n, "package.json"))  # noqa: E731
     instances: dict[str, list] = {}
     formatting: list = []
+    links: list = []
 
     def add(sev, code, where, msg):
         out.append({"severity": sev, "code": code, "where": prefix + where, "message": msg})
@@ -217,6 +218,9 @@ def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
                 instances.setdefault(body["visualType"], []).append(
                     (vrel, set(qs) if isinstance(qs, dict) else set()))
                 formatting.append((vrel, body["visualType"], body))
+            vco = body.get("visualContainerObjects") if isinstance(body.get("visualContainerObjects"), dict) else {}
+            for entry in vco.get("visualLink") or [] if isinstance(vco.get("visualLink"), list) else []:
+                links.append((vrel, (entry or {}).get("properties") or {} if isinstance(entry, dict) else {}))
             fields = set()
             for role, bucket in qs.items() if isinstance(qs, dict) else []:
                 for proj in (bucket or {}).get("projections") or [] if isinstance(bucket, dict) else []:
@@ -325,4 +329,40 @@ def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
                 seen.add(key)
     _custom_visuals(add, ddir, report_dir, instances, has_package)
     _formatting(add, formatting)
+    _links(add, ddir, page_ids, links)
     return out
+
+
+def _lit_str(node) -> str | None:
+    raw = _literal(node)
+    if isinstance(raw, str) and len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
+        return raw[1:-1].replace("''", "'")
+    return None
+
+
+def _links(add, ddir: str, page_ids: list, links: list) -> None:
+    """Button actions point at pages and bookmarks that exist (drillthrough targets are drillthrough pages)."""
+    if not links:
+        return
+    kinds = {}
+    for pid in page_ids:
+        p = _load(os.path.join(ddir, "pages", pid, "page.json")) or {}
+        kinds[pid] = ((p.get("pageBinding") or {}).get("type") if isinstance(p.get("pageBinding"), dict) else None)
+    bdir = os.path.join(ddir, "bookmarks")
+    marks = {f[:-len(".bookmark.json")] for f in os.listdir(bdir) if f.endswith(".bookmark.json")} if os.path.isdir(bdir) else set()
+    for vrel, props in links:
+        kind = _lit_str(props.get("type"))
+        if kind == "PageNavigation":
+            target = _lit_str(props.get("navigationSection"))
+            if target is not None and target not in kinds:
+                add("error", "PBIR_LINK_TARGET_MISSING", vrel, f"page navigation points at missing page {target}")
+        elif kind == "Drillthrough":
+            target = _lit_str(props.get("drillthroughSection"))
+            if target is not None and target not in kinds:
+                add("error", "PBIR_LINK_TARGET_MISSING", vrel, f"drillthrough points at missing page {target}")
+            elif target is not None and kinds.get(target) != "Drillthrough":
+                add("warning", "PBIR_LINK_NOT_DRILLTHROUGH", vrel, f"drillthrough target {target} is not a drillthrough page")
+        elif kind == "Bookmark":
+            target = _lit_str(props.get("bookmark"))
+            if target is not None and target not in marks:
+                add("error", "PBIR_LINK_TARGET_MISSING", vrel, f"bookmark action points at missing bookmark {target}")

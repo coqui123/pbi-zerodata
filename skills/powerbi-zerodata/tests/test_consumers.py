@@ -307,6 +307,38 @@ def main() -> int:
     why = guard.check_write(reg_path, "Write", {"file_path": reg_path, "content": "{}"}, guard.norm(gw))
     check(why == "consumers", f"guard let an agent edit the consumer registry: {why}")
 
+    # ---------------------------------------------------------------- discovery (connection parts only)
+    share = os.path.join(files, "share")
+    os.makedirs(os.path.join(share, "sub"))
+    os.makedirs(os.path.join(share, "pbz-workspace"))
+    make_xlsx(os.path.join(share, "Team pack.xlsx"))
+    make_xlsx(os.path.join(share, "pbz-workspace", "skipped.xlsx"))
+    make_xlsx(os.path.join(share, "~$Team pack.xlsx"))
+    with zipfile.ZipFile(os.path.join(share, "other.xlsx"), "w") as z:
+        z.writestr("xl/connections.xml", f"<connections {MAIN}><connection id='1' name='x'><dbPr connection="
+                                         "'Provider=MSOLAP.8;Data Source=powerbi://example;Initial Catalog=OtherModel'/>"
+                                         "</connection></connections>")
+        z.writestr("xl/sharedStrings.xml", f"<sst {MAIN}><si><t>Zorblax Industries</t></si></sst>")
+    with zipfile.ZipFile(os.path.join(share, "sub", "byid.pbix"), "w") as z:
+        z.writestr("Connections", json.dumps({"Connections": [{"ConnectionString":
+                                              "Data Source=pbiazure://example;Initial Catalog=1b2c3d4e-0000-1111-2222-333344445555"}]}))
+        z.writestr("DataModel", b"Zorblax Industries")
+    with open(os.path.join(share, "sub", "paged2.rdl"), "w", encoding="utf-8") as f:
+        f.write("<Report><DataSources><DataSource Name='d'><ConnectionProperties><ConnectString>"
+                "Data Source=powerbi://example;Initial Catalog=Parity</ConnectString></ConnectionProperties></DataSource>"
+                f"</DataSources><DataSets><DataSet Name='a'><Query><CommandText>{Q} VALUES('Sales'[Region])</CommandText>"
+                "</Query></DataSet></DataSets></Report>")
+    make_thin_pbir(os.path.join(share, "git"))
+    d = keep(consumers.discover(ws, project, share))
+    cands = {c["path"]: c["match"] for c in d["candidates"]}
+    check(cands == {"Team pack.xlsx": "model name", "sub/paged2.rdl": "model name", "git/Thin.Report": "model name",
+                    "sub/byid.pbix": "dataset id (unverified)"} and d["other"] == 1, f"discover: {d}")
+    d = keep(consumers.discover(ws, project, share, add_matches=True))
+    check(len(d.get("added", [])) == 3, f"discover --register: {d}")
+    d = keep(consumers.discover(ws, project, share))
+    check(all(c.get("registered") for c in d["candidates"] if c["match"] == "model name") and "added" not in d,
+          f"rediscover: {d}")
+
     # ---------------------------------------------------------------- canaries
     blobs = [json.dumps(outputs, ensure_ascii=False)]
     for base in (os.path.join(ws.private, consumers.CACHE), os.path.join(root, ".pbz"), ws.mirror):

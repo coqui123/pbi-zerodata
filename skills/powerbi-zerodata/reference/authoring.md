@@ -43,6 +43,12 @@ questions: check them with `pbz check` (`unique`, `no_orphans`) while Desktop is
 
 - `pbz add page "<name>" [--after <page>] [--hidden] [--width --height]` creates the page folder with
   a fresh 20-character id and inserts it into `pages.json`.
+  - `--tooltip`: a report-page tooltip (hidden, 320x240, actual size, Tooltip page binding). Point a
+    visual at it with `pbz link <page> <visual> --tooltip "<tooltip page>"`.
+  - `--drillthrough "'T'[C]"` (repeatable): a drillthrough target. pbz writes the Drillthrough page
+    binding with one parameter per column, the bound page filters (`howCreated: Drillthrough`) and a
+    Back button, as Microsoft's validator expects. A button elsewhere opens it with
+    `pbz link <page> <button> --drillthrough "<drillthrough page>"`.
 - `pbz add visual <type> --page <page> --field <ref> ... [--pos x,y,w,h] [--title] [--text]` builds
   `visual.json` with the query state for the type. Types: every built-in type in Microsoft's core
   visual capabilities (cards, `kpi`, `gauge`, tables, slicers, charts, maps, `textbox`, shapes,
@@ -56,6 +62,49 @@ questions: check them with `pbz check` (`unique`, `no_orphans`) while Desktop is
   value-specific formatting.
 - `pbz style` formats visuals (titles, data labels, colors, fonts, axes, legends, borders, one
   series, button states), one at a time or every visual of a type: [style.md](style.md).
+
+## Button actions and tooltips: `pbz link`
+
+`pbz link <page> <visual> --to-page <page> | --back | --bookmark <name> | --drillthrough <page> |
+--url <https://...> | --clear` sets the action of a button, shape or image (the container's
+`visualLink`: show, type, and the target page id or bookmark name). `--tooltip <page>` makes any
+visual show a tooltip page on hover (`visualTooltip` type Canvas). Targets must exist: drillthrough
+targets must be drillthrough pages, tooltip targets tooltip pages. Validate flags dangling targets
+(`PBIR_LINK_TARGET_MISSING`) and drillthrough links to plain pages (`PBIR_LINK_NOT_DRILLTHROUGH`).
+
+## Filters: `pbz filter`
+
+```
+pbz filter add "'Customer'[Segment]" --page <p> --in Retail Corporate        # basic (Categorical, In)
+pbz filter add "'Sales'[Region]" --page <p> --not-in North                    # Not In
+pbz filter add "'Date'[Year]" --report --where ">= 2020" --where "<= 2030"    # advanced, AND
+pbz filter add "'Customer'[Name]" --page <p> --visual <v> --top 5 --by "[Total Sales]" [--bottom]
+pbz filter add "[Total Sales]" --page <p> --visual <v> --where "> 0"         # measure: visual level only
+pbz filter add "'Sales'[Comment]" --page <p>                                  # the field, no condition
+pbz filter list [--report | --page <p> [--visual <v>]]                        # every scope without a target
+pbz filter remove <filter name or field> --page <p>
+```
+
+Values are category labels, values you type (typed by the column: whole numbers `L`, decimals `D` /
+`M`, dates `datetime'...'`, text quoted), or mirror tokens (`«T[C]#n»` stands for the whole literal
+and becomes the real value on push; an invented token fails push with `UNKNOWN_TOKEN`). Filters use
+From aliases in `Where`, names unique across the report, and `howCreated: User`, matching what Desktop
+writes. Drillthrough filters belong to their page and are not removed here.
+
+## Bookmarks: `pbz bookmark`
+
+`pbz bookmark add "<name>" --page <p> [--hide v ...] [--show v ...] [--only v ...]` captures a page
+and which of its visuals are shown or hidden (every other visual keeps its saved visibility). It never
+captures data state: `suppressData` is set, so applying it keeps the reader's filters and slicers.
+`--only` limits it to some visuals. Point a button at it with `pbz link <page> <button> --bookmark
+"<name>"`. `pbz bookmark list`, `pbz bookmark remove <name>` (validate then flags buttons that still
+point at it). Bookmarks that capture filters or slicer selections are made in Desktop.
+
+## Interactions: `pbz interaction`
+
+`pbz interaction <page> <source> <target|all> filter|highlight|none|default` writes the page's
+`visualInteractions` (DataFilter, HighlightFilter, NoFilter); `default` removes the entry so Desktop
+decides.
 
 ## Seeing a page: `pbz layout`
 

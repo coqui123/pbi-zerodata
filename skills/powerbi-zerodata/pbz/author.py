@@ -61,10 +61,14 @@ def _find_page(pages: dict, page: str) -> str:
     raise PbzError("NOT_FOUND", f"page {page}")
 
 
-def add_page(ws, project, name: str, width: int = 1280, height: int = 720, hidden: bool = False,
-             after: str | None = None) -> dict:
+def add_page(ws, project, name: str, width: int | None = None, height: int | None = None, hidden: bool = False,
+             after: str | None = None, tooltip: bool = False, drillthrough: list[str] | None = None) -> dict:
+    """A plain page, a report-page tooltip (`tooltip`, 320x240, hidden) or a drillthrough target
+    (`drillthrough`: the columns it drills on; a Back button is added)."""
     if TOKEN_RE.search(name) or not name.strip():
         raise PbzError("BAD_REQUEST", "a page needs a plain display name")
+    if tooltip and drillthrough:
+        raise PbzError("BAD_REQUEST", "a page is a tooltip page or a drillthrough page, not both")
     rdir = project.mirror_report
     pdir, meta_p, meta, pages = _pages(rdir)
     if not os.path.isdir(pdir):
@@ -73,20 +77,136 @@ def add_page(ws, project, name: str, width: int = 1280, height: int = 720, hidde
         raise PbzError("NAME_TAKEN", f"page {name}")
     ver = _versions(rdir).get("page", "2.1.0")
     pid = _id()
+    width = width or (320 if tooltip else 1280)
+    height = height or (240 if tooltip else 720)
     page = {"$schema": f"{SCHEMA}/page/{ver}/schema.json", "name": pid, "displayName": name,
-            "displayOption": "FitToPage", "height": height, "width": width}
-    if hidden:
+            "displayOption": "ActualSize" if tooltip else "FitToPage", "height": height, "width": width}
+    if hidden or tooltip:
         page["visibility"] = "HiddenInViewMode"
-    write_text(os.path.join(pdir, pid, "page.json"), json.dumps(page, indent=2) + "\n")
+    if tooltip:
+        page["type"] = "Tooltip"
+        page["pageBinding"] = {"name": _id(), "type": "Tooltip", "referenceScope": "Default"}
+    if drillthrough:
+        from . import filters
+        model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+        taken = filters._all_filter_names(project)
+        flts = []
+        for ref in drillthrough:
+            if _parse_field(model, ref)[0] == "measure":
+                raise PbzError("BAD_REQUEST", f"{ref}: drillthrough fields are columns")
+            f = filters.build(model, ref)
+            while f["name"] in taken:
+                f["name"] = filters._id()
+            taken.add(f["name"])
+            f["howCreated"] = "Drillthrough"
+            flts.append(f)
+        page["type"] = "Drillthrough"
+        page["filterConfig"] = {"filters": flts}
+        page["pageBinding"] = {"name": _id(), "type": "Drillthrough", "referenceScope": "Default",
+                               "parameters": [{"name": _id(), "boundFilter": f["name"], "fieldExpr": f["field"]} for f in flts]}
+    write_text(os.path.join(pdir, pid, "page.json"), json.dumps(page, indent=2, ensure_ascii=False) + "\n")
     order = list(meta.get("pageOrder") or [])
     pos = order.index(_find_page(pages, after)) + 1 if after else len(order)
     order.insert(pos, pid)
     meta["pageOrder"] = order
     _t, bom = read_text(meta_p) if os.path.exists(meta_p) else ("", b"")
     write_text(meta_p, json.dumps(meta, indent=2) + "\n", bom)
-    return {"verb": "add", "kind": "page", "page": name, "id": pid, "position": pos,
-            "files": [os.path.relpath(p, ws.mirror).replace("\\", "/") for p in (os.path.join(pdir, pid, "page.json"), meta_p)],
-            "next": f"pbz add visual <type> --page \"{name}\" --field ..., then pbz validate / pbz push"}
+    files = [os.path.relpath(p, ws.mirror).replace("\\", "/") for p in (os.path.join(pdir, pid, "page.json"), meta_p)]
+    out = {"verb": "add", "kind": "page", "page": name, "id": pid, "position": pos, "files": files,
+           "next": f"pbz add visual <type> --page \"{name}\" --field ..., then pbz validate / pbz push"}
+    if tooltip:
+        out["type"] = "tooltip"
+        out["next"] = f"pbz add visual ... --page \"{name}\", then pbz link <page> <visual> --tooltip \"{name}\""
+    if drillthrough:
+        btn = add_visual(ws, project, "actionButton", name, [], pos="16,16,96,40")
+        link(ws, project, name, btn["id"], back=True)
+        out.update(type="drillthrough", drill_on=[filters._label(f) for f in flts], back_button=btn["id"])
+        out["files"] += btn["files"]
+        out["next"] = (f"pbz add visual ... --page \"{name}\"; a button elsewhere can open it with "
+                       f"pbz link <page> <button> --drillthrough \"{name}\"")
+    return out
+
+
+LINKABLE = {"actionButton", "shape", "basicShape", "image"}
+
+
+def _bookmark_id(rdir: str, ref: str) -> str:
+    bdir = os.path.join(rdir, "definition", "bookmarks")
+    for f in sorted(os.listdir(bdir)) if os.path.isdir(bdir) else []:
+        if not f.endswith(".bookmark.json"):
+            continue
+        bid = f[:-len(".bookmark.json")]
+        try:
+            disp = json.loads(read_text(os.path.join(bdir, f))[0]).get("displayName", "")
+        except ValueError:
+            disp = ""
+        if ref.lower() in (bid.lower(), str(disp).lower()):
+            return bid
+    raise PbzError("NOT_FOUND", f"bookmark {ref}")
+
+
+def link(ws, project, page: str, visual: str, to_page: str | None = None, back: bool = False,
+         bookmark: str | None = None, drillthrough: str | None = None, url: str | None = None,
+         tooltip: str | None = None, clear: bool = False) -> dict:
+    """Button actions (page navigation, back, bookmark, drillthrough, web URL) and report-page
+    tooltips, written as the visual container's visualLink / visualTooltip."""
+    from .style import targets
+    t = targets(project, page, visual, None, False)[0]
+    rdir = project.mirror_report
+    _pdir, _mp, _meta, pages = _pages(rdir)
+    actions = [x for x in (to_page, bookmark, drillthrough, url) if x] + ([True] if back else [])
+    if len(actions) > 1:
+        raise PbzError("BAD_REQUEST", "one action per button: --to-page, --back, --bookmark, --drillthrough or --url")
+    if (actions or clear) and t["type"] not in LINKABLE:
+        raise PbzError("BAD_REQUEST", f"actions go on buttons, shapes and images, not {t['type']}")
+    if not (actions or clear or tooltip):
+        raise PbzError("BAD_REQUEST", "pass an action, --tooltip <page> or --clear")
+    lit = lambda v: {"expr": {"Literal": {"Value": v}}}  # noqa: E731
+    quoted = lambda s: "'" + s.replace("'", "''") + "'"  # noqa: E731
+    text, bom = read_text(t["path"])
+    doc = json.loads(text)
+    body = doc["visual"]
+    vco = body.setdefault("visualContainerObjects", {})
+    done = []
+    if clear:
+        if vco.pop("visualLink", None) is not None:
+            done.append("action cleared")
+    elif actions:
+        props = {"show": lit("true")}
+        if back:
+            props["type"] = lit("'Back'")
+            done.append("back")
+        elif to_page:
+            pid = _find_page(pages, to_page)
+            props.update(type=lit("'PageNavigation'"), navigationSection=lit(quoted(pid)))
+            done.append(f"page {pages[pid].get('displayName', pid)}")
+        elif drillthrough:
+            pid = _find_page(pages, drillthrough)
+            if (pages[pid].get("pageBinding") or {}).get("type") != "Drillthrough":
+                raise PbzError("BAD_REQUEST", f"{drillthrough} is not a drillthrough page (`pbz add page --drillthrough`)")
+            props.update(type=lit("'Drillthrough'"), drillthroughSection=lit(quoted(pid)))
+            done.append(f"drillthrough {pages[pid].get('displayName', pid)}")
+        elif bookmark:
+            props.update(type=lit("'Bookmark'"), bookmark=lit(quoted(_bookmark_id(rdir, bookmark))))
+            done.append(f"bookmark {bookmark}")
+        else:
+            if TOKEN_RE.search(url) or not re.match(r"^https?://", url):
+                raise PbzError("BAD_REQUEST", "a web link is an http(s) URL without mirror tokens")
+            props.update(type=lit("'WebUrl'"), webUrl=lit(quoted(url)))
+            done.append("web link")
+        vco["visualLink"] = [{"properties": props}]
+    if tooltip:
+        pid = _find_page(pages, tooltip)
+        if (pages[pid].get("pageBinding") or {}).get("type") != "Tooltip":
+            raise PbzError("BAD_REQUEST", f"{tooltip} is not a tooltip page (`pbz add page --tooltip`)")
+        vco["visualTooltip"] = [{"properties": {"show": lit("true"), "type": lit("'Canvas'"), "section": lit(quoted(pid))}}]
+        done.append(f"tooltip page {pages[pid].get('displayName', pid)}")
+    if not vco:
+        body.pop("visualContainerObjects", None)
+    write_text(t["path"], json.dumps(doc, indent=2, ensure_ascii=False) + "\n", bom)
+    return {"verb": "link", "page": t["page"], "visual": t["id"], "type": t["type"], "set": done,
+            "files": [os.path.relpath(t["path"], ws.mirror).replace("\\", "/")],
+            "next": "pbz validate, then pbz push --reload"}
 
 
 def _parse_field(model, ref: str):

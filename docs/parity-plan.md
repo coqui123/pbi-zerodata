@@ -113,6 +113,22 @@ Microsoft's own authoring CLI rules.
 - New checks: `PBIR_OBJECT_UNKNOWN`, `PBIR_PROPERTY_UNKNOWN`, `PBIR_PROPERTY_VALUE` (warnings). On a
   large Desktop-authored report every object, property and literal value matched the catalog.
 
+## Round 6 (2026-11-05): the rest of the authoring list
+
+- `consumers discover <folder> [--register]`: finds Excel, PBIX, RDL, thin report and composite model
+  consumers of this model from connection parts only.
+- `filter add|remove|list`: report, page and visual filters (Categorical In / Not In, Advanced with
+  AND, Top N with an ordered subquery, measure filters at visual level, field-only); values are labels,
+  typed values or mirror tokens. `interaction`: DataFilter, HighlightFilter, NoFilter, or default.
+- `add page --tooltip` and `--drillthrough 'T'[C]` (page binding, bound parameters and filters, a Back
+  button), `link` for button actions (page, back, bookmark, drillthrough, web link) and report-page
+  tooltips; validate flags dangling link targets. `bookmark add|remove|list`: show/hide bookmarks that
+  never capture data state (`suppressData`). Every shape was checked against Microsoft's report
+  validator with its JSON schemas on a Desktop-made report before use.
+- `synth test save|run|list|remove`: golden results on the synthetic copy, SAME / DIFF per query with
+  drift reported separately (built by a parallel agent; offline and live tests pass).
+- CI: GitHub Actions runs the offline suites and the engine's offline tests on Windows for every push.
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,

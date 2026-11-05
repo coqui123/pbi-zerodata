@@ -510,6 +510,15 @@ def build(ws, project, rows: int = 200, seed: int = 7) -> dict:
 # ---------------------------------------------------------------- lifecycle
 
 
+def build_info(ws, project) -> dict:
+    """Settings of the current synthetic build (source_project, built, rows, seed, tables); refuses a
+    folder that is not a pbz synthetic copy."""
+    root = synth_project(ws, project).ws.root
+    _require_synthetic(root)
+    with open(os.path.join(root, ".pbz", "synth.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
 def status(ws, project) -> dict:
     sp = synth_project(ws, project)
     root = sp.ws.root

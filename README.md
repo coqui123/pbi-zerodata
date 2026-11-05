@@ -23,6 +23,12 @@ without company data entering the agent's context.
 - `style`: visual formatting (titles, data labels, colors, fonts, axes, legends, borders, one series,
   button states) for one visual or every visual of a type, checked against Microsoft's formatting
   catalog (`reference/style.md`).
+- `filter` (basic, not in, advanced, Top N, measure filters at report, page and visual level),
+  `interaction`, tooltip and drillthrough pages (`add page --tooltip | --drillthrough`), show/hide
+  `bookmark`s and button actions (`link`): `reference/authoring.md`.
+- `synth test`: golden results on the synthetic model and SAME / DIFF after a refactor
+  (`reference/synth.md`); `consumers discover` finds files connected to the model.
+- CI: `.github/workflows/tests.yml` runs the offline suites on every push (Desktop suites stay local).
 - `consumers`: register thin reports, PBIX, Excel workbooks, paginated reports, composite models, query
   exports or a scanner result so `unused` keeps what they use (`used_external`) and refuses removals
   while coverage is incomplete (`reference/consumers.md`).
@@ -64,6 +70,8 @@ python skills/powerbi-zerodata/tests/test_synth.py      # synthetic model (add -
 python skills/powerbi-zerodata/tests/test_consumers.py  # external consumers: every kind, coverage gaps, canaries
 python skills/powerbi-zerodata/tests/test_visuals.py    # built-in catalog, custom visuals, private package push
 python skills/powerbi-zerodata/tests/test_style.py      # visual formatting: values, selectors, bulk, checks
+python skills/powerbi-zerodata/tests/test_reportedit.py # filters, interactions, tooltip / drillthrough pages, links
+python skills/powerbi-zerodata/tests/test_synthtest.py  # synthetic regression tests (add --live to run in Desktop)
 python skills/powerbi-zerodata/tests/test_engine.py    # engine verbs + canary scan (needs Desktop)
 python skills/powerbi-zerodata/tests/test_e2e.py       # every verb on a fixture copy in Desktop, canary scan
 ```

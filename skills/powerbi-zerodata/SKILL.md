@@ -117,7 +117,11 @@ Prefer these over hand edits: they keep every cross-file reference consistent. D
 | `pbz move measure <name> --to <table>` | moves a measure (for example into a measure table), fixing visuals and qualified refs |
 | `pbz new measure-table\|date-table\|calc-group\|field-parameter <name> ...` | Desktop-shaped scaffolds with fresh lineageTags (date table: `--start/--end` years, `--relate 'T'[C]`) |
 | `pbz relationship add\|remove\|set <'T'[C]> <'U'[K]> [--inactive] [--both]` | relationship edits with type, duplicate and ambiguous-path guards |
-| `pbz add page <name>` / `pbz add visual <type> --page <p> --field ...` | pages and visuals of any built-in type (roles, kinds and field limits from Microsoft's core visual capabilities) or a registered custom visual |
+| `pbz add page <name> [--tooltip \| --drillthrough 'T'[C]]` / `pbz add visual <type> --page <p> --field ...` | pages (plain, report-page tooltip, drillthrough target with a Back button) and visuals of any built-in type (roles, kinds and field limits from Microsoft's core visual capabilities) or a registered custom visual |
+| `pbz link <page> <visual> --to-page P \| --back \| --bookmark B \| --drillthrough P \| --url U \| --tooltip P \| --clear` | button actions and report-page tooltips |
+| `pbz filter add 'T'[C] --report\|--page P [--visual V] --in ... \| --not-in ... \| --where ">= 100" \| --top N --by [M]`, `remove`, `list` | report, page and visual filters (values: labels, typed values or mirror tokens) |
+| `pbz interaction <page> <source> <target\|all> filter\|highlight\|none\|default` | how one visual affects others on its page |
+| `pbz bookmark add <name> --page P [--hide v ...] [--only v ...]`, `remove`, `list` | show/hide bookmarks (never data state) for buttons |
 | `pbz visual list\|roles <type>\|import <file.pbiviz> [--as contract\|public\|private]\|register <guid> --as public\|organizational [--role NAME:kind]` | custom visuals: contracts (data roles), registration in report.json, private packages installed by push ([reference/visuals.md](reference/visuals.md)) |
 | `pbz style <page> <visual>\|--type T\|--all --set object.property=value [--series [M]] [--state hover]`, `--unset`, `--show`, `--list --type T` | visual formatting (titles, data labels, colors, fonts, axes, legends, borders) checked against Microsoft's formatting catalog ([reference/style.md](reference/style.md)) |
 | `pbz layout [--page <p>]` | text canvas map of a page plus overlap / off-canvas / z-order lint: how you "see" a page |
@@ -141,8 +145,10 @@ More editors ([reference/governance.md](reference/governance.md)):
 `pbz synth build` writes a synthetic copy of the model (from the mirror, fake rows, outside the
 workspace, marked synthetic); `pbz synth open`, then `pbz synth query "EVALUATE ..."` returns real
 query results of that fake data, so you can see what a measure does. It refuses any model that is not
-its own synthetic copy. Details: [reference/synth.md](reference/synth.md). Agent hosts that prefer
-typed tools can run `pbz mcp` (see [reference/mcp.md](reference/mcp.md)).
+its own synthetic copy. `pbz synth test save <name> --measure "[M]" --by "'T'[C]"` stores golden
+results of that fake data; after a refactor, rebuild and `pbz synth test run <name>` reports SAME / DIFF
+per query. Details: [reference/synth.md](reference/synth.md). Agent hosts that prefer typed tools can
+run `pbz mcp` (see [reference/mcp.md](reference/mcp.md)).
 
 ## Model hygiene and analysis (metadata only)
 
@@ -152,7 +158,7 @@ These read the mirror and print names, states, counts, scores and rule ids. Deta
 | Verb | Use it for |
 |---|---|
 | `pbz unused [--all] [--report <dir>]` | state of every object: used / used_external / locked / used_by_unused / unused / unknown |
-| `pbz consumers add <path> \| --object <ref> --label <l>`, `list`, `scan`, `show <id>` | register external consumers (thin reports, PBIX, Excel, RDL, composite models, query exports, a scanner result) so `unused` keeps what they use ([reference/consumers.md](reference/consumers.md)) |
+| `pbz consumers add <path> \| --object <ref> --label <l>`, `discover <folder> [--register]`, `list`, `scan`, `show <id>` | find and register external consumers (thin reports, PBIX, Excel, RDL, composite models, query exports, a scanner result) so `unused` keeps what they use ([reference/consumers.md](reference/consumers.md)) |
 | `pbz lineage <obj> [--up]` | where-used tree (default) or what it depends on |
 | `pbz unused --remove [--dry-run] [--cascade] [--only kinds] [--m-step remove\|keep\|none]` | delete unused objects from the mirror, with a restore point |
 | `pbz unused --restore <stamp>` | undo a removal (before or after push) |

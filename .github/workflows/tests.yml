@@ -1,0 +1,59 @@
+# Offline test suites on every push and pull request. Power BI Desktop is not available on hosted
+# runners, so the Desktop suites (test_e2e.py, test_engine.py live mode, test_synth.py --live,
+# test_synthtest.py --live) stay local. The engine is built so TOM validation runs in push tests.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skills/powerbi-zerodata
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check jsonschema
+
+      - name: Build the engine
+        run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+
+      - name: Offline suites
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          $suites = "guard", "mirror", "parity", "bpa", "tools", "refactor", "authoring", "selfcontained",
+                    "governance", "mcp", "synth", "consumers", "visuals", "style", "reportedit", "synthtest"
+          $failed = @()
+          foreach ($t in $suites) {
+            Write-Host "::group::test_$t"
+            python "tests/test_$t.py"
+            if ($LASTEXITCODE -ne 0) { $failed += $t }
+            Write-Host "::endgroup::"
+          }
+          python tests/test_engine.py --offline
+          if ($LASTEXITCODE -ne 0) { $failed += "engine-offline" }
+          if ($failed.Count) { throw "failed: $($failed -join ', ')" }

@@ -869,6 +869,137 @@ def show(ws, project, cid: str) -> dict:
     return {"verb": "consumers", "action": "show", **rec, "uses": rows[:500]}
 
 
+GUIDISH = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+SKIP_DIRS = {".git", "node_modules", ".pbi", "pbz-workspace", ".pbz", "customvisuals", "staticresources",
+             "$recycle.bin", "appdata"}
+
+
+def _binding_only(path: str, kind: str) -> tuple[list[str], str]:
+    """(catalog names the consumer connects to, note) from connection parts only: never data parts."""
+    if kind == "xlsx":
+        with zipfile.ZipFile(path) as z:
+            if "xl/connections.xml" not in z.namelist():
+                return [], "no external model connection"
+            cats = []
+            for c in _xml(z.read("xl/connections.xml")).iter(NS + "connection"):
+                db = c.find(NS + "dbPr")
+                cs = db.get("connection", "") if db is not None else ""
+                olap = "msolap" in cs.lower() or c.find(NS + "olapPr") is not None
+                if olap and "$embedded$" not in cs.lower() and c.get("name") != "ThisWorkbookDataModel":
+                    cats.append(_kv(cs, "Initial Catalog"))
+            return cats, "" if cats else "no external model connection"
+    if kind == "pbix":
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            if "Connections" not in names:
+                return [], "own model" if "DataModel" in names else "no connection"
+            conn = json.loads(z.read("Connections").decode("utf-8-sig") or "{}")
+            return [_kv(c.get("ConnectionString", ""), "Initial Catalog") for c in conn.get("Connections") or []
+                    if isinstance(c, dict)], ""
+    if kind == "rdl":
+        cats = [_kv(el.text, "Initial Catalog") for el in ET.parse(path).getroot().iter()
+                if _local(el.tag) == "ConnectString" and el.text]
+        return cats, "" if cats else "no connection string (shared data source)"
+    if kind == "pbir":
+        ref = json.loads(read_text(os.path.join(path, "definition.pbir"))[0]).get("datasetReference") or {}
+        p = (ref.get("byPath") or {}).get("path") or ""
+        if p:
+            b = os.path.basename(os.path.normpath(p.replace("\\", "/")))
+            return [b[:-len(".SemanticModel")] if b.lower().endswith(".semanticmodel") else b], "by path"
+        return [_kv((ref.get("byConnection") or {}).get("connectionString") or "", "Initial Catalog")], ""
+    if kind == "model":
+        mdef = os.path.join(path, "definition")
+        m = tmdl.load_model(mdef)
+        cats = []
+        for node in m.expressions.values():
+            text = m.text_of(node.expr) if node.expr is not None else ""
+            hit = re.search(r'(?i)AnalysisServices\.Database\(\s*"[^"]*"\s*,\s*"([^"]*)"', text)
+            if hit:
+                cats.append(hit.group(1))
+        return cats, "" if cats else "no DirectQuery to a semantic model"
+    return [], "unsupported"
+
+
+def discover(ws, project, folder: str, add_matches: bool = False, model_names: list[str] | None = None,
+             depth: int = 6, limit: int = 20000) -> dict:
+    """Find files and folders under `folder` that connect to this model, reading connection parts only
+    (Excel connections.xml, PBIX Connections, RDL connect strings, definition.pbir, composite model
+    expressions). With add_matches, register every one bound to this model by name."""
+    base = os.path.abspath(os.path.expanduser(folder))
+    if not os.path.isdir(base):
+        raise PbzError("NOT_FOUND", "folder does not exist")
+    want = {n.lower() for n in (model_names or [project.name])}
+    reg = load_registry(ws)
+    known = {os.path.normcase(e["path"]) for e in reg["consumers"] if e.get("path")}
+    own = {os.path.normcase(os.path.abspath(p)) for p in (project.report_dir, project.model_dir, ws.mirror)}
+    found, seen = [], 0
+    root_depth = base.rstrip("\\/").count(os.sep)
+    for cur, dirs, files in os.walk(base):
+        if cur.count(os.sep) - root_depth >= depth:
+            dirs[:] = []
+        keep = []
+        for d in sorted(dirs):
+            full = os.path.join(cur, d)
+            low = d.lower()
+            if low in SKIP_DIRS or low.startswith(".") or os.path.normcase(full) in own:
+                continue
+            if low.endswith(".report") and os.path.exists(os.path.join(full, "definition.pbir")):
+                found.append((full, "pbir"))
+            elif low.endswith(".semanticmodel") and os.path.isdir(os.path.join(full, "definition")):
+                found.append((full, "model"))
+            else:
+                keep.append(d)
+        dirs[:] = keep
+        for f in sorted(files):
+            seen += 1
+            if seen > limit:
+                break
+            ext = os.path.splitext(f)[1].lower()
+            kind = {".xlsx": "xlsx", ".xlsm": "xlsx", ".pbix": "pbix", ".pbit": "pbix", ".rdl": "rdl", ".rsd": "rdl"}.get(ext)
+            if kind and not f.startswith("~$"):
+                found.append((os.path.join(cur, f), kind))
+        if seen > limit:
+            break
+    out_rows, added = [], []
+    for path, kind in found:
+        try:
+            cats, note = _binding_only(path, kind)
+        except Exception as e:  # noqa: BLE001  untrusted file: report the class only
+            cats, note = [], f"unreadable ({type(e).__name__})"
+        cats = [c for c in cats if c]
+        if cats and {c.lower() for c in cats} & want:
+            match = "model name"
+        elif cats and all(GUIDISH.match(c) for c in cats):
+            match = "dataset id (unverified)"
+        elif cats:
+            match = "other model"
+        else:
+            match = note or "no connection"
+        row = {"path": os.path.relpath(path, base).replace("\\", "/"), "kind": kind, "match": match}
+        if os.path.normcase(path) in known:
+            row["registered"] = True
+        out_rows.append(row)
+        if add_matches and match == "model name" and os.path.normcase(path) not in known:
+            r = add(ws, project, path, kind, model_names=model_names)
+            added.append(r["id"])
+            row["registered"] = r["id"]
+    rank = {"model name": 0, "dataset id (unverified)": 1}
+    out_rows.sort(key=lambda r: (rank.get(r["match"], 2), r["path"].lower()))
+    out = {"verb": "consumers", "action": "discover", "folder": base, "scanned_files": min(seen, limit),
+           "candidates": [r for r in out_rows if r["match"] in rank][:500],
+           "other": len([r for r in out_rows if r["match"] not in rank])}
+    if seen > limit:
+        out["note"] = f"stopped after {limit} files: narrow the folder"
+    if added:
+        out["added"] = added
+    elif any(r["match"] == "model name" and not r.get("registered") for r in out_rows):
+        out["next"] = "pbz consumers discover <folder> --add registers the model-name matches"
+    if any(r["match"].startswith("dataset id") for r in out_rows):
+        out["unverified"] = ("files bound by dataset id: if they use this model, register them with "
+                             "`pbz consumers add <path>` (ids are not names)")
+    return out
+
+
 def users_of(ws, project, kind: str, table: str, name: str) -> list[str]:
     """Consumer ids that reference one object directly (for rename warnings)."""
     if not load_registry(ws)["consumers"]:
