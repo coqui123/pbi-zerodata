@@ -13,9 +13,15 @@ BRIDGE = os.path.join(TOOLS_BIN, "powerbi-desktop.cmd")
 
 
 def _ps(script: str, timeout: int = 60) -> str:
-    p = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
-                       capture_output=True, timeout=timeout)
-    return p.stdout.decode("utf-8", errors="replace")
+    """Run a PowerShell snippet: PowerShell 7 when installed, else the Windows PowerShell every Windows has."""
+    for exe in ("pwsh", "powershell"):
+        try:
+            p = subprocess.run([exe, "-NoProfile", "-NonInteractive", "-Command", script],
+                               capture_output=True, timeout=timeout)
+        except FileNotFoundError:
+            continue
+        return p.stdout.decode("utf-8", errors="replace")
+    return ""
 
 
 def _json_list(text: str) -> list:

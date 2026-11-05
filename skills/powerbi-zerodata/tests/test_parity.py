@@ -480,7 +480,8 @@ def heuristic_canary_scan(check) -> None:
     outs = []
     for args in (["pull"], ["unused", "--all", "--impact"], ["lineage", "[Canary Person Hours]", "--up"], ["lineage", "Person"],
                  ["suggest"], ["m-lineage"], ["similar"], ["changes"], ["docs", "--dax"], ["docs", "--format", "html", "--dax"],
-                 ["docs", "--format", "json"], ["unused", "--remove", "--dry-run"], ["bpa"]):
+                 ["docs", "--format", "json"], ["unused", "--remove", "--dry-run"], ["bpa"], ["layout", "--page", "Canary Page"],
+                 ["format"], ["repair", "--dry-run"], ["status"], ["bpa", "--fix", "HIDE_FOREIGN_KEYS", "--dry-run"]):
         p = subprocess.run([sys.executable, "-I", os.path.join(SKILL, "pbz", "cli.py"), *args], cwd=wsd, env=env,
                            capture_output=True, timeout=600)
         outs.append((" ".join(args), p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")))

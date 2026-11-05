@@ -17,6 +17,11 @@ copyright belongs to their respective authors, as stated in each repository's LI
 | [sql-bi/Vpax-Obfuscator](https://github.com/sql-bi/Vpax-Obfuscator), [sql-bi/VertiPaq-Analyzer](https://github.com/sql-bi/VertiPaq-Analyzer) | DAX tokenizer keyword classes; `DISCOVER_CALC_DEPENDENCY` usage |
 | [microsoft/powerquery-parser](https://github.com/microsoft/powerquery-parser) | M grammar reference for the let-step analyser |
 
+Design references only (documentation, no code used): Microsoft's Power BI report authoring CLI
+reference in microsoft/skills-for-fabric (visual role names and PBIR pitfalls behind `pbz add`), the
+Microsoft PBIR / TMDL documentation and json-schemas repository (structure checked by `pbz validate`),
+and SQLBI's DAX formatting conventions (`pbz format`).
+
 Measure Killer (Brunner BI) informed the feature list, the usage states and the published scoring
 formula; no Measure Killer code or assets are used. Its grade labels are available only as an
 optional preset (`pbz bpa --labels measure-killer`).

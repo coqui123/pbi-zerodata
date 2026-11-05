@@ -176,6 +176,25 @@ def main() -> int:
                      ("docs", "--dax"), ("docs", "--format", "html", "--dax"), ("docs", "--format", "json")):
             res = r.pbz(*args)
             expect(res.get("verb") and res.get("ok") is not False, f"{' '.join(args)}: {res}")
+        for args in (("status",), ("layout",), ("layout", "--page", "Canary Page"), ("format",), ("repair", "--dry-run"),
+                     ("bpa", "--fix", "HIDE_FOREIGN_KEYS", "--dry-run")):
+            res = r.pbz(*args)
+            expect(res.get("verb") and res.get("ok") is not False, f"{' '.join(args)}: {res}")
+        # authoring verbs: their output must pass the staged validation (TOM + Microsoft's PBIR validator)
+        res = r.pbz("new", "measure-table", "E2E Measures")
+        expect(res.get("verb") == "new", f"new measure-table: {res}")
+        res = r.pbz("move", "measure", "Active Hours", "--to", "E2E Measures")
+        expect(res.get("verb") == "move", f"move measure: {res}")
+        res = r.pbz("add", "page", "E2E Page")
+        expect(res.get("verb") == "add", f"add page: {res}")
+        for vargs in (("card", "--field", "[Total Hours]", "--title", "Hours"),
+                      ("clusteredColumnChart", "--field", "'Project'[Status]", "--field", "[Total Hours]"),
+                      ("tableEx", "--field", "'Project'[Status]", "--field", "[Active Hours]"),
+                      ("slicer", "--field", "'Project'[Status]")):
+            res = r.pbz("add", "visual", vargs[0], "--page", "E2E Page", *vargs[1:])
+            expect(res.get("verb") == "add" and res.get("placement") == "free_spot", f"add visual {vargs[0]}: {res}")
+        res = r.pbz("validate")
+        expect(not [f for f in res.get("findings", []) if f.get("severity") == "error"], f"validate after authoring: {res}")
         tdir = os.path.join(ws_dir, "pbz-workspace", "Canary.SemanticModel", "definition", "tables")
         with open(os.path.join(tdir, "Hours.tmdl"), "a", encoding="utf-8", newline="") as f:
             f.write("\n\tmeasure 'E2E Added' = [Total Hours] * 2\n\t\tformatString: 0\n")

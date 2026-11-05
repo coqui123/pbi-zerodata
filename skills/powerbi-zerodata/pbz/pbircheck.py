@@ -1,0 +1,224 @@
+"""Built-in PBIR integrity checks: the cross-file structure hand edits break most often (page order,
+folder and object names, positions, groups, interactions, bookmarks). Runs on the mirror and on the
+staged real files, with or without Microsoft's optional schema validator. Names and ids only."""
+from __future__ import annotations
+
+import json
+import os
+
+from . import pbir
+from .common import read_text
+
+
+def _load(path: str):
+    try:
+        return pbir.to_py(pbir.parse_json(read_text(path)[0]))
+    except (OSError, UnicodeDecodeError, pbir.JsonError):
+        return None  # unreadable JSON is reported by the field-reference check
+
+
+def _tooltip_sections(v) -> list[str]:
+    """Page names a visual's report-page tooltip points at (visualTooltip.section literal)."""
+    out = []
+
+    def walk(n):
+        if isinstance(n, dict):
+            for k, x in n.items():
+                if k == "visualTooltip" and isinstance(x, list):
+                    for entry in x:
+                        props = (entry or {}).get("properties") or {}
+                        lit = (((props.get("section") or {}).get("expr") or {}).get("Literal") or {}).get("Value")
+                        if isinstance(lit, str) and lit.startswith("'") and lit.endswith("'"):
+                            out.append(lit[1:-1].replace("''", "'"))
+                else:
+                    walk(x)
+        elif isinstance(n, list):
+            for x in n:
+                walk(x)
+
+    walk(v)
+    return out
+
+
+def _num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def run(report_dir: str, prefix: str = "") -> list[dict]:
+    out: list[dict] = []
+
+    def add(sev, code, where, msg):
+        out.append({"severity": sev, "code": code, "where": prefix + where, "message": msg})
+
+    ddir = os.path.join(report_dir, "definition")
+    pbir_file = os.path.join(report_dir, "definition.pbir")
+    ref = _load(pbir_file) if os.path.exists(pbir_file) else None
+    if ref is None:
+        add("error", "PBIR_NO_DATASET_REFERENCE", "definition.pbir", "missing or unreadable definition.pbir")
+    elif not isinstance(ref.get("datasetReference"), dict) or not (
+            ref["datasetReference"].get("byPath") or ref["datasetReference"].get("byConnection")):
+        add("error", "PBIR_NO_DATASET_REFERENCE", "definition.pbir", "datasetReference needs byPath or byConnection")
+    if not os.path.isdir(ddir):
+        return out
+    if not os.path.exists(os.path.join(ddir, "report.json")):
+        add("error", "PBIR_NO_REPORT_JSON", "definition/report.json", "report.json is missing")
+    if not os.path.exists(os.path.join(ddir, "version.json")):
+        add("warning", "PBIR_NO_VERSION", "definition/version.json", "version.json is missing")
+
+    pages_dir = os.path.join(ddir, "pages")
+    page_ids = sorted(d for d in os.listdir(pages_dir) if os.path.isdir(os.path.join(pages_dir, d))) \
+        if os.path.isdir(pages_dir) else []
+    visuals_of: dict[str, set] = {}
+    bindings: dict[str, list] = {}
+    sync_groups: dict[str, dict] = {}
+    tooltip_refs: list[tuple[str, str]] = []
+    for pid in page_ids:
+        rel = f"definition/pages/{pid}/page.json"
+        page = _load(os.path.join(pages_dir, pid, "page.json"))
+        if page is None:
+            if not os.path.exists(os.path.join(pages_dir, pid, "page.json")):
+                add("error", "PAGE_JSON_MISSING", f"definition/pages/{pid}", "page folder without page.json")
+            continue
+        if page.get("name") != pid:
+            add("error", "PAGE_NAME_MISMATCH", rel, f"page name must equal its folder name ({pid})")
+        pb = page.get("pageBinding")
+        if isinstance(pb, dict) and pb.get("name"):
+            bindings.setdefault(pb["name"], []).append(pid)
+        if not page.get("displayName"):
+            add("warning", "PAGE_NO_DISPLAY_NAME", rel, "page has no displayName")
+        vdir = os.path.join(pages_dir, pid, "visuals")
+        vids = sorted(d for d in os.listdir(vdir) if os.path.isdir(os.path.join(vdir, d))) if os.path.isdir(vdir) else []
+        visuals_of[pid] = set(vids)
+        groups, parents = set(), {}
+        for vid in vids:
+            vrel = f"definition/pages/{pid}/visuals/{vid}/visual.json"
+            v = _load(os.path.join(vdir, vid, "visual.json"))
+            if v is None:
+                if not os.path.exists(os.path.join(vdir, vid, "visual.json")):
+                    add("error", "VISUAL_JSON_MISSING", f"definition/pages/{pid}/visuals/{vid}", "visual folder without visual.json")
+                continue
+            if v.get("name") != vid:
+                add("error", "VISUAL_NAME_MISMATCH", vrel, f"visual name must equal its folder name ({vid})")
+            pos = v.get("position")
+            if not isinstance(pos, dict) or not all(_num(pos.get(k)) for k in ("x", "y", "width", "height")):
+                add("error", "VISUAL_POSITION", vrel, "position needs numeric x, y, width and height")
+            elif pos["width"] <= 0 or pos["height"] <= 0:
+                add("warning", "VISUAL_ZERO_SIZE", vrel, "visual has zero width or height")
+            if "visualGroup" in v:
+                groups.add(vid)
+            elif not isinstance(v.get("visual"), dict):
+                add("error", "VISUAL_EMPTY", vrel, "visual.json needs a visual or a visualGroup")
+            for misplaced in ("visualContainerObjects", "objects", "query", "visualType"):
+                if misplaced in v:
+                    add("error", "PBIR_MISPLACED_PROPERTY", vrel, f"{misplaced} belongs inside \"visual\", not at the root")
+            if v.get("parentGroupName"):
+                parents[vid] = v["parentGroupName"]
+            body = v.get("visual") if isinstance(v.get("visual"), dict) else {}
+            qs = ((body.get("query") or {}).get("queryState") or {}) if isinstance(body.get("query"), dict) else {}
+            fields = set()
+            for role, bucket in qs.items() if isinstance(qs, dict) else []:
+                for proj in (bucket or {}).get("projections") or [] if isinstance(bucket, dict) else []:
+                    if isinstance(proj, dict) and "field" in proj and not proj.get("queryRef"):
+                        add("warning", "PROJECTION_NO_QUERYREF", vrel, f"a {role} projection has no queryRef")
+                    if isinstance(proj, dict):
+                        fields.add(json.dumps(proj.get("field"), sort_keys=True))
+            sg = body.get("syncGroup")
+            if isinstance(sg, dict) and sg.get("groupName"):
+                sync_groups.setdefault(sg["groupName"], {})[f"{pid}/{vid}"] = frozenset(fields)
+            for sec in _tooltip_sections(v):
+                tooltip_refs.append((vrel, sec))
+        for vid, grp in parents.items():
+            if grp not in groups:
+                add("error", "GROUP_MISSING", f"definition/pages/{pid}/visuals/{vid}/visual.json",
+                    f"parentGroupName {grp} is not a visual group on this page")
+        for it in page.get("visualInteractions") or []:
+            if not isinstance(it, dict):
+                continue
+            for side in ("source", "target"):
+                if it.get(side) and it[side] not in visuals_of[pid]:
+                    add("error", "INTERACTION_MISSING_VISUAL", rel, f"visual interaction {side} {it[side]} does not exist")
+
+    for name, pids in bindings.items():
+        if len(pids) > 1:
+            add("error", "DUPLICATE_PAGE_BINDING", "definition/pages", f"pageBinding name shared by pages {', '.join(pids)}")
+    for grp, members in sync_groups.items():
+        if len(set(members.values())) > 1:
+            add("warning", "SYNC_GROUP_FIELDS_DIFFER", "definition/pages",
+                f"slicers in sync group {grp} bind different fields: {', '.join(sorted(members))}")
+    names = {}
+    for pid in page_ids:
+        page = _load(os.path.join(pages_dir, pid, "page.json")) or {}
+        names[pid] = pid
+        if page.get("displayName"):
+            names[page["displayName"]] = pid
+    for vrel, sec in tooltip_refs:
+        if sec not in names:
+            add("error", "TOOLTIP_PAGE_MISSING", vrel, f"report page tooltip points at missing page {sec}")
+    meta = _load(os.path.join(pages_dir, "pages.json")) if os.path.exists(os.path.join(pages_dir, "pages.json")) else None
+    if page_ids and meta is None and not os.path.exists(os.path.join(pages_dir, "pages.json")):
+        add("error", "PAGES_JSON_MISSING", "definition/pages/pages.json", "pages.json is missing")
+    if isinstance(meta, dict):
+        order = meta.get("pageOrder") or []
+        seen = set()
+        for pid in order:
+            if pid in seen:
+                add("error", "PAGE_ORDER_DUPLICATE", "definition/pages/pages.json", f"page {pid} listed twice")
+            seen.add(pid)
+            if pid not in visuals_of and pid not in page_ids:
+                add("error", "PAGE_ORDER_MISSING_PAGE", "definition/pages/pages.json", f"pageOrder lists missing page {pid}")
+        for pid in page_ids:
+            if pid not in seen:
+                add("warning", "PAGE_NOT_IN_ORDER", "definition/pages/pages.json", f"page {pid} is not in pageOrder")
+        active = meta.get("activePageName")
+        if active and active not in page_ids:
+            add("error", "ACTIVE_PAGE_MISSING", "definition/pages/pages.json", f"activePageName {active} does not exist")
+
+    bdir = os.path.join(ddir, "bookmarks")
+    if os.path.isdir(bdir):
+        files = {f[:-len(".bookmark.json")] for f in os.listdir(bdir) if f.endswith(".bookmark.json")}
+        listed = set()
+        bm = _load(os.path.join(bdir, "bookmarks.json")) if os.path.exists(os.path.join(bdir, "bookmarks.json")) else None
+        for it in (bm or {}).get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            names = [c for c in it.get("children") or [] if isinstance(c, str)] or ([it["name"]] if it.get("name") and not it.get("children") else [])
+            for name in names:
+                listed.add(name)
+                if name not in files:
+                    add("error", "BOOKMARK_MISSING_FILE", "definition/bookmarks/bookmarks.json", f"bookmark {name} has no file")
+        for name in sorted(files - listed):
+            add("warning", "BOOKMARK_NOT_LISTED", f"definition/bookmarks/{name}.bookmark.json", "bookmark file not in bookmarks.json")
+        for name in sorted(files):
+            b = _load(os.path.join(bdir, f"{name}.bookmark.json"))
+            if not isinstance(b, dict):
+                continue
+            brel = f"definition/bookmarks/{name}.bookmark.json"
+            if b.get("name") and b["name"] != name:
+                add("error", "BOOKMARK_NAME_MISMATCH", brel, "bookmark name must equal its file name")
+            es = b.get("explorationState") or {}
+            act = es.get("activeSection")
+            if act and act not in page_ids:
+                add("error", "BOOKMARK_MISSING_PAGE", brel, f"activeSection {act} does not exist")
+            for pid, sec in (es.get("sections") or {}).items():
+                if pid not in page_ids:
+                    add("warning", "BOOKMARK_MISSING_PAGE", brel, f"section {pid} does not exist")
+                    continue
+                for vid in (sec or {}).get("visualContainers") or {}:
+                    if vid not in visuals_of.get(pid, set()):
+                        add("warning", "BOOKMARK_MISSING_VISUAL", brel, f"visual {vid} no longer exists on page {pid}")
+            all_visuals = set().union(*visuals_of.values()) if visuals_of else set()
+            for vid in (b.get("options") or {}).get("targetVisualNames") or []:
+                if vid not in all_visuals:
+                    add("warning", "BOOKMARK_MISSING_VISUAL", brel, f"target visual {vid} does not exist")
+
+    ext = _load(os.path.join(ddir, "reportExtensions.json")) if os.path.exists(os.path.join(ddir, "reportExtensions.json")) else None
+    if isinstance(ext, dict):
+        seen = set()
+        for ent in ext.get("entities") or []:
+            for m in (ent or {}).get("measures") or []:
+                key = (str((ent or {}).get("name", "")).lower(), str((m or {}).get("name", "")).lower())
+                if key in seen:
+                    add("error", "DUPLICATE_REPORT_MEASURE", "definition/reportExtensions.json",
+                        f"report measure {m.get('name')} defined twice")
+                seen.add(key)
+    return out

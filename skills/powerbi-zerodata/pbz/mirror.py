@@ -6,7 +6,6 @@ import difflib
 import json
 import os
 import shutil
-import subprocess
 
 from . import desktop, policy as policy_mod, tmdl, tokens, validate
 from .classify import Classifier
@@ -163,26 +162,70 @@ def pull(ws: Workspace, project: Project, force: bool = False, rebase: bool = Fa
             "token_occurrences": counts, "lossy_files": lossy, "conflicts": conflicts}
 
 
+def merge3(base: str, mine: str, theirs: str) -> tuple[str, bool]:
+    """Line-based three-way merge in the style of `git merge-file` (no git needed).
+    Returns (merged text, clean). Overlapping or adjacent edits from both sides that differ become
+    conflict blocks with <<<<<<< mine / ======= / >>>>>>> theirs markers."""
+    b, a, t = base.splitlines(keepends=True), mine.splitlines(keepends=True), theirs.splitlines(keepends=True)
+
+    def hunks(other):
+        sm = difflib.SequenceMatcher(None, b, other, autojunk=False)
+        return [(i1, i2, other[j1:j2]) for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal"]
+
+    def apply(hs, s, e):
+        out, pos = [], s
+        for hs_, he_, lines in hs:
+            out += b[pos:hs_] + lines
+            pos = he_
+        return out + b[pos:e]
+
+    ha, hb = hunks(a), hunks(t)
+    out, pos, clean, ia, ib = [], 0, True, 0, 0
+    while ia < len(ha) or ib < len(hb):
+        first_a = ia < len(ha) and (ib >= len(hb) or ha[ia][0] <= hb[ib][0])
+        s, e = (ha[ia] if first_a else hb[ib])[:2]
+        ga, gb = [], []
+        grew = True
+        while grew:  # absorb every hunk from either side that overlaps or touches the region
+            grew = False
+            while ia < len(ha) and ha[ia][0] <= e:
+                ga.append(ha[ia])
+                s, e = min(s, ha[ia][0]), max(e, ha[ia][1])
+                ia += 1
+                grew = True
+            while ib < len(hb) and hb[ib][0] <= e:
+                gb.append(hb[ib])
+                s, e = min(s, hb[ib][0]), max(e, hb[ib][1])
+                ib += 1
+                grew = True
+        out += b[pos:s]
+        va, vb = apply(ga, s, e), apply(gb, s, e)
+        if not gb or va == vb:
+            out += va
+        elif not ga:
+            out += vb
+        else:
+            clean = False
+            nl = "\r\n" if any(x.endswith("\r\n") for x in va + vb) else "\n"
+            fix = lambda xs: xs[:-1] + [xs[-1] + nl] if xs and not xs[-1].endswith(("\n", "\r")) else xs
+            out += [f"<<<<<<< mine{nl}"] + fix(va) + [f"======={nl}"] + fix(vb) + [f">>>>>>> theirs{nl}"]
+        pos = e
+    out += b[pos:]
+    return "".join(out), clean
+
+
 def _merge3(ws: Workspace, project: Project, rel: str, theirs: str | None) -> str | None:
     """Three-way merge agent edits (mirror) with a new upstream mirror text. All inputs sanitized."""
     if theirs is None:
         return None
     mine = os.path.join(ws.mirror, *rel.split("/"))
     base = os.path.join(base_dir(ws, project), *rel.split("/"))
-    tmp = os.path.join(ws.private, "merge-theirs.tmp")
-    write_text(tmp, theirs)
-    try:
-        p = subprocess.run(["git", "merge-file", "-p", mine, base if os.path.exists(base) else tmp, tmp],
-                           capture_output=True)
-    except FileNotFoundError:
-        return None
-    finally:
-        os.remove(tmp)
-    merged = p.stdout.decode("utf-8", errors="replace")
-    _text, bom = read_text(mine)
+    mine_text, bom = read_text(mine)
+    base_text = read_text(base)[0] if os.path.exists(base) else theirs
+    merged, clean = merge3(base_text, mine_text, theirs)
     write_text(mine, merged, bom)
     write_text(base, theirs, bom)
-    return merged if p.returncode == 0 else None
+    return merged if clean else None
 
 
 def diff(ws: Workspace, project: Project, patch: bool = False) -> dict:
@@ -250,6 +293,10 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
     if open_inst and (model_touched or not reload):
         return {"verb": "push", "project": project.name, "result": "DESKTOP_OPEN",
                 "hint": "close Desktop first (`pbz desktop close`), or use --reload for report-only changes"}
+    if open_inst and open_inst.get("unsaved"):
+        return {"verb": "push", "project": project.name, "result": "DESKTOP_DIRTY",
+                "hint": "Desktop has unsaved changes a reload would discard: ask the user to save (then pbz pull "
+                        "--rebase) or close it"}
     tm = tokens.TokenMap(ws.private)
     new_real: dict[str, tuple[str, bytes]] = {}
     unknown_all: list[str] = []

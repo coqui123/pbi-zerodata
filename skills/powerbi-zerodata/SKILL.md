@@ -96,9 +96,32 @@ Constants in checks are limited (3 distinct per target per day) and there is a d
 | `ENGINE_UNAVAILABLE` | Desktop not open / engine not built | `pbz desktop open`; tell the user if it persists |
 | `ERROR:<class>` | engine error class (SYNTAX, UNKNOWN_OBJECT, ...) | fix the expression; raw text is human-only |
 | `BUDGET` | probe limit reached | summarize what you know, ask the user |
+| `DESKTOP_DIRTY` (push --reload) | Desktop has unsaved changes a reload would discard | ask the user to save or close Desktop |
+| `AMBIGUOUS_PATH` / `TYPE_MISMATCH` / `DUPLICATE` (relationship) | the relationship would break or duplicate the model | add it `--inactive`, fix the columns, or `set` the existing one |
+| `NO_FREE_SPACE` (add visual placement) | the page is full | pass `--pos x,y,w,h` or make room (`pbz layout`) |
 | `INCOMPLETE` (unused --remove) | a report file could not be read, so nothing is provably unused | fix the file, rerun |
 | `CONFLICT` (unused --restore) | the mirror changed after the removal | restore later points first, or pull |
 | guard deny `[pbz guard] ...` | you tried a blocked path or command | follow the hint; never retry variants |
+
+## Refactor and author (edits the mirror; then `pbz diff`, `pbz validate`, `pbz push`)
+
+Prefer these over hand edits: they keep every cross-file reference consistent. Details:
+[reference/authoring.md](reference/authoring.md).
+
+| Verb | Does |
+|---|---|
+| `pbz rename measure\|column\|table <old> <new>` | renames and fixes DAX, M, relationships, RLS, perspectives, PBIR entities and queryRefs |
+| `pbz move measure <name> --to <table>` | moves a measure (for example into a measure table), fixing visuals and qualified refs |
+| `pbz new measure-table\|date-table\|calc-group\|field-parameter <name> ...` | Desktop-shaped scaffolds with fresh lineageTags (date table: `--start/--end` years, `--relate 'T'[C]`) |
+| `pbz relationship add\|remove\|set <'T'[C]> <'U'[K]> [--inactive] [--both]` | relationship edits with type, duplicate and ambiguous-path guards |
+| `pbz add page <name>` / `pbz add visual <type> --page <p> --field ...` | pages and visuals from built-in templates (card, tableEx, pivotTable, slicer, charts, textbox) |
+| `pbz layout [--page <p>]` | text canvas map of a page plus overlap / off-canvas / z-order lint: how you "see" a page |
+| `pbz format [<measure>] [--apply]` | local, token-safe DAX formatting (check by default) |
+| `pbz repair [--fields] [--lineage]` | fixes page order, names, groups, interactions, bookmark lists, stale targets, copied lineageTags |
+| `pbz bpa --fix <RULE> [--dry-run]` | property-only BPA fixes (hide foreign keys, summarizeBy, isAvailableInMdx, mark date table) |
+
+`pbz status` shows `sync` (IN_SYNC, PENDING_PUSH, BEHIND, CONFLICT_RISK) and, with Desktop open,
+whether the loaded model matches the files. `push --reload` refuses while Desktop has unsaved changes.
 
 ## Model hygiene and analysis (metadata only)
 

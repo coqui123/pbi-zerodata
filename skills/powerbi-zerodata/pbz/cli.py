@@ -12,7 +12,7 @@ if __package__ in (None, ""):
     __package__ = "pbz"
 
 from pbz import checks, describe, desktop, dpapi, handoff, memscrub, mirror, policy, rename, scan, smoke, validate  # noqa: E402
-from pbz.common import PbzError, emit, engine_call, find_workspace  # noqa: E402
+from pbz.common import PbzError, emit, engine_call, file_sha, find_workspace  # noqa: E402
 
 
 def _spec(arg: str | None) -> dict | None:
@@ -39,7 +39,21 @@ def cmd_status(ws, project, a):
            "engine": "available" if engine_call("ping", {"private_dir": ws.private}).get("ok") else "unavailable"}
     if man:
         out["pending"] = mirror.mirror_changes(ws, project, man)
+        # real files saved behind the mirror's back (Desktop save, another tool): pull --rebase before pushing
+        behind = sorted(rel for rel, info in man.get("files", {}).items()
+                        if file_sha(os.path.join(ws.root, *rel.split("/"))) != info.get("real"))
+        out["real_changed_since_pull"] = behind[:50]
+        out["sync"] = ("CONFLICT_RISK" if behind and any(out["pending"].values()) else
+                       "BEHIND" if behind else "PENDING_PUSH" if any(out["pending"].values()) else "IN_SYNC")
     out["desktop"] = desktop.status(project)
+    if out["desktop"].get("open") and out["desktop"].get("engine") == "READY":
+        res = engine_call("health", {"private_dir": ws.private, "port": desktop.require_port(project)}, timeout=300)
+        if res.get("ok"):
+            real = mirror.real_model(project)
+            files = {"tables": len([t for t in real.tables.values() if not t.private]),
+                     "measures": len(real.all_measures())}
+            loaded = {k: (res.get("objects") or {}).get(k) for k in files}
+            out["desktop"]["loaded_matches_files"] = loaded == files
     settings = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
     try:
         with open(settings, encoding="utf-8") as f:
@@ -94,7 +108,7 @@ def main(argv=None) -> int:
     p.add_argument("--reload", action="store_true", help="report-only change: reload the open Desktop")
     p.add_argument("--dry-run", action="store_true", help="validate only")
     p = sub.add_parser("rename")
-    p.add_argument("kind", choices=["measure", "column"])
+    p.add_argument("kind", choices=["measure", "column", "table"])
     p.add_argument("old")
     p.add_argument("new")
     p.add_argument("--table")
@@ -153,6 +167,9 @@ def main(argv=None) -> int:
     p.add_argument("--opinion", action="store_true", help="include opinion rules (naming and format conventions)")
     p.add_argument("--labels", default="letters", choices=["letters", "measure-killer"])
     p.add_argument("--report", action="append", default=[])
+    p.add_argument("--fix", action="append", default=[], metavar="RULE",
+                   help="apply a rule's property-only fix to the mirror (repeatable)")
+    p.add_argument("--dry-run", action="store_true", help="with --fix: list what would change")
     p = sub.add_parser("similar", help="duplicate and near-duplicate measures")
     p.add_argument("--threshold", type=float, default=0.80)
     p.add_argument("--max", type=int, default=100)
@@ -165,6 +182,54 @@ def main(argv=None) -> int:
     p.add_argument("--dax", action="store_true", help="include DAX and M expressions")
     p = sub.add_parser("m-lineage", help="Power Query step and column lineage")
     p.add_argument("table", nargs="?")
+    p = sub.add_parser("new", help="scaffold a measure table, date table, calculation group or field parameter")
+    p.add_argument("kind", choices=["measure-table", "date-table", "calc-group", "field-parameter"])
+    p.add_argument("name", help="new table name")
+    p.add_argument("--start", type=int, help="date-table: first year")
+    p.add_argument("--end", type=int, help="date-table: last year")
+    p.add_argument("--relate", action="append", help="date-table: fact date column to relate, 'T'[C] (repeatable)")
+    p.add_argument("--date", help="calc-group: the date column, 'Date'[Date]")
+    p.add_argument("--items", nargs="*", help="calc-group items: Current MTD QTD YTD PY \"PY YTD\" YoY \"YoY %%\"")
+    p.add_argument("--precedence", type=int)
+    p.add_argument("--fields", nargs="*", help="field-parameter: [Measure] or 'Table'[Column] list")
+    p.add_argument("--labels", nargs="*", help="field-parameter: display labels, one per field")
+    p = sub.add_parser("add", help="create a report page or a visual from a built-in template")
+    p.add_argument("kind", choices=["page", "visual"])
+    p.add_argument("name", help="page: display name; visual: visual type (card, tableEx, pivotTable, slicer, "
+                                "clusteredColumnChart, lineChart, textbox, ...)")
+    p.add_argument("--page", help="visual: target page (display name or id)")
+    p.add_argument("--field", action="append", default=[], help="visual: [Measure], 'T'[Column] or ROLE='T'[Column]")
+    p.add_argument("--pos", help="visual: x,y,width,height")
+    p.add_argument("--title", help="visual: title text")
+    p.add_argument("--text", help="textbox: text")
+    p.add_argument("--width", type=int, default=1280)
+    p.add_argument("--height", type=int, default=720)
+    p.add_argument("--hidden", action="store_true", help="page: hidden in view mode")
+    p.add_argument("--after", help="page: insert after this page")
+    p = sub.add_parser("relationship", help="add, remove or change a relationship (metadata-guarded)")
+    p.add_argument("action", choices=["add", "remove", "set"])
+    p.add_argument("from_col", help="many side, 'Table'[Column]")
+    p.add_argument("to_col", help="one side, 'Table'[Column]")
+    p.add_argument("--inactive", action="store_true")
+    p.add_argument("--active", action="store_true", help="set: make it active")
+    p.add_argument("--both", action="store_true", help="filter in both directions")
+    p.add_argument("--single", action="store_true", help="set: filter in one direction")
+    p.add_argument("--many-to-many", action="store_true")
+    p.add_argument("--force", action="store_true", help="add: allow mismatched data types")
+    p = sub.add_parser("move", help="move a measure to another table, fixing references")
+    p.add_argument("kind", choices=["measure"])
+    p.add_argument("name")
+    p.add_argument("--to", required=True, help="target table")
+    p = sub.add_parser("format", help="format DAX (measures, calculated columns, calculation items), token-safe")
+    p.add_argument("target", nargs="?", help="one measure or column name (default: all)")
+    p.add_argument("--apply", action="store_true", help="write the formatting (default: check only)")
+    p = sub.add_parser("repair", help="fix structural PBIR breakage found by validate")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--fields", action="store_true", help="also drop projections on fields the model no longer has")
+    p.add_argument("--lineage", action="store_true", help="also give objects with copied lineageTags fresh ones")
+    p = sub.add_parser("layout", help="text canvas map of report pages plus layout lint")
+    p.add_argument("--page", help="page display name or id (draws its map)")
+    p.add_argument("--no-map", action="store_true")
     p = sub.add_parser("admin")
     p.add_argument("action", choices=["budget-reset", "allow", "category", "synthetic", "log"])
     p.add_argument("value", nargs="?")
@@ -236,6 +301,9 @@ def main(argv=None) -> int:
         elif a.cmd == "suggest":
             from pbz import suggest
             out = suggest.run(ws, project, a.report)
+        elif a.cmd == "bpa" and a.fix:
+            from pbz import fix
+            out = fix.run(ws, project, a.fix, dry_run=a.dry_run)
         elif a.cmd == "bpa":
             from pbz import bpa
             out = bpa.run(ws, project, a.scope, rules_path=a.rules, opinion=a.opinion, labels=a.labels,
@@ -252,6 +320,40 @@ def main(argv=None) -> int:
         elif a.cmd == "m-lineage":
             from pbz import mlineage
             out = mlineage.run(ws, project, a.table)
+        elif a.cmd == "new":
+            from pbz import scaffold
+            out = scaffold.run(ws, project, a)
+        elif a.cmd == "add":
+            from pbz import author
+            if a.kind == "page":
+                out = author.add_page(ws, project, a.name, a.width, a.height, a.hidden, a.after)
+            else:
+                if not a.page:
+                    raise PbzError("BAD_REQUEST", "--page is required for a visual")
+                out = author.add_visual(ws, project, a.name, a.page, a.field, a.pos, a.title, a.text)
+        elif a.cmd == "relationship":
+            from pbz import relate
+            if a.action == "add":
+                out = relate.add(ws, project, a.from_col, a.to_col, inactive=a.inactive, both=a.both,
+                                 many_to_many=a.many_to_many, force=a.force)
+            elif a.action == "remove":
+                out = relate.remove(ws, project, a.from_col, a.to_col)
+            else:
+                out = relate.set_(ws, project, a.from_col, a.to_col,
+                                  active=True if a.active else (False if a.inactive else None),
+                                  both=True if a.both else (False if a.single else None))
+        elif a.cmd == "move":
+            from pbz import move
+            out = move.move_measure(ws, project, a.name, a.to)
+        elif a.cmd == "format":
+            from pbz import daxfmt
+            out = daxfmt.run(ws, project, apply=a.apply, target=a.target)
+        elif a.cmd == "repair":
+            from pbz import repair
+            out = repair.run(ws, project, dry_run=a.dry_run, fields=a.fields, lineage=a.lineage)
+        elif a.cmd == "layout":
+            from pbz import layout
+            out = layout.run(ws, project, a.page, show_map=not a.no_map)
         elif a.cmd == "admin":
             out = admin(ws, a)
         else:

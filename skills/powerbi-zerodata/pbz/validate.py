@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 
-from . import lint, pbir, tmdl
+from . import lint, pbir, pbircheck, tmdl
 from .classify import PII_IN_TEXT
 from .common import TOOLS_BIN, engine_call
 from .tokens import TOKEN_RE
@@ -150,6 +150,9 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
     else:
         model = tmdl.Model()
     findings += report_author(stage, project, scrub)
+    rdir = os.path.join(stage, project.name + ".Report")
+    if os.path.isdir(rdir):
+        findings += [dict(f, message=scrub(f["message"])) for f in pbircheck.run(rdir)]
     findings += field_refs(stage, project, model, scrub)
     for cur, _dirs, files in os.walk(stage):
         for name in files:
@@ -169,4 +172,6 @@ def run_mirror(ws, project) -> list[dict]:
     ident = lambda s: s  # mirror text is already sanitized
     out = lint.run(model)
     out += field_refs(ws.mirror, project, model, ident)
+    if os.path.isdir(project.mirror_report):
+        out += pbircheck.run(project.mirror_report)
     return out

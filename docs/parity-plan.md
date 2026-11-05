@@ -37,6 +37,30 @@ still uses. A heuristic-mode canary scan (no engine index) found two tokenizer g
 filters had no home table for bare `[Column]` references, and string cells of embedded tables under
 headers the model does not know were kept visible (they are now tokenized when they look specific).
 
+## Round 2 (2026-11-04): gap research and authoring verbs
+
+Three research passes (a Perplexity deep research survey of Tabular Editor 2/3, Measure Killer, Bravo,
+DAX Studio, ALM Toolkit, fab-inspector, pbir-utils, semantic-link-labs, Microsoft's modeling MCP and
+report CLIs, Fabric Git tooling and community MCP projects; plus independent design reviews) agreed that the biggest gaps were write-side: safe
+refactoring, deterministic report construction, scaffolds, relationship edits, offline cross-file
+validation and local DAX formatting. Built:
+
+- `rename table`, `move measure` (reference-aware across TMDL, M and PBIR).
+- `new measure-table | date-table | calc-group | field-parameter`, `relationship add|remove|set`.
+- `add page | visual` (templates for cards, tables, matrix, slicer, text box and native charts).
+- `layout` (text canvas map plus layout lint), `format` (token-preserving DAX formatter).
+- Built-in PBIR integrity checks in `validate` and every push, `repair` (structural fixes, optional
+  projection and lineageTag repair), `bpa --fix` (property-only fixes).
+- `status` sync state; `push --reload` refuses while Desktop has unsaved changes.
+- Runtime self-containment: pure-Python three-way merge (no git), PowerShell fallback, optional npm
+  CLIs, and a test that no third-party binary is invoked.
+
+Deferred (documented, not built): culture / perspective / role editors and incremental-refresh setup;
+`changes`-based selective plan / apply; an MCP transport; a synthetic-model test host. Design risks the
+reviews raised, kept as roadmap items: a schema-driven allowlist tokenizer instead of the current
+classifier, a disclosure ledger shared across sessions and query shapes for engine checks, and
+OS-level isolation in addition to the hook.
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,

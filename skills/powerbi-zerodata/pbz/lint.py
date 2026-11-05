@@ -75,6 +75,18 @@ def run(model) -> list[dict]:
                 if tab.lower() in names and not model.column(tab, col) and not model.measure(col):
                     out.append({"severity": "warning", "code": "UNKNOWN_REF", "where": f"{m.table}[{m.name}]",
                                 "message": f"reference '{tab}'[{col}] not found in the model"})
+    tags: dict[str, list] = {}
+    for doc in model.docs.values():
+        for node in doc.nodes:
+            tag = node.props.get("lineageTag", "").strip()
+            if tag:
+                parent = node.parent.name + "." if node.parent is not None and node.parent.kind == "table" else ""
+                tags.setdefault(tag.lower(), []).append(f"{node.kind} {parent}{node.name}")
+    for tag, objs in tags.items():
+        if len(objs) > 1:  # Desktop loads such models, but Git sync and deployment match objects by tag
+            out.append({"severity": "warning", "code": "DUPLICATE_LINEAGE_TAG", "where": objs[0],
+                        "message": f"lineageTag shared by {len(objs)} objects: " + ", ".join(objs[:5])
+                                   + " (pbz repair --lineage gives the copies new tags)"})
     both = [r for r in model.relationships if r.both]
     if both:
         out.append({"severity": "info", "code": "BIDIRECTIONAL", "where": "relationships",

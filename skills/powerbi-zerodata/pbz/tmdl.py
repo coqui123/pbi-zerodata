@@ -275,6 +275,32 @@ def block_span(doc: TmdlDoc, node: Node) -> tuple[int, int]:
     return lines[first][0], end
 
 
+def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tuple[int, int, str]]:
+    """Edits that set `prop: value` on a node (value None: a bare flag line such as isHidden).
+    Replaces an existing value in place, else inserts a line right after the declaration and its
+    expression. Returns [] when the property already has that value."""
+    lines = _lines(doc.text)
+    s, e = block_span(doc, node)
+    for off, ln in lines:
+        if off < s or off >= e or _indent(ln) != node.indent + 1:
+            continue
+        m = PROP_RE.match(ln)
+        if m and m.group("prop") == prop:
+            if value is None or m.group("val").strip() == value:
+                return []
+            return [(off + m.start("val"), off + len(ln), value)]
+        if ln.strip() == prop:
+            return [] if value is None else [(off + len(ln) - len(ln.lstrip("\t")), off + len(ln), f"{prop}: {value}")]
+    regs = [r for r in doc.regions if r.node is node and r.prop == "expression"]
+    after = max([r.end for r in regs] + [lines[node.line][0] + len(lines[node.line][1])])
+    nl = doc.text.find("\n", after)
+    eol = "\r\n" if "\r\n" in doc.text else "\n"
+    line = "\t" * (node.indent + 1) + prop + (f": {value}" if value is not None else "") + eol
+    if nl < 0:
+        return [(len(doc.text), len(doc.text), eol + line)]
+    return [(nl + 1, nl + 1, line)]
+
+
 def node_regions(doc: TmdlDoc, node: Node, deep: bool = True) -> list[Region]:
     """Expression regions owned by a node (and, with deep, by its child nodes: KPIs, format strings...)."""
     ids = {id(node)} | ({id(d) for d in node.descendants()} if deep else set())
