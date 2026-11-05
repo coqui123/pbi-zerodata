@@ -535,6 +535,8 @@ def policy_loosened(old: dict, new: dict) -> bool:
         return True
     if old.get("disclosure", "shape") == "strict" and new.get("disclosure", "shape") != "strict":
         return True
+    if old.get("literals") == "strict" and new.get("literals") != "strict":
+        return True
     for key in ("deny", "deny_scripts", "sensitive_hosts", "sensitive_columns"):
         if not set(old.get(key, [])) <= set(new.get(key, [])):
             return True

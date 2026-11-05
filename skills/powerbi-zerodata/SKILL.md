@@ -82,8 +82,10 @@ diverge, and whether the data has a shape problem. See [reference/checks.md](ref
 4. `pbz probe <Table>` for blanks, duplicate keys, orphans, negatives, future dates (booleans +
    coarse buckets).
 5. Fix, re-check, `snapshot compare` = SAME where nothing should change, then `pbz handoff`.
-Constants in checks are limited (3 distinct per target per day) and there is a daily budget;
-`BUDGET` means stop probing and ask the user. There is no `between`.
+Constants in checks are limited (3 distinct per target, remembered for 30 days, including literals
+you pushed into measures the target reaches) and checks, probes, snapshot queries and smoke runs have
+daily budgets; `BUDGET` means stop probing and ask the user. There is no `between`. To test logic
+freely, use `pbz synth` instead of the real model.
 
 ## Verdicts and what to do
 
@@ -122,6 +124,22 @@ Prefer these over hand edits: they keep every cross-file reference consistent. D
 
 `pbz status` shows `sync` (IN_SYNC, PENDING_PUSH, BEHIND, CONFLICT_RISK) and, with Desktop open,
 whether the loaded model matches the files. `push --reload` refuses while Desktop has unsaved changes.
+
+More editors ([reference/governance.md](reference/governance.md)):
+- `pbz culture add|remove|list|missing`, `pbz translate <code> <object> --caption ...`: translations
+  (culture files are mirrored; the Q&A linguistic schema stays one opaque token).
+- `pbz perspective add|remove|include|exclude`, `pbz role add|remove|filter|unfilter|member-add|member-remove`.
+- `pbz refresh-policy set|remove|show`: incremental refresh (parameters, filter step, windows).
+- `pbz push --only <paths>` pushes part of the pending edits; `pbz revert [paths] [--object ...]`
+  discards mirror edits.
+
+## Debugging DAX on fake data: `pbz synth`
+
+`pbz synth build` writes a synthetic copy of the model (from the mirror, fake rows, outside the
+workspace, marked synthetic); `pbz synth open`, then `pbz synth query "EVALUATE ..."` returns real
+query results of that fake data, so you can see what a measure does. It refuses any model that is not
+its own synthetic copy. Details: [reference/synth.md](reference/synth.md). Agent hosts that prefer
+typed tools can run `pbz mcp` (see [reference/mcp.md](reference/mcp.md)).
 
 ## Model hygiene and analysis (metadata only)
 

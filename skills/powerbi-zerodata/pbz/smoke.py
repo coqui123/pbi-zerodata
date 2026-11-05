@@ -146,6 +146,9 @@ def build_query(visual_root, page_root, model, tm) -> tuple[str | None, str]:
 
 
 def run(ws, project, page: str | None = None) -> dict:
+    from .checks import spend
+    if not spend(ws, "smoke"):
+        return {"verb": "smoke", "status": "BUDGET", "note": "daily smoke budget reached; the user can reset it"}
     port = desktop.require_port(project)
     tm = tokens.TokenMap(ws.private)
     mdef = os.path.join(project.mirror_model, "definition")

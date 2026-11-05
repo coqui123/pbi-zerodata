@@ -79,3 +79,17 @@ Only HMACs of results are stored, in the private store.
   other slicers is not applied.
 - `pbz probe <Table> [--columns A B]`: has_blanks, dup keys, negatives, future dates, plus
   row / blank-share / cardinality buckets and year span in the shape tier.
+
+## Disclosure ledger
+
+Budgets live in the private store and are charged before anything reaches the engine:
+
+- per target (the checked expression), at most `constants_per_target` (3) distinct constants within
+  30 days. Constants are the literals in the check and, since an edited measure is a new question,
+  every literal you pushed into a measure the target reaches (pushes record their new literals as
+  hashes);
+- per day: `session_checks` (300), `per_target` (60), `probes_per_day` (100),
+  `snapshot_queries_per_day` (200), `smoke_runs_per_day` (50).
+
+`BUDGET` is final for the day (or the 30-day window for constants); only the user can reset it. To
+test logic freely use `pbz synth` (fake data) instead of the real model.

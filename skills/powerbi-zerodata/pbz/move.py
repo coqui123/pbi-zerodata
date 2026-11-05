@@ -41,10 +41,6 @@ def move_measure(ws, project, name: str, target: str) -> dict:
         raise PbzError("NAME_TAKEN", f"{dst.name} has a column named {m.name}")
     if m.name.lower() in translated_names(project):
         raise PbzError("UNSUPPORTED", "the measure has translations in cultures/ (not mirrored): move it in Desktop")
-    for p in model.perspectives.values():
-        for pt in (c for c in p.children if c.kind == "perspectiveTable" and c.name.lower() == src.name.lower()):
-            if any(c.kind == "perspectiveMeasure" and c.name.lower() == m.name.lower() for c in pt.children):
-                raise PbzError("UNSUPPORTED", f"perspective {p.name} lists the measure: move it in Desktop")
     sdoc, ddoc = model.docs[src.file], model.docs[dst.file]
     s, e = tmdl.block_span(sdoc, m.node)
     block = sdoc.text[s:e]
@@ -134,6 +130,9 @@ def move_measure(ws, project, name: str, target: str) -> dict:
         if pedits and not file_refused:
             write_text(path, apply_edits(text, sorted(set(pedits))), bom)
             changed.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
+    from .governance import culture_edits_move, perspective_edits_move
+    changed += [f"{project.name}.SemanticModel/definition/{r}" for r in culture_edits_move(mdef, src.name, dst.name, m.name)]
+    changed += [f"{project.name}.SemanticModel/definition/{r}" for r in perspective_edits_move(mdef, src.name, dst.name, m.name)]
     out = {"verb": "move", "measure": m.name, "from": src.name, "to": dst.name, "files": sorted(set(changed)),
            "next": "pbz diff, pbz validate, then pbz push"}
     if refused:

@@ -17,12 +17,13 @@
     { "$ref": "#/$defs/snapshotSave" },
     { "$ref": "#/$defs/snapshotCompare" },
     { "$ref": "#/$defs/smoke" },
-    { "$ref": "#/$defs/deps" }
+    { "$ref": "#/$defs/deps" },
+    { "$ref": "#/$defs/synthQuery" }
   ],
   "$defs": {
     "verb": {
       "enum": ["ping", "connect", "health", "tmdl-validate", "refresh", "compiles", "index", "check", "probe",
-               "snapshot-save", "snapshot-compare", "smoke", "deps"]
+               "snapshot-save", "snapshot-compare", "smoke", "deps", "synth-query"]
     },
     "anyVerb": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_\\-]*$" },
     "errorClass": {
@@ -376,6 +377,23 @@
             }
           }
         }
+      }
+    },
+    "synthQuery": {
+      "description": "Rows of a query against a verified pbz synthetic model (fake data only); the one verb whose strings are not a closed vocabulary.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "columns", "rows", "truncated"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "synth-query" },
+        "columns": { "type": "array", "items": { "type": "string", "maxLength": 512 } },
+        "rows": {
+          "type": "array",
+          "maxItems": 500,
+          "items": { "type": "array", "items": { "type": ["string", "number", "boolean", "null"] } }
+        },
+        "truncated": { "type": "boolean" }
       }
     },
     "depsName": { "type": "string", "maxLength": 512, "pattern": "^[^\\u0000-\\u001f]*$" },

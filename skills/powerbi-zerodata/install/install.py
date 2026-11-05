@@ -2,11 +2,13 @@
 
   python install/install.py            apply
   python install/install.py --what-if  show what would change, change nothing
-  python install/install.py --uninstall
+  python install/install.py --mcp      also register the pbz MCP server for Claude Code and Codex
+  python install/install.py --uninstall  (also removes the MCP registrations)
 
 Steps: junctions into ~/.agents/skills and ~/.claude/skills; guard hooks in ~/.claude/settings.json
 and ~/.codex/hooks.json; Read deny rules for Power BI caches; a short rule block in
-~/.claude/CLAUDE.md and ~/.codex/AGENTS.md. Every file it edits is backed up first.
+~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; with --mcp, mcpServers.pbz in ~/.claude.json and
+[mcp_servers.pbz] in ~/.codex/config.toml. Every file it edits is backed up first.
 """
 from __future__ import annotations
 
@@ -25,6 +27,9 @@ CANON = LINKS[0]
 CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
 CODEX_HOOKS = os.path.join(HOME, ".codex", "hooks.json")
 RULE_FILES = [os.path.join(HOME, ".claude", "CLAUDE.md"), os.path.join(HOME, ".codex", "AGENTS.md")]
+CLAUDE_JSON = os.path.join(HOME, ".claude.json")
+CODEX_CONFIG = os.path.join(HOME, ".codex", "config.toml")
+MCP_NAME = "pbz"
 BEGIN, END = "<!-- powerbi-zerodata:begin -->", "<!-- powerbi-zerodata:end -->"
 DENY_RULES = [
     "Read(//**/.pbi/**)", "Read(//**/*.abf)", "Read(//**/*.abf.stale)",
@@ -160,9 +165,105 @@ def rule_block(path: str, what_if: bool, uninstall: bool) -> str:
     return f"{'removed block from' if uninstall else 'rule block ->'} {path}"
 
 
+def mcp_args() -> list[str]:
+    return ["-I", os.path.join(CANON, "pbz", "cli.py").replace("\\", "/"), "mcp"]
+
+
+def _ours(args) -> bool:
+    return isinstance(args, list) and any(str(a).replace("\\", "/").endswith("pbz/cli.py") for a in args) and "mcp" in args
+
+
+def merge_claude_mcp(data: dict, uninstall: bool) -> tuple[dict, str]:
+    """mcpServers.pbz in ~/.claude.json (user scope, like `claude mcp add --scope user`)."""
+    servers = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
+    cur = servers.get(MCP_NAME)
+    if cur is not None and not _ours(cur.get("args") if isinstance(cur, dict) else None):
+        return data, f"SKIP mcpServers.{MCP_NAME} exists and is not ours"
+    if uninstall:
+        if cur is None:
+            return data, "absent"
+        servers.pop(MCP_NAME)
+        if servers:
+            data["mcpServers"] = servers
+        else:
+            data.pop("mcpServers", None)
+        return data, "removed"
+    entry = {"type": "stdio", "command": python_exe(), "args": mcp_args(), "env": {}}
+    if cur == entry:
+        return data, "ok"
+    data["mcpServers"] = {**servers, MCP_NAME: entry}
+    return data, "registered"
+
+
+def _toml_str(s: str) -> str:
+    return json.dumps(s, ensure_ascii=False)  # a JSON string is a valid TOML basic string
+
+
+def merge_codex_toml(text: str, uninstall: bool) -> tuple[str, str]:
+    """[mcp_servers.pbz] in ~/.codex/config.toml, edited as text (stdlib has no TOML writer)."""
+    import re
+    header = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*(?:pbz|"pbz")\s*(?:\.[^\]]*)?\]\s*(?:#.*)?$')
+    lines = text.splitlines(keepends=True)
+    keep, section = [], []
+    in_ours = False
+    for ln in lines:
+        if ln.lstrip().startswith("["):
+            in_ours = bool(header.match(ln.rstrip("\r\n")))
+        (section if in_ours else keep).append(ln)
+    if section:
+        body = "".join(section).replace("\\\\", "/").replace("\\", "/")
+        if not ("pbz/cli.py" in body and '"mcp"' in body):
+            return text, f"SKIP [mcp_servers.{MCP_NAME}] exists and is not ours"
+    if uninstall:
+        if not section:
+            return text, "absent"
+        rest = "".join(keep).rstrip("\n")
+        return (rest + "\n" if rest else ""), "removed"
+    block = (f"[mcp_servers.{MCP_NAME}]\n"
+             f"command = {_toml_str(python_exe())}\n"
+             f"args = [{', '.join(_toml_str(a) for a in mcp_args())}]\n")
+    base = "".join(keep).rstrip("\n")
+    new = (base + "\n\n" if base else "") + block
+    if section and "".join(section).strip() == block.strip():
+        return text, "ok"
+    try:
+        import tomllib
+        tomllib.loads(new)
+    except ImportError:
+        pass
+    except Exception:
+        return text, "SKIP the result would not parse as TOML; add the block by hand"
+    return new, "registered" if not section else "updated"
+
+
+def mcp_step(what_if: bool, uninstall: bool) -> list[str]:
+    out = []
+    data = load_json(CLAUDE_JSON)
+    new, how = merge_claude_mcp(json.loads(json.dumps(data)), uninstall)
+    if new != data:
+        backup(CLAUDE_JSON, what_if)
+        save_json(CLAUDE_JSON, new, what_if)
+    out.append(f"{how} mcpServers.{MCP_NAME} -> {CLAUDE_JSON}")
+    try:
+        with open(CODEX_CONFIG, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    new_text, how = merge_codex_toml(text, uninstall)
+    if new_text != text:
+        backup(CODEX_CONFIG, what_if)
+        if not what_if:
+            os.makedirs(os.path.dirname(CODEX_CONFIG), exist_ok=True)
+            with open(CODEX_CONFIG, "w", encoding="utf-8", newline="\n") as f:
+                f.write(new_text)
+    out.append(f"{how} [mcp_servers.{MCP_NAME}] -> {CODEX_CONFIG}")
+    return out
+
+
 def main() -> int:
     what_if = "--what-if" in sys.argv
     uninstall = "--uninstall" in sys.argv
+    with_mcp = "--mcp" in sys.argv
     print(("WHAT-IF: " if what_if else "") + ("uninstall" if uninstall else "install") + f" {NAME} from {SKILL}")
     for link in LINKS:
         print(" ", junction(link, what_if, uninstall))
@@ -187,8 +288,14 @@ def main() -> int:
 
     for path in RULE_FILES:
         print(" ", rule_block(path, what_if, uninstall))
+    if with_mcp or uninstall:
+        for line in mcp_step(what_if, uninstall):
+            print(" ", line)
     if not uninstall:
         print(f"  hook command: {hook_cmd('claude')}")
+        if with_mcp:
+            print(f"  mcp server: {python_exe()} {' '.join(mcp_args())}  (Claude Code alternative: "
+                  f"claude mcp add --scope user {MCP_NAME} -- {python_exe()} {' '.join(mcp_args())})")
     return 0
 
 

@@ -11,7 +11,7 @@ from . import desktop, policy as policy_mod, tmdl, tokens, validate
 from .classify import Classifier
 from .common import PbzError, Project, Workspace, file_sha, read_text, sha, write_text
 
-SKIP_DIRS = {".pbi", "daxqueries", "tmdlscripts", "cultures", "customvisuals", "node_modules"}
+SKIP_DIRS = {".pbi", "daxqueries", "tmdlscripts", "customvisuals", "node_modules"}  # cultures: mirrored, see tokens
 JSON_EXT = (".json", ".pbir", ".pbism", ".platform")
 
 
@@ -266,13 +266,32 @@ def _object_summary(rel: str, old: str, new: str) -> list[str]:
     return out or [f"~ {rel} (formatting only)"]
 
 
-def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False) -> dict:
+def _select(ch: dict, only: list[str] | None) -> tuple[dict, list[str]]:
+    """Keep the pending changes whose mirror path matches one of `only` (globs, or a path prefix)."""
+    if not only:
+        return ch, []
+    import fnmatch
+    pats = [o.replace("\\", "/").strip("/") for o in only]
+
+    def hit(rel):
+        low = rel.lower()
+        return any(fnmatch.fnmatch(low, p.lower()) or low.startswith(p.lower() + "/") or low == p.lower()
+                   or fnmatch.fnmatch(low, "*/" + p.lower()) for p in pats)
+
+    picked = {k: [r for r in v if hit(r)] for k, v in ch.items()}
+    held = sorted(r for v in ch.values() for r in v if not hit(r))
+    return picked, held
+
+
+def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False,
+         only: list[str] | None = None) -> dict:
     man = load_manifest(ws, project)
     if not man:
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    ch = mirror_changes(ws, project, man)
+    ch, held = _select(mirror_changes(ws, project, man), only)
     if not any(ch.values()):
-        return {"verb": "push", "project": project.name, "result": "NOTHING_TO_PUSH"}
+        return {"verb": "push", "project": project.name, "result": "NOTHING_TO_PUSH",
+                **({"held_back": held} if held else {})}
     files = man.get("files", {})
     touched = ch["changed"] + ch["added"] + ch["deleted"]
     conflicts = []
@@ -336,7 +355,11 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
             summary += _object_summary(rel, old, new)
         if errors or dry_run:
             return {"verb": "push", "project": project.name, "result": "INVALID" if errors else "DRY_RUN_OK",
-                    "objects": summary, "findings": findings}
+                    "objects": summary, "findings": findings, **({"held_back": held} if held else {})}
+        authored_before = {rel: (read_text(os.path.join(base_dir(ws, project), *rel.split("/")))[0]
+                                 if os.path.exists(os.path.join(base_dir(ws, project), *rel.split("/"))) else None)
+                           for rel in ch["changed"] + ch["added"]}
+        authored_after = {rel: read_text(os.path.join(ws.mirror, *rel.split("/")))[0] for rel in ch["changed"] + ch["added"]}
         backup = os.path.join(ws.private, "backups", stamp)
         for rel in ch["changed"] + ch["deleted"]:
             real = _real_path(ws, rel)
@@ -361,8 +384,12 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
         save_manifest(ws, project, man)
         _log_push(ws, project, stamp, summary)
         snapshot(ws, project, "push")
+        from .checks import record_authored
+        record_authored(ws, authored_before, authored_after)
         result = {"verb": "push", "project": project.name, "result": "PUSHED", "objects": summary,
                   "findings": findings, "backup": stamp}
+        if held:
+            result["held_back"] = held  # still pending in the mirror
         if reload and open_inst:
             result["reload"] = desktop.reload(project)
         return result
@@ -372,6 +399,85 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
 
 def _real_path(ws: Workspace, rel: str) -> str:
     return os.path.join(ws.root, *rel.split("/"))
+
+
+def revert(ws: Workspace, project: Project, paths: list[str] | None = None, obj: str | None = None) -> dict:
+    """Discard mirror edits: whole files back to the last pulled / pushed text (`paths`, globs allowed), or
+    one TMDL object (`obj` = "measure 'Table'[Name]" style: kind, table, name) back to its base block."""
+    man = load_manifest(ws, project)
+    if not man:
+        raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    bdir = base_dir(ws, project)
+    if obj:
+        return _revert_object(ws, project, bdir, obj)
+    ch, _held = _select(mirror_changes(ws, project, man), paths or ["*"])
+    done = []
+    for rel in ch["changed"] + ch["deleted"]:
+        bp = os.path.join(bdir, *rel.split("/"))
+        if not os.path.exists(bp):
+            continue
+        text, bom = read_text(bp)
+        write_text(os.path.join(ws.mirror, *rel.split("/")), text, bom)
+        done.append(rel)
+    for rel in ch["added"]:
+        os.remove(os.path.join(ws.mirror, *rel.split("/")))
+        done.append(rel)
+    return {"verb": "revert", "project": project.name, "files": sorted(done),
+            "result": "REVERTED" if done else "NOTHING_TO_REVERT"}
+
+
+def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict:
+    import re as _re
+    m = _re.match(r"^\s*(measure|column|hierarchy|partition|calculationItem)\s+(?:'((?:[^']|'')+)'|([^\s\[]+))\s*\[(.+)\]\s*$", obj)
+    if not m:
+        raise PbzError("BAD_REQUEST", "object as: measure 'Table'[Name] (kinds: measure column hierarchy partition calculationItem)")
+    kind, table, name = m.group(1), (m.group(2) or m.group(3)).replace("''", "'"), m.group(4)
+    mdef = os.path.join(project.mirror_model, "definition")
+    bdef = os.path.join(bdir, project.name + ".SemanticModel", "definition")
+
+    def find(model):
+        for rel, doc in model.docs.items():
+            for n in doc.nodes:
+                owner = n.parent.parent if kind == "calculationItem" and n.parent is not None else n.parent
+                if n.kind == kind and n.name.lower() == name.lower() and owner is not None \
+                        and owner.kind == "table" and owner.name.lower() == table.lower():
+                    return rel, doc, n
+        return None
+
+    mine = find(tmdl.load_model(mdef))
+    base = find(tmdl.load_model(bdef)) if os.path.isdir(bdef) else None
+    if mine is None and base is None:
+        raise PbzError("NOT_FOUND", obj)
+    if base is None:  # added since the last pull: drop it
+        rel, doc, n = mine
+        new = apply_block(doc.text, tmdl.block_span(doc, n), "")
+    elif mine is None:  # deleted in the mirror: put the base block back at the end of its table
+        rel, bdoc, bn = base
+        mt = tmdl.load_model(mdef)
+        tdoc = next((d for r, d in mt.docs.items() if r == rel), None)
+        if tdoc is None:
+            raise PbzError("NOT_FOUND", f"table file {rel} (revert the whole file instead)")
+        tnode = next(x for x in tdoc.nodes if x.kind == "table" and x.parent is None)
+        s, e = tmdl.block_span(bdoc, bn)
+        end = tmdl.block_span(tdoc, tnode)[1]
+        block = bdoc.text[s:e]
+        body = tdoc.text[:end].rstrip("\r\n")
+        eol = "\r\n" if "\r\n" in tdoc.text else "\n"
+        new = body + eol + eol + block.rstrip("\r\n") + eol + tdoc.text[end:]
+        doc = tdoc
+    else:
+        rel, doc, n = mine
+        _brel, bdoc, bn = base
+        new = apply_block(doc.text, tmdl.block_span(doc, n), bdoc.text[slice(*tmdl.block_span(bdoc, bn))])
+    path = os.path.join(mdef, *rel.split("/"))
+    _t, bom = read_text(path)
+    write_text(path, new, bom)
+    return {"verb": "revert", "project": project.name, "object": f"{kind} {table}[{name}]",
+            "result": "REVERTED", "files": [f"{project.name}.SemanticModel/definition/{rel}"]}
+
+
+def apply_block(text: str, span: tuple[int, int], new: str) -> str:
+    return text[:span[0]] + new + text[span[1]:]
 
 
 # ---------------------------------------------------------------- mirror history (sanitized snapshots)

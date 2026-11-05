@@ -37,7 +37,8 @@ def blocks() -> dict[str, list[str]]:
 class Runner:
     def __init__(self, ws: str, private_root: str):
         self.ws = ws
-        self.env = {**os.environ, "PBZ_PRIVATE_ROOT": private_root, "PYTHONUTF8": "1"}
+        self.synth_root = os.path.join(os.path.dirname(private_root), "synth")  # keep `pbz synth` inside the temp dir
+        self.env = {**os.environ, "PBZ_PRIVATE_ROOT": private_root, "PBZ_SYNTH_ROOT": self.synth_root, "PYTHONUTF8": "1"}
         self.outputs: list[str] = []
         self.log: list[str] = []
 
@@ -77,7 +78,7 @@ def close_desktop(r: Runner) -> None:
 
 def visible_text(r: Runner) -> str:
     parts = list(r.outputs)
-    for base in (os.path.join(r.ws, "pbz-workspace"), os.path.join(r.ws, ".pbz")):
+    for base in (os.path.join(r.ws, "pbz-workspace"), os.path.join(r.ws, ".pbz"), r.synth_root):  # synth is agent-readable
         for cur, _d, files in os.walk(base):
             for f in files:
                 with open(os.path.join(cur, f), encoding="utf-8", errors="replace") as fh:
@@ -193,6 +194,13 @@ def main() -> int:
                       ("slicer", "--field", "'Project'[Status]")):
             res = r.pbz("add", "visual", vargs[0], "--page", "E2E Page", *vargs[1:])
             expect(res.get("verb") == "add" and res.get("placement") == "free_spot", f"add visual {vargs[0]}: {res}")
+        for args in (("culture", "add", "fr-FR"), ("translate", "fr-FR", "Hours", "--caption", "Heures"),
+                     ("translate", "fr-FR", "[Total Hours]", "--caption", "Heures totales"),
+                     ("perspective", "add", "E2E View"), ("perspective", "include", "E2E View", "Project", "[Total Hours]"),
+                     ("role", "add", "E2E Role"), ("role", "filter", "E2E Role", "Project", "[Status] = \"Active\""),
+                     ("refresh-policy", "show"), ("synth", "build")):
+            res = r.pbz(*args)
+            expect(res.get("verb") and res.get("ok") is not False, f"{' '.join(args)}: {res}")
         res = r.pbz("validate")
         expect(not [f for f in res.get("findings", []) if f.get("severity") == "error"], f"validate after authoring: {res}")
         tdir = os.path.join(ws_dir, "pbz-workspace", "Canary.SemanticModel", "definition", "tables")

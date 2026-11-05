@@ -63,6 +63,7 @@ public static class Program
         "snapshot-compare" => Snapshots.Compare(req, ctx),
         "smoke" => Smoke.Run(req, ctx),
         "deps" => Deps.Run(req, ctx),
+        "synth-query" => SynthQuery.Run(req, ctx),
         _ => throw new BadRequestException("unknown verb"),
     };
 

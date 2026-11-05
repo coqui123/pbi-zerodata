@@ -384,11 +384,33 @@ def _num_value(text: str):
             return text
 
 
+TRANSLATED_PROPS = ("caption", "description", "displayFolder")
+
+
 def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
     doc = tmdl.parse(relpath, text)
     edits: list[tuple[int, int, str]] = []
+    if relpath.lower().startswith("cultures/"):
+        # Q&A linguistic schema (synonyms, phrasings, examples) can be data-derived: one opaque payload.
+        # Translated captions, descriptions and folders are names, still screened as free text.
+        lines = doc.text.splitlines(keepends=True)
+        pos = 0
+        for raw_line in lines:
+            line = raw_line.rstrip("\r\n")
+            m = tmdl.PROP_RE.match(line)
+            if m and m.group("prop") in TRANSLATED_PROPS:
+                vs = pos + m.start("val")
+                val = m.group("val")
+                for s, e, lab in clf.free_text(val, numbers=m.group("prop") == "description"):
+                    edits.append((vs + s, vs + e, tm.raw(lab, val[s:e], "tmdl")))
+            pos += len(raw_line)
     for reg in doc.regions:
         seg = text[reg.start:reg.end]
+        if reg.node.kind == "linguisticMetadata":
+            lead = len(seg) - len(seg.lstrip(" \t"))
+            if seg[lead:].strip():
+                edits.append((reg.start + lead, reg.end, tm.raw("payload:linguisticMetadata", seg[lead:], "tmdl")))
+            continue
         if reg.kind in ("dax", "m"):
             toks = (lexers.lex_dax if reg.kind == "dax" else lexers.lex_m)(seg, reg.start)
             sig = lexers.significant(toks)

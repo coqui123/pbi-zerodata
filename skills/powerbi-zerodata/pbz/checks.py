@@ -21,16 +21,97 @@ def _state_path(ws) -> str:
     return os.path.join(ws.private, "state.json")
 
 
+LEDGER_DAYS = 30
+DAILY = {"checks": ("session_checks", 300), "probes": ("probes_per_day", 100),
+         "snapshot_queries": ("snapshot_queries_per_day", 200), "smoke": ("smoke_runs_per_day", 50)}
+
+
 def _load_state(ws) -> dict:
+    """Daily counters (reset each day) plus a persistent ledger: distinct constants per target fingerprint
+    for LEDGER_DAYS and hashes of literals the agent introduced through pushes."""
     today = dt.date.today().isoformat()
     try:
         with open(_state_path(ws), encoding="utf-8") as f:
             st = json.load(f)
     except (OSError, ValueError):
         st = {}
+    ledger = st.get("ledger") or {"constants": {}, "authored": []}
+    for th, hs in (st.get("constants") or {}).items():  # migrate the old daily constants
+        if st.get("day") == today:
+            ledger["constants"].setdefault(th, []).extend({"h": h, "day": today} for h in hs)
     if st.get("day") != today:
-        st = {"day": today, "checks": 0, "per_target": {}, "constants": {}}
+        st = {"day": today, "per_target": {}}
+    st.pop("constants", None)
+    for k in DAILY:
+        st.setdefault(k, 0)
+    cutoff = (dt.date.today() - dt.timedelta(days=LEDGER_DAYS)).isoformat()
+    ledger["constants"] = {th: [e for e in es if e.get("day", today) >= cutoff]
+                           for th, es in ledger["constants"].items()}
+    ledger["constants"] = {th: es for th, es in ledger["constants"].items() if es}
+    st["ledger"] = ledger
     return st
+
+
+def spend(ws, kind: str, n: int = 1) -> bool:
+    """Charge n units of a daily disclosure budget (checks, probes, snapshot_queries, smoke). False when spent."""
+    from . import policy as policy_mod
+    budgets = policy_mod.load(ws).get("budgets", {})
+    st = _load_state(ws)
+    key, default = DAILY[kind]
+    if st[kind] + n > int(budgets.get(key, default)):
+        return False
+    st[kind] += n
+    _save_state(ws, st)
+    return True
+
+
+def record_authored(ws, before: dict, after: dict) -> int:
+    """Remember (as hashes) the literals a push introduced into DAX / M, so later checks that reach them
+    through measure definitions count them as constants. before/after: {rel: sanitized text}."""
+    def lits(text: str, rel: str) -> set[str]:
+        out = set()
+        doc = tmdl.parse(rel, text)
+        for reg in doc.regions:
+            if reg.kind not in ("dax", "m"):
+                continue
+            for t in (lexers.lex_dax if reg.kind == "dax" else lexers.lex_m)(text[reg.start:reg.end]):
+                if t.kind == "str" and t.value and not tokens.TOKEN_RE.search(t.value):
+                    out.add(t.value)
+                elif t.kind == "num" and t.text not in ("0", "1"):
+                    out.add(t.text)
+        return out
+
+    new = set()
+    for rel, text in after.items():
+        if rel.lower().endswith(".tmdl") and text is not None:
+            new |= lits(text, rel) - (lits(before[rel], rel) if before.get(rel) else set())
+    if not new:
+        return 0
+    st = _load_state(ws)
+    authored = set(st["ledger"]["authored"]) | {_h(x) for x in new}
+    st["ledger"]["authored"] = sorted(authored)[-5000:]
+    _save_state(ws, st)
+    return len(new)
+
+
+def _reached_literals(model, res, expr: str, home: str) -> set[str]:
+    """Literals inside the definitions of every measure the expression reaches (transitively)."""
+    from . import deps
+    out, seen, todo = set(), set(), [(expr, home)]
+    while todo:
+        text, tab = todo.pop()
+        for t in lexers.significant(lexers.lex_dax(text)):
+            if t.kind == "str" and t.value and not tokens.TOKEN_RE.search(t.value):
+                out.add(t.value)
+            elif t.kind == "num":
+                out.add(t.text)
+        for ref in deps.dax(text, tab, res).refs:
+            if ref.kind == "measure" and (ref.table, ref.name) not in seen:
+                seen.add((ref.table, ref.name))
+                m = model.table(ref.table).measures.get(ref.name) if model.table(ref.table) else None
+                if m is not None:
+                    todo.append((m.expression, m.table))
+    return out
 
 
 def _save_state(ws, st: dict) -> None:
@@ -100,6 +181,11 @@ def run_checks(ws, project, spec: dict) -> dict:
     known = model_literals(project)
     real_model = tmdl.load_model(os.path.join(project.model_dir, "definition"))
     clf = Classifier(real_model, ws.private, pol)
+    from . import deps
+    mdef = os.path.join(project.mirror_model, "definition")
+    mmodel = tmdl.load_model(mdef) if os.path.isdir(mdef) else tmdl.Model()
+    mres = deps.Resolver(mmodel)
+    authored = set(st["ledger"]["authored"])
     results, to_engine, compiles_items, negate = [], [], [], set()
     for raw in spec.get("checks", []):
         cid = str(raw.get("id") or f"c{len(results) + len(to_engine) + len(compiles_items) + 1}")
@@ -121,9 +207,17 @@ def run_checks(ws, project, spec: dict) -> dict:
             if isinstance(w, str):
                 consts |= _constants(w)
         consts = {x for x in consts if x not in known}
-        seen_consts = set(st["constants"].get(th, []))
+        # literals the agent pushed into measures this target reaches count as constants too: editing a
+        # measure body must not turn a fixed check into a fresh guessing channel
+        for f in EXPR_FIELDS:
+            if isinstance(c.get(f), str):
+                consts |= {x for x in _reached_literals(mmodel, mres, c[f], next(iter(mmodel.tables), ""))
+                           if _h(x) in authored}
+        ledger = st["ledger"]["constants"].setdefault(th, [])
+        seen_consts = {e["h"] for e in ledger}
         if len(seen_consts | {_h(x) for x in consts}) > int(budgets.get("constants_per_target", 3)):
-            results.append({"id": cid, "status": "BUDGET", "note": "too many distinct constants against this target"})
+            results.append({"id": cid, "status": "BUDGET",
+                            "note": f"too many distinct constants against this target in {LEDGER_DAYS} days"})
             continue
         if st["checks"] >= int(budgets.get("session_checks", 300)) or \
                 st["per_target"].get(th, 0) >= int(budgets.get("per_target", 60)):
@@ -151,7 +245,7 @@ def run_checks(ws, project, spec: dict) -> dict:
             continue
         st["checks"] += 1
         st["per_target"][th] = st["per_target"].get(th, 0) + 1
-        st["constants"][th] = sorted(seen_consts | {_h(x) for x in consts})
+        ledger += [{"h": h, "day": st["day"]} for h in sorted({_h(x) for x in consts} - seen_consts)]
         if c.get("_negate"):
             negate.add(cid)
         if out["kind"] == "compiles":
@@ -235,6 +329,8 @@ def health(ws, project) -> dict:
 
 def probe(ws, project, table: str, columns: list[str] | None) -> dict:
     pol = policy_mod.load(ws)
+    if not spend(ws, "probes"):
+        return {"verb": "probe", "status": "BUDGET", "note": "daily probe budget reached; the user can reset it"}
     port = desktop.require_port(project)
     req = {"private_dir": ws.private, "port": port, "table": table, "disclosure": pol.get("disclosure", "shape")}
     if columns:
@@ -330,6 +426,8 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
             raise PbzError("BAD_REQUEST", "unknown token in query " + str(q.get("id")))
         queries.append({"id": q.get("id"), "dax": dax, "keys": q.get("keys", [])})
     verb = "snapshot-save" if action == "save" else "snapshot-compare"
+    if not spend(ws, "snapshot_queries", max(1, len(queries))):
+        return {"verb": verb, "status": "BUDGET", "note": "daily snapshot query budget reached; the user can reset it"}
     res = engine_call(verb, {"private_dir": ws.private, "port": port, "name": name, "queries": queries}, timeout=1800)
     if not res.get("ok"):
         raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))

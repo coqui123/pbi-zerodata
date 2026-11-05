@@ -613,8 +613,7 @@ def main() -> int:
     rm = unused.remove(ws, project)
     outputs.append(rm)
     gone = set(rm["removed"])
-    check("measure [Sales Copy]" not in gone and any(s["object"].startswith("measure [Sales Copy]") and "translation" in s["reason"]
-                                                     for s in rm["skipped"]), f"translated measure removed: {rm['skipped']}")
+    check("measure [Sales Copy]" in gone, f"translated measure not removed: {rm['skipped']}")
     for want in ("measure [Top Unused]", "measure [Named Sales]", "table Orphan", "m_query Staging",
                  "relationship Sales[DueDateKey] -> Date[Date]", "column Sales[Comment]", "column Customer[Unused Col]",
                  "report_measure [Dead RM]", "custom_visual denebViz0000000000000000"):
@@ -627,8 +626,10 @@ def main() -> int:
     check("ref table Orphan" not in mt["Parity.SemanticModel/definition/model.tmdl"]
           and '"Orphan"' not in mt["Parity.SemanticModel/definition/model.tmdl"], "model.tmdl ref / query order not pruned")
     persp = mt["Parity.SemanticModel/definition/perspectives/Sales View.tmdl"]
-    check("Orphan" not in persp and "Comment" not in persp and "Total Sales" in persp and "Sales Copy" in persp,
+    check("Orphan" not in persp and "Comment" not in persp and "Total Sales" in persp and "Sales Copy" not in persp,
           "perspective not pruned (or a kept object pruned)")
+    culture = mt["Parity.SemanticModel/definition/cultures/de-DE.tmdl"]
+    check("Sales Copy" not in culture and "cultureInfo de-DE" in culture, "translation of a removed measure not pruned")
     check("Dead RM" not in mt["Parity.Report/definition/reportExtensions.json"]
           and "Report Margin" in mt["Parity.Report/definition/reportExtensions.json"], "report measure not removed")
     json.loads(mt["Parity.Report/definition/reportExtensions.json"])

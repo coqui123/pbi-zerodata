@@ -107,6 +107,10 @@ def main(argv=None) -> int:
     p = sub.add_parser("push")
     p.add_argument("--reload", action="store_true", help="report-only change: reload the open Desktop")
     p.add_argument("--dry-run", action="store_true", help="validate only")
+    p.add_argument("--only", nargs="+", metavar="PATH", help="push only these mirror files (globs or folder prefixes)")
+    p = sub.add_parser("revert", help="discard mirror edits: files back to the last pull / push, or one object")
+    p.add_argument("paths", nargs="*", help="mirror files (globs, folder prefixes); default all")
+    p.add_argument("--object", help="one TMDL object: measure 'Table'[Name] (also column, hierarchy, partition, calculationItem)")
     p = sub.add_parser("rename")
     p.add_argument("kind", choices=["measure", "column", "table"])
     p.add_argument("old")
@@ -220,6 +224,42 @@ def main(argv=None) -> int:
     p.add_argument("kind", choices=["measure"])
     p.add_argument("name")
     p.add_argument("--to", required=True, help="target table")
+    p = sub.add_parser("culture", help="add, remove, list cultures; list objects missing a caption")
+    p.add_argument("action", choices=["add", "remove", "list", "missing"])
+    p.add_argument("code", nargs="?", help="culture code, e.g. de-DE")
+    p = sub.add_parser("translate", help="set a translated caption, description or display folder")
+    p.add_argument("code", help="culture code")
+    p.add_argument("target", help="Table, 'Table'[Column], [Measure] or 'Table'[Hierarchy]")
+    p.add_argument("--caption")
+    p.add_argument("--description")
+    p.add_argument("--folder")
+    p = sub.add_parser("perspective", help="add, remove, include or exclude objects in a perspective")
+    p.add_argument("action", choices=["add", "remove", "include", "exclude"])
+    p.add_argument("name")
+    p.add_argument("targets", nargs="*", help="Table, 'T'[Column], [Measure] or T.Hierarchy")
+    p = sub.add_parser("role", help="security roles: add, remove, filter, unfilter, member-add, member-remove")
+    p.add_argument("action", choices=["add", "remove", "filter", "unfilter", "member-add", "member-remove"])
+    p.add_argument("name", help="role name")
+    p.add_argument("args", nargs="*", help="filter: <table> \"<DAX>\"; unfilter: <table>; member-*: <member or token>")
+    p.add_argument("--permission", default="read")
+    p = sub.add_parser("refresh-policy", help="incremental refresh: set, remove or show a table's policy")
+    p.add_argument("action", choices=["set", "remove", "show"])
+    p.add_argument("table", nargs="?")
+    p.add_argument("--date", help="set: dateTime column to filter on")
+    p.add_argument("--store", type=int, help="set: archive window length")
+    p.add_argument("--store-unit", default="year", choices=["day", "month", "quarter", "year"])
+    p.add_argument("--refresh", type=int, help="set: incremental window length")
+    p.add_argument("--refresh-unit", default="day", choices=["day", "month", "quarter", "year"])
+    p.add_argument("--detect", help="set: column whose maximum detects changed periods")
+    p.add_argument("--complete", action="store_true", help="set: only refresh complete periods")
+    p.add_argument("--hybrid", action="store_true", help="set: latest period in DirectQuery (Premium)")
+    sub.add_parser("mcp", help="serve pbz verbs as MCP tools over stdio (for agent hosts)")
+    p = sub.add_parser("synth", help="synthetic test copy of the model with fake data (query it freely)")
+    p.add_argument("action", choices=["build", "status", "open", "close", "query", "remove"])
+    p.add_argument("dax", nargs="?", help="query: an EVALUATE statement (synthetic model only)")
+    p.add_argument("--rows", type=int, default=200, help="build: rows per fact table")
+    p.add_argument("--seed", type=int, default=7, help="build: random seed")
+    p.add_argument("--wait", type=int, default=480)
     p = sub.add_parser("format", help="format DAX (measures, calculated columns, calculation items), token-safe")
     p.add_argument("target", nargs="?", help="one measure or column name (default: all)")
     p.add_argument("--apply", action="store_true", help="write the formatting (default: check only)")
@@ -234,6 +274,9 @@ def main(argv=None) -> int:
     p.add_argument("action", choices=["budget-reset", "allow", "category", "synthetic", "log"])
     p.add_argument("value", nargs="?")
     a = ap.parse_args(argv)
+    if a.cmd == "mcp":
+        from pbz import mcp
+        return mcp.serve(a.workspace, a.project)
     try:
         ws = find_workspace(a.workspace)
         project = ws.project(a.project) if a.cmd not in ("scan", "admin", "memscrub") or ws.projects else None
@@ -248,7 +291,9 @@ def main(argv=None) -> int:
         elif a.cmd == "diff":
             out = mirror.diff(ws, project, patch=a.patch)
         elif a.cmd == "push":
-            out = mirror.push(ws, project, reload=a.reload, dry_run=a.dry_run)
+            out = mirror.push(ws, project, reload=a.reload, dry_run=a.dry_run, only=a.only)
+        elif a.cmd == "revert":
+            out = mirror.revert(ws, project, a.paths or None, a.object)
         elif a.cmd == "rename":
             out = rename.rename(ws, project, a.kind, a.old, a.new, a.table)
         elif a.cmd == "describe":
@@ -345,6 +390,55 @@ def main(argv=None) -> int:
         elif a.cmd == "move":
             from pbz import move
             out = move.move_measure(ws, project, a.name, a.to)
+        elif a.cmd in ("culture", "translate", "perspective", "role"):
+            from pbz import governance as gv
+            if a.cmd == "culture":
+                if a.action != "list" and not a.code:
+                    raise PbzError("BAD_REQUEST", "culture code required")
+                out = {"add": gv.culture_add, "remove": gv.culture_remove, "missing": gv.culture_missing}[a.action](
+                    ws, project, a.code) if a.action != "list" else gv.culture_list(ws, project, a.code)
+            elif a.cmd == "translate":
+                out = gv.translate(ws, project, a.code, a.target, a.caption, a.description, a.folder)
+            elif a.cmd == "perspective":
+                if a.action == "add":
+                    out = gv.perspective_add(ws, project, a.name)
+                elif a.action == "remove":
+                    out = gv.perspective_remove(ws, project, a.name)
+                else:
+                    out = gv.perspective_edit(ws, project, a.name, a.targets, a.action == "include")
+            else:
+                if a.action == "add":
+                    out = gv.role_add(ws, project, a.name, a.permission)
+                elif a.action == "remove":
+                    out = gv.role_remove(ws, project, a.name)
+                elif a.action == "filter":
+                    if len(a.args) != 2:
+                        raise PbzError("BAD_REQUEST", "role filter <name> <table> \"<DAX>\"")
+                    out = gv.role_filter(ws, project, a.name, a.args[0], a.args[1])
+                elif a.action == "unfilter":
+                    if len(a.args) != 1:
+                        raise PbzError("BAD_REQUEST", "role unfilter <name> <table>")
+                    out = gv.role_filter(ws, project, a.name, a.args[0], None)
+                else:
+                    if len(a.args) != 1:
+                        raise PbzError("BAD_REQUEST", "role member-add|member-remove <name> <member>")
+                    out = gv.role_member(ws, project, a.name, "add" if a.action == "member-add" else "remove", a.args[0])
+        elif a.cmd == "refresh-policy":
+            from pbz import refreshpolicy as rp
+            if a.action == "show":
+                out = rp.show(ws, project, a.table)
+            elif not a.table:
+                raise PbzError("BAD_REQUEST", "table required")
+            elif a.action == "remove":
+                out = rp.remove_policy(ws, project, a.table)
+            else:
+                if not (a.date and a.store and a.refresh):
+                    raise PbzError("BAD_REQUEST", "set needs --date, --store and --refresh")
+                out = rp.set_policy(ws, project, a.table, a.date, a.store, a.store_unit, a.refresh, a.refresh_unit,
+                                    a.detect, a.complete, a.hybrid)
+        elif a.cmd == "synth":
+            from pbz import synth
+            out = synth.run(ws, project, a)
         elif a.cmd == "format":
             from pbz import daxfmt
             out = daxfmt.run(ws, project, apply=a.apply, target=a.target)

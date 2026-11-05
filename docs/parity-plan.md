@@ -61,6 +61,24 @@ reviews raised, kept as roadmap items: a schema-driven allowlist tokenizer inste
 classifier, a disclosure ledger shared across sessions and query shapes for engine checks, and
 OS-level isolation in addition to the hook.
 
+## Round 3 (2026-11-05): the deferred items
+
+- Cultures are mirrored (linguistic schema as one payload token); `culture`, `translate`; rename /
+  move / remove keep translations in step (removes the earlier "manual: has translations" limit).
+- `perspective` and `role` editors; measure and column renames now also rename perspective
+  membership (a gap TOM caught in testing), and moving a measure moves it.
+- `refresh-policy set|remove|show` for incremental refresh.
+- `push --only` (selective, validated together with the real files) and `revert` (files or one object).
+- `synth`: synthetic model built from the mirror with fake rows; engine verb `synth-query` (contract
+  v1.3) answers only for a model carrying the HMAC marker of its own lineage tags; push refuses the
+  marker in a real model.
+- `mcp`: stdio MCP server exposing the verbs as typed tools; `install.py --mcp` registers it.
+- Safety: `"literals": "strict"` policy; disclosure ledger (30-day constants per target including
+  literals pushed into reached measures; daily budgets for checks, probes, snapshot queries, smoke);
+  heuristic name detection no longer shielded by a capitalized common word next to a name.
+- OS-level isolation is documented as a hardening tier for the machine owner
+  (`reference/leak-vectors.md`); pbz does not change security settings itself.
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,

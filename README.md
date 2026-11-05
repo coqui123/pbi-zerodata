@@ -17,6 +17,13 @@ without company data entering the agent's context.
 - Refactoring and authoring verbs (mirror edits, validated on push): `rename table`, `move measure`,
   `new` (measure table, date table, calculation group, field parameter), `relationship`,
   `add page|visual`, `layout`, `format`, `repair`. Usage: `reference/authoring.md`.
+- Governance and refresh editors: `culture`, `translate`, `perspective`, `role`, `refresh-policy`;
+  `push --only` and `revert`. Usage: `reference/governance.md`.
+- `synth`: a synthetic copy of the model with fake data that agents may query freely
+  (`reference/synth.md`); `mcp`: the same verbs as typed MCP tools (`reference/mcp.md`, register with
+  `install.py --mcp`).
+- Safety: optional `"literals": "strict"` policy (hide every literal by default) and a 30-day
+  disclosure ledger for engine checks; OS-level hardening steps in `reference/leak-vectors.md`.
 - Self-contained at runtime: no third-party binaries (no Measure Killer, Tabular Editor, DAX Studio or
   Bravo); built-in three-way merge and PBIR integrity checks; Microsoft's npm CLIs are optional.
 
@@ -42,6 +49,9 @@ python skills/powerbi-zerodata/tests/test_tools.py     # similar, changes, docs
 python skills/powerbi-zerodata/tests/test_refactor.py  # rename table, move measure, layout, bpa --fix
 python skills/powerbi-zerodata/tests/test_authoring.py # scaffolds, relationships, pages/visuals, repair
 python skills/powerbi-zerodata/tests/test_selfcontained.py # built-in merge and PBIR checks, no external binaries
+python skills/powerbi-zerodata/tests/test_governance.py # cultures, perspectives, roles, refresh policy, ledger, strict
+python skills/powerbi-zerodata/tests/test_mcp.py        # MCP server over stdio
+python skills/powerbi-zerodata/tests/test_synth.py      # synthetic model (add --live to open it in Desktop)
 python skills/powerbi-zerodata/tests/test_engine.py    # engine verbs + canary scan (needs Desktop)
 python skills/powerbi-zerodata/tests/test_e2e.py       # every verb on a fixture copy in Desktop, canary scan
 ```

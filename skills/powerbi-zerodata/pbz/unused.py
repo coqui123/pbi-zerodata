@@ -26,7 +26,11 @@ def _index_summary(ws) -> dict:
 
 
 def translated(project) -> set[tuple]:
-    """Keys of objects with translations in the real cultures/ files (never mirrored). Names only."""
+    """Keys of objects with translations in real culture files the mirror does not hold yet (mirrors
+    pulled before cultures were mirrored): those removals stay manual. Names only."""
+    from .governance import cultures_mirrored
+    if cultures_mirrored(project):
+        return set()  # translations are pruned in the mirror together with the object
     out = set()
     cdir = os.path.join(project.model_dir, "definition", "cultures")
     for f in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
@@ -423,6 +427,11 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
     for rel, d in docs.items():
         res = d.result()
         out[mroot + rel if rel in model.docs else rel] = res
+    from .governance import culture_edits_drop
+    gone = [(g.objects[k].kind, g.objects[k].table, g.objects[k].name) for k in todo
+            if g.objects[k].kind in ("table", "column", "measure", "hierarchy")]
+    for rel, text in culture_edits_drop(os.path.join(project.mirror_model, "definition"), gone).items():
+        out[mroot + rel] = text
     _plan_report(ws, project, g, todo, rep, out)
     return out
 

@@ -55,9 +55,15 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
     for rel, doc in model.docs.items():
         text = doc.text
         edits = []
+        pkind = {"measure": "perspectiveMeasure", "column": "perspectiveColumn"}[kind]
         for node in doc.nodes:
             if node.kind == kind and node.name.lower() == old.lower() and node.parent and node.parent.name == home:
                 e = _decl_edit(text, node, kind, new)
+                if e:
+                    edits.append(e)
+            elif node.kind == pkind and node.name.lower() == old.lower() and node.parent is not None \
+                    and node.parent.name.lower() == home.lower():  # perspective membership follows the rename
+                e = _decl_edit(text, node, pkind, new)
                 if e:
                     edits.append(e)
         for reg in doc.regions:
@@ -119,6 +125,8 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         if edits:
             write_text(path, apply_edits(text, edits), bom)
             changed.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
+    from .governance import culture_edits_rename
+    changed += [f"{project.name}.SemanticModel/definition/{r}" for r in culture_edits_rename(mdef, kind, home, old, new)]
     return {"verb": "rename", "kind": kind, "table": home, "from": old, "to": new, "files": changed,
             "next": "pbz diff, then pbz push"}
 
@@ -137,9 +145,10 @@ def _m_ident(new: str) -> str:
 
 
 def translated_names(project) -> set[str]:
-    """Lower-case names of objects with translations in the real (never mirrored) culture files."""
+    """Lower-case names of objects with translations in real culture files the mirror lacks."""
     from .unused import translated
-    return {k[2] for k in translated(project)} | {k[1] for k in translated(project) if k[1]}
+    keys = translated(project)
+    return {k[2] for k in keys} | {k[1] for k in keys if k[1]}
 
 
 def rename_table(ws, project, model, old: str, new: str) -> dict:
@@ -258,6 +267,8 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         if edits:
             write_text(path, apply_edits(text, sorted(set(edits))), bom)
             changed.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
+    from .governance import culture_edits_rename
+    changed += [f"{project.name}.SemanticModel/definition/{r}" for r in culture_edits_rename(mdef, "table", "", old, new)]
     out = {"verb": "rename", "kind": "table", "from": old, "to": new, "files": sorted(set(changed)),
            "next": "pbz diff, pbz validate, then pbz push"}
     if renamed_file:

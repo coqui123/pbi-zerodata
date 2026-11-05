@@ -16,7 +16,7 @@ DECL_KINDS = {
     "perspectiveColumn", "perspectiveMeasure", "perspectiveHierarchy", "culture", "linguisticMetadata",
     "dataSource", "queryGroup", "ref", "function", "calendar", "calendarColumnGroup", "variation",
     "objectTranslation", "alternateOf", "refreshPolicy", "formatStringDefinition", "detailRowsDefinition",
-    "kpi",
+    "kpi", "cultureInfo", "translations",
 }
 # Known expression properties. Any other `name = value` property line is ALSO treated as an
 # expression region (fail closed), so its literals are tokenized like the rest.

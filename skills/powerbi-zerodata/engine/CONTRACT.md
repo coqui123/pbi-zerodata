@@ -223,6 +223,21 @@ must equal a TMSCHEMA object name (table, column, measure, hierarchy, partition,
 becomes `"?"`; each type must match `^[A-Z_]{1,40}$` or it becomes `"?"`. Duplicate rows are dropped.
 Used by `pbz unused --verify-engine` to cross-check the metadata parser; never the primary source.
 
+## v1.3 addition: `synth-query`
+
+Request `{"private_dir", "port", "dax": "EVALUATE ...", "max_rows": 500}`. Response `{"ok": true,
+"verb": "synth-query", "columns": ["..."], "rows": [[...]], "truncated": false}`: the only verb that
+returns values, and only for a model built by `pbz synth build` (fake data from the sanitized mirror).
+Before evaluating, the engine requires (a) that every partition of every user table is calculated or a
+calculation group (TMSCHEMA_PARTITIONS `Type` 2 or 7), and (b) that the model annotation `PBZ_SYNTHETIC`
+(TMSCHEMA_ANNOTATIONS, object type Model) equals `hmac("pbz-synthetic:" + ",".join(sorted lineage tags))`
+over the non-private tables (TMSCHEMA_TABLES `LineageTag`; `IsPrivate`, `ShowAsVariationsOnly` and
+`LocalDateTable_*` / `DateTableTemplate_*` excluded), with the key in `private_dir`. Lineage tags are
+regenerated for each synthetic build and `pbz push` refuses the annotation (SYNTHETIC_MARKER_IN_REAL_MODEL),
+so the marker cannot be moved onto a real model. Otherwise `BAD_REQUEST` and no rows. The query must pass
+the same guard as snapshot / smoke (DEFINE or EVALUATE first, no INFO.* or EVALUATEANDLOG). Rows are capped at
+500; DateTime values are `yyyy-MM-ddTHH:mm:ss` strings.
+
 Implementation clarifications that callers must know (response container names, the blank group
 key, optional `timeout_s`, stricter message scrubbing, query guards) are listed in
 `engine/README.md` under "Contract deviations and clarifications".

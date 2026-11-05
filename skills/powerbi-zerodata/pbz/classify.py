@@ -76,6 +76,9 @@ def is_id_column(column: str) -> bool:
 
 
 PII_VALUE = re.compile(r"(?i)^[\w.+'-]+@[\w-]+(\.[\w-]+)+$|^\+?[\d\s().-]{10,}$")
+# format patterns stay readable under the strict literal policy (FORMAT() codes, number formats)
+FORMATISH = re.compile(r"(?i)^(?:(?:yyyy|yy|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|nn|ss|s|q|am/pm|a/p|tt)[\s\-/.:,]*)+$"
+                       r"|^[#0.,%\s$€£¥+()\-]+$|^(?:general|long|short) (?:date|time)$|^(?:true|false)$")
 PII_IN_TEXT = re.compile(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+")
 NAME_LIKE = re.compile(r"^[A-Z][a-z'À-ɏ-]+(?: [A-Z][a-z'À-ɏ.-]+){1,3}$")
 WORD_RE = re.compile(r"[A-Za-z0-9À-ɏ][\w'&.À-ɏ-]*")
@@ -177,10 +180,16 @@ class Classifier:
         self.category_cols = {c.lower() for c in self.policy.get("category_columns", [])}
         self.model_words: set[str] = set()
         self.model_names: set[str] = set()
+        # policy "literals": "strict" hides by default: every literal is tokenized unless it is a known
+        # category label, a model object / source column name, a format pattern or one or two characters
+        self.strict = self.policy.get("literals") == "strict"
         if model is not None:
             for name in model.object_names():
                 self.model_names.add(name.strip().lower())
                 self.model_words |= {w.lower() for w in WORD_RE.findall(name)}
+            for c in model.all_columns():
+                if c.source_column:
+                    self.model_names.add(c.source_column.strip().lower())
         # Unbound-text recognizers: only sensitive person / identifier / title columns qualify.
         # Category labels, free-text columns and numbers or dates stored as text never do.
         self.col_kind: dict[str, str] = {}
@@ -283,6 +292,8 @@ class Classifier:
         """Token label for a literal that must be hidden, or None to keep it."""
         if vtype == "string" and isinstance(value, str) and PII_VALUE.match(value.strip()):
             return "pii"
+        if self.strict:
+            return self._strict_literal(value, vtype, column)
         if column:
             cls = self.column_class(*column)
             if cls == "sensitive":
@@ -299,6 +310,25 @@ class Classifier:
                 return hit
             if self.mode == "heuristic" and self._person_like(value):
                 return "lit"
+        return None
+
+    def _strict_literal(self, value, vtype: str, column: tuple | None) -> str | None:
+        cls = self.column_class(*column) if column else None
+        if vtype == "string" and isinstance(value, str):
+            s = value.strip()
+            if not s or len(s) <= 2 or s.lower() in self.model_names or FORMATISH.match(s):
+                return None
+            if column and cls == "category" and self.mode == "index":
+                vals = self.category_values(*column) or []
+                if s in vals:
+                    return None  # a label the engine index has seen as a category value
+            return self.label(*column) if column else "lit"
+        if vtype == "number" and column and cls not in ("date",):
+            try:
+                small = float(value) == int(float(value)) and 0 <= float(value) <= 31
+            except (TypeError, ValueError):
+                small = False
+            return None if small else self.label(*column)
         return None
 
     def _person_like(self, value: str) -> bool:
@@ -341,9 +371,20 @@ class Classifier:
                     i += 1
         if self.mode == "heuristic":
             for m in CAP_RUN.finditer(text):
-                words = m.group(0).split()
-                if not any(w.lower() in COMMON_WORDS or w.lower() in self.model_words for w in words):
-                    spans.append((m.start(), m.end(), "lit"))
+                # "Owner Jane Doe": a common capitalized word must not shield the name next to it, so
+                # look at every run of two or more uncommon words inside the match
+                run, start = [], None
+                for wm in re.finditer(r"\S+", m.group(0)):
+                    w = wm.group(0)
+                    if w.lower() in COMMON_WORDS or w.lower() in self.model_words:
+                        if len(run) >= 2:
+                            spans.append((m.start() + start, m.start() + run[-1].end(), "lit"))
+                        run, start = [], None
+                    else:
+                        run.append(wm)
+                        start = wm.start() if start is None else start
+                if len(run) >= 2:
+                    spans.append((m.start() + start, m.start() + run[-1].end(), "lit"))
         if numbers:
             for m in re.finditer(r"[$€£]?\s?\d[\d,]*(?:\.\d+)?\s?[%KMB]?", text):
                 tok = m.group(0).strip()

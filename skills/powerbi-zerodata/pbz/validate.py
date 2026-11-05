@@ -147,6 +147,7 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
         for f in lint.run(model):
             f["message"] = scrub(f["message"])
             findings.append(f)
+        findings += synthetic_marker(model)
     else:
         model = tmdl.Model()
     findings += report_author(stage, project, scrub)
@@ -165,12 +166,20 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
     return findings
 
 
+def synthetic_marker(model) -> list[dict]:
+    """The PBZ_SYNTHETIC marker unlocks `pbz synth query`; it must never reach a real model."""
+    return [{"severity": "error", "code": "SYNTHETIC_MARKER_IN_REAL_MODEL", "where": doc.path,
+             "message": "the PBZ_SYNTHETIC annotation belongs to pbz synth copies only; remove it"}
+            for doc in model.docs.values() for node in doc.nodes
+            if node.kind == "annotation" and node.name.strip("'").upper() == "PBZ_SYNTHETIC"]
+
+
 def run_mirror(ws, project) -> list[dict]:
     """Metadata-only checks on the mirror itself (no engine): lint + field references."""
     mdef = os.path.join(project.mirror_model, "definition")
     model = tmdl.load_model(mdef) if os.path.isdir(mdef) else tmdl.Model()
     ident = lambda s: s  # mirror text is already sanitized
-    out = lint.run(model)
+    out = lint.run(model) + synthetic_marker(model)
     out += field_refs(ws.mirror, project, model, ident)
     if os.path.isdir(project.mirror_report):
         out += pbircheck.run(project.mirror_report)
