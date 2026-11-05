@@ -16,12 +16,13 @@
     { "$ref": "#/$defs/probe" },
     { "$ref": "#/$defs/snapshotSave" },
     { "$ref": "#/$defs/snapshotCompare" },
-    { "$ref": "#/$defs/smoke" }
+    { "$ref": "#/$defs/smoke" },
+    { "$ref": "#/$defs/deps" }
   ],
   "$defs": {
     "verb": {
       "enum": ["ping", "connect", "health", "tmdl-validate", "refresh", "compiles", "index", "check", "probe",
-               "snapshot-save", "snapshot-compare", "smoke"]
+               "snapshot-save", "snapshot-compare", "smoke", "deps"]
     },
     "anyVerb": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_\\-]*$" },
     "errorClass": {
@@ -373,6 +374,29 @@
               "class": { "$ref": "#/$defs/errorClass" },
               "log_id": { "$ref": "#/$defs/logId" }
             }
+          }
+        }
+      }
+    },
+    "depsName": { "type": "string", "maxLength": 512, "pattern": "^[^\\u0000-\\u001f]*$" },
+    "depsType": { "type": "string", "pattern": "^([A-Z_]{1,40}|\\?)$" },
+    "deps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "edges"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "deps" },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              { "$ref": "#/$defs/depsType" }, { "$ref": "#/$defs/depsName" }, { "$ref": "#/$defs/depsName" },
+              { "$ref": "#/$defs/depsType" }, { "$ref": "#/$defs/depsName" }, { "$ref": "#/$defs/depsName" }
+            ],
+            "minItems": 6,
+            "maxItems": 6
           }
         }
       }

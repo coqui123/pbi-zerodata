@@ -47,6 +47,8 @@ def build(tmp: str) -> dict:
     write(os.path.join(syn, "tests", "fixture", "Canary.pbip"), "{}")
     write(os.path.join(syn, "tests", "fixture", "Canary.SemanticModel", "definition", "x.tmdl"), "table X")
     write(os.path.join(other, "readme.md"), "hi")
+    write(os.path.join(ws, "audit.measurekiller"), "x")
+    write(os.path.join(tmp, "mk", "m.measurekiller"), "x")
     return {"ws": ws, "syn": syn, "other": other}
 
 
@@ -92,6 +94,10 @@ def main() -> int:
         ("read cache.abf", pre("Read", {"file_path": j(ws, "Demo.SemanticModel", ".pbi", "cache.abf")}, ws), "caches"),
         ("read other md", pre("Read", {"file_path": j(other, "readme.md")}, other), None),
         ("read abf anywhere", pre("Read", {"file_path": j(other, "x.abf")}, other), "caches"),
+        ("read measurekiller anywhere", pre("Read", {"file_path": j(tmp, "mk", "m.measurekiller")}, other), "caches"),
+        ("grep measurekiller folder", pre("Grep", {"pattern": "x", "path": j(tmp, "mk")}, other), "Content search"),
+        ("read measure killer app data", pre("Read", {"file_path": j(os.environ.get("APPDATA") or j(home, "AppData", "Roaming"), "Measure Killer", "log.db")}, other), "caches"),
+        ("gc measurekiller", pre("PowerShell", {"command": "Get-Content .\\audit.measurekiller"}, ws), "caches"),
         ("policy deny glob", pre("Read", {"file_path": j(ws, "secret-report.md")}, ws), "Data-bearing"),
         ("read notes", pre("Read", {"file_path": j(ws, "notes.md")}, ws), None),
         ("read png", pre("Read", {"file_path": j(ws, "shot.png")}, ws), "Data-bearing"),

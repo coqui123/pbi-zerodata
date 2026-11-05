@@ -164,6 +164,18 @@ def main() -> int:
         expect([x.get("result") for x in res.get("queries", [])] == ["SAME"], f"snapshot compare: {res}")
         res = r.pbz("smoke")
         expect(res.get("verb") == "smoke" and res.get("summary"), f"smoke: {res}")
+        # parity verbs (metadata only): usage states, engine cross-check, lineage, cleanup, BPA, docs
+        res = r.pbz("unused")
+        expect(res.get("verb") == "unused" and res.get("analysis") == "complete", f"unused: {res}")
+        res = r.pbz("unused", "--verify-engine")
+        expect(res.get("result") in ("MATCH", "DIFF") and res.get("edges", {}).get("engine", 0) > 0
+               and not res.get("engine_only"), f"verify-engine: {res}")
+        for args in (("unused", "--all", "--impact"), ("unused", "--remove", "--dry-run"), ("lineage", "[Total Hours]"),
+                     ("lineage", "[Canary Person Hours]", "--up"), ("suggest",), ("m-lineage",), ("bpa",),
+                     ("bpa", "model", "--labels", "measure-killer"), ("similar",), ("changes",), ("changes", "--list"),
+                     ("docs", "--dax"), ("docs", "--format", "html", "--dax"), ("docs", "--format", "json")):
+            res = r.pbz(*args)
+            expect(res.get("verb") and res.get("ok") is not False, f"{' '.join(args)}: {res}")
         tdir = os.path.join(ws_dir, "pbz-workspace", "Canary.SemanticModel", "definition", "tables")
         with open(os.path.join(tdir, "Hours.tmdl"), "a", encoding="utf-8", newline="") as f:
             f.write("\n\tmeasure 'E2E Added' = [Total Hours] * 2\n\t\tformatString: 0\n")

@@ -47,6 +47,14 @@ table Person
 \tmeasure 'PTO Hours' = CALCULATE([Total Hours], CONTAINSSTRING(Project[Work Type], "PTO"))
 \t\tlineageTag: 44444444-4444-4444-4444-444444444444
 
+\tmeasure 'KPI Hours' = [Total Hours]
+\t\tlineageTag: 45454545-4545-4545-4545-454545454545
+
+\t\tkpi
+\t\t\ttargetExpression = IF(SELECTEDVALUE(Person[Name]) = "Ana Ruiz", 10, 20)
+\t\t\tstatusExpression = 1
+\t\t\tfutureProperty = "jane.doe@example.invalid"
+
 \tcolumn Name
 \t\tdataType: string
 \t\tlineageTag: 55555555-5555-5555-5555-555555555555

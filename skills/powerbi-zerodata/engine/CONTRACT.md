@@ -212,6 +212,17 @@ Agreed after v1 (coordinator addendum and the Desktop refresh finding). Implemen
      and nothing is attempted.
    - Response `status` is `PASS` or `UNSUPPORTED`; engine failures use the error envelope.
 
+## v1.2 addition: `deps`
+
+Request `{"private_dir", "port"}`. Response `{"ok": true, "verb": "deps", "edges": [[type, table, object,
+ref_type, ref_table, ref_object], ...]}` from `$SYSTEM.DISCOVER_CALC_DEPENDENCY`, the one DMV besides
+`TMSCHEMA_*` / `DBSCHEMA_CATALOGS` the engine may read, and only with the fixed column list
+`OBJECT_TYPE, TABLE, OBJECT, REFERENCED_OBJECT_TYPE, REFERENCED_TABLE, REFERENCED_OBJECT`. The
+`EXPRESSION`, `REFERENCED_EXPRESSION` and `QUERY` columns (formula text) are never selected. Each name
+must equal a TMSCHEMA object name (table, column, measure, hierarchy, partition, relationship) or it
+becomes `"?"`; each type must match `^[A-Z_]{1,40}$` or it becomes `"?"`. Duplicate rows are dropped.
+Used by `pbz unused --verify-engine` to cross-check the metadata parser; never the primary source.
+
 Implementation clarifications that callers must know (response container names, the blank group
 key, optional `timeout_s`, stricter message scrubbing, query guards) are listed in
 `engine/README.md` under "Contract deviations and clarifications".

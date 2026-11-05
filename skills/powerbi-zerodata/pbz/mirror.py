@@ -158,6 +158,7 @@ def pull(ws: Workspace, project: Project, force: bool = False, rebase: bool = Fa
            "classification": clf.mode, "files": new_files}
     save_manifest(ws, project, man)
     _write_guide(ws, clf.mode)
+    snapshot(ws, project, "pull")
     return {"verb": "pull", "project": project.name, "files": len(new_files), "classification": clf.mode,
             "token_occurrences": counts, "lossy_files": lossy, "conflicts": conflicts}
 
@@ -312,6 +313,7 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
         man["files"] = files
         save_manifest(ws, project, man)
         _log_push(ws, project, stamp, summary)
+        snapshot(ws, project, "push")
         result = {"verb": "push", "project": project.name, "result": "PUSHED", "objects": summary,
                   "findings": findings, "backup": stamp}
         if reload and open_inst:
@@ -323,6 +325,83 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
 
 def _real_path(ws: Workspace, rel: str) -> str:
     return os.path.join(ws.root, *rel.split("/"))
+
+
+# ---------------------------------------------------------------- mirror history (sanitized snapshots)
+
+HISTORY_KEEP = 20
+
+
+def history_dir(ws: Workspace, project: Project) -> str:
+    return os.path.join(ws.private, "mirror-history", project.name)
+
+
+def mirror_texts(ws: Workspace, project: Project) -> dict[str, str]:
+    """{mirror-relative path: text} of the project's current mirror files (sanitized)."""
+    out = {}
+    for base in (project.mirror_model, project.mirror_report):
+        top = os.path.basename(base)
+        for cur, _dirs, files in os.walk(base):
+            for f in files:
+                low = f.lower()
+                if low.endswith(".tmdl") or low.endswith(JSON_EXT):
+                    p = os.path.join(cur, f)
+                    rel = f"{top}/" + os.path.relpath(p, base).replace("\\", "/")
+                    out[rel] = read_text(p)[0]
+    return out
+
+
+def snapshot(ws: Workspace, project: Project, event: str) -> str:
+    """Record the mirror as a history snapshot (content-addressed, deduplicated, last HISTORY_KEEP kept)."""
+    hdir = history_dir(ws, project)
+    blobs, snaps = os.path.join(hdir, "blobs"), os.path.join(hdir, "snapshots")
+    os.makedirs(blobs, exist_ok=True)
+    os.makedirs(snaps, exist_ok=True)
+    files = {}
+    for rel, text in mirror_texts(ws, project).items():
+        h = sha(text)
+        bp = os.path.join(blobs, h + ".txt")
+        if not os.path.exists(bp):
+            write_text(bp, text)
+        files[rel] = h
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    n = 1
+    while os.path.exists(os.path.join(snaps, f"{stamp}.json")):
+        n += 1
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{n:03d}"  # sorts after the bare stamp
+    with open(os.path.join(snaps, f"{stamp}.json"), "w", encoding="utf-8") as f:
+        json.dump({"stamp": stamp, "event": event, "files": files}, f)
+    names = sorted(os.listdir(snaps))
+    for old in names[:-HISTORY_KEEP]:
+        os.remove(os.path.join(snaps, old))
+    live = set()
+    for name in sorted(os.listdir(snaps)):
+        with open(os.path.join(snaps, name), encoding="utf-8") as f:
+            live |= set(json.load(f).get("files", {}).values())
+    for b in os.listdir(blobs):
+        if b[:-4] not in live:
+            os.remove(os.path.join(blobs, b))
+    return stamp
+
+
+def history_list(ws: Workspace, project: Project) -> list[dict]:
+    snaps = os.path.join(history_dir(ws, project), "snapshots")
+    out = []
+    for name in sorted(os.listdir(snaps)) if os.path.isdir(snaps) else []:
+        with open(os.path.join(snaps, name), encoding="utf-8") as f:
+            s = json.load(f)
+        out.append({"stamp": s["stamp"], "event": s.get("event", ""), "files": len(s.get("files", {}))})
+    return out
+
+
+def history_texts(ws: Workspace, project: Project, stamp: str) -> dict[str, str]:
+    hdir = history_dir(ws, project)
+    try:
+        with open(os.path.join(hdir, "snapshots", f"{stamp}.json"), encoding="utf-8") as f:
+            files = json.load(f)["files"]
+    except (OSError, ValueError, KeyError):
+        raise PbzError("NOT_FOUND", f"snapshot {stamp}")
+    return {rel: read_text(os.path.join(hdir, "blobs", h + ".txt"))[0] for rel, h in files.items()}
 
 
 def _log_push(ws: Workspace, project: Project, stamp: str, summary: list[str]) -> None:

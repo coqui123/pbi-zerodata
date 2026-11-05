@@ -25,8 +25,9 @@ _OPS = ["==", "<>", "<=", ">=", "&&", "||", "=>", "..", "...", "=", "<", ">", "+
         "(", ")", "{", "}", ",", ";", ":", "!", "?", "@", "#", "."]
 
 
-def _quoted(src: str, i: int, q: str) -> tuple[int, str]:
-    """Scan a quote-delimited token starting at src[i] == q, doubled quote escapes. Returns (end, value)."""
+def _quoted(src: str, i: int, q: str, one_line: bool = False) -> tuple[int, str]:
+    """Scan a quote-delimited token starting at src[i] == q, doubled quote escapes. Returns (end, value).
+    Unterminated: consume to end, or with one_line (names never span lines) return (-1, "")."""
     j = i + 1
     out = []
     n = len(src)
@@ -38,12 +39,15 @@ def _quoted(src: str, i: int, q: str) -> tuple[int, str]:
                 j += 2
                 continue
             return j + 1, "".join(out)
+        if one_line and c in "\r\n":
+            return -1, ""
         out.append(c)
         j += 1
-    return n, "".join(out)  # unterminated: consume to end
+    return (-1, "") if one_line else (n, "".join(out))
 
 
 def _bracket(src: str, i: int) -> tuple[int, str]:
+    """[Name] with ]] escapes; names never span lines, so an unterminated bracket returns (-1, "")."""
     j = i + 1
     out = []
     n = len(src)
@@ -55,9 +59,19 @@ def _bracket(src: str, i: int) -> tuple[int, str]:
                 j += 2
                 continue
             return j + 1, "".join(out)
+        if c in "\r\n":
+            return -1, ""
         out.append(c)
         j += 1
-    return n, "".join(out)
+    return -1, ""
+
+
+def _pbz_token(src: str, i: int) -> int:
+    """End of a mirror token «...» starting at i, or -1."""
+    if src[i] != "«":
+        return -1
+    j = src.find("»", i + 1, i + 302)
+    return j + 1 if j > 0 and "\n" not in src[i:j] else -1
 
 
 def lex_dax(src: str, base: int = 0) -> list[Tok]:
@@ -65,7 +79,11 @@ def lex_dax(src: str, base: int = 0) -> list[Tok]:
     i, n = 0, len(src)
     while i < n:
         c = src[i]
-        if c.isspace():
+        j = _pbz_token(src, i) if c == "«" else -1
+        if j > 0:  # sanitized literal: opaque, never a reference
+            toks.append(Tok("pbztok", base + i, base + j, src[i:j], src[i:j]))
+            i = j
+        elif c.isspace():
             j = i
             while j < n and src[j].isspace():
                 j += 1
@@ -85,13 +103,9 @@ def lex_dax(src: str, base: int = 0) -> list[Tok]:
             j, v = _quoted(src, i, '"')
             toks.append(Tok("str", base + i, base + j, src[i:j], v))
             i = j
-        elif c == "'":
-            j, v = _quoted(src, i, "'")
-            toks.append(Tok("table", base + i, base + j, src[i:j], v))
-            i = j
-        elif c == "[":
-            j, v = _bracket(src, i)
-            toks.append(Tok("bracket", base + i, base + j, src[i:j], v))
+        elif c in "'[" and (j_v := (_quoted(src, i, "'", one_line=True) if c == "'" else _bracket(src, i)))[0] > 0:
+            j, v = j_v
+            toks.append(Tok("table" if c == "'" else "bracket", base + i, base + j, src[i:j], v))
             i = j
         elif c.isdigit() or (c == "." and i + 1 < n and src[i + 1].isdigit()):
             m = _NUM.match(src, i)
@@ -119,7 +133,11 @@ def lex_m(src: str, base: int = 0) -> list[Tok]:
     i, n = 0, len(src)
     while i < n:
         c = src[i]
-        if c.isspace():
+        j = _pbz_token(src, i) if c == "«" else -1
+        if j > 0:
+            toks.append(Tok("pbztok", base + i, base + j, src[i:j], src[i:j]))
+            i = j
+        elif c.isspace():
             j = i
             while j < n and src[j].isspace():
                 j += 1

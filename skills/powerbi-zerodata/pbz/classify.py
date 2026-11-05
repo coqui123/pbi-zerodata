@@ -262,8 +262,17 @@ class Classifier:
         return len(s) >= (4 if nwords == 1 else 6)  # person
 
     def hmac_column(self, value) -> str | None:
-        """Column whose distinctive value equals this unbound text (precision-first), else None."""
-        if not self.key or value is None or not isinstance(value, str) or not self._specific(value):
+        """Column whose distinctive value equals this unbound text (precision-first), else None.
+
+        Multi-word text that exactly equals a person / identifier / title value is strong evidence and
+        is hidden even when its words are common ("Mark Price"); single words must be specific."""
+        if not self.key or value is None or not isinstance(value, str):
+            return None
+        s = value.strip()
+        if len(s) < 4 or sum(ch.isalpha() for ch in s) < 3 or s.lower() in self.model_names:
+            return None
+        if len(WORD_RE.findall(s)) < 2 and not self._specific(s) \
+                and not (s[:1].isupper() and is_proper_noun(s)):
             return None
         col = self.hmac_to_col.get(dpapi.hmac_hex(self.key, value))
         if col and self._fits_kind(value, self.col_kind.get(col, "person")):

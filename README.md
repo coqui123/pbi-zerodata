@@ -10,6 +10,10 @@ without company data entering the agent's context.
   that runs checks against Power BI Desktop's local engine and prints verdicts only.
 - `skills/powerbi-zerodata/tools/`: Microsoft's `powerbi-report-author` and `powerbi-desktop`
   CLIs (npm, local install; `screenshot` / `preview` are blocked by the guard).
+- Model hygiene verbs with Measure Killer parity, all metadata only: `unused` (with `--remove` /
+  `--restore`), `lineage`, `suggest`, `bpa` (scores and grades), `similar`, `changes`, `docs`,
+  `m-lineage`. Plan and status: `docs/parity-plan.md`; usage: `reference/analysis.md`,
+  `reference/bpa.md`; attributions: `THIRD_PARTY_NOTICES.md`.
 
 ## Install
 
@@ -27,7 +31,11 @@ Then trust the hooks once in Codex (`/hooks`). Uninstall: `python install/instal
 ```
 python skills/powerbi-zerodata/tests/test_guard.py     # hook decision table (Claude + Codex shapes)
 python skills/powerbi-zerodata/tests/test_mirror.py    # tokenizer, round trip, push, rename, conflicts
+python skills/powerbi-zerodata/tests/test_parity.py    # resolver, usage states, unused/remove/restore, m-lineage
+python skills/powerbi-zerodata/tests/test_bpa.py       # best-practice rules, scores, grades
+python skills/powerbi-zerodata/tests/test_tools.py     # similar, changes, docs
 python skills/powerbi-zerodata/tests/test_engine.py    # engine verbs + canary scan (needs Desktop)
+python skills/powerbi-zerodata/tests/test_e2e.py       # every verb on a fixture copy in Desktop, canary scan
 ```
 
 This repo is marked synthetic (`.pbz/policy.json`), so the guard treats its fixtures as fake data.

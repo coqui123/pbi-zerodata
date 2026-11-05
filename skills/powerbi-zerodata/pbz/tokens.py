@@ -357,7 +357,7 @@ def bind_literals(sig: list, lang: str, cur_table: str | None, model) -> dict:
 def _table_of(node) -> str | None:
     n = node
     while n is not None:
-        if n.kind == "table":
+        if n.kind in ("table", "tablePermission"):  # an RLS filter's row context is the table it filters
             return n.name
         n = n.parent
     return None
@@ -412,6 +412,9 @@ def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
                                       tm.raw(f"payload:{cur or 'blob'}", inner, "tmdl")))
                         continue
                     label = clf.literal(t.value, "string", col)
+                    if not label and in_row and clf.mode == "heuristic" and clf.column_class(*col) == "unknown" \
+                            and clf._specific(t.value):
+                        label = clf.label(*col)  # embedded row under a header the model does not know: fail closed
                     if label:
                         edits.append((t.start + 1, t.start + 1 + len(inner),
                                       tm.lit(label, t.value, "string", "tmdl", inner)))

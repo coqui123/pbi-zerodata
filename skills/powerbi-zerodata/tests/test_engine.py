@@ -701,6 +701,16 @@ def test_live(env: Env, key_holder: dict) -> None:
             v.get("page/unsupported", {}).get("status")) == ("OK", "EMPTY", "ERROR", "UNSUPPORTED")
            and v["page/error"].get("class") == "OTHER" and v.get("page/dmv", {}).get("class") == "BAD_REQUEST", r)
 
+    # deps: engine dependency list, identity columns only, names limited to TMSCHEMA names
+    r = engine("deps", env.req(), "deps")
+    edges = {tuple(e) for e in (r or {}).get("edges", [])}
+    expect("deps: measure -> measure and measure -> column edges from DISCOVER_CALC_DEPENDENCY",
+           ("MEASURE", "Hours", "Active Hours", "MEASURE", "Hours", "Total Hours") in edges
+           and any(e[0] == "MEASURE" and e[2] == "Total Hours" and e[3] in ("COLUMN", "CALC_COLUMN") and e[5] == "Hours"
+                   for e in edges), r)
+    expect("deps: every name is a model object name, \"\" or \"?\"",
+           all(len(e) == 6 for e in edges) and not any("=" in x or "(" in x for e in edges for x in e), r)
+
     # the raw text of a forced error exists only inside the DPAPI log
     log_id = env.log_ids.get("errfn", "")
     found = False

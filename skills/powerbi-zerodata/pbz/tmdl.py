@@ -16,9 +16,13 @@ DECL_KINDS = {
     "perspectiveColumn", "perspectiveMeasure", "perspectiveHierarchy", "culture", "linguisticMetadata",
     "dataSource", "queryGroup", "ref", "function", "calendar", "calendarColumnGroup", "variation",
     "objectTranslation", "alternateOf", "refreshPolicy", "formatStringDefinition", "detailRowsDefinition",
+    "kpi",
 }
+# Known expression properties. Any other `name = value` property line is ALSO treated as an
+# expression region (fail closed), so its literals are tokenized like the rest.
 EXPR_PROPS = {"source", "expression", "filterExpression", "formatStringDefinition", "detailRowsDefinition",
-              "defaultExpression", "pollingExpression", "sourceExpression"}
+              "defaultExpression", "pollingExpression", "sourceExpression", "targetExpression", "statusExpression",
+              "trendExpression", "noSelectionExpression", "multipleOrEmptySelectionExpression"}
 DAX_DECLS = {"measure", "column", "calculationItem", "tablePermission", "columnPermission", "function"}
 
 _NAME = r"'(?:[^']|'')*'|[^\s=:'][^\s=:]*"
@@ -81,6 +85,22 @@ class Node:
     children: list = field(default_factory=list)
     expr: Region | None = None
     decl_value: str = ""   # e.g. "m" / "calculated" for partitions
+    file: str = ""         # document path the node was parsed from
+
+    def __repr__(self) -> str:  # parent/children links make the default repr recursive
+        return f"Node({self.kind} {self.name!r} @ {self.file}:{self.line + 1})"
+
+    def flag(self, prop: str) -> bool:
+        """Boolean property: bare flag line (isHidden) or `prop: true`."""
+        return self.props.get(prop, "false").strip().lower() == "true"
+
+    def prop(self, prop: str, default: str = "") -> str:
+        return unquote(self.props.get(prop, default).strip()) if prop in self.props else default
+
+    def descendants(self):
+        for c in self.children:
+            yield c
+            yield from c.descendants()
 
 
 @dataclass
@@ -171,11 +191,13 @@ def parse(path: str, text: str) -> TmdlDoc:
             i += 1
             continue
         m = DECL_RE.match(line)
-        if m and m.group("kw") in DECL_KINDS and not PROP_RE.match(line):
+        known = bool(m) and m.group("kw") in DECL_KINDS
+        unknown_expr = bool(m) and not known and m.group("name") and m.group("rest") is not None
+        if m and (known or unknown_expr) and not PROP_RE.match(line):
             kw = m.group("kw")
             parent = owner_for(ind)
             name = m.group("name") or ""
-            node = Node(kw, unquote(name), ind, i, parent)
+            node = Node(kw, unquote(name), ind, i, parent, file=path)
             nodes.append(node)
             if parent:
                 parent.children.append(node)
@@ -203,15 +225,16 @@ def parse(path: str, text: str) -> TmdlDoc:
                 if kw in DAX_DECLS or kw == "expression" or kw == "calculationItem":
                     i = take_expr(i, ind, rest, rest_offset, node, "expression")
                     continue
-                if kw == "table":  # calculated table shorthand is rare; treat as DAX
-                    i = take_expr(i, ind, rest, rest_offset, node, "expression")
-                    continue
+                # any other declaration carrying `= ...` (table shorthand, future object kinds):
+                # treat the value as an expression so it is lexed and tokenized (fail closed)
+                i = take_expr(i, ind, rest, rest_offset, node, "expression")
+                continue
             i += 1
             continue
         pe = PROP_EXPR_RE.match(line)
-        if pe and pe.group("prop") in EXPR_PROPS and not PROP_RE.match(line):
+        if pe and not PROP_RE.match(line):
             owner = owner_for(ind)
-            node = owner or Node("orphan", "", ind, i)
+            node = owner or Node("orphan", "", ind, i, file=path)
             rest_offset = off + pe.start("rest")
             i = take_expr(i, ind, pe.group("rest"), rest_offset, node, pe.group("prop"))
             continue
@@ -230,6 +253,34 @@ def parse(path: str, text: str) -> TmdlDoc:
     return TmdlDoc(path, text, nodes, regions)
 
 
+def block_span(doc: TmdlDoc, node: Node) -> tuple[int, int]:
+    """Character span of a node's whole block: its /// description lines, its own line, every deeper
+    line, and the blank lines that follow it (up to the next line at the same or a lower indent)."""
+    lines = _lines(doc.text)
+    first = node.line
+    while first > 0 and lines[first - 1][1].strip().startswith("///") and _indent(lines[first - 1][1]) == node.indent:
+        first -= 1
+    j = node.line + 1
+    in_fence = False
+    while j < len(lines):
+        ln = lines[j][1]
+        if ln.strip().startswith("```"):
+            in_fence = not in_fence
+            j += 1
+            continue
+        if not in_fence and ln.strip() and _indent(ln) <= node.indent:
+            break
+        j += 1
+    end = lines[j][0] if j < len(lines) else len(doc.text)
+    return lines[first][0], end
+
+
+def node_regions(doc: TmdlDoc, node: Node, deep: bool = True) -> list[Region]:
+    """Expression regions owned by a node (and, with deep, by its child nodes: KPIs, format strings...)."""
+    ids = {id(node)} | ({id(d) for d in node.descendants()} if deep else set())
+    return [r for r in doc.regions if id(r.node) in ids]
+
+
 # ---------------------------------------------------------------- model index
 
 @dataclass
@@ -241,6 +292,7 @@ class Column:
     source_column: str = ""
     sort_by: str = ""
     hidden: bool = False
+    node: Node | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -250,6 +302,7 @@ class Measure:
     expression: str = ""
     format_string: str = ""
     folder: str = ""
+    node: Node | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -262,6 +315,16 @@ class Table:
     hierarchies: dict = field(default_factory=dict)  # hierarchy -> {level: column}
     calculated: bool = False
     hidden: bool = False
+    node: Node | None = field(default=None, repr=False, compare=False)
+    calc_items: dict = field(default_factory=dict)   # calculation group items: name -> Node
+    partition_nodes: list = field(default_factory=list, repr=False, compare=False)
+
+    @property
+    def private(self) -> bool:
+        """Auto date/time tables and other engine-private tables."""
+        n = self.node
+        return self.name.startswith(("LocalDateTable_", "DateTableTemplate_")) or bool(
+            n and (n.flag("isPrivate") or n.flag("showAsVariationsOnly")))
 
 
 @dataclass
@@ -273,6 +336,7 @@ class Relationship:
     to_column: str
     both: bool = False
     active: bool = True
+    node: Node | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -281,6 +345,17 @@ class Model:
     relationships: list = field(default_factory=list)
     roles: list = field(default_factory=list)
     docs: dict = field(default_factory=dict)  # relpath -> TmdlDoc
+    expressions: dict = field(default_factory=dict)  # shared M queries and parameters: name -> Node
+    functions: dict = field(default_factory=dict)    # DAX user-defined functions: name -> Node
+    role_nodes: dict = field(default_factory=dict)   # name -> Node
+    model_node: Node | None = None
+    perspectives: dict = field(default_factory=dict)  # name -> Node
+
+    def text_of(self, reg: Region) -> str:
+        return self.docs[reg.node.file].text[reg.start:reg.end]
+
+    def table(self, name: str) -> "Table | None":
+        return self.tables.get(name) or next((v for k, v in self.tables.items() if k.lower() == name.lower()), None)
 
     def column(self, table: str, col: str) -> Column | None:
         t = self.tables.get(table) or next((v for k, v in self.tables.items() if k.lower() == table.lower()), None)
@@ -329,6 +404,8 @@ def load_model(definition_dir: str, texts: dict | None = None) -> Model:
                 raw = raw[3:]
             texts[os.path.relpath(p, definition_dir).replace("\\", "/")] = raw.decode("utf-8")
     for relp, text in texts.items():
+        if relp.lower().startswith("cultures/"):
+            continue  # translations and linguistic metadata, not model objects
         doc = parse(relp, text)
         model.docs[relp] = doc
         for node in doc.nodes:
@@ -336,26 +413,40 @@ def load_model(definition_dir: str, texts: dict | None = None) -> Model:
                 t = model.tables.setdefault(node.name, Table(node.name, relp))
                 t.file = relp
                 t.hidden = "isHidden" in node.props
+                t.node = node
             elif node.kind == "column" and node.parent and node.parent.kind == "table":
                 t = model.tables.setdefault(node.parent.name, Table(node.parent.name, relp))
                 t.columns[node.name] = Column(
                     t.name, node.name, node.props.get("dataType", "").strip(), node.expr is not None or any(
                         r.node is node and r.kind == "dax" for r in doc.regions),
                     unquote(node.props.get("sourceColumn", "").strip()), unquote(node.props.get("sortByColumn", "").strip()),
-                    "isHidden" in node.props)
+                    "isHidden" in node.props, node)
             elif node.kind == "measure" and node.parent and node.parent.kind == "table":
                 t = model.tables.setdefault(node.parent.name, Table(node.parent.name, relp))
                 reg = next((r for r in doc.regions if r.node is node and r.kind == "dax"), None)
                 t.measures[node.name] = Measure(t.name, node.name, text[reg.start:reg.end] if reg else "",
                                                 node.props.get("formatString", "").strip(),
-                                                node.props.get("displayFolder", "").strip())
+                                                node.props.get("displayFolder", "").strip(), node)
             elif node.kind == "partition" and node.parent and node.parent.kind == "table":
                 t = model.tables.setdefault(node.parent.name, Table(node.parent.name, relp))
                 reg = next((r for r in doc.regions if r.node is node), None)
                 kind = node.decl_value.strip().lower() or "m"
                 t.partitions.append((node.name, kind, text[reg.start:reg.end] if reg else ""))
+                t.partition_nodes.append(node)
                 if kind == "calculated":
                     t.calculated = True
+            elif node.kind == "calculationItem":
+                tnode = node.parent.parent if node.parent and node.parent.kind == "calculationGroup" else None
+                if tnode is not None and tnode.kind == "table":
+                    model.tables.setdefault(tnode.name, Table(tnode.name, relp)).calc_items[node.name] = node
+            elif node.kind == "expression" and node.parent is None:
+                model.expressions[node.name] = node
+            elif node.kind == "function" and node.parent is None:
+                model.functions[node.name] = node
+            elif node.kind == "model" and node.parent is None:
+                model.model_node = node
+            elif node.kind == "perspective" and node.parent is None:
+                model.perspectives[node.name] = node
             elif node.kind == "level" and node.parent and node.parent.kind == "hierarchy":
                 h = node.parent
                 if h.parent and h.parent.kind == "table":
@@ -368,7 +459,8 @@ def load_model(definition_dir: str, texts: dict | None = None) -> Model:
                     model.relationships.append(Relationship(
                         node.name, fr[0], fr[1], to[0], to[1],
                         node.props.get("crossFilteringBehavior", "").strip() == "bothDirections",
-                        node.props.get("isActive", "true").strip().lower() != "false"))
+                        node.props.get("isActive", "true").strip().lower() != "false", node))
             elif node.kind == "role":
                 model.roles.append(node.name)
+                model.role_nodes[node.name] = node
     return model

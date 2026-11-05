@@ -25,6 +25,7 @@ MAX_SCRIPT_BYTES = 2_000_000
 
 HOME = os.path.normcase(os.path.normpath(os.path.expanduser("~"))).replace("\\", "/")
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+APPDATA = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PRIVATE_ROOT = os.path.join(os.path.expanduser("~"), ".pbz-private")  # pbz private store (DPAPI, HMACs, backups)
 
@@ -33,9 +34,11 @@ GLOBAL_DENY_DIRS = [
     os.path.join(os.path.expanduser("~"), "Microsoft", "Power BI Desktop Store App"),
     os.path.join(LOCALAPPDATA, "Microsoft", "Power BI Desktop"),
     os.path.join(LOCALAPPDATA, "pbz"),
+    os.path.join(APPDATA, "Measure Killer"),  # activity logs, save files, exports, deletion backups
     PRIVATE_ROOT,
 ]
-GLOBAL_DENY_PATTERNS = [r"(^|/)\.pbi(/|$)", r"\.abf(\.stale)?$"]
+# .measurekiller analysis files hold user emails and column sizes.
+GLOBAL_DENY_PATTERNS = [r"(^|/)\.pbi(/|$)", r"\.abf(\.stale)?$", r"\.measurekiller$"]
 
 # Content access denied inside zero-data workspaces (globs relative to the workspace root).
 DEFAULT_WS_DENY = [
@@ -65,7 +68,7 @@ DATA_READ_PATTERNS = [
 ]
 DEFINITION_REF = re.compile(r"(?i)\.(semanticmodel|report)\b")
 DATA_EXT = re.compile(
-    r"(?i)\.(xlsx|xls|xlsm|xlsb|csv|tsv|parquet|pbix|pbit|pbids|abf|zip|tgz|7z|rar|dax|trc|xel)\b"
+    r"(?i)\.(xlsx|xls|xlsm|xlsb|csv|tsv|parquet|pbix|pbit|pbids|abf|zip|tgz|7z|rar|dax|trc|xel|measurekiller)\b"
 )
 
 SAFE_PATH_VERBS = {
@@ -103,7 +106,7 @@ MEMORY_DATA_PATTERNS = [
 REASONS = {
     "definition": "Real Power BI definition files are off-limits in zero-data mode. Run `pbz pull` and edit the sanitized mirror in pbz-workspace\\, then `pbz push`.",
     "data_file": "Data-bearing file blocked in zero-data mode (data files, caches, images, documents, dumps). Ask the user, or use pbz verbs that return metadata only.",
-    "global": "Power BI caches, Desktop app data and the pbz private store are never readable by agents.",
+    "global": "Power BI caches, Desktop and Measure Killer app data and the pbz private store are never readable by agents.",
     "engine": "Direct engine, REST or data access is blocked. Use pbz verbs (health, check, probe, snapshot, smoke, describe, values).",
     "admin": "`pbz admin` is for the user in their own terminal only.",
     "script": "Script blocked: it reads data files, real definition folders or a Power BI engine. Use pbz verbs or work on pbz-workspace\\.",

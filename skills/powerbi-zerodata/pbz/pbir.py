@@ -207,6 +207,8 @@ class FieldRef:
     node: JObj | None = None   # the object holding Entity/Property
     prop_node: JStr | None = None
     entity_node: JStr | None = None
+    hierarchy: str = ""        # hierarchy name for HierarchyLevel references
+    variation: bool = False    # auto date/time: the field is a variation of the base column `name`
 
 
 def _source_entity(expr: JObj | None, aliases: dict) -> tuple[str, JStr | None]:
@@ -220,19 +222,32 @@ def _source_entity(expr: JObj | None, aliases: dict) -> tuple[str, JStr | None]:
         src = sr.get("Source")
         if isinstance(src, JStr):
             return aliases.get(src.value, src.value), None
+    pvs = expr.get("PropertyVariationSource")
+    if isinstance(pvs, JObj):
+        return _source_entity(pvs.get("Expression"), aliases)
     return "", None
 
 
+def _variation_base(expr) -> str:
+    """Base column of an auto date/time PropertyVariationSource expression, else ""."""
+    pvs = expr.get("PropertyVariationSource") if isinstance(expr, JObj) else None
+    prop = pvs.get("Property") if isinstance(pvs, JObj) else None
+    return prop.value if isinstance(prop, JStr) else ""
+
+
 def field_of(node, aliases: dict, model=None) -> FieldRef | None:
-    """Resolve a Column / Measure / Aggregation / HierarchyLevel object to a FieldRef."""
+    """Resolve a Column / Measure / Aggregation / HierarchyLevel / GroupRef object to a FieldRef."""
     if not isinstance(node, JObj):
         return None
-    for kind, key in (("column", "Column"), ("measure", "Measure")):
+    for kind, key in (("column", "Column"), ("measure", "Measure"), ("column", "GroupRef")):
         inner = node.get(key)
         if isinstance(inner, JObj):
             table, ent = _source_entity(inner.get("Expression"), aliases)
             prop = inner.get("Property")
             if isinstance(prop, JStr):
+                base = _variation_base(inner.get("Expression"))
+                if base:
+                    return FieldRef("column", table, base, prop.value, entity_node=ent, variation=True)
                 return FieldRef(kind, table, prop.value, node=inner, prop_node=prop, entity_node=ent)
     agg = node.get("Aggregation")
     if isinstance(agg, JObj):
@@ -252,10 +267,13 @@ def field_of(node, aliases: dict, model=None) -> FieldRef | None:
             hname = h.get("Hierarchy")
             hname = hname.value if isinstance(hname, JStr) else ""
             lname = level.value if isinstance(level, JStr) else ""
+            base = _variation_base(h.get("Expression"))
+            if base:  # auto date/time hierarchy of a date column
+                return FieldRef("hierarchy", table, base, lname, entity_node=ent, hierarchy=hname, variation=True)
             col = ""
             if model is not None and table in model.tables:
                 col = model.tables[table].hierarchies.get(hname, {}).get(lname, "")
-            return FieldRef("hierarchy", table, col or hname, lname, entity_node=ent)
+            return FieldRef("hierarchy", table, col or hname, lname, entity_node=ent, hierarchy=hname)
     return None
 
 
@@ -274,7 +292,7 @@ def walk_literals(root, model=None) -> list[LiteralSite]:
         return False
 
     def col_key(f: FieldRef | None):
-        if f and f.kind in ("column", "aggregation", "hierarchy") and f.table and f.name:
+        if f and f.kind in ("column", "aggregation", "hierarchy") and f.table and f.name and not f.variation:
             return (f.table, f.name)
         return None
 
@@ -408,6 +426,35 @@ def walk_fields(root, model=None) -> list[FieldRef]:
             visit(v, aliases)
 
     visit(root, {})
+    return refs
+
+
+def walk_fields_with_path(root, model=None) -> list[tuple[FieldRef, tuple]]:
+    """walk_fields plus the JSON key path to each reference (for 'where is it used' classification)."""
+    refs: list[tuple[FieldRef, tuple]] = []
+
+    def visit(node, aliases, path):
+        if isinstance(node, JArr):
+            for v in node.items:
+                visit(v, aliases, path)
+            return
+        if not isinstance(node, JObj):
+            return
+        frm = node.get("From")
+        if isinstance(frm, JArr):
+            aliases = dict(aliases)
+            for e in frm.items:
+                if isinstance(e, JObj) and isinstance(e.get("Name"), JStr) and isinstance(e.get("Entity"), JStr):
+                    aliases[e.get("Name").value] = e.get("Entity").value
+        f = field_of(node, aliases, model)
+        if f:
+            refs.append((f, path))
+            if f.kind == "aggregation":
+                return
+        for k, v in node.pairs:
+            visit(v, aliases, path + (k.value,))
+
+    visit(root, {}, ())
     return refs
 
 

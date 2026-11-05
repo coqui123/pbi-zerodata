@@ -62,6 +62,7 @@ public static class Program
         "snapshot-save" => Snapshots.Save(req, ctx),
         "snapshot-compare" => Snapshots.Compare(req, ctx),
         "smoke" => Smoke.Run(req, ctx),
+        "deps" => Deps.Run(req, ctx),
         _ => throw new BadRequestException("unknown verb"),
     };
 

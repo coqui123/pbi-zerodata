@@ -96,7 +96,32 @@ Constants in checks are limited (3 distinct per target per day) and there is a d
 | `ENGINE_UNAVAILABLE` | Desktop not open / engine not built | `pbz desktop open`; tell the user if it persists |
 | `ERROR:<class>` | engine error class (SYNTAX, UNKNOWN_OBJECT, ...) | fix the expression; raw text is human-only |
 | `BUDGET` | probe limit reached | summarize what you know, ask the user |
+| `INCOMPLETE` (unused --remove) | a report file could not be read, so nothing is provably unused | fix the file, rerun |
+| `CONFLICT` (unused --restore) | the mirror changed after the removal | restore later points first, or pull |
 | guard deny `[pbz guard] ...` | you tried a blocked path or command | follow the hint; never retry variants |
+
+## Model hygiene and analysis (metadata only)
+
+These read the mirror and print names, states, counts, scores and rule ids. Details:
+[reference/analysis.md](reference/analysis.md), [reference/bpa.md](reference/bpa.md).
+
+| Verb | Use it for |
+|---|---|
+| `pbz unused [--all] [--report <dir>]` | state of every object: used / locked / used_by_unused / unused / unknown |
+| `pbz lineage <obj> [--up]` | where-used tree (default) or what it depends on |
+| `pbz unused --remove [--dry-run] [--cascade] [--only kinds] [--m-step remove\|keep\|none]` | delete unused objects from the mirror, with a restore point |
+| `pbz unused --restore <stamp>` | undo a removal (before or after push) |
+| `pbz suggest` | cleanup suggestions (auto date/time, unused variables, hidden pages, key columns...) |
+| `pbz bpa [model\|report] [--labels measure-killer]` | best-practice findings, score and grade |
+| `pbz similar` | identical, alias, same-shape and near-duplicate measures |
+| `pbz changes [--from previous --to last]` | semantic diff of mirror snapshots (pending edits, or what changed between pulls) |
+| `pbz docs [--format md\|html\|json] [--dax]` | documentation into `pbz-workspace\docs\` |
+| `pbz m-lineage [table]` | Power Query steps, column origins, columns the query drops or the model lacks |
+| `pbz unused --verify-engine` | cross-check the dependency parser against the open Desktop engine |
+
+"Unused" means unused in the scanned reports and the model. Service reports, Excel, paginated
+reports and composite models built on the model are invisible here, so ask the user before a removal
+and push it like any other edit (`pbz diff`, `pbz push`).
 
 ## Memory hygiene
 

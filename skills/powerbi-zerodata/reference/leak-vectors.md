@@ -10,6 +10,7 @@ deny rules, a broker CLI), not an OS security boundary.
 | `.pbi\cache.abf`, `cache.abf.stale`, `unappliedChanges.json`, `localSettings.json` | Read deny rules (Claude) + guard everywhere |
 | `DAXQueries\*.dax`, `TMDLScripts\`, `cultures\*.tmdl` (linguistic) | not mirrored; guard denies in workspaces |
 | Desktop app data: TempSaves, Backups, AutoRecovery, AnalysisServicesWorkspaces, Traces | guard denies `~\Microsoft\Power BI Desktop Store App\` and `%LOCALAPPDATA%\Microsoft\Power BI Desktop\` |
+| Measure Killer: `*.measurekiller` analysis files (user emails, column sizes), `%APPDATA%\Measure Killer\` (activity logs, save files, exports, deletion backups) | guard everywhere; Read deny rules after the next `install.py` run |
 | Source files, dumps, exports, images, PDFs, Office docs in the workspace | guard default denies + `pbz scan` policy entries |
 | Filter / slicer / bookmark / selector literals in PBIR | tokenized in the mirror (column-bound) |
 | DATATABLE, `#table`, Enter Data blobs, RLS members, M literals | tokenized or payload markers |

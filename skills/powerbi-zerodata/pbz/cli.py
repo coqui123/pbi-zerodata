@@ -127,6 +127,44 @@ def main(argv=None) -> int:
     p.add_argument("--dir", required=True, help="memory folder to scrub")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--show", help="print the scrubbed text of one file")
+    p = sub.add_parser("unused", help="usage state of every object (used / locked / used_by_unused / unused)")
+    p.add_argument("--report", action="append", default=[], help="extra *.Report folder (thin report) to scan")
+    p.add_argument("--all", action="store_true", help="also list used objects and auto date/time tables")
+    p.add_argument("--kinds", nargs="*", help="limit to object kinds (measure column table ...)")
+    p.add_argument("--impact", action="store_true", help="add cardinality / row buckets from `pbz index`")
+    p.add_argument("--remove", action="store_true", help="delete unused objects from the mirror")
+    p.add_argument("--cascade", action="store_true", help="with --remove: repeat until nothing new is unused")
+    p.add_argument("--only", nargs="*", help="with --remove: only these kinds (bookmark must be named here)")
+    p.add_argument("--m-step", default="remove", choices=["remove", "keep", "none"],
+                   help="with --remove: how removed import columns leave the Power Query query")
+    p.add_argument("--dry-run", action="store_true", help="with --remove: list what would go, change nothing")
+    p.add_argument("--restore", metavar="STAMP", help="undo a removal (restore point printed by --remove)")
+    p.add_argument("--verify-engine", action="store_true", help="cross-check dependencies with the open Desktop engine")
+    p = sub.add_parser("lineage", help="dependency tree of one object")
+    p.add_argument("target", help="'Table'[Column], [Measure], Table or a bare name")
+    p.add_argument("--up", action="store_true", help="what it depends on (default: what depends on it)")
+    p.add_argument("--depth", type=int, default=6)
+    p.add_argument("--report", action="append", default=[])
+    p = sub.add_parser("suggest", help="cleanup and optimisation suggestions")
+    p.add_argument("--report", action="append", default=[])
+    p = sub.add_parser("bpa", help="best practice analysis with scores and grades")
+    p.add_argument("scope", nargs="?", default="all", choices=["model", "report", "all"])
+    p.add_argument("--rules", help="JSON overlay: rule ids to disable / severities / extra settings")
+    p.add_argument("--opinion", action="store_true", help="include opinion rules (naming and format conventions)")
+    p.add_argument("--labels", default="letters", choices=["letters", "measure-killer"])
+    p.add_argument("--report", action="append", default=[])
+    p = sub.add_parser("similar", help="duplicate and near-duplicate measures")
+    p.add_argument("--threshold", type=float, default=0.80)
+    p.add_argument("--max", type=int, default=100)
+    p = sub.add_parser("changes", help="semantic diff of mirror snapshots (what changed, by object)")
+    p.add_argument("--from", dest="from_", default="last", help="last (latest snapshot), previous, or a stamp")
+    p.add_argument("--to", default="mirror", help="mirror (current files), last, or a stamp")
+    p.add_argument("--list", action="store_true", help="list snapshots")
+    p = sub.add_parser("docs", help="documentation of the model and reports from the mirror")
+    p.add_argument("--format", default="md", choices=["md", "html", "json"])
+    p.add_argument("--dax", action="store_true", help="include DAX and M expressions")
+    p = sub.add_parser("m-lineage", help="Power Query step and column lineage")
+    p.add_argument("table", nargs="?")
     p = sub.add_parser("admin")
     p.add_argument("action", choices=["budget-reset", "allow", "category", "synthetic", "log"])
     p.add_argument("value", nargs="?")
@@ -180,6 +218,40 @@ def main(argv=None) -> int:
             out = handoff.build(ws, project, a.all)
         elif a.cmd == "memscrub":
             out = memscrub.run(ws, project, a.dir, apply=a.apply, show=a.show)
+        elif a.cmd == "unused":
+            from pbz import unused
+            if a.restore:
+                out = unused.restore(ws, project, a.restore)
+            elif a.remove:
+                out = unused.remove(ws, project, a.report, m_step=a.m_step, cascade=a.cascade, only=a.only,
+                                    dry_run=a.dry_run)
+            elif a.verify_engine:
+                from pbz import engdeps
+                out = engdeps.verify(ws, project, a.report)
+            else:
+                out = unused.report(ws, project, a.report, include_all=a.all, impact=a.impact, kinds=a.kinds)
+        elif a.cmd == "lineage":
+            from pbz import unused
+            out = unused.lineage(ws, project, a.target, "up" if a.up else "down", a.depth, a.report)
+        elif a.cmd == "suggest":
+            from pbz import suggest
+            out = suggest.run(ws, project, a.report)
+        elif a.cmd == "bpa":
+            from pbz import bpa
+            out = bpa.run(ws, project, a.scope, rules_path=a.rules, opinion=a.opinion, labels=a.labels,
+                          extra_reports=a.report)
+        elif a.cmd == "similar":
+            from pbz import similar
+            out = similar.run(ws, project, a.threshold, a.max)
+        elif a.cmd == "changes":
+            from pbz import changes
+            out = changes.list_snapshots(ws, project) if a.list else changes.run(ws, project, a.from_, a.to)
+        elif a.cmd == "docs":
+            from pbz import docs
+            out = docs.run(ws, project, a.format, a.dax)
+        elif a.cmd == "m-lineage":
+            from pbz import mlineage
+            out = mlineage.run(ws, project, a.table)
         elif a.cmd == "admin":
             out = admin(ws, a)
         else:

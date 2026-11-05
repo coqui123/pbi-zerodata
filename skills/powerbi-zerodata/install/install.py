@@ -29,6 +29,7 @@ BEGIN, END = "<!-- powerbi-zerodata:begin -->", "<!-- powerbi-zerodata:end -->"
 DENY_RULES = [
     "Read(//**/.pbi/**)", "Read(//**/*.abf)", "Read(//**/*.abf.stale)",
     "Read(~/Microsoft/Power BI Desktop Store App/**)", "Read(~/AppData/Local/pbz/**)", "Read(~/.pbz-private/**)",
+    "Read(//**/*.measurekiller)", "Read(~/AppData/Roaming/Measure Killer/**)",
 ]
 RULE_BLOCK = f"""{BEGIN}
 # Power BI zero-data rule (always on)
