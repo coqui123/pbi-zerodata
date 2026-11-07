@@ -110,6 +110,22 @@ class CliMcpParityTests(unittest.TestCase):
                 exposed = {spec[0] for spec in tool.opts.values()}
                 self.assertNotIn("--accept", exposed)
 
+    def test_cli_dry_run_verbs_have_mcp_twins(self):
+        for name, parser in self.commands.items():
+            flags = {opt for action in parser._actions for opt in action.option_strings}
+            if "--dry-run" not in flags:
+                continue
+            tools = [tool for tool in mcp.TOOLS if tool.verb and tool.verb[0] == name]
+            self.assertTrue(tools, name)
+            exposed = {spec[0] for tool in tools for spec in tool.opts.values()}
+            self.assertIn("--dry-run", exposed, name)
+
+    def test_preview_spec_is_an_object(self):
+        flag, schema, mode = mcp.BY_NAME["preview"].opts["spec"]
+        self.assertEqual(flag, "--spec")
+        self.assertEqual(mode, "json")
+        self.assertEqual(schema["type"], "object")
+
 
 if __name__ == "__main__":
     unittest.main()

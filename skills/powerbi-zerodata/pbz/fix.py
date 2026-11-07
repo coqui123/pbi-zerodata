@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 
 from . import bpa, tmdl, usage
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 from .tokens import apply_edits
 
 # rule id -> (property, value) set on each offending column; value None = bare flag line
@@ -60,14 +60,19 @@ def run(ws, project, rules: list[str], dry_run: bool = False) -> dict:
             edits.setdefault(node.file, []).extend(ed)
             fixed.append({"rule": rid, "object": h.obj, **({"note": note} if note else {})})
     files = []
+    planned = []
     mdef = os.path.join(project.mirror_model, "definition")
     for rel, eds in edits.items():
-        files.append(f"{project.name}.SemanticModel/definition/{rel}")
-        if dry_run:
-            continue
+        shown = f"{project.name}.SemanticModel/definition/{rel}"
+        files.append(shown)
         path = os.path.join(mdef, *rel.split("/"))
-        _t, bom = read_text(path)
-        write_text(path, apply_edits(model.docs[rel].text, sorted(set(eds))), bom)
+        try:
+            _text, bom = read_text(path)
+        except (OSError, UnicodeError, ValueError):
+            raise PbzError("REFUSED", shown) from None
+        planned.append((path, apply_edits(model.docs[rel].text, sorted(set(eds))), bom))
+    if planned and not dry_run:
+        commit_bytes([("write", path, text, bom) for path, text, bom in planned])
     return {"verb": "bpa-fix", "project": project.name, "result": "DRY_RUN" if dry_run else ("FIXED" if fixed else "NOTHING_TO_FIX"),
             "fixed": fixed, "skipped": skipped, "files": sorted(files),
             **({} if dry_run or not fixed else {"next": "pbz diff, pbz bpa (rerun), then pbz push"})}

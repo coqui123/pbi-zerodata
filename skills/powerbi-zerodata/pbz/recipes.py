@@ -22,9 +22,8 @@ import io
 import json
 import os
 import re
-import shutil
 
-from .common import PbzError
+from .common import PbzError, commit_bytes
 
 ALLOWED = {"set", "rename", "move", "new", "relationship", "add", "style", "filter", "interaction", "link",
            "bookmark", "copy", "hierarchy", "format-expr", "function", "culture", "translate", "perspective", "role",
@@ -45,22 +44,19 @@ def _snapshot(ws, project) -> dict[str, bytes]:
 
 def _restore(ws, project, snap: dict[str, bytes]) -> int:
     now = _snapshot(ws, project)
-    n = 0
+    ops = []
     for rel, data in snap.items():
         if now.get(rel) != data:
-            p = os.path.join(ws.mirror, rel)
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            with open(p, "wb") as h:
-                h.write(data)
-            n += 1
+            ops.append(("write_bytes", os.path.join(ws.mirror, rel), data))
     for rel in set(now) - set(snap):
-        os.remove(os.path.join(ws.mirror, rel))
-        n += 1
-    for base in (project.mirror_model, project.mirror_report):  # drop folders a step created
-        for cur, dirs, files in sorted(os.walk(base), key=lambda x: -len(x[0])):
-            if cur != base and not os.listdir(cur):
-                shutil.rmtree(cur, ignore_errors=True)
-    return n
+        ops.append(("delete", os.path.join(ws.mirror, rel)))
+    if not ops:
+        return 0
+    try:
+        commit_bytes(ops)
+    except PbzError:
+        raise PbzError("RECOVERY_REQUIRED", "the recipe could not be restored") from None
+    return len(ops)
 
 
 def _subst(arg: str, params: dict) -> str:
@@ -95,62 +91,131 @@ def load(spec: str) -> dict:
     return r
 
 
+def _flag(args: list[str], name: str) -> bool:
+    return any(a == name or a.startswith(name + "=") for a in args)
+
+
+def _forbidden(verb: str, args: list[str]) -> bool:
+    if verb == "image":
+        return True
+    if verb == "unused" and (_flag(args, "--remove") or _flag(args, "--verify-engine")):
+        return True
+    return False
+
+
+def _prepare(ws, project, steps: list, params: dict) -> list[tuple[dict, list[str]]]:
+    """Substitute and parse every step before any step runs. Parser text stays local."""
+    from . import cli
+    parser = cli.argument_parser()
+    ready = []
+    for i, s in enumerate(steps, 1):
+        try:
+            args = [_subst(str(a), params) for a in s.get("args", [])]
+        except PbzError as e:
+            raise PbzError(e.code, f"step {i}") from None
+        if any(str(a).startswith(("--workspace", "--project")) for a in args):
+            raise PbzError("BAD_REQUEST", f"step {i}: a recipe works on the current workspace and project only")
+        if _forbidden(s["verb"], args):
+            raise PbzError("BAD_REQUEST", f"step {i}: that action is not allowed in a recipe")
+        argv = ["--workspace", ws.root, "--project", project.name, s["verb"], *args]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                parser.parse_args(argv)
+        except (SystemExit, Exception):
+            raise PbzError("BAD_REQUEST", f"step {i}: arguments are not valid") from None
+        ready.append((s, args))
+    return ready
+
+
 def _call(ws, project, verb: str, args: list[str]) -> tuple[int, dict]:
     from . import cli
     argv = ["--workspace", ws.root, "--project", project.name, verb, *args]
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = cli.main(argv)
+    buf, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+        try:
+            rc = cli.main(argv)
+        except SystemExit:
+            return 2, {"error": "BAD_REQUEST"}
     text = buf.getvalue().strip()
     try:
         out = json.loads(text) if text else {}
     except ValueError:
-        out = {"raw": text[-300:]}
-    return rc, out if isinstance(out, dict) else {"value": out}
+        out = {"error": "BAD_REQUEST"}
+    if not isinstance(out, dict):
+        out = {"error": "BAD_REQUEST"}
+    out.pop("raw", None)
+    return rc, out
 
 
 def run(ws, project, spec: str, params: dict | None = None, dry_run: bool = False) -> dict:
-    from . import validate
+    from . import cli, validate
     r = load(spec)
     params = {**(r.get("params") or {}), **(params or {})}
     limits = r.get("limits") or {}
+    resolved = _prepare(ws, project, r["steps"], params)
     snap = _snapshot(ws, project)
-    steps, failed = [], None
-    for i, s in enumerate(r["steps"], 1):
-        args = [_subst(str(a), params) for a in s.get("args", [])]
-        rc, out = _call(ws, project, s["verb"], args)
-        rec = {"step": i, "verb": s["verb"], "rc": rc}
-        for k in ("result", "action", "changed", "error", "detail"):
-            if k in out:
-                rec[k] = out[k] if k != "changed" or not isinstance(out[k], list) else len(out[k])
-        if rc != 0:
-            policy = (s.get("on_error") or {}).get(out.get("error", ""), "fail")
-            if policy == "skip":
-                rec["skipped"] = True
-                steps.append(rec)
-                continue
-            failed = f"step {i} ({s['verb']}) failed: {out.get('error')}"
-            steps.append(rec)
-            break
-        for k, want in (s.get("expect") or {}).items():
-            if out.get(k) != want:
-                failed = f"step {i} ({s['verb']}) expected {k}={want}, got {out.get(k)}"
+    steps, failed, findings = [], None, []
+    changed, removed = [], []
+    prev = cli.suppress_evidence
+    cli.suppress_evidence = True
+    try:
+        # Leftover empty folders from an earlier rollback are not this recipe's fault.
+        baseline = {(f.get("code"), f.get("where")) for f in validate.run_mirror(ws, project)
+                    if f.get("severity") == "error"}
+        for i, (s, args) in enumerate(resolved, 1):
+            try:
+                rc, out = _call(ws, project, s["verb"], args)
+            except Exception:
+                failed = f"step {i}"
+                steps.append({"step": i, "verb": s["verb"], "error": "BAD_REQUEST"})
                 break
-        steps.append(rec)
-        if failed:
-            break
-    changed = sorted(rel.replace("\\", "/") for rel, data in _snapshot(ws, project).items() if snap.get(rel) != data)
-    removed = sorted(rel.replace("\\", "/") for rel in set(snap) - set(_snapshot(ws, project)))
-    if not failed and limits.get("max_files") is not None and len(changed) + len(removed) > int(limits["max_files"]):
-        failed = f"the recipe touched {len(changed) + len(removed)} files, more than its limit of {limits['max_files']}"
-    findings = [] if failed else [f for f in validate.run_mirror(ws, project) if f.get("severity") == "error"]
-    if findings and not failed:
-        failed = f"validation failed after the recipe: {len(findings)} error(s)"
+            rec = {"step": i, "verb": s["verb"], "rc": rc}
+            for k in ("result", "action", "error"):
+                if k in out and not isinstance(out[k], (list, dict)):
+                    rec[k] = out[k]
+            if "changed" in out:
+                rec["changed"] = len(out["changed"]) if isinstance(out["changed"], list) else out["changed"]
+            if rc != 0:
+                policy = (s.get("on_error") or {}).get(out.get("error", ""), "fail")
+                if policy == "skip":
+                    rec["skipped"] = True
+                    steps.append(rec)
+                    continue
+                failed = f"step {i} ({s['verb']}) failed: {out.get('error') or 'BAD_REQUEST'}"
+                steps.append(rec)
+                break
+            for k, want in (s.get("expect") or {}).items():
+                if out.get(k) != want:
+                    failed = f"step {i} ({s['verb']}) expected {k}={want}"
+                    break
+            steps.append(rec)
+            if failed:
+                break
+        if not failed:
+            now = _snapshot(ws, project)
+            changed = sorted(rel.replace("\\", "/") for rel, data in now.items() if snap.get(rel) != data)
+            removed = sorted(rel.replace("\\", "/") for rel in set(snap) - set(now))
+            if limits.get("max_files") is not None and len(changed) + len(removed) > int(limits["max_files"]):
+                failed = f"the recipe touched {len(changed) + len(removed)} files, more than its limit of {limits['max_files']}"
+            else:
+                findings = [f for f in validate.run_mirror(ws, project) if f.get("severity") == "error"
+                            and (f.get("code"), f.get("where")) not in baseline]
+                if findings:
+                    failed = f"validation failed after the recipe: {len(findings)} error(s)"
+    except PbzError as e:
+        if e.code == "RECOVERY_REQUIRED":
+            raise
+        failed = failed or "the recipe failed"
+    except Exception:
+        failed = failed or "the recipe failed"
+    finally:
+        cli.suppress_evidence = prev
     out = {"verb": "recipe", "recipe": r.get("recipe", "unnamed"), "version": r.get("version"), "steps": steps,
            "files_changed": changed[:200], "files_removed": removed[:50]}
     if failed or dry_run:
         restored = _restore(ws, project, snap)
-        out.update(result="ROLLED_BACK" if failed else "DRY_RUN", restored_files=restored)
+        out.update(result="ROLLED_BACK" if failed else "DRY_RUN", restored_files=restored,
+                   files_changed=[], files_removed=[])
         if failed:
             out["reason"] = failed
             if findings:

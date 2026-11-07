@@ -9,7 +9,7 @@ import re
 import uuid
 
 from . import lexers, mlineage, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 from .tokens import apply_edits
 
 UNITS = ("day", "month", "quarter", "year")
@@ -48,12 +48,11 @@ def _partition(model, t):
     return p, reg
 
 
-def _params(mdef: str, model) -> list[str]:
-    """Create RangeStart / RangeEnd DateTime parameters when missing. Returns created names."""
+def _params(mdef: str, model) -> tuple[list[str], str | None]:
+    """Plan RangeStart / RangeEnd parameters. Returns created names and the new file text, or None."""
     have = {e.lower() for e in model.expressions}
     made = []
-    rel = "expressions.tmdl"
-    path = os.path.join(mdef, rel)
+    path = os.path.join(mdef, "expressions.tmdl")
     text = read_text(path)[0] if os.path.exists(path) else ""
     eol = "\r\n" if "\r\n" in text else "\n"
     for name, (y, mo) in (("RangeStart", (2024, 1)), ("RangeEnd", (2024, 2))):
@@ -63,9 +62,7 @@ def _params(mdef: str, model) -> list[str]:
                  f"IsParameterQueryRequired=true]{eol}\tlineageTag: {uuid.uuid4()}{eol}{eol}\tannotation PBI_ResultType = DateTime{eol}")
         text = (text.rstrip("\r\n") + eol + eol if text.strip() else "") + block
         made.append(name)
-    if made:
-        _write(mdef, rel, text)
-    return made
+    return made, (text if made else None)
 
 
 def set_policy(ws, project, table: str, date_col: str, store: int, store_unit: str, refresh: int, refresh_unit: str,
@@ -92,7 +89,7 @@ def set_policy(ws, project, table: str, date_col: str, store: int, store_unit: s
     steps, result = mlineage.split_steps(src)
     if steps is None or result is None:
         raise PbzError("UNSUPPORTED", "the query is not a simple `let ... in <step>`")
-    made = _params(mdef, model)
+    made, expr = _params(mdef, model)
     # 1) filter step in the partition query (skip when the query already filters on RangeStart)
     if "RangeStart" in src and "RangeEnd" in src:
         new_src, filtered = src, "EXISTING"
@@ -134,7 +131,15 @@ def set_policy(ws, project, table: str, date_col: str, store: int, store_unit: s
     kids = [ch for ch in t.node.children if ch.kind not in ("annotation", "changedProperty")]
     at = tmdl.block_span(doc, kids[0])[0] if kids else tmdl.block_span(doc, t.node)[1]
     edits = [(reg.start, reg.end, new_src), (at, at, block)] if filtered == "ADDED" else [(at, at, block)]
-    _write(mdef, p.file, apply_edits(doc.text, sorted(edits)))
+    ops = []
+    if expr is not None:
+        epath = os.path.join(mdef, "expressions.tmdl")
+        ebom = read_text(epath)[1] if os.path.exists(epath) else b""
+        ops.append(("write", epath, expr, ebom))
+    ppath = os.path.join(mdef, *p.file.split("/"))
+    _t, pbom = read_text(ppath)
+    ops.append(("write", ppath, apply_edits(doc.text, sorted(edits)), pbom))
+    commit_bytes(ops)
     files = [f"{project.name}.SemanticModel/definition/{p.file}"] + (
         [f"{project.name}.SemanticModel/definition/expressions.tmdl"] if made else [])
     return {"verb": "refresh-policy", "action": "set", "table": t.name, "status": "CONFIGURED_NOT_REFRESH_VERIFIED",

@@ -4,45 +4,76 @@ from __future__ import annotations
 BLOCKED = {"DESKTOP_OPEN", "DESKTOP_DIRTY", "DESKTOP_STATE_UNKNOWN", "WAITING_ON_DIALOG", "CONFLICT",
            "CONFLICT_RISK", "PENDING_PQ_CHANGES", "BUDGET", "RECOVERY_REQUIRED", "INCOMPARABLE",
            "PENDING_PUSH", "INCOMPLETE", "HUMAN_REVIEW_REQUIRED", "DEPENDENCY_PENDING", "STALE_EVIDENCE",
-           "RECOVERY_CONFLICT", "COMMIT_BUSY", "AMBIGUOUS_DESKTOP"}
+           "RECOVERY_CONFLICT", "COMMIT_BUSY", "AMBIGUOUS_DESKTOP", "NOT_COMPARABLE", "LOCAL_STATE_UNAVAILABLE"}
 UNAVAILABLE = {"ENGINE_UNAVAILABLE", "NOT_AVAILABLE", "UNSUPPORTED", "TIMEOUT", "NOT_READY", "CLI_UNAVAILABLE"}
 INVALID = {"INVALID", "BAD_REQUEST", "BAD_ARGUMENTS", "UNKNOWN_TOKEN", "SPEC_INVALID"}
+
+
+def _exec_error(value) -> bool:
+    """Synthetic or engine execution verdicts (`ERROR` and `ERROR:CLASS`), never a success."""
+    return isinstance(value, str) and (value == "ERROR" or value.startswith("ERROR:"))
+
+
+def _row_failed(row: dict) -> bool:
+    return (row.get("status") in {"FAIL", "ERROR", "PROTOCOL_ERROR"} or row.get("result") in {"DIFF", "ERROR"}
+            or _exec_error(row.get("result")) or _exec_error(row.get("status")))
+
+
+def _smoke_incomplete(out: dict) -> bool:
+    """Partial smoke coverage is inconclusive, not a successful execution."""
+    if out.get("verb") != "smoke":
+        return False
+    rows = [r for r in out.get("visuals") or [] if isinstance(r, dict)]
+    if any(r.get("coverage") not in (None, "FULL") or r.get("note") for r in rows):
+        return True
+    summary = out.get("summary")
+    skipped = summary.get("not_executed") if isinstance(summary, dict) else None
+    return isinstance(skipped, dict) and any(isinstance(v, int) and not isinstance(v, bool) and v for v in skipped.values())
 
 
 def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
     """Keep existing fields while giving callers one canonical status and exit code."""
     out = dict(out)
     candidates = [out.get(k) for k in ("result", "status", "action", "error")]
-    known = BLOCKED | UNAVAILABLE | INVALID | {"ROLLED_BACK"}
-    code = next((c for c in candidates if isinstance(c, str) and c in known),
+    known = BLOCKED | UNAVAILABLE | INVALID | {"ROLLED_BACK", "FAILED", "INTERNAL_ERROR"}
+    code = next((c for c in candidates if isinstance(c, str) and (c in known or _exec_error(c))),
                 str(out.get("error") or out.get("result") or out.get("status") or out.get("action") or "OK"))
     query_rows = [r for r in out.get("results", []) + out.get("queries", []) if isinstance(r, dict)]
     visual_rows = [r for r in out.get("visuals") or [] if isinstance(r, dict)]
     status, rc = "SUCCEEDED", 0
     reload = out.get("reload")
+    assertions = any(_row_failed(r) for r in query_rows) or any(_row_failed(r) for r in visual_rows)
     if out.get("result") == "PUSHED" and reload and reload != "RELOADED":
         status, code, rc = "PARTIAL", "APPLIED_RELOAD_FAILED", 5
     elif out.get("result") == "PARTIAL":
         status, code, rc = "PARTIAL", "PARTIAL", 5
+    elif code == "INTERNAL_ERROR" or out.get("error") == "INTERNAL_ERROR":
+        status, code, rc = "FAILED", "INTERNAL_ERROR", 1
     elif code in BLOCKED:
         status, rc = "BLOCKED", 3
     elif code in UNAVAILABLE:
         status, rc = "UNAVAILABLE", 4
     elif code in INVALID or out.get("spec_valid") is False:
         status, rc = "INVALID", 2
-    elif code == "ROLLED_BACK" or code == "FAILED":
+    elif code in {"ROLLED_BACK", "FAILED"}:
         status, rc = "FAILED", 1
+    elif _exec_error(code) or _exec_error(out.get("result")) or _exec_error(out.get("status")):
+        # `--diagnostic` collects check findings without an assertion-failure exit.
+        if diagnostic:
+            status, code, rc = "FINDINGS", "DIAGNOSTIC_FINDINGS", 0
+        else:
+            status, code, rc = "FAILED", code if _exec_error(code) else "ASSERTION_FAILED", 1
     elif out.get("ok") is False or out.get("error"):
         status, rc = "FAILED", 2
     elif out.get("gate") == "FAIL":
         status, code, rc = "FAILED", "GATE_FAILED", 1
     elif any(f.get("severity") == "error" for f in out.get("findings", []) if isinstance(f, dict)):
         status, code, rc = "INVALID", "VALIDATION_FAILED", 2
-    elif any(r.get("status") in {"FAIL", "ERROR"} or r.get("result") in {"DIFF", "ERROR"} for r in query_rows) \
-            or any(r.get("status") in {"ERROR", "PROTOCOL_ERROR", "FAIL"} for r in visual_rows):
+    elif assertions:
         status, code, rc = ("FINDINGS", "DIAGNOSTIC_FINDINGS", 0) if diagnostic else ("FAILED", "ASSERTION_FAILED", 1)
-    elif any(r.get("status") in {"EMPTY", "UNSUPPORTED", "BUDGET"} or r.get("result") in {"STALE_DATA", "ERROR"}
-             for r in query_rows):
+    elif _smoke_incomplete(out) or any(
+            r.get("status") in {"EMPTY", "UNSUPPORTED", "BUDGET"} or r.get("result") in {"STALE_DATA", "NOT_COMPARABLE"}
+            for r in query_rows):
         status, code, rc = "BLOCKED", "INCONCLUSIVE_EVIDENCE", 3
     elif out.get("status") == "BUDGET":
         status, code, rc = "BLOCKED", "BUDGET", 3

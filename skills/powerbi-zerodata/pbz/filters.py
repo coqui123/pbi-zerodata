@@ -19,7 +19,7 @@ import secrets
 from datetime import datetime as _dt
 
 from . import author, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 from .tokens import TOKEN_RE
 
 OPS = {"=": 0, "==": 0, ">": 1, ">=": 2, "<": 3, "<=": 4}
@@ -156,6 +156,37 @@ def build(model, field: str, values_in: list[str] | None = None, values_out: lis
 
 # ---------------------------------------------------------------- scopes
 
+def _strict_docs(project) -> None:
+    """Mutation reads every filter document first. A bad sibling is REFUSED, path only."""
+    ddir = os.path.join(project.mirror_report, "definition")
+    if not os.path.isdir(ddir):
+        raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    for cur, _d, fs in os.walk(ddir):
+        for name in fs:
+            if name not in ("report.json", "page.json", "visual.json"):
+                continue
+            path = os.path.join(cur, name)
+            rel = os.path.relpath(path, project.ws.mirror).replace("\\", "/")
+            try:
+                json.loads(read_text(path)[0])
+            except (OSError, UnicodeError, ValueError):
+                raise PbzError("REFUSED", rel) from None
+
+
+def _dump(doc: dict) -> str:
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+def _commit_json(path, bom, body: str, dry_run: bool, out: dict, mirror: str) -> dict:
+    rel = os.path.relpath(path, mirror).replace("\\", "/")
+    out["files"] = [rel]
+    if dry_run:
+        out["result"] = "DRY_RUN"
+        return out
+    commit_bytes([("write", path, body, bom)])
+    return out
+
+
 def _scope_file(project, page: str | None, visual: str | None, report: bool) -> tuple[str, str]:
     """(json path, scope label)"""
     ddir = os.path.join(project.mirror_report, "definition")
@@ -231,7 +262,8 @@ def _summary(flt: dict) -> str:
 # ---------------------------------------------------------------- verbs
 
 def add(ws, project, field: str, page: str | None = None, visual: str | None = None, report: bool = False,
-        values_in=None, values_out=None, where=None, top=None, by=None, bottom=False) -> dict:
+        values_in=None, values_out=None, where=None, top=None, by=None, bottom=False, dry_run: bool = False) -> dict:
+    _strict_docs(project)
     model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
     path, scope = _scope_file(project, page, visual, report)
     flt = build(model, field, values_in, values_out, where, top, by, bottom)
@@ -244,14 +276,15 @@ def add(ws, project, field: str, page: str | None = None, visual: str | None = N
     doc = json.loads(text)
     filters = doc.setdefault("filterConfig", {}).setdefault("filters", [])
     filters.append(flt)
-    write_text(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n", bom)
-    return {"verb": "filter", "action": "add", "scope": scope, "name": flt["name"], "field": _label(flt),
-            "type": flt["type"], "condition": _summary(flt),
-            "files": [os.path.relpath(path, ws.mirror).replace("\\", "/")],
-            "next": "pbz validate, then pbz push --reload (report-only change)"}
+    return _commit_json(path, bom, _dump(doc), dry_run, {
+        "verb": "filter", "action": "add", "scope": scope, "name": flt["name"], "field": _label(flt),
+        "type": flt["type"], "condition": _summary(flt),
+        "next": "pbz validate, then pbz push --reload (report-only change)"}, ws.mirror)
 
 
-def remove(ws, project, target: str, page: str | None = None, visual: str | None = None, report: bool = False) -> dict:
+def remove(ws, project, target: str, page: str | None = None, visual: str | None = None, report: bool = False,
+           dry_run: bool = False) -> dict:
+    _strict_docs(project)
     path, scope = _scope_file(project, page, visual, report)
     text, bom = read_text(path)
     doc = json.loads(text)
@@ -268,9 +301,8 @@ def remove(ws, project, target: str, page: str | None = None, visual: str | None
         doc["filterConfig"].pop("filters")
         if not doc["filterConfig"]:
             doc.pop("filterConfig")
-    write_text(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n", bom)
-    return {"verb": "filter", "action": "remove", "scope": scope, "removed": len(filters) - len(keep),
-            "files": [os.path.relpath(path, ws.mirror).replace("\\", "/")]}
+    return _commit_json(path, bom, _dump(doc), dry_run, {
+        "verb": "filter", "action": "remove", "scope": scope, "removed": len(filters) - len(keep)}, ws.mirror)
 
 
 def list_(ws, project, page: str | None = None, visual: str | None = None, report: bool = False) -> dict:
@@ -297,12 +329,13 @@ def list_(ws, project, page: str | None = None, visual: str | None = None, repor
                          **({"how": x["howCreated"]} if x.get("howCreated") else {})} for x in fl]}
 
 
-def interaction(ws, project, page: str, source: str, target: str, mode: str) -> dict:
+def interaction(ws, project, page: str, source: str, target: str, mode: str, dry_run: bool = False) -> dict:
     """How `source` affects `target` on a page: filter, highlight, none, or default (Desktop's choice).
     target may be `all` (every other visual on the page)."""
     from .style import targets
     if mode not in (*MODES, "default"):
         raise PbzError("BAD_REQUEST", "mode: filter, highlight, none or default")
+    _strict_docs(project)
     src = targets(project, page, source, None, False)[0]
     page_dir = os.path.dirname(os.path.dirname(os.path.dirname(src["path"])))
     every = [t for t in targets(project, page, None, None, True) if t["id"] != src["id"]]
@@ -320,7 +353,6 @@ def interaction(ws, project, page: str, source: str, target: str, mode: str) -> 
         doc["visualInteractions"] = inter
     else:
         doc.pop("visualInteractions", None)
-    write_text(pj, json.dumps(doc, indent=2, ensure_ascii=False) + "\n", bom)
-    return {"verb": "interaction", "page": src["page"], "source": src["id"], "targets": [t["id"] for t in tg],
-            "mode": mode, "files": [os.path.relpath(pj, ws.mirror).replace("\\", "/")],
-            "next": "pbz validate, then pbz push --reload"}
+    return _commit_json(pj, bom, _dump(doc), dry_run, {
+        "verb": "interaction", "page": src["page"], "source": src["id"], "targets": [t["id"] for t in tg],
+        "mode": mode, "next": "pbz validate, then pbz push --reload"}, ws.mirror)

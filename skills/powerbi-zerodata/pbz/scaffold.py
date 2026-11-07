@@ -8,7 +8,7 @@ import re
 import uuid
 
 from . import lexers, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 from .tokens import TOKEN_RE, apply_edits
 
 TI_ITEMS = {  # calculation item name -> DAX template ({date} = the date column), optional format string
@@ -66,18 +66,19 @@ def _plan_table(mdef: str, model, name: str, text: str, model_flags: list[str] =
     eol = "\r\n" if "\r\n" in (model.docs.get("model.tmdl").text if "model.tmdl" in model.docs else "") else "\n"
     planned = [(path, text.replace("\n", eol))]
     mt = model.docs.get("model.tmdl")
-    if mt is not None:
-        refs = list(re.finditer(r"(?m)^ref table .*$", mt.text))
-        line = f"ref table {_q(name)}"
-        if refs:
-            at = refs[-1].end()
-            edits = [(at, at, eol + line)]
-        else:
-            edits = [(len(mt.text), len(mt.text), ("" if mt.text.endswith(("\n", "\r")) else eol) + eol + line + eol)]
-        if model.model_node is not None:
-            for flag in model_flags:
-                edits += tmdl.prop_edit(mt, model.model_node, flag, None)
-        planned.append((os.path.join(mdef, "model.tmdl"), apply_edits(mt.text, sorted(edits))))
+    if mt is None:
+        raise PbzError("NO_MIRROR", "model.tmdl is missing; run `pbz pull` first")
+    refs = list(re.finditer(r"(?m)^ref table .*$", mt.text))
+    line = f"ref table {_q(name)}"
+    if refs:
+        at = refs[-1].end()
+        edits = [(at, at, eol + line)]
+    else:
+        edits = [(len(mt.text), len(mt.text), ("" if mt.text.endswith(("\n", "\r")) else eol) + eol + line + eol)]
+    if model.model_node is not None:
+        for flag in model_flags:
+            edits += tmdl.prop_edit(mt, model.model_node, flag, None)
+    planned.append((os.path.join(mdef, "model.tmdl"), apply_edits(mt.text, sorted(edits))))
     return planned
 
 
@@ -156,12 +157,35 @@ def date_table(ws, project, name: str, start: int, end: int, relate: list[str] =
             + "".join(f"\t\tlevel {_q(lv)}\n\t\t\tlineageTag: {_tag()}\n\t\t\tcolumn: {_q(lv)}\n\n"
                       for lv in ("Year", "Quarter", "Month", "Date"))
             + f"\tpartition {_q(name)} = calculated\n\t\tmode: import\n\t\tsource ={expr}")
-    files = _write_table(project, mdef, model, name, text)
-    out = {"verb": "new", "kind": "date-table", "table": name, "files": files, "marked": True,
-           "next": "pbz relationship add ... (or --relate), pbz diff, pbz push, then `pbz refresh` with Desktop open"}
+    planned = _plan_table(mdef, model, name, text)
+    texts = {rel: doc.text for rel, doc in model.docs.items()}
+    for path, body in planned:
+        texts[os.path.relpath(path, mdef).replace("\\", "/")] = body
+    mem = tmdl.load_model(mdef, texts)
+    rel_text = texts.get("relationships.tmdl", "")
+    labels = []
     if relate:
         from . import relate as rel_mod
-        out["relationships"] = [rel_mod.add(ws, project, r, f"{qt}[Date]")["relationship"] for r in relate]
+        for ref in relate:
+            rel_text, info = rel_mod.plan_add(mem, rel_text, ref, f"{qt}[Date]")
+            labels.append(info["relationship"])
+    ops = []
+    files = []
+    for path, body in planned:
+        rel = os.path.relpath(path, mdef).replace("\\", "/")
+        files.append(f"{project.name}.SemanticModel/definition/{rel}")
+        bom = read_text(path)[1] if os.path.isfile(path) else b""
+        ops.append(("write", path, body, bom))
+    if relate:
+        rpath = os.path.join(mdef, "relationships.tmdl")
+        bom = read_text(rpath)[1] if os.path.isfile(rpath) else b""
+        ops.append(("write", rpath, rel_text, bom))
+        files.append(f"{project.name}.SemanticModel/definition/relationships.tmdl")
+    commit_bytes(ops)
+    out = {"verb": "new", "kind": "date-table", "table": name, "files": files, "marked": True,
+           "next": "pbz relationship add ... (or --relate), pbz diff, pbz push, then `pbz refresh` with Desktop open"}
+    if labels:
+        out["relationships"] = labels
     return out
 
 

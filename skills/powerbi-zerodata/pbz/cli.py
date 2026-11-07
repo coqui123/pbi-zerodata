@@ -15,6 +15,28 @@ from pbz import checks, describe, desktop, dpapi, handoff, memscrub, mirror, pol
 from pbz.common import PbzError, emit, engine_call, file_sha, find_workspace  # noqa: E402
 
 
+def _preview_spec(ws, arg: str | None):
+    """Inline JSON object, or a path that stays inside the mirror. Never an arbitrary file read."""
+    if not arg:
+        return None
+    text = arg.strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            raise PbzError("REFUSED", "preview spec is malformed")
+        if not isinstance(obj, dict):
+            raise PbzError("REFUSED", "preview spec is not an object")
+        return obj
+    from pathlib import Path
+    path = Path(arg)
+    mirror = Path(ws.mirror).resolve()
+    resolved = path.resolve() if path.is_absolute() else (mirror / path).resolve()
+    if not resolved.is_relative_to(mirror):
+        raise PbzError("REFUSED", "preview spec must stay inside the mirror")
+    return str(resolved)
+
+
 def _spec(arg: str | None) -> dict | None:
     if not arg:
         return None
@@ -39,7 +61,6 @@ ISOLATION = (
 )
 DOCTOR_NOTE = ("heuristic mode is not OS-isolated; closed verdicts do not prove non-inference. "
                "doctor does not change ACLs, accounts, firewall rules or brokers.")
-_DOCTOR_STATUS = {"configured", "unverified", "failed"}
 
 
 def cmd_doctor() -> dict:
@@ -47,11 +68,6 @@ def cmd_doctor() -> dict:
     items = []
     for item_id, title in ISOLATION:
         status = "unverified"
-        # Only a positive, privilege-free fact. Absence is unverified, not failed.
-        if item_id == "disposable" and os.environ.get("USERNAME", "").lower() == "wdagutilityaccount":
-            status = "configured"
-        if status not in _DOCTOR_STATUS:
-            status = "unverified"
         items.append({"id": item_id, "title": title, "status": status})
     return {"verb": "doctor", "isolation": items, "note": DOCTOR_NOTE}
 
@@ -118,6 +134,9 @@ def cmd_init(ws, project, a):
 def argument_parser():
     """Argparse tree only. Contract tests use this; it does not run a command."""
     return main(parser_only=True)
+
+
+suppress_evidence = False
 
 
 def main(argv=None, *, parser_only: bool = False) -> int:
@@ -336,6 +355,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("--top", type=int, help="Top N: keep the N best items of the column")
     p.add_argument("--by", help="Top N: the measure that ranks them")
     p.add_argument("--bottom", action="store_true", help="Top N: the lowest instead")
+    p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("copy", help="duplicate a report page or a visual (or group) with new ids")
     p.add_argument("kind", choices=["page", "visual"])
     p.add_argument("page", help="source page (display name or id)")
@@ -378,6 +398,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("action", choices=["run", "check"])
     p.add_argument("spec", help="recipe file or JSON")
     p.add_argument("--param", action="append", default=[], help="name=value (repeatable)")
+    p.add_argument("--dry-run", action="store_true", help="apply then restore; write nothing")
     for verb in ("set", "get"):
         p = sub.add_parser(verb, help="typed model properties (description, displayFolder, formatString, isHidden, isKey, "
                                       "dataCategory, summarizeBy, sortByColumn, isAvailableInMdx)"
@@ -403,6 +424,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("source", help="visual id or layout label")
     p.add_argument("target", help="visual id, layout label, or all")
     p.add_argument("mode", choices=["filter", "highlight", "none", "default"])
+    p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("style", help="visual formatting (titles, labels, colors, fonts, axes, legends, ...) checked "
                                      "against Microsoft's formatting catalog")
     p.add_argument("page", nargs="?", help="page display name or id")
@@ -455,6 +477,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     direction.add_argument("--single", action="store_true", help="set: filter in one direction")
     p.add_argument("--many-to-many", action="store_true")
     p.add_argument("--force", action="store_true", help="add: allow mismatched data types")
+    p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("move", help="move a measure to another table, fixing references")
     p.add_argument("kind", choices=["measure"])
     p.add_argument("name")
@@ -574,7 +597,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             out = {"verb": "check-schema", "schema": checks.check_schema()}
         elif a.cmd == "preview":
             from pbz import preview
-            out = preview.run(ws, project, a.page, _spec(a.spec))
+            out = preview.run(ws, project, a.page, _preview_spec(ws, a.spec))
         elif a.cmd == "interactions":
             from pbz import interactiontest
             out = interactiontest.capabilities() if a.action == "capabilities" else interactiontest.run(ws, project, a.spec, a.mode)
@@ -633,7 +656,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             from pbz import evidence
             out = evidence.review(ws, project, a.accept)
         elif a.cmd == "memscrub":
-            out = memscrub.run(ws, project, a.dir, apply=a.apply, show=a.show)
+            out = memscrub.run(ws, project, a.dir, apply=a.apply, show=a.show, human=_is_human())
         elif a.cmd == "unused":
             from pbz import unused
             if a.restore:
@@ -724,13 +747,13 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             elif not a.target:
                 raise PbzError("BAD_REQUEST", f"filter {a.action} needs a field or filter name")
             elif a.action == "remove":
-                out = filters.remove(ws, project, a.target, a.page, a.visual, a.report)
+                out = filters.remove(ws, project, a.target, a.page, a.visual, a.report, dry_run=a.dry_run)
             else:
                 out = filters.add(ws, project, a.target, a.page, a.visual, a.report, a.values_in, a.values_out,
-                                  a.where or None, a.top, a.by, a.bottom)
+                                  a.where or None, a.top, a.by, a.bottom, dry_run=a.dry_run)
         elif a.cmd == "interaction":
             from pbz import filters
-            out = filters.interaction(ws, project, a.page, a.source, a.target, a.mode)
+            out = filters.interaction(ws, project, a.page, a.source, a.target, a.mode, dry_run=a.dry_run)
         elif a.cmd == "copy":
             from pbz import components
             if a.kind == "page":
@@ -791,7 +814,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
                 out = {"verb": "recipe", "action": "check", "recipe": r.get("recipe", "unnamed"),
                        "steps": [s["verb"] for s in r["steps"]], "result": "VALID"}
             else:
-                out = recipes.run(ws, project, a.spec, params)
+                out = recipes.run(ws, project, a.spec, params, dry_run=a.dry_run)
         elif a.cmd in ("set", "get"):
             from pbz import props
             assigns = [x for x in a.items if "=" in x and x.split("=", 1)[0].strip() in props.PROPS]
@@ -871,13 +894,13 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             from pbz import relate
             if a.action == "add":
                 out = relate.add(ws, project, a.from_col, a.to_col, inactive=a.inactive, both=a.both,
-                                 many_to_many=a.many_to_many, force=a.force)
+                                 many_to_many=a.many_to_many, force=a.force, dry_run=a.dry_run)
             elif a.action == "remove":
-                out = relate.remove(ws, project, a.from_col, a.to_col)
+                out = relate.remove(ws, project, a.from_col, a.to_col, dry_run=a.dry_run)
             else:
                 out = relate.set_(ws, project, a.from_col, a.to_col,
                                   active=True if a.active else (False if a.inactive else None),
-                                  both=True if a.both else (False if a.single else None))
+                                  both=True if a.both else (False if a.single else None), dry_run=a.dry_run)
         elif a.cmd == "move":
             from pbz import move
             out = move.move_measure(ws, project, a.name, a.to)
@@ -988,7 +1011,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
         out, rc = envelope(error)
         emit(out)
         return rc
-    if project is not None:  # revision-bound evidence for `pbz review` (verdict counts and ids only)
+    if project is not None and not suppress_evidence:  # revision-bound evidence for `pbz review`
         from pbz import evidence
         try:
             evidence.record(ws, project, a.cmd, getattr(a, "action", None), out)

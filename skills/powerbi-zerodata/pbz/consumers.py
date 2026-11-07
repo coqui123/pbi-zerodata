@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from . import lexers, pbir, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 
 REG = (".pbz", "consumers.json")
 CACHE = "consumers"
@@ -53,19 +53,61 @@ def _reg_path(ws) -> str:
     return os.path.join(ws.root, *REG)
 
 
+def _entry_ok(entry) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    cid = entry.get("id")
+    kind = entry.get("kind")
+    if not isinstance(cid, str) or not cid.strip() or kind not in KINDS:
+        return False
+    if kind == "manual":
+        objs = entry.get("objects")
+        return isinstance(objs, list) and all(isinstance(o, str) for o in objs)
+    path = entry.get("path")
+    return isinstance(path, str) and bool(path.strip())
+
+
 def load_registry(ws) -> dict:
+    """Load .pbz/consumers.json. A missing file is an empty registry. A present file that
+    cannot be read or does not match the envelope is refused before any evaluation or write."""
+    path = _reg_path(ws)
+    if not os.path.lexists(path):
+        return {"version": 1, "consumers": []}
     try:
-        with open(_reg_path(ws), encoding="utf-8") as f:
-            reg = json.load(f)
-    except (OSError, ValueError):
-        reg = {}
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        raise PbzError("REFUSED", "consumer registry is unreadable")
+    try:
+        reg = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        raise PbzError("REFUSED", "consumer registry is malformed")
     if not isinstance(reg, dict) or not isinstance(reg.get("consumers"), list):
-        reg = {"version": 1, "consumers": []}
+        raise PbzError("REFUSED", "consumer registry structure is invalid")
+    if any(not _entry_ok(e) for e in reg["consumers"]):
+        raise PbzError("REFUSED", "consumer registry entry is invalid")
     return reg
 
 
-def _save_registry(ws, reg: dict) -> None:
-    write_text(_reg_path(ws), json.dumps(reg, indent=1, ensure_ascii=False) + "\n")
+def _registry_text(reg: dict) -> str:
+    return json.dumps(reg, indent=1, ensure_ascii=False) + "\n"
+
+
+def _cache_path(ws, cid: str) -> str:
+    return os.path.join(ws.private, CACHE, cid + ".json")
+
+
+def _cache_text(sig: str, nh: str, res: dict) -> str:
+    return json.dumps({"sig": f"{sig}|{nh}", "result": res}, ensure_ascii=False)
+
+
+def _commit_registry(ws, reg: dict, caches: dict[str, str | None]) -> None:
+    """One private commit: the registry plus each cache write (text) or delete (None)."""
+    ops: list[tuple] = [("write", _reg_path(ws), _registry_text(reg), b"")]
+    for cid, text in caches.items():
+        path = _cache_path(ws, cid)
+        ops.append(("write", path, text, b"") if text is not None else ("delete", path))
+    commit_bytes(ops, private=True)
 
 
 def detect_kind(path: str) -> str:
@@ -120,15 +162,10 @@ def add(ws, project, path: str | None = None, kind: str = "auto", label: str | N
             if e.get("path") and os.path.normcase(e["path"]) == os.path.normcase(ap):
                 raise PbzError("NAME_TAKEN", f"already registered as {e['id']}")
         entry = {"path": ap}
-    ids = [int(e["id"][1:]) for e in reg["consumers"] if re.match(r"^c\d+$", str(e.get("id", "")))]
-    entry = {"id": f"c{max(ids, default=0) + 1}", "kind": kind,
-             "label": (label or os.path.basename(entry.get("path", "")) or kind)[:120], **entry,
-             "added": dt.datetime.now().replace(microsecond=0).isoformat()}
-    if model_names:
-        entry["model_names"] = model_names
-    reg["consumers"].append(entry)
-    _save_registry(ws, reg)
-    r = evaluate(ws, project, entry, force=True, names=names)
+    entry = _stage_entry(reg, entry, kind, label, model_names)
+    caches: dict[str, str | None] = {}
+    r = evaluate(ws, project, entry, force=True, names=names, persist=False, cache_out=caches)
+    _commit_registry(ws, reg, caches)
     out = {"verb": "consumers", "action": "add", "id": entry["id"], "kind": kind, "label": entry["label"],
            **_summary(entry, r, None, None)}
     out["next"] = "pbz unused (external usage now counts), pbz consumers show " + entry["id"]
@@ -142,33 +179,44 @@ def remove(ws, cid: str) -> dict:
     if len(keep) == len(reg["consumers"]):
         raise PbzError("NOT_FOUND", cid)
     reg["consumers"] = keep
-    _save_registry(ws, reg)
-    try:
-        os.remove(os.path.join(ws.private, CACHE, cid + ".json"))
-    except OSError:
-        pass
+    _commit_registry(ws, reg, {cid: None})
     return {"verb": "admin", "consumer_removed": cid}
 
 
 # ---------------------------------------------------------------- evaluation (cached by signature)
 
 def _signature(entry: dict) -> str:
-    if entry["kind"] == "manual":
-        return hashlib.sha256(json.dumps(entry.get("objects", [])).encode("utf-8")).hexdigest()
-    p = entry.get("path", "")
-    if os.path.isfile(p):
-        st = os.stat(p)
-        return f"f:{st.st_size}:{st.st_mtime_ns}"
-    if os.path.isdir(p):
-        h = hashlib.sha256()
-        for cur, dirs, files in os.walk(p):
-            dirs[:] = sorted(d for d in dirs if d.lower() not in (".pbi", "customvisuals", "staticresources", ".git"))
-            for f in sorted(files):
-                if f.lower().endswith((".json", ".pbir", ".tmdl", ".platform")):
-                    st = os.stat(os.path.join(cur, f))
-                    h.update(f"{os.path.relpath(os.path.join(cur, f), p)}:{st.st_size}:{st.st_mtime_ns};".encode("utf-8"))
-        return "d:" + h.hexdigest()
-    return "missing"
+    try:
+        if entry["kind"] == "manual":
+            return hashlib.sha256(json.dumps(entry.get("objects", [])).encode("utf-8")).hexdigest()
+        p = entry.get("path", "")
+        if os.path.isfile(p):
+            st = os.stat(p)
+            return f"f:{st.st_size}:{st.st_mtime_ns}"
+        if os.path.isdir(p):
+            h = hashlib.sha256()
+            for cur, dirs, files in os.walk(p):
+                dirs[:] = sorted(d for d in dirs if d.lower() not in (".pbi", "customvisuals", "staticresources", ".git"))
+                for f in sorted(files):
+                    if f.lower().endswith((".json", ".pbir", ".tmdl", ".platform")):
+                        st = os.stat(os.path.join(cur, f))
+                        h.update(f"{os.path.relpath(os.path.join(cur, f), p)}:{st.st_size}:{st.st_mtime_ns};".encode("utf-8"))
+            return "d:" + h.hexdigest()
+        return "missing"
+    except OSError:
+        return "missing"
+
+
+def _stage_entry(reg: dict, entry: dict, kind: str, label: str | None, model_names: list[str] | None) -> dict:
+    """Allocate the next id in memory and append. Nothing is written."""
+    ids = [int(e["id"][1:]) for e in reg["consumers"] if re.match(r"^c\d+$", str(e.get("id", "")))]
+    entry = {"id": f"c{max(ids, default=0) + 1}", "kind": kind,
+             "label": (label or os.path.basename(entry.get("path", "")) or kind)[:120], **entry,
+             "added": dt.datetime.now().replace(microsecond=0).isoformat()}
+    if model_names:
+        entry["model_names"] = model_names
+    reg["consumers"].append(entry)
+    return entry
 
 
 def model_names(model) -> set[str]:
@@ -220,11 +268,12 @@ def _keep(r: dict, names: set[str]) -> dict | None:
     return None
 
 
-def evaluate(ws, project, entry: dict, force: bool = False, names: set[str] | None = None) -> dict:
+def evaluate(ws, project, entry: dict, force: bool = False, names: set[str] | None = None,
+             persist: bool = True, cache_out: dict | None = None) -> dict:
     names = names if names is not None else _mirror_names(project)
     nh = hashlib.sha256("\n".join(sorted(names)).encode("utf-8")).hexdigest()[:16]
     sig = _signature(entry)
-    cpath = os.path.join(ws.private, CACHE, entry["id"] + ".json")
+    cpath = _cache_path(ws, entry["id"])
     if not force and sig != "missing":
         try:
             with open(cpath, encoding="utf-8") as f:
@@ -248,7 +297,15 @@ def evaluate(ws, project, entry: dict, force: bool = False, names: set[str] | No
     res.setdefault("binding", {})
     res.setdefault("coverage", "field" if res["refs"] else "none")
     res["scanned"] = dt.datetime.now().replace(microsecond=0).isoformat()
-    write_text(cpath, json.dumps({"sig": f"{sig}|{nh}", "result": res}, ensure_ascii=False))
+    if sig != "missing":
+        body = _cache_text(sig, nh, res)
+        if cache_out is not None:
+            cache_out[entry["id"]] = body
+        if persist:
+            try:
+                write_text(cpath, body)
+            except OSError:
+                pass
     return res
 
 
@@ -769,7 +826,14 @@ def _resolve(g, res, model, r: dict) -> list[tuple]:
 def apply(g, ws, project, model, res) -> None:
     """Add external usage evidence to the usage graph (before states are computed)."""
     from .usage import Usage
-    reg = load_registry(ws)
+    try:
+        reg = load_registry(ws)
+    except PbzError as e:
+        if e.code != "REFUSED":
+            raise
+        g.incomplete = True
+        g.warnings.append({"code": "CONSUMER_REGISTRY"})
+        return
     if not reg["consumers"]:
         return
     names = model_names(model)
@@ -961,6 +1025,8 @@ def discover(ws, project, folder: str, add_matches: bool = False, model_names: l
         if seen > limit:
             break
     out_rows, added = [], []
+    caches: dict[str, str | None] = {}
+    names = _mirror_names(project) if add_matches else None
     for path, kind in found:
         try:
             cats, note = _binding_only(path, kind)
@@ -980,9 +1046,13 @@ def discover(ws, project, folder: str, add_matches: bool = False, model_names: l
             row["registered"] = True
         out_rows.append(row)
         if add_matches and match == "model name" and os.path.normcase(path) not in known:
-            r = add(ws, project, path, kind, model_names=model_names)
-            added.append(r["id"])
-            row["registered"] = r["id"]
+            entry = _stage_entry(reg, {"path": path}, kind, None, model_names)
+            evaluate(ws, project, entry, force=True, names=names, persist=False, cache_out=caches)
+            known.add(os.path.normcase(path))
+            added.append(entry["id"])
+            row["registered"] = entry["id"]
+    if caches:
+        _commit_registry(ws, reg, caches)
     rank = {"model name": 0, "dataset id (unverified)": 1}
     out_rows.sort(key=lambda r: (rank.get(r["match"], 2), r["path"].lower()))
     out = {"verb": "consumers", "action": "discover", "folder": base, "scanned_files": min(seen, limit),
@@ -993,7 +1063,7 @@ def discover(ws, project, folder: str, add_matches: bool = False, model_names: l
     if added:
         out["added"] = added
     elif any(r["match"] == "model name" and not r.get("registered") for r in out_rows):
-        out["next"] = "pbz consumers discover <folder> --add registers the model-name matches"
+        out["next"] = "pbz consumers discover <folder> --register registers the model-name matches"
     if any(r["match"].startswith("dataset id") for r in out_rows):
         out["unverified"] = ("files bound by dataset id: if they use this model, register them with "
                              "`pbz consumers add <path>` (ids are not names)")

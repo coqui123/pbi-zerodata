@@ -23,7 +23,7 @@ import shutil
 import uuid
 
 from . import desktop, deps, dpapi, lexers, pbir, tmdl
-from .common import PbzError, Project, Workspace, engine_call, read_text, write_text
+from .common import PbzError, Project, Workspace, commit_bytes, engine_call, read_text, write_text
 from .tokens import TOKEN_RE, apply_edits
 
 MARKER = "PBZ_SYNTHETIC"
@@ -56,6 +56,73 @@ def _is_synthetic_root(root: str) -> bool:
 def _require_synthetic(root: str) -> None:
     if not _is_synthetic_root(root):
         raise PbzError("UNSAFE", "not a pbz synthetic folder; refusing to touch it")
+
+
+def _refuse_incomplete(root: str) -> None:
+    """A directory that exists but is not a marked synthetic root is refused, never deleted."""
+    if os.path.exists(root) and not _is_synthetic_root(root):
+        raise PbzError("REFUSED", "synthetic root is incomplete")
+
+
+def _verified_owned(ws, root: str) -> bool:
+    """True only when policy, synth.json and the model HMAC all agree this tree is pbz's.
+
+    Missing or malformed markers are not ownership. Callers must not delete on False.
+    """
+    if not _is_synthetic_root(root):
+        return False
+    try:
+        with open(os.path.join(root, ".pbz", "synth.json"), encoding="utf-8") as f:
+            info = json.load(f)
+        if not isinstance(info, dict) or not isinstance(info.get("built"), str) or not info["built"].strip():
+            return False
+        if not isinstance(info.get("source_project"), str) or not info["source_project"].strip():
+            return False
+        models = [d for d in os.listdir(root) if d.lower().endswith(".semanticmodel") and
+                  os.path.isdir(os.path.join(root, d, "definition"))]
+        if len(models) != 1:
+            return False
+        mdef = os.path.join(root, models[0], "definition")
+        texts = {}
+        for path in tmdl.tmdl_files(mdef):
+            rel = os.path.relpath(path, mdef).replace("\\", "/")
+            texts[rel] = read_text(path)[0]
+        mt = texts.get("model.tmdl", "")
+        mark = re.search(r"(?m)^annotation PBZ_SYNTHETIC = (\S+)", mt)
+        if not mark:
+            return False
+        return mark.group(1) == marker_value(dpapi.load_key(ws.private), _table_tags(texts))
+    except (OSError, ValueError, KeyError, AttributeError):
+        return False
+
+
+def _stage_root(root: str) -> str:
+    """Sibling of the destination, under the synth base: `<id>.pbz-stage`."""
+    return root + ".pbz-stage"
+
+
+def _stage_project(sp: Project, stage: str) -> Project:
+    """Same artifact names as `sp`, rooted at the staging directory. Does not retarget the private store."""
+    ws = Workspace.__new__(Workspace)
+    ws.root = stage
+    ws.mirror = os.path.join(stage, "pbz-workspace")
+    ws.pbz_dir = os.path.join(stage, ".pbz")
+    ws.private = sp.ws.private
+    out = Project.__new__(Project)
+    out.ws = ws
+    out.name = sp.name
+    out.pbip = os.path.join(stage, sp.name + ".pbip")
+    out.model_dir = os.path.join(stage, sp.name + ".SemanticModel")
+    out.report_dir = os.path.join(stage, sp.name + ".Report")
+    out.mirror_model = sp.mirror_model
+    out.mirror_report = sp.mirror_report
+    return out
+
+
+def _drop_stage(stage: str, created: bool) -> None:
+    """Delete only a staging directory this invocation created."""
+    if created and os.path.isdir(stage):
+        shutil.rmtree(stage)
 
 
 # ---------------------------------------------------------------- fake values
@@ -587,7 +654,12 @@ def _report_edits(text: str, pools: _Pools) -> str:
 
 
 def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> dict:
-    """edge: the edge-case profile (see `_edge`); literal calculated tables are faked as well."""
+    """edge: the edge-case profile (see `_edge`); literal calculated tables are faked as well.
+
+    The candidate is written under a sibling staging directory and validated there. The destination
+    is replaced only after validation succeeds, as one commit. A rejected or unavailable validator
+    leaves the previous destination untouched. Staging is removed only when this call created it.
+    """
     src = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(src):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
@@ -596,11 +668,17 @@ def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> di
     rows = max(10, min(int(rows), 5000))
     sp = synth_project(ws, project)
     root = sp.ws.root
-    if os.path.exists(root):
-        _require_synthetic(root)
+    stage = _stage_root(root)
+    existed = os.path.exists(root)
+    owned = False
+    if existed:
         if desktop.find_instance(sp):
             raise PbzError("DESKTOP_OPEN", "close the synthetic model first (`pbz synth close`)")
-        shutil.rmtree(root)
+        owned = _verified_owned(ws, root)
+        if not owned:
+            raise PbzError("UNSAFE", "not a pbz synthetic folder; refusing to touch it")
+    if os.path.exists(stage):
+        raise PbzError("REFUSED", "synthetic staging path is already present")
     model = tmdl.load_model(src)
     lo, hi = _date_range(model)
     pools = _collect_pools(model, project, lo, hi)
@@ -618,7 +696,43 @@ def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> di
     first_ref = re.search(r"(?m)^ref ", mt)
     texts["model.tmdl"] = (mt[:first_ref.start()] + line + mt[first_ref.start():]) if first_ref else \
         (mt.rstrip("\r\n") + eol + eol + line)
-    # ---- write the synthetic project
+    rows_by_table = {t: len(r) for t, (_c, r) in gen.items()}
+    staged = _stage_project(sp, stage)
+    created = False
+    try:
+        os.makedirs(stage)
+        created = True
+        _write_candidate(ws, project, staged, texts, pools, rows, seed, edge, rows_by_table)
+        res = engine_call("tmdl-validate", {"private_dir": ws.private,
+                                            "folder": os.path.join(staged.model_dir, "definition")}, timeout=300)
+        if not isinstance(res, dict):
+            raise PbzError("ENGINE_UNAVAILABLE",
+                           "synthetic validation is unavailable; the destination was not replaced")
+        errors = [{"file": e.get("file"), "line": e.get("line"), "class": e.get("class")}
+                  for e in res.get("errors", []) if isinstance(e, dict)]
+        errors += [{"file": f, "class": "MISSING_FILE"} for f in res.get("missing_refs", []) or []]
+        unavailable = (res.get("class") == "ENGINE_UNAVAILABLE"
+                       or (res.get("ok") is not True and not errors and not res.get("errors")))
+        if unavailable:
+            raise PbzError("ENGINE_UNAVAILABLE",
+                           "synthetic validation is unavailable; the destination was not replaced")
+        if not res.get("ok") or errors:
+            raise PbzError("REFUSED", "synthetic validation rejected the candidate; the destination was not replaced")
+        _publish_candidate(stage, root, owned)
+    finally:
+        _drop_stage(stage, created)
+    out = {"verb": "synth-build", "project": sp.name, "root": root, "pbip": sp.pbip, "valid": True,
+           "tables_faked": rows_by_table, "date_range": [lo.isoformat(), hi.isoformat()],
+           "profile": "edge" if edge else "standard"}
+    if edge:
+        out["edge_cases"] = edge_notes
+    out["next"] = "pbz synth open, then pbz synth query \"EVALUATE ...\" (fake data: values are shown)"
+    return out
+
+
+def _write_candidate(ws, project, sp, texts, pools, rows, seed, edge, rows_by_table) -> None:
+    """Write a complete candidate under `sp` (the staging project). Does not touch the destination."""
+    root = sp.ws.root
     os.makedirs(os.path.join(root, ".pbz"), exist_ok=True)
     shutil.copytree(project.mirror_model, sp.model_dir, ignore=shutil.ignore_patterns("*.tmdl"))
     for rel, text in texts.items():
@@ -644,27 +758,39 @@ def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> di
         "settings": {"enableAutoRecovery": False}}, indent=2) + "\n")
     with open(os.path.join(root, ".pbz", "policy.json"), "w", encoding="utf-8") as f:
         json.dump({"synthetic": True}, f, indent=1)
-    rows_by_table = {t: len(r) for t, (_c, r) in gen.items()}
     with open(os.path.join(root, ".pbz", "synth.json"), "w", encoding="utf-8") as f:
         json.dump({"source_project": project.name, "built": dt.datetime.now().isoformat(timespec="seconds"),
                    "rows": rows, "seed": seed, "tables": rows_by_table, "profile": "edge" if edge else "standard"},
                   f, indent=1)
-    res = engine_call("tmdl-validate", {"private_dir": ws.private, "folder": os.path.join(sp.model_dir, "definition")},
-                      timeout=300)
-    errors = [{"file": e.get("file"), "line": e.get("line"), "class": e.get("class")} for e in res.get("errors", [])]
-    errors += [{"file": f, "class": "MISSING_FILE"} for f in res.get("missing_refs", [])]
-    valid = bool(res.get("ok")) and not errors
-    out = {"verb": "synth-build", "project": sp.name, "root": root, "pbip": sp.pbip, "valid": valid,
-           "tables_faked": rows_by_table, "date_range": [lo.isoformat(), hi.isoformat()],
-           "profile": "edge" if edge else "standard"}
-    if edge:
-        out["edge_cases"] = edge_notes
-    if not res.get("ok"):
-        out["validation"] = res.get("class", "ENGINE_UNAVAILABLE")
-    if errors:
-        out["errors"] = errors[:20]
-    out["next"] = "pbz synth open, then pbz synth query \"EVALUATE ...\" (fake data: values are shown)"
-    return out
+
+
+def _publish_candidate(stage: str, dest: str, owned: bool) -> None:
+    """Copy the staged file map onto `dest` in one commit, deleting obsolete destination files."""
+    staged: dict[str, bytes] = {}
+    for cur, _dirs, files in os.walk(stage):
+        for name in files:
+            path = os.path.join(cur, name)
+            rel = os.path.relpath(path, stage)
+            with open(path, "rb") as f:
+                staged[rel] = f.read()
+    ops: list[tuple] = [("write_bytes", os.path.join(dest, rel), data) for rel, data in staged.items()]
+    if os.path.isdir(dest):
+        if not owned:
+            raise PbzError("UNSAFE", "not a pbz synthetic folder; refusing to touch it")
+        for cur, _dirs, files in os.walk(dest):
+            for name in files:
+                path = os.path.join(cur, name)
+                rel = os.path.relpath(path, dest)
+                if rel not in staged:
+                    ops.append(("delete", path))
+    try:
+        commit_bytes(ops, private=True)
+    except Exception:
+        # First publish: dest was not a directory before this commit, so the leftover is ours.
+        # An owned rebuild is restored by commit_bytes and must not be removed here.
+        if not owned and os.path.isdir(dest):
+            shutil.rmtree(dest, ignore_errors=True)
+        raise
 
 
 # ---------------------------------------------------------------- lifecycle
@@ -682,16 +808,23 @@ def build_info(ws, project) -> dict:
 def status(ws, project) -> dict:
     sp = synth_project(ws, project)
     root = sp.ws.root
+    _refuse_incomplete(root)
     if not _is_synthetic_root(root):
         return {"verb": "synth-status", "built": False, "root": root, "next": "pbz synth build"}
-    with open(os.path.join(root, ".pbz", "synth.json"), encoding="utf-8") as f:
-        info = json.load(f)
+    try:
+        with open(os.path.join(root, ".pbz", "synth.json"), encoding="utf-8") as f:
+            info = json.load(f)
+        if not isinstance(info, dict):
+            raise ValueError("synth.json")
+    except (OSError, ValueError):
+        raise PbzError("REFUSED", "synthetic root is incomplete")
     return {"verb": "synth-status", "built": True, "root": root, "pbip": sp.pbip, "built_at": info.get("built"),
             "tables_faked": info.get("tables"), "desktop": desktop.status(sp)}
 
 
 def open_(ws, project, wait: int = 480) -> dict:
     sp = synth_project(ws, project)
+    _refuse_incomplete(sp.ws.root)
     _require_synthetic(sp.ws.root)
     res = desktop.open_(sp, wait)
     inst = desktop.find_instance(sp)
@@ -703,6 +836,7 @@ def open_(ws, project, wait: int = 480) -> dict:
 
 def close(ws, project) -> dict:
     sp = synth_project(ws, project)
+    _refuse_incomplete(sp.ws.root)
     _require_synthetic(sp.ws.root)
     return {**desktop.close(sp), "verb": "synth-close", "project": sp.name}
 
@@ -712,9 +846,10 @@ def remove(ws, project) -> dict:
     root = sp.ws.root
     if not os.path.exists(root):
         return {"verb": "synth-remove", "result": "NOTHING_TO_REMOVE"}
-    _require_synthetic(root)
     if desktop.find_instance(sp):
         raise PbzError("DESKTOP_OPEN", "close the synthetic model first (`pbz synth close`)")
+    if not _verified_owned(ws, root):
+        raise PbzError("UNSAFE", "not a pbz synthetic folder; refusing to touch it")
     shutil.rmtree(root)
     return {"verb": "synth-remove", "result": "REMOVED", "root": root}
 
@@ -723,6 +858,7 @@ def query(ws, project, dax: str, max_rows: int = 500) -> dict:
     if not dax or not dax.strip():
         raise PbzError("BAD_REQUEST", "pass an EVALUATE statement")
     sp = synth_project(ws, project)
+    _refuse_incomplete(sp.ws.root)
     _require_synthetic(sp.ws.root)
     inst = desktop.find_instance(sp)  # the instance must hold the synthetic PBIP itself
     if not inst or not inst.get("pid"):

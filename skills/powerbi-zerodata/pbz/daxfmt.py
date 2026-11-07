@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 
 from . import lexers, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 from .tokens import apply_edits
 
 WIDTH = 90
@@ -200,11 +200,13 @@ def run(ws, project, apply: bool = False, target: str | None = None) -> dict:
                     start, rep = reg.start, block
             edits.setdefault(rel, []).append((start, reg.end, rep))
             changed.append(label)
-    if apply:
+    if apply and edits:
+        ops = []
         for rel, eds in edits.items():
             path = os.path.join(mdef, *rel.split("/"))
             _t, bom = read_text(path)
-            write_text(path, apply_edits(model.docs[rel].text, sorted(eds)), bom)
+            ops.append(("write", path, apply_edits(model.docs[rel].text, sorted(eds)), bom))
+        commit_bytes(ops)
     return {"verb": "format", "mode": "apply" if apply else "check", "formatted": len(changed), "unchanged": unchanged,
             "objects": changed[:200], "skipped": skipped[:100],
             **({"next": "pbz diff, then pbz push"} if apply and changed else {})}

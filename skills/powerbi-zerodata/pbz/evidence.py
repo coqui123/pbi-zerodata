@@ -137,6 +137,9 @@ def summarize(verb: str, action: str | None, out: dict) -> tuple[str, dict] | No
     """Summaries contain only outcomes, object/check identifiers and coarse counts."""
     if not isinstance(out, dict):
         return None
+    # `pbz check --validate-only` proves nothing about the model; do not append a line.
+    if verb == "check" and (action in ("validate", "validate-only") or str(out.get("verb") or "") == "check validate"):
+        return None
     blocked = out.get("status") or out.get("error") or out.get("class")
     if verb == "validate":
         f = out.get("findings") or []
@@ -223,6 +226,9 @@ def _scoped_summaries(verb: str, action: str | None, out: dict) -> list[tuple[st
                       _outcome([r.get("status", "UNKNOWN") for r in rows]) == "PASS" else
                       _outcome([r.get("status", "UNKNOWN") for r in rows])), "executed": True})
                 for page, rows in pages.items()]
+    if verb == "synth-test" and action == "run":
+        # One scope per golden name so two tests on the same revision do not collapse together.
+        return [(stage, "synth-test:" + str(out.get("name") or "?"), summary)]
     events = [(stage, verb + (":" + action if action else ""), summary)]
     if verb == "push" and out.get("result") == "PUSHED" and "reload" in out:
         ready = _reload_ready(out["reload"])

@@ -124,21 +124,44 @@ def read_text(path: str) -> tuple[str, bytes]:
     return data.decode("utf-8"), bom
 
 
-def write_text(path: str, text: str, bom: bytes = b"") -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def _replace_via_tmp(path: str, data: bytes) -> None:
+    """Write `path` via `path + '.pbz-tmp'`. Any OSError removes that temp before it propagates."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = path + ".pbz-tmp"
-    with open(tmp, "wb") as f:
-        f.write(bom + text.encode("utf-8"))
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            if os.path.lexists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
-def commit_bytes(ops: list[tuple]) -> None:
-    """Apply ('write', path, text, bom) and ('delete', path) as one mirror edit.
+def write_text(path: str, text: str, bom: bytes = b"") -> None:
+    _replace_via_tmp(path, bom + text.encode("utf-8"))
+
+
+def write_bytes(path: str, data: bytes) -> None:
+    """Write raw bytes the same way as write_text: temp file, then replace."""
+    _replace_via_tmp(path, data)
+
+
+def commit_bytes(ops: list[tuple], *, private: bool = False) -> None:
+    """Apply ('write', path, text, bom), ('write_bytes', path, data) and ('delete', path) as one edit.
 
     Snapshots each path's bytes first (missing -> None), same idea as a recipe
     snapshot or a push journal, but only for files this call touches. On failure,
     restores those snapshots and removes leftover `.pbz-tmp` files so a later
     step cannot leave an earlier write or temp behind.
+
+    private=True is for the private store (staged images). A failed restore then
+    reports only the closed recovery code: no path, no bytes, no exception text.
     """
     snap: dict[str, bytes | None] = {}
     for op in ops:
@@ -156,6 +179,8 @@ def commit_bytes(ops: list[tuple]) -> None:
             kind, path = op[0], op[1]
             if kind == "write":
                 write_text(path, op[2], op[3] if len(op) > 3 else b"")
+            elif kind == "write_bytes":
+                write_bytes(path, op[2])
             elif kind == "delete":
                 if os.path.lexists(path):
                     os.remove(path)
@@ -190,8 +215,12 @@ def commit_bytes(ops: list[tuple]) -> None:
             except OSError as e:
                 restore_fail.append(f"{path}:{type(e).__name__}")
         if restore_fail:
+            if private:
+                raise PbzError("RECOVERY_REQUIRED", "commit rolled back incompletely") from None
             raise PbzError("RECOVERY_REQUIRED",
                            "commit rolled back incompletely: " + ", ".join(restore_fail[:12])) from first
+        if private:
+            raise PbzError("FAILED", "write failed; mirror rolled back, no file changed") from None
         raise PbzError("FAILED", "write failed; mirror rolled back, no file changed") from first
 
 

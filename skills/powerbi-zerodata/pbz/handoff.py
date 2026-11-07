@@ -7,7 +7,7 @@ import os
 import re
 
 from . import tmdl
-from .common import PbzError, write_text
+from .common import PbzError, commit_bytes
 from .describe import field_usage
 
 
@@ -15,17 +15,18 @@ START = "<!-- pbz:generated:start -->"
 END = "<!-- pbz:generated:end -->"
 
 
-def write_packet(ws, alias: str, text: str, folder: str) -> str:
-    """Immutable generated packet plus an alias preserving all text outside its managed block."""
+def _packet_plan(ws, alias: str, text: str, folder: str) -> tuple[str, list]:
+    """Plan the immutable packet, a legacy archive and the alias. Nothing is written."""
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
     rel = f"{folder}/{digest}.md"
     packet = os.path.join(ws.mirror, folder, digest + ".md")
+    ops: list[tuple] = []
     if os.path.exists(packet):
         with open(packet, encoding="utf-8") as f:
             if f.read() != text:
                 raise PbzError("PACKET_CONFLICT", "immutable packet contents differ")
     else:
-        write_text(packet, text)
+        ops.append(("write", packet, text, b""))
     target = os.path.join(ws.mirror, alias)
     try:
         with open(target, encoding="utf-8-sig") as f:
@@ -42,25 +43,40 @@ def write_packet(ws, alias: str, text: str, folder: str) -> str:
         legacy = hashlib.sha256(old.encode("utf-8")).hexdigest()[:20]
         archive = os.path.join(ws.mirror, folder, "legacy-" + legacy + ".md")
         if not os.path.exists(archive):
-            write_text(archive, old)
+            ops.append(("write", archive, old, b""))
         new = managed + "\n\n## Preserved previous checklist and notes\n\n" + old
     else:
         new = managed + "\n\n## Reviewer notes\n\n"
     if new != old:
-        write_text(target, new)
-    return "pbz-workspace/" + rel
+        ops.append(("write", target, new, b""))
+    return "pbz-workspace/" + rel, ops
+
+
+def write_packet(ws, alias: str, text: str, folder: str) -> str:
+    """Immutable generated packet plus an alias preserving all text outside its managed block."""
+    rel, ops = _packet_plan(ws, alias, text, folder)
+    if ops:
+        commit_bytes(ops)
+    return rel
 
 
 def _load_state(path: str) -> dict:
+    """Missing state is empty. A present file that cannot be read or parsed is refused."""
+    if not os.path.lexists(path):
+        return {"version": 2, "projects": {}}
     try:
         with open(path, encoding="utf-8") as f:
-            state = json.load(f)
-    except (OSError, ValueError):
-        state = {}
-    # Legacy `last` meant generated, never accepted. Do not consume those outstanding items.
-    if not isinstance(state, dict):
-        state = {}
-    return {"version": 2, "projects": state.get("projects", {}) if isinstance(state.get("projects"), dict) else {}}
+            raw = f.read()
+    except OSError:
+        raise PbzError("REFUSED", "handoff state is unreadable")
+    try:
+        state = json.loads(raw)
+    except ValueError:
+        raise PbzError("REFUSED", "handoff state is malformed")
+    projects = state.get("projects", {}) if isinstance(state, dict) else None
+    if not isinstance(state, dict) or not isinstance(projects, dict):
+        raise PbzError("REFUSED", "handoff state is malformed")
+    return {"version": 2, "projects": projects}
 
 
 def accept_generated(ws, project, mirror_revision: str, real_revision: str) -> bool:
@@ -88,8 +104,7 @@ def accept_generated(ws, project, mirror_revision: str, real_revision: str) -> b
     if current.get("revision") != {"mirror": mirror_revision, "real": real_revision} or not current.get("generated"):
         return False
     current["accepted"] = current["generated"]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f)
+    commit_bytes([("write", path, json.dumps(state), b"")])
     return True
 
 
@@ -102,14 +117,23 @@ def build(ws, project, include_all: bool = False) -> dict:
         current = {}
     since = "" if include_all else current.get("accepted", "")
     entries = []
-    try:
-        with open(log, encoding="utf-8") as f:
-            for line in f:
+    if os.path.lexists(log):
+        try:
+            with open(log, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            raise PbzError("REFUSED", "push log is unreadable")
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
                 e = json.loads(line)
-                if e.get("project") == project.name and e.get("stamp", "") > since:
-                    entries.append(e)
-    except FileNotFoundError:
-        pass
+            except ValueError:
+                raise PbzError("REFUSED", "push log is malformed")
+            if not isinstance(e, dict):
+                raise PbzError("REFUSED", "push log is malformed")
+            if e.get("project") == project.name and e.get("stamp", "") > since:
+                entries.append(e)
     if not entries:
         out = {"verb": "handoff", "project": project.name, "result": "NOTHING_NEW"}
         if os.path.exists(os.path.join(ws.mirror, "HANDOFF.md")):
@@ -156,17 +180,16 @@ def build(ws, project, include_all: bool = False) -> dict:
         lines.append("")
     if model_items:
         lines += ["## Model changes (no direct visual)", *[f"- [ ] {x}" for x in sorted(set(model_items))], ""]
-    lines += ["Tell the agent what looks wrong in words (blank, doubled, too high, wrong period) or share",
-              "the specific numbers only if you choose to."]
+    lines += ["Tell the agent what looks wrong in words (blank, doubled, too high, wrong period).",
+              "Do not paste numbers or names from the report."]
     text = "\n".join(lines) + "\n"
-    packet = write_packet(ws, "HANDOFF.md", text, "handoffs")
-    os.makedirs(ws.pbz_dir, exist_ok=True)
+    packet, ops = _packet_plan(ws, "HANDOFF.md", text, "handoffs")
     from . import evidence
     revision = {"mirror": evidence.mirror_rev(ws, project), "real": evidence.real_rev(ws, project)}
     current.update(generated=max(e["stamp"] for e in entries), packet=packet, revision=revision)
     cursor["projects"][project.name] = current
-    with open(state, "w", encoding="utf-8") as f:
-        json.dump(cursor, f)
+    ops.append(("write", state, json.dumps(cursor), b""))
+    commit_bytes(ops)
 
     return {"verb": "handoff", "project": project.name, "file": "pbz-workspace/HANDOFF.md",
             "packet": packet, "review_required": True, "checklist": text}

@@ -239,6 +239,103 @@ Not built this round: staging a whole cascade on a disposable mirror copy, movin
 Not built this round: relationship, filter and interaction `--dry-run`, native interactions,
 Power Query authoring, semantic merge, an RLS harness, VPAX, screenshots, empty-directory cleanup.
 
+## Round 12 (2026-11-07): project-wide hardening
+
+- A present consumer registry that cannot be read or parsed is a closed `REFUSED` before any
+  evaluation or write. A missing registry is still "none". A bad entry blocks `unused --remove`
+  as incomplete coverage. `consumers discover` points at `--register`.
+- `image add` and `image remove` parse the report strictly, then commit the registration edit,
+  staged bytes and orphan pending deletes together (`write_bytes` on `commit_bytes`). A private
+  restore that fails is `RECOVERY_REQUIRED` with a fixed message: no absolute path, pending-store
+  location, image bytes or exception text.
+- Filter, relationship and interaction edits plan first, expose `--dry-run` (and the MCP twin),
+  refuse a malformed sibling document, and apply with one `commit_bytes`. Relationship results
+  name `files`.
+- A date table and every `--relate` are validated on an in-memory model that already contains the
+  new table and each previously planned relationship, then written as one commit (one relationships
+  document). A missing `model.tmdl` is refused instead of an unreferenced table.
+- Dynamic format strings and function add/rename commit the measure or call sites together with
+  `database.tmdl` when the compatibility level changes. An unknown reference is refused before that
+  write. `files` uses the real `database.tmdl` path.
+- `recipe run --dry-run` substitutes and parses every step before any step runs, refuses `image`
+  and `unused --remove` / `--verify-engine` (including a substituted flag) with zero engine calls,
+  and hides parser text. A failed step or a later validation error restores through `commit_bytes`;
+  a restore that fails is `RECOVERY_REQUIRED`. Evidence is the final recipe outcome only.
+- `refresh-policy set` and `format --apply` use one `commit_bytes` as well.
+
+Not built this round: native interactions, Power Query authoring, semantic merge, an RLS harness,
+VPAX, screenshots, Desktop UI automation, Performance Analyzer replay, Direct Lake, a mirror
+pull/push rewrite, empty-directory cleanup.
+
+## Round 13 (2026-11-07): remaining transactions and honesty
+
+- `write_text` and `write_bytes` remove their `.pbz-tmp` if the write or replace fails. `commit_bytes`
+  is unchanged. Empty directories may remain.
+- `consumers add`, `remove` and `discover --register` plan the evaluation in memory, then write the
+  registry and the cache (or delete a cache) in one private `commit_bytes`. A cache write on a read
+  path stays best-effort. A signature that cannot be stated is `missing`. A present bad registry is
+  still `REFUSED`.
+- `synth build` writes the candidate in a sibling `<id>.pbz-stage`, validates that folder, and
+  publishes with one private commit only when validation succeeds. A rejected validator does not
+  replace the previous destination. An unavailable validator does not publish either: the previous
+  good tree stays, and a first build leaves no destination. Cleanup deletes only a stage this call
+  created, or a destination whose policy, `synth.json` and HMAC marker all verify. Missing or
+  malformed markers never authorize a delete. Status, open and query refuse an incomplete root.
+- `handoff` refuses a present malformed or unreadable cursor, and a malformed push log, before any
+  write. The packet, archive, alias and cursor are one commit. Acceptance uses `commit_bytes`.
+  The checklist asks for qualitative feedback only.
+- `preview` plans every page, then commits the SVG and JSON once. `--spec` is an inline JSON object
+  or a path inside the mirror. An outside path is refused and not read. MCP still passes an object.
+- `memscrub --apply` is `HUMAN_ONLY` before any read or write, then one private commit of the notes
+  and a collision-safe backup. `doctor` does not mark disposable isolation `configured` from
+  `USERNAME=WDAGUtilityAccount` alone; that step stays `unverified`. MCP still omits `--apply`.
+- `synth test run` is never `SAME` when either side is truncated, when the saved query list is
+  empty, or when the saved envelope is malformed. A malformed envelope makes no query and no engine
+  call. An invalid build timestamp or a stale synthetic copy is `NOT_COMPARABLE`. A private
+  `commit_bytes` restore that fails is `RECOVERY_REQUIRED` on the CLI and on MCP, with no path,
+  bytes or exception text.
+
+Not built this round: native interactions, Power Query authoring, semantic merge, an RLS harness,
+VPAX, screenshots, Desktop UI automation, Performance Analyzer replay, Direct Lake, a mirror
+pull/push rewrite, empty-directory cleanup, control/memory/docs migrations, disclosure expansion.
+
+## Round 14 (2026-11-07): mirror honesty and remaining writers
+
+- Outcome mapping: `NOT_COMPARABLE` and `LOCAL_STATE_UNAVAILABLE` are blocked (exit 3).
+  `ERROR` / `ERROR:CLASS` and `INTERNAL_ERROR` are failed (exit 1). Incomplete smoke is
+  inconclusive, not success. `--diagnostic` stays exit 0. `recover` of an unknown id is
+  `NOT_FOUND`. `check --validate-only` appends no evidence. Synth evidence is scoped by
+  golden name. A repeated synthetic error is never `SAME`.
+- `revert` and `bpa --fix` read targets first (an unreadable file is `REFUSED`) and then
+  apply one `commit_bytes`. Dry-run uses that same plan and writes nothing.
+- Pull prepares every selected file, and for rebase every mirror and base text the merge
+  will consume, before any write. A decode failure names the mirror-relative path only.
+  Pending recovery or a commit lock blocks ordinary, forced and rebased pulls. A journal
+  with an unknown state or a bad entry shape is recovery-required and is not echoed.
+- Push captures candidate bytes before validation and returns `CONFLICT` if those files
+  change before apply, without taking the new bytes as the baseline. Hashes written into
+  the manifest come from the captured candidate. A reload failure after commit stays
+  `PUSHED` with `PARTIAL` (exit 5).
+- History snapshots use `write_text`. An unreadable snapshot is `UNREADABLE` and blocks
+  blob garbage collection. A history failure after a successful pull is a
+  `POST_PULL_HISTORY` warning; the pull result stays `PULLED`.
+- `synth test save` refuses a stale or invalid build before any query, then writes with
+  one `commit_bytes`. Remove deletes through the same helper. An unreadable golden is
+  `REFUSED` (missing is `NOT_FOUND`). `run` with `comparable` false returns
+  `NOT_COMPARABLE` and does not query.
+- Strict memory disclosure strips `size_band` and `share_band` on the live result and when
+  a shape-mode cache is loaded under the current strict policy. Predicates stay. An
+  unexpected engine error class is a closed `ENGINE_UNAVAILABLE` with no sentinel.
+  The docs change log parses each line, keeps the valid records, reports `INCOMPLETE`
+  and a skipped count, and never echoes a rejected line.
+- New offline suites are registered. `test_engine.py --offline` counts as registered
+  offline work. `test_e2e.py` stays Desktop-only.
+
+Not built this round: a full mirror pull/push rewrite, native interactions, Power Query
+authoring, semantic merge, an RLS harness, VPAX, screenshots, Desktop UI automation,
+Performance Analyzer replay, Direct Lake, empty-directory cleanup, control/docs writer
+migrations as product, disclosure expansion.
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,

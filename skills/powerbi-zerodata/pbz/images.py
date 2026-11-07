@@ -25,7 +25,7 @@ import secrets
 import shutil
 import xml.etree.ElementTree as ET
 
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 
 PACKAGE = "RegisteredResources"
 PACKAGE_TYPE = 1
@@ -203,20 +203,36 @@ def registered(report_json_text: str) -> dict[str, dict]:
         return {}
 
 
-def _edit_report(project, fn) -> str:
+def _parse_report(project):
+    """report.json as data, or a closed refusal. Called before any pending-store change."""
     path = _report_json(project.mirror_report)
-    if not os.path.exists(path):
+    rel = os.path.relpath(path, project.ws.mirror).replace("\\", "/")
+    if not os.path.isfile(path):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    text, bom = read_text(path)
-    data = json.loads(text)
-    fn(data)
+    try:
+        text, bom = read_text(path)
+        data = json.loads(text)
+    except (OSError, UnicodeError, ValueError):
+        raise PbzError("REFUSED", rel) from None
+    if not isinstance(data, dict):
+        raise PbzError("REFUSED", rel)
+    return path, rel, text, bom, data
+
+
+def _render(text: str, data: dict) -> str:
     nl = "\r\n" if "\r\n" in text else "\n"
     new = json.dumps(data, indent=2, ensure_ascii=False)
     if nl != "\n":
         new = new.replace("\n", nl)
     if text.endswith("\n"):
         new += nl
-    write_text(path, new, bom)
+    return new
+
+
+def _edit_report(project, fn) -> str:
+    path, _rel, text, bom, data = _parse_report(project)
+    fn(data)
+    write_text(path, _render(text, data), bom)
     return path
 
 
@@ -339,7 +355,28 @@ def _load(path: str):
         return None
 
 
-def uses(report_dir: str) -> dict[str, list[str]]:
+def _strict_definition(report_dir: str, mirror: str | None = None) -> None:
+    """Every definition JSON must parse before a removal can trust `uses`."""
+    ddir = os.path.join(report_dir, "definition")
+    root = mirror or os.path.dirname(report_dir)
+    rel_dir = os.path.relpath(ddir, root).replace("\\", "/")
+    if not os.path.isdir(ddir):
+        raise PbzError("REFUSED", rel_dir)
+    for cur, _dirs, files in os.walk(ddir):
+        for name in files:
+            if not name.lower().endswith(".json"):
+                continue
+            path = os.path.join(cur, name)
+            rel = os.path.relpath(path, root).replace("\\", "/")
+            try:
+                json.loads(read_text(path)[0])
+            except (OSError, UnicodeError, ValueError):
+                raise PbzError("REFUSED", rel) from None
+
+
+def uses(report_dir: str, *, strict: bool = False, mirror: str | None = None) -> dict[str, list[str]]:
+    if strict:
+        _strict_definition(report_dir, mirror)
     out: dict[str, list[str]] = {}
     for r in scan(report_dir):
         if r["package"] == PACKAGE and isinstance(r["item"], str):
@@ -388,10 +425,9 @@ def add(ws, project, path: str, name: str | None = None) -> dict:
     kind, w, h = sniff(data)
     if KINDS[ext] != kind:
         raise PbzError("BAD_IMAGE", f"the file extension says {KINDS[ext]} but the content is {kind}")
-    rjson = _report_json(project.mirror_report)
-    reg = registered(read_text(rjson)[0])
+    rjson, rel, text, bom, doc = _parse_report(project)
+    reg = registered_in(doc)
     digest = hashlib.sha256(data).hexdigest()
-    rel = os.path.relpath(rjson, ws.mirror).replace("\\", "/")
     facts = {"kind": kind, "size_kib": max(1, round(size / 1024)), **({"pixels": [w, h]} if w and h else {})}
     for item in sorted(reg):
         p = _file_of(ws, project, item)
@@ -406,15 +442,15 @@ def add(ws, project, path: str, name: str | None = None) -> dict:
         if item not in reg and not os.path.exists(os.path.join(rr, item)):
             break
     pend = _pending_dir(ws, project)
-    os.makedirs(pend, exist_ok=True)
-    for f in os.listdir(pend):  # staged files whose registration was reverted
-        if f not in reg:
-            os.remove(os.path.join(pend, f))
-    tmp = os.path.join(pend, item + ".pbz-tmp")
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, os.path.join(pend, item))
-    _edit_report(project, lambda d: _register(d, item))
+    ops: list[tuple] = []
+    if os.path.isdir(pend):
+        for fname in os.listdir(pend):  # staged files whose registration was reverted
+            if fname not in reg:
+                ops.append(("delete", os.path.join(pend, fname)))
+    ops.append(("write_bytes", os.path.join(pend, item), data))
+    _register(doc, item)
+    ops.append(("write", rjson, _render(text, doc), bom))
+    commit_bytes(ops, private=True)
     out = {"verb": "image", "action": "add", "result": "STAGED", "item": item, "display_name": display_name(item),
            **facts, "files": [rel], "next": _next(item)}
     if size > LARGE_BYTES:
@@ -463,22 +499,21 @@ def list_(ws, project) -> dict:
 
 
 def remove(ws, project, item: str) -> dict:
-    rjson = _report_json(project.mirror_report)
-    if not os.path.exists(rjson):
-        raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    rjson, rel, text, bom, doc = _parse_report(project)
     item = resolve(ws, project, item)
-    where = uses(project.mirror_report).get(item)
+    where = uses(project.mirror_report, strict=True, mirror=ws.mirror).get(item)
     if where:
         raise PbzError("IN_USE", f"{item} is used by: {'; '.join(where[:8])}"
                                  f"{' ...' if len(where) > 8 else ''}. Unset or delete those first "
                                  "(pbz style ... --unset <object>.image, or delete the image visual)")
-    _edit_report(project, lambda d: _unregister(d, item))
+    _unregister(doc, item)
+    ops: list[tuple] = [("write", rjson, _render(text, doc), bom)]
     pend = os.path.join(_pending_dir(ws, project), item)
     was_staged = os.path.isfile(pend)
     if was_staged:
-        os.remove(pend)
-    out = {"verb": "image", "action": "remove", "item": item,
-           "files": [os.path.relpath(rjson, ws.mirror).replace("\\", "/")]}
+        ops.append(("delete", pend))
+    commit_bytes(ops, private=True)
+    out = {"verb": "image", "action": "remove", "item": item, "files": [rel]}
     out["next"] = ("unstaged; nothing to push for the file" if was_staged else
                    "pbz push deletes the file from the report (backed up with the push)")
     return out

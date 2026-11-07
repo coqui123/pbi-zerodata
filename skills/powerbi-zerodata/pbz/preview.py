@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 import re
 
-from .common import PbzError, write_text
+from .common import PbzError, commit_bytes, write_text
 
 VERSION = 1
 CONTROL_TYPES = {"actionButton", "slicer", "advancedSlicerVisual"}
@@ -297,7 +297,7 @@ def run(ws, project, page: str | None = None, spec=None) -> dict:
         raise PbzError('NOT_FOUND', 'no matching sanitized report page')
     output = _inside(mirror / 'previews', mirror)
     output.mkdir(exist_ok=True)
-    results, findings = [], []
+    results, findings, planned = [], [], []
     for folder, obj in selected:
         pid = folder.name
         width = _number(obj.get('width'), 1280)
@@ -392,10 +392,17 @@ def run(ws, project, page: str | None = None, spec=None) -> dict:
                   'custom_visual_rendering': 'UNSUPPORTED' if any(v['kind'] not in KNOWN_TYPES for v in live) else 'NOT_APPLICABLE',
                   'capabilities': capabilities, 'visual_capabilities': visual_capabilities,
                   'size': [width,height], 'region_fill': fill, 'findings': current}
-        _write(svg_path, svg, mirror)
-        _write(metadata_path, json.dumps(record, indent=2) + '\n', mirror)
+        planned.append((svg_path, svg, metadata_path, json.dumps(record, indent=2) + '\n', record))
         findings += current
         results.append(record)
+    ops = []
+    for svg_path, svg, metadata_path, meta, _record in planned:
+        _inside(svg_path, mirror)
+        _inside(metadata_path, mirror)
+        ops.append(("write", str(svg_path), svg, b""))
+        ops.append(("write", str(metadata_path), meta, b""))
+    if ops:
+        commit_bytes(ops)
     return {'verb':'preview', 'version':VERSION, 'result':'GENERATED', 'project':project.name,
             'gate':'FAIL' if any(f['severity']=='error' for f in findings) else 'PASS',
             'pages':results, 'findings':findings,

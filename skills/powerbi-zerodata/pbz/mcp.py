@@ -315,7 +315,8 @@ TOOLS = [
                                 ("from_col", D(S, "many side, 'Table'[Column]"), True),
                                 ("to_col", D(S, "one side, 'Table'[Column]"), True)],
          opts={"inactive": _f("--inactive"), "active": _f("--active"), "both": _f("--both"), "single": _f("--single"),
-               "many_to_many": _f("--many-to-many"), "force": ("--force", D(B, "add: allow mismatched types"), "flag")},
+               "many_to_many": _f("--many-to-many"), "force": ("--force", D(B, "add: allow mismatched types"), "flag"),
+               "dry_run": _f("--dry-run")},
          read_only=False),
     Tool("add_page", "Create a report page in the mirror: plain, a report-page tooltip, or a drillthrough target "
                      "(with a Back button).", ["add", "page"],
@@ -339,7 +340,8 @@ TOOLS = [
          opts={"report": ("--report", B, "flag"), "page": ("--page", S, "value"), "visual": ("--visual", S, "value"),
                "values_in": ("--in", D(L, "keep these values"), "multi"), "values_out": ("--not-in", D(L, "drop these values"), "multi"),
                "where": ("--where", D(L, "\">= 100\" (two for AND)"), "append"), "top": ("--top", I, "value"),
-               "by": ("--by", D(S, "Top N: ranking measure"), "value"), "bottom": ("--bottom", B, "flag")},
+               "by": ("--by", D(S, "Top N: ranking measure"), "value"), "bottom": ("--bottom", B, "flag"),
+               "dry_run": _f("--dry-run")},
          read_only=False),
     Tool("bookmark", "Bookmarks of a page's shown and hidden visuals (never data state): add, remove, list.",
          ["bookmark"],
@@ -353,6 +355,7 @@ TOOLS = [
          pos=[("page", S, True), ("source", D(S, "visual id or layout label"), True),
               ("target", D(S, "visual id, layout label, or all"), True),
               ("mode", E("filter", "highlight", "none", "default"), True)],
+         opts={"dry_run": _f("--dry-run")},
          read_only=False),
     Tool("add_visual", "Create a visual bound to model fields: any built-in type (roles from Microsoft's core "
                        "visual capabilities) or a registered custom visual with a known contract.", ["add", "visual"],
@@ -425,7 +428,7 @@ TOOLS = [
     Tool("recipe", "Run (or check) a recipe: a JSON batch of mirror-editing verbs applied as one transaction, rolled "
                    "back on any failed step, unmet expectation, limit or validation error.", ["recipe"],
          pos=[("action", E("run", "check"), True), ("spec", D(S, "recipe file path or JSON"), True)],
-         opts={"params": ("--param", D(L, "name=value"), "append")}, read_only=False),
+         opts={"params": ("--param", D(L, "name=value"), "append"), "dry_run": _f("--dry-run")}, read_only=False),
     Tool("desktop", "Power BI Desktop control without screenshots: status, open, close, reload.", ["desktop"],
          pos=[("action", E("status", "open", "close", "reload"), True)],
          opts={"wait": ("--wait", D(I, "seconds to wait for the engine"), "value")}, read_only=False, timeout=1800),

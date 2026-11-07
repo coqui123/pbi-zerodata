@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import copy
 import difflib
+import hashlib
 import json
 import os
 import shutil
@@ -11,7 +12,7 @@ import uuid
 
 from . import desktop, policy as policy_mod, tmdl, tokens, validate
 from .classify import Classifier
-from .common import PbzError, Project, Workspace, file_sha, read_text, sha, write_text
+from .common import PbzError, Project, Workspace, commit_bytes, file_sha, read_text, sha, write_text
 
 SKIP_DIRS = {".pbi", "daxqueries", "tmdlscripts", "customvisuals", "node_modules"}  # cultures: mirrored, see tokens
 JSON_EXT = (".json", ".pbir", ".pbism", ".platform")
@@ -101,7 +102,19 @@ def mirror_changes(ws: Workspace, project: Project, man: dict) -> dict:
     return {"changed": sorted(changed), "added": sorted(added), "deleted": sorted(deleted)}
 
 
+def _read_prepared(path: str, rel: str):
+    """Read one pull input. A decode or IO failure names the mirror-relative path and nothing else."""
+    try:
+        return read_text(path)
+    except (OSError, UnicodeError, ValueError):
+        raise PbzError("REFUSED", rel) from None
+
+
 def pull(ws: Workspace, project: Project, force: bool = False, rebase: bool = False) -> dict:
+    # Force and rebase do not bypass an interrupted commit.
+    gate = _pull_blocked(ws, project)
+    if gate:
+        return gate
     pol = policy_mod.load(ws)
     man = load_manifest(ws, project)
     if man and os.path.isdir(ws.mirror):
@@ -117,21 +130,35 @@ def pull(ws: Workspace, project: Project, force: bool = False, rebase: bool = Fa
     keep = set(pending["changed"] + pending["added"]) if rebase else set()
     conflicts = []
     bdir = base_dir(ws, project)
+    # Phase 1: read and tokenize every selected file, plus every rebase input merge will consume.
+    # Nothing is written here, so a later decode failure leaves the mirror untouched.
+    prepared = []
     for rel, real in project_files(project):
-        text, bom = read_text(real)
+        text, bom = _read_prepared(real, rel)
         mtext = _tokenize(rel, text, model, clf, tm)
         back, unknown = _detokenize(rel, mtext, tm)
         if back != text or unknown:
             lossy.append(rel)
             mtext = None
-        mpath = os.path.join(ws.mirror, *rel.split("/"))
         real_h = file_sha(real)
         old = man.get("files", {}).get(rel, {})
+        item = {"rel": rel, "bom": bom, "mtext": mtext, "real_h": real_h, "old": old}
+        if rel in keep and old.get("real") != real_h:
+            mine = os.path.join(ws.mirror, *rel.split("/"))
+            base = os.path.join(bdir, *rel.split("/"))
+            item["mine_text"], item["mine_bom"] = _read_prepared(mine, rel)
+            item["base_text"] = _read_prepared(base, rel)[0] if os.path.exists(base) else None
+        prepared.append(item)
+    # Phase 2 reuses those strings. It does not read the same files again.
+    for item in prepared:
+        rel, bom, mtext = item["rel"], item["bom"], item["mtext"]
+        real_h, old = item["real_h"], item["old"]
+        mpath = os.path.join(ws.mirror, *rel.split("/"))
         if rel in keep:
             if old.get("real") == real_h:
                 new_files[rel] = old  # real unchanged; keep agent edits as they are
                 continue
-            merged = _merge3(ws, project, rel, mtext)
+            merged = _merge3(ws, project, rel, mtext, item["mine_text"], item["mine_bom"], item.get("base_text"))
             if merged is None:
                 conflicts.append(rel)
             new_files[rel] = {"real": real_h, "mirror": old.get("mirror"), "lossy": mtext is None}
@@ -158,9 +185,16 @@ def pull(ws: Workspace, project: Project, force: bool = False, rebase: bool = Fa
            "classification": clf.mode, "files": new_files}
     save_manifest(ws, project, man)
     _write_guide(ws, clf.mode)
-    snapshot(ws, project, "pull")
-    return {"verb": "pull", "project": project.name, "files": len(new_files), "classification": clf.mode,
-            "token_occurrences": counts, "lossy_files": lossy, "conflicts": conflicts}
+    warnings = []
+    try:
+        snapshot(ws, project, "pull")
+    except (OSError, ValueError, TypeError, PbzError):
+        warnings.append({"code": "POST_PULL_HISTORY", "message": "pull succeeded; history snapshot was not recorded"})
+    out = {"verb": "pull", "project": project.name, "result": "PULLED", "files": len(new_files),
+           "classification": clf.mode, "token_occurrences": counts, "lossy_files": lossy, "conflicts": conflicts}
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 def merge3(base: str, mine: str, theirs: str) -> tuple[str, bool]:
@@ -215,17 +249,24 @@ def merge3(base: str, mine: str, theirs: str) -> tuple[str, bool]:
     return "".join(out), clean
 
 
-def _merge3(ws: Workspace, project: Project, rel: str, theirs: str | None) -> str | None:
-    """Three-way merge agent edits (mirror) with a new upstream mirror text. All inputs sanitized."""
+def _merge3(ws: Workspace, project: Project, rel: str, theirs: str | None,
+            mine_text: str | None = None, mine_bom: bytes | None = None, base_text: str | None = None) -> str | None:
+    """Three-way merge agent edits (mirror) with a new upstream mirror text. All inputs sanitized.
+
+    Pull passes the phase-1 strings so this write cannot fail on a late re-read.
+    """
     if theirs is None:
         return None
     mine = os.path.join(ws.mirror, *rel.split("/"))
     base = os.path.join(base_dir(ws, project), *rel.split("/"))
-    mine_text, bom = read_text(mine)
-    base_text = read_text(base)[0] if os.path.exists(base) else theirs
+    if mine_text is None:
+        mine_text, mine_bom = read_text(mine)
+        base_text = read_text(base)[0] if os.path.exists(base) else theirs
+    elif base_text is None:
+        base_text = theirs
     merged, clean = merge3(base_text, mine_text, theirs)
-    write_text(mine, merged, bom)
-    write_text(base, theirs, bom)
+    write_text(mine, merged, mine_bom or b"")
+    write_text(base, theirs, mine_bom or b"")
     return merged if clean else None
 
 
@@ -303,6 +344,41 @@ def _transaction_path(ws, project, entry) -> str:
     return path
 
 
+_JOURNAL_STATES = {"PREPARING", "PREPARED", "APPLYING", "COMMITTED", "ROLLED_BACK", "RECOVERY_REQUIRED"}
+
+
+def _pull_blocked(ws, project) -> dict | None:
+    """Ordinary, forced and rebased pulls all stop while a commit lock or pending recovery exists."""
+    lock = os.path.join(_transaction_dir(ws, project), ".commit-lock")
+    pending = pending_recovery(ws, project)
+    if pending or os.path.exists(lock):
+        return {"verb": "pull", "project": project.name, "result": "RECOVERY_REQUIRED", "transactions": pending}
+    return None
+
+
+def _journal_ok(journal) -> bool:
+    """Known states and entry shapes only. Invalid journals never contribute their payload."""
+    if not isinstance(journal, dict) or journal.get("version") != 1:
+        return False
+    if journal.get("state") not in _JOURNAL_STATES:
+        return False
+    entries = journal.get("entries")
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("scope") not in ("workspace", "private"):
+            return False
+        path = entry.get("path")
+        if not isinstance(path, str) or not path or ".." in path.replace("\\", "/").split("/"):
+            return False
+        for key in ("before", "after"):
+            if key in entry and entry[key] is not None and not isinstance(entry[key], str):
+                return False
+        if "backup" in entry and not isinstance(entry["backup"], str):
+            return False
+    return True
+
+
 def pending_recovery(ws, project) -> list[dict]:
     """Closed metadata only; journal payloads and backups remain private."""
     out = []
@@ -317,8 +393,11 @@ def pending_recovery(ws, project) -> list[dict]:
         except (OSError, ValueError):
             out.append({"id": name, "state": "UNREADABLE"})
             continue
-        if journal.get("state") not in ("COMMITTED", "ROLLED_BACK"):
-            out.append({"id": name, "state": journal.get("state", "UNKNOWN")})
+        if not _journal_ok(journal):
+            out.append({"id": name, "state": "INVALID"})
+            continue
+        if journal["state"] not in ("COMMITTED", "ROLLED_BACK"):
+            out.append({"id": name, "state": journal["state"]})
     return out
 
 
@@ -363,6 +442,8 @@ def _begin_transaction(ws, project, stamp, targets):
 
 
 def _restore_transaction(ws, project, directory, journal):
+    if not _journal_ok(journal):
+        return {"result": "RECOVERY_REQUIRED"}
     conflicts = []
     # Check all targets before restoring any. Never overwrite a third-party change.
     for entry in journal["entries"]:
@@ -445,6 +526,8 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
             return {"verb": "recover", "result": "RECOVERY_REQUIRED"}
     pending = pending_recovery(ws, project)
     if transaction_id is not None:
+        if not any(p["id"] == transaction_id for p in pending):
+            return {"verb": "recover", "result": "NOT_FOUND", "transactions": []}
         pending = [p for p in pending if p["id"] == transaction_id]
     results = []
     for item in pending:
@@ -452,7 +535,10 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
         try:
             with open(os.path.join(directory, "journal.json"), encoding="utf-8") as f:
                 journal = json.load(f)
-            result = _restore_transaction(ws, project, directory, journal)
+            if not _journal_ok(journal):
+                result = {"result": "RECOVERY_REQUIRED"}
+            else:
+                result = _restore_transaction(ws, project, directory, journal)
         except (OSError, ValueError, KeyError, PbzError):
             result = {"result": "RECOVERY_REQUIRED"}
         results.append({"id": item["id"], **result})
@@ -506,15 +592,20 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
                         "then pbz pull --rebase"}
     tm = tokens.TokenMap(ws.private)
     new_real: dict[str, tuple[str, bytes]] = {}
+    captured_mirror: dict[str, tuple[str, bytes]] = {}
     unknown_all: list[str] = []
     for rel in ch["changed"] + ch["added"]:
         mtext, bom = read_text(os.path.join(ws.mirror, *rel.split("/")))
+        captured_mirror[rel] = (mtext, bom)
         rtext, unknown = _detokenize(rel, mtext, tm)
         unknown_all += unknown
         new_real[rel] = (rtext, bom)
     if unknown_all:
         return {"verb": "push", "project": project.name, "result": "UNKNOWN_TOKEN",
                 "tokens": sorted(set(unknown_all))}
+    # Candidate bytes and the preconditions they were read against, before validation.
+    pre_real = {rel: file_sha(_real_path(ws, rel)) for rel in ch["changed"] + ch["deleted"]}
+    pre_mirror = {rel: file_sha(os.path.join(ws.mirror, *rel.split("/"))) for rel in captured_mirror}
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     stage = os.path.join(ws.private, "stage", stamp)
     transaction = None
@@ -544,6 +635,10 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
         images.install(imgs_new, os.path.join(stage, project.name + ".Report"))
         images.delete(imgs_drop, os.path.join(stage, project.name + ".Report"))
         findings = validate.run_stage(ws, project, stage, tm)
+        if any(file_sha(_real_path(ws, rel)) != pre_real[rel] for rel in pre_real) or \
+                any(file_sha(os.path.join(ws.mirror, *rel.split("/"))) != pre_mirror[rel] for rel in pre_mirror):
+            return {"verb": "push", "project": project.name, "result": "CONFLICT",
+                    "hint": "project files changed during validation; pull and retry"}
         errors = [f for f in findings if f["severity"] == "error"]
         summary = []
         for rel in touched:
@@ -557,10 +652,12 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
         if errors or dry_run or preflight_only:
             return {"verb": "push", "project": project.name, "result": "INVALID" if errors else "DRY_RUN_OK",
                     "objects": summary, "findings": findings, **({"held_back": held} if held else {})}
-        authored_before = {rel: (read_text(os.path.join(base_dir(ws, project), *rel.split("/")))[0]
-                                 if os.path.exists(os.path.join(base_dir(ws, project), *rel.split("/"))) else None)
-                           for rel in ch["changed"] + ch["added"]}
-        authored_after = {rel: read_text(os.path.join(ws.mirror, *rel.split("/")))[0] for rel in ch["changed"] + ch["added"]}
+        authored_before = {}
+        authored_after = {}
+        for rel in ch["changed"] + ch["added"]:
+            bpath = os.path.join(base_dir(ws, project), *rel.split("/"))
+            authored_before[rel] = read_text(bpath)[0] if os.path.exists(bpath) else None
+            authored_after[rel] = captured_mirror[rel][0]
         # Include every resource file, not only its report.json registration, in recovery.
         resource_paths = set()
         for guid in pkgs:
@@ -570,13 +667,20 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
                                   _tree_files(os.path.join(stage, project.name + ".Report", "CustomVisuals", guid)))
         resource_paths.update(f"{project.name}.Report/StaticResources/RegisteredResources/{item}"
                               for item in set(imgs_new) | set(imgs_drop))
-        real_targets = {rel: file_sha(os.path.join(stage, *rel.split("/"))) for rel in set(touched) | resource_paths}
+        real_targets = {}
+        for rel in set(touched) | resource_paths:
+            if rel in new_real:
+                rtext, bom = new_real[rel]
+                real_targets[rel] = hashlib.sha256(bom + rtext.encode("utf-8")).hexdigest()
+            else:
+                real_targets[rel] = file_sha(os.path.join(stage, *rel.split("/")))
         new_files = copy.deepcopy(files)
         private_targets = {}
         for rel in ch["changed"] + ch["added"]:
-            mp = os.path.join(ws.mirror, *rel.split("/"))
-            new_files[rel] = {"real": real_targets[rel], "mirror": file_sha(mp)}
-            private_targets[os.path.relpath(os.path.join(base_dir(ws, project), *rel.split("/")), ws.private).replace("\\", "/")] = file_sha(mp)
+            mtext, bom = captured_mirror[rel]
+            mirror_hash = hashlib.sha256(bom + mtext.encode("utf-8")).hexdigest()
+            new_files[rel] = {"real": real_targets[rel], "mirror": mirror_hash}
+            private_targets[os.path.relpath(os.path.join(base_dir(ws, project), *rel.split("/")), ws.private).replace("\\", "/")] = mirror_hash
         for rel in ch["deleted"]:
             new_files.pop(rel, None)
             private_targets[os.path.relpath(os.path.join(base_dir(ws, project), *rel.split("/")), ws.private).replace("\\", "/")] = None
@@ -622,9 +726,9 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
                 _prune_empty(target, project.report_dir)
         installed, img_in, img_out = sorted(pkgs), sorted(imgs_new), sorted(imgs_drop)
         for rel in ch["changed"] + ch["added"]:
-            mp = os.path.join(ws.mirror, *rel.split("/"))
-            files[rel] = {"real": file_sha(_real_path(ws, rel)), "mirror": file_sha(mp)}
-            mtext, bom = read_text(mp)
+            mtext, bom = captured_mirror[rel]
+            mirror_hash = hashlib.sha256(bom + mtext.encode("utf-8")).hexdigest()
+            files[rel] = {"real": real_targets[rel], "mirror": mirror_hash}
             write_text(os.path.join(base_dir(ws, project), *rel.split("/")), mtext, bom)
         for rel in ch["deleted"]:
             files.pop(rel, None)
@@ -658,7 +762,10 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
         if warnings:
             result["warnings"] = warnings
         if reload and open_inst:
-            result["reload"] = desktop.reload(project)
+            try:
+                result["reload"] = desktop.reload(project)
+            except Exception:
+                result["reload"] = "RELOAD_FAILED"
         return result
     except BaseException:
         if transaction is None:
@@ -732,17 +839,22 @@ def revert(ws: Workspace, project: Project, paths: list[str] | None = None, obj:
     if obj:
         return _revert_object(ws, project, bdir, obj)
     ch, _held = _select(mirror_changes(ws, project, man), paths or ["*"])
-    done = []
+    ops, done = [], []
+    readable = []
     for rel in ch["changed"] + ch["deleted"]:
         bp = os.path.join(bdir, *rel.split("/"))
         if not os.path.exists(bp):
             continue
-        text, bom = read_text(bp)
-        write_text(os.path.join(ws.mirror, *rel.split("/")), text, bom)
+        readable.append((rel, bp))
+    for rel, bp in readable:
+        text, bom = _read_prepared(bp, rel)
+        ops.append(("write", os.path.join(ws.mirror, *rel.split("/")), text, bom))
         done.append(rel)
     for rel in ch["added"]:
-        os.remove(os.path.join(ws.mirror, *rel.split("/")))
+        ops.append(("delete", os.path.join(ws.mirror, *rel.split("/"))))
         done.append(rel)
+    if ops:
+        commit_bytes(ops)
     return {"verb": "revert", "project": project.name, "files": sorted(done),
             "result": "REVERTED" if done else "NOTHING_TO_REVERT"}
 
@@ -791,8 +903,8 @@ def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict
         _brel, bdoc, bn = base
         new = apply_block(doc.text, tmdl.block_span(doc, n), bdoc.text[slice(*tmdl.block_span(bdoc, bn))])
     path = os.path.join(mdef, *rel.split("/"))
-    _t, bom = read_text(path)
-    write_text(path, new, bom)
+    _text, bom = _read_prepared(path, f"{project.name}.SemanticModel/definition/{rel}")
+    commit_bytes([("write", path, new, bom)])
     return {"verb": "revert", "project": project.name, "object": f"{kind} {table}[{name}]",
             "result": "REVERTED", "files": [f"{project.name}.SemanticModel/definition/{rel}"]}
 
@@ -843,18 +955,29 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
     while os.path.exists(os.path.join(snaps, f"{stamp}.json")):
         n += 1
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{n:03d}"  # sorts after the bare stamp
-    with open(os.path.join(snaps, f"{stamp}.json"), "w", encoding="utf-8") as f:
-        json.dump({"stamp": stamp, "event": event, "files": files}, f)
+    write_text(os.path.join(snaps, f"{stamp}.json"),
+               json.dumps({"stamp": stamp, "event": event, "files": files}))
     names = sorted(os.listdir(snaps))
-    for old in names[:-HISTORY_KEEP]:
-        os.remove(os.path.join(snaps, old))
-    live = set()
-    for name in sorted(os.listdir(snaps)):
-        with open(os.path.join(snaps, name), encoding="utf-8") as f:
-            live |= set(json.load(f).get("files", {}).values())
-    for b in os.listdir(blobs):
-        if b[:-4] not in live:
-            os.remove(os.path.join(blobs, b))
+    kept = names[-HISTORY_KEEP:]
+    live, readable = set(), True
+    for name in kept:
+        try:
+            with open(os.path.join(snaps, name), encoding="utf-8") as f:
+                doc = json.load(f)
+            blob_ids = doc.get("files") if isinstance(doc, dict) else None
+            if not isinstance(blob_ids, dict):
+                readable = False
+                break
+            live |= set(blob_ids.values())
+        except (OSError, ValueError, TypeError):
+            readable = False
+            break
+    if readable:
+        for old in names[:-HISTORY_KEEP]:
+            os.remove(os.path.join(snaps, old))
+        for b in os.listdir(blobs):
+            if b[:-4] not in live:
+                os.remove(os.path.join(blobs, b))
     return stamp
 
 
@@ -862,9 +985,15 @@ def history_list(ws: Workspace, project: Project) -> list[dict]:
     snaps = os.path.join(history_dir(ws, project), "snapshots")
     out = []
     for name in sorted(os.listdir(snaps)) if os.path.isdir(snaps) else []:
-        with open(os.path.join(snaps, name), encoding="utf-8") as f:
-            s = json.load(f)
-        out.append({"stamp": s["stamp"], "event": s.get("event", ""), "files": len(s.get("files", {}))})
+        try:
+            with open(os.path.join(snaps, name), encoding="utf-8") as f:
+                s = json.load(f)
+            if not isinstance(s, dict) or not isinstance(s.get("stamp"), str) or not isinstance(s.get("files"), dict):
+                raise ValueError("snapshot")
+            out.append({"stamp": s["stamp"], "event": s.get("event", ""), "files": len(s.get("files", {}))})
+        except (OSError, ValueError, TypeError):
+            stamp = name[:-5] if name.endswith(".json") else name
+            out.append({"stamp": stamp, "event": "UNREADABLE", "files": 0})
     return out
 
 

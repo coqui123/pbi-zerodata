@@ -111,6 +111,31 @@ removal that already committed earlier rounds reports `PARTIAL` (exit 5) and kee
 Round 11 puts property sets, repair, bookmarks, tab order, phone layout, style, page and visual
 adds, and page and visual copies on the same single `commit_bytes`. A present malformed document
 those edits must read is `REFUSED` with a mirror-relative path before any write.
+Round 12 does the same for filters, relationships, interactions, date-table scaffolds (including
+every planned relationship), dynamic formats, function renames, image registration and staged
+bytes, refresh policy and `format --apply`. A private image restore that cannot finish is
+`RECOVERY_REQUIRED` with a fixed message only. A present but unreadable consumer registry is
+refused before unused analysis, and a recipe substitutes and parses every step before it runs.
+Round 13 puts consumer registration, synthetic publish, handoff packets, previews and memory
+scrubs on one `commit_bytes`. A synthetic candidate is validated in a sibling stage first. An
+unavailable validator does not publish: the previous destination stays, and nothing is marked
+ready. `synth test` is not `SAME` for a truncated side, an empty or malformed saved envelope, an
+invalid build timestamp or a stale synthetic copy. A malformed envelope is not queried.
+`memscrub --apply` is human-only, and `doctor` does not treat a sandbox account name as configured
+isolation.
+Round 14 keeps a repeated synthetic error as `ERROR` (exit 1), never `SAME`. `NOT_COMPARABLE`
+and `LOCAL_STATE_UNAVAILABLE` are blocked (exit 3). `INTERNAL_ERROR` is failed (exit 1). An
+incomplete smoke stays inconclusive. `recover` of an unknown id is `NOT_FOUND`. `check
+--validate-only` writes no evidence line. Revert and `bpa --fix` plan, then one `commit_bytes`.
+Pull reads every selected file, and every rebase input the merge will use, before it writes;
+a bad file is `REFUSED` by mirror-relative path. A pending recovery blocks pull even with
+`--force`. Push captures candidate bytes before validation and does not adopt a file that
+changes during that check. A reload that fails after a committed push is `PARTIAL` (exit 5).
+An unreadable history snapshot is listed as `UNREADABLE` and is not deleted. Strict memory
+disclosure strips size and share bands from a live result and from a previously saved shape-mode
+cache. A docs change log skips a bad line, reports `INCOMPLETE` and the skip count, and does
+not copy that line into JSON, Markdown or HTML.
+
 `--diagnostic` explicitly permits check-result collection without assertion failure exit codes.
 Do not interpret an artifact being generated as validation passing. Unexpected CLI exceptions
 return a protected diagnostic ID rather than echoing potentially sensitive traceback text.

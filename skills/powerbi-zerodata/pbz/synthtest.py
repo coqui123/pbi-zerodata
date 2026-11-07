@@ -9,7 +9,8 @@ never answer. Tests live in <ws>/.pbz/synth-tests/<name>.json.
 - save <name>: run a spec ({"queries": [{"id", "dax", "keys"?}]}) and/or a measure shortcut
   (measures, optionally grouped by columns) and keep the results, the synth build settings (seed,
   rows, tables) and a hash of the mirror model.
-- run <name>: rerun and compare per query (SAME, DIFF with the changed rows and cells, ERROR:<class>),
+- run <name>: rerun and compare per query (SAME, DIFF with the changed rows and cells, ERROR:<class>).
+  A query that still errors is ERROR:<class>, never SAME,
   floats within a relative tolerance. Drift is reported apart: a synthetic copy rebuilt with another
   seed or row count makes results not comparable; a mirror model changed since the save is expected
   after a refactor; a synthetic copy older than the mirror model still runs the old DAX.
@@ -24,7 +25,7 @@ import os
 import re
 
 from . import lexers, synth, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 
 DIR = (".pbz", "synth-tests")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$")
@@ -52,10 +53,12 @@ def _load(ws, name: str) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
+    except FileNotFoundError:
+        raise PbzError("NOT_FOUND", f"synth test {name} (`pbz synth test list`)") from None
     except OSError:
-        raise PbzError("NOT_FOUND", f"synth test {name} (`pbz synth test list`)")
+        raise PbzError("REFUSED", f"synth test {name}") from None
     except ValueError:
-        raise PbzError("BAD_REQUEST", f"synth test {name} is not valid JSON")
+        raise PbzError("BAD_REQUEST", f"synth test {name} is not valid JSON") from None
 
 
 def _model_files(project) -> list[str]:
@@ -190,10 +193,14 @@ def _key_index(keys, columns: list, rows: list) -> list[int]:
 
 
 def compare(gold: dict, now: dict, tol: float = 1e-9) -> dict:
+    if gold.get("truncated") or now.get("truncated"):
+        return {"result": "NOT_COMPARABLE", "note": "truncated"}
     if now.get("error"):
+        # A repeated error class is still a failure, never a passing SAME.
+        out = {"result": f"ERROR:{now['error']}"}
         if gold.get("error") == now["error"]:
-            return {"result": "SAME", "note": f"still ERROR:{now['error']}"}
-        return {"result": f"ERROR:{now['error']}"}
+            out["note"] = f"still ERROR:{now['error']}"
+        return out
     if gold.get("error"):
         return {"result": "DIFF", "note": f"was ERROR:{gold['error']}, now returns {len(now['rows'])} row(s)"}
     gc, nc = gold.get("columns", []), now.get("columns", [])
@@ -256,7 +263,9 @@ def save(ws, project, name: str, spec=None, measures: list[str] | None = None, b
     if len(set(ids)) != len(ids):
         raise PbzError("BAD_REQUEST", "query ids must be unique")
     info = synth.build_info(ws, project)  # UNSAFE unless the synthetic copy exists
-    stale = _stale(project, info)
+    if not _built_stamp_ok(info) or _stale(project, info):
+        return {"verb": "synth-test", "action": "save", "name": name, "result": "NOT_COMPARABLE",
+                "error": "STALE_EVIDENCE", "queries": [], "data": "synthetic"}
     results = []
     for q in queries:
         r = _query(ws, project, q["dax"])
@@ -273,20 +282,50 @@ def save(ws, project, name: str, spec=None, measures: list[str] | None = None, b
            "synth": {**{k: info.get(k) for k in ("seed", "rows", "built", "tables")},
                      "profile": info.get("profile", "standard")},
            "model_hash": model_hash(project), "queries": results}
-    write_text(path, json.dumps(doc, indent=1, ensure_ascii=False) + "\n")
+    commit_bytes([("write", path, json.dumps(doc, indent=1, ensure_ascii=False) + "\n", b"")])
     out = {"verb": "synth-test", "action": "save", "name": name, "data": "synthetic",
            "queries": [{"id": r["id"], **({"error": r["error"]} if r.get("error") else
                                           {"rows": len(r["rows"]), "columns": len(r["columns"])})} for r in results],
            "file": os.path.relpath(path, ws.root).replace("\\", "/"),
            "next": f"after a refactor: pbz synth build, pbz synth open, pbz synth test run {name}"}
-    if stale:
-        out["warning"] = ("the synthetic copy is older than the mirror model, so these results come from the old "
-                          "DAX: rebuild it (`pbz synth build`, `pbz synth open`) and save again with --replace")
     return out
+
+
+def _saved_shape(doc) -> str:
+    """ok, empty, or malformed. Malformed means the envelope cannot be compared at all."""
+    if not isinstance(doc, dict):
+        return "malformed"
+    queries = doc.get("queries")
+    if not isinstance(queries, list):
+        return "malformed"
+    synth_info = doc.get("synth")
+    if synth_info is not None and not isinstance(synth_info, dict):
+        return "malformed"
+    for q in queries:
+        if not isinstance(q, dict) or not isinstance(q.get("id"), str) or not isinstance(q.get("dax"), str):
+            return "malformed"
+        if "columns" in q and not isinstance(q.get("columns"), list):
+            return "malformed"
+        if "rows" in q and not isinstance(q.get("rows"), list):
+            return "malformed"
+    return "empty" if not queries else "ok"
+
+
+def _built_stamp_ok(info: dict) -> bool:
+    try:
+        dt.datetime.fromisoformat(str(info.get("built")))
+    except ValueError:
+        return False
+    return True
 
 
 def run(ws, project, name: str, tol: float = 1e-9) -> dict:
     doc = _load(ws, name)
+    shape = _saved_shape(doc)
+    if shape != "ok":
+        return {"verb": "synth-test", "action": "run", "name": name, "result": "NOT_COMPARABLE",
+                "summary": {}, "tolerance": tol, "queries": [], "data": "synthetic",
+                "note": "saved envelope is malformed" if shape == "malformed" else "saved queries are empty"}
     info = synth.build_info(ws, project)
     drift, comparable = {}, True
     s0 = doc.get("synth") or {}
@@ -302,18 +341,27 @@ def run(ws, project, name: str, tol: float = 1e-9) -> dict:
                             f"rebuild with{' --edge' if p0 == 'edge' else 'out --edge'} or save again")
     if doc.get("model_hash") != model_hash(project):
         drift["model"] = "the mirror model changed since the save: expected after a refactor, review each DIFF"
-    if _stale(project, info):
+    if not _built_stamp_ok(info):
+        comparable = False
+        drift["built"] = "the synthetic build timestamp is not comparable"
+    elif _stale(project, info):
+        comparable = False
         drift["synth_stale"] = ("the synthetic copy is older than the mirror model and still runs the old DAX: "
                                 "rebuild and reopen it (`pbz synth build`, `pbz synth open`)")
+    if not comparable:
+        return {"verb": "synth-test", "action": "run", "name": name, "result": "NOT_COMPARABLE",
+                "summary": {}, "tolerance": tol, "queries": [], "data": "synthetic",
+                **({"drift": drift} if drift else {})}
     results = []
     for q in doc.get("queries", []):
         cmp = compare(q, _query(ws, project, q["dax"]), tol)
         results.append({"id": q["id"], **cmp})
     counts: dict[str, int] = {}
     for r in results:
-        k = r["result"] if not r["result"].startswith("ERROR") else "ERROR"
+        k = r["result"] if not str(r["result"]).startswith("ERROR") else "ERROR"
         counts[k] = counts.get(k, 0) + 1
-    verdict = ("NOT_COMPARABLE" if not comparable else "SAME" if counts.get("SAME", 0) == len(results)
+    verdict = ("NOT_COMPARABLE" if not comparable or counts.get("NOT_COMPARABLE")
+               else "SAME" if counts.get("SAME", 0) == len(results)
                else "DIFF" if counts.get("DIFF") else "ERROR")
     out = {"verb": "synth-test", "action": "run", "name": name, "result": verdict, "summary": counts,
            "tolerance": tol, "queries": results, "data": "synthetic"}
@@ -623,5 +671,5 @@ def remove(ws, name: str) -> dict:
     path = _path(ws, name)
     if not os.path.exists(path):
         raise PbzError("NOT_FOUND", f"synth test {name}")
-    os.remove(path)
+    commit_bytes([("delete", path)])
     return {"verb": "synth-test", "action": "remove", "name": name, "result": "REMOVED"}

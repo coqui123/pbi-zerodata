@@ -240,15 +240,7 @@ def collect(ws, project, dax: bool = False) -> dict:
         summary[o.kind][st] += 1
         if st == "unused" and o.kind in ("table", "column", "measure", "hierarchy", "relationship", "m_query", "function"):
             unused.append(f"{o.kind} {o.label()}")
-    changelog = []
-    try:
-        with open(os.path.join(ws.pbz_dir, "push-log.jsonl"), encoding="utf-8") as f:
-            for line in f:
-                e = json.loads(line)
-                if e.get("project") == project.name:
-                    changelog.append({"stamp": e.get("stamp", ""), "objects": e.get("objects", [])[:30]})
-    except (OSError, ValueError):
-        pass
+    changelog, skipped = _changelog(ws, project)
     doc["overview"] = {"tables": len(tables), "columns": sum(len(t["columns"]) for t in tables),
                        "measures": len(measures), "relationships": len(rels), "roles": len(security),
                        "calculation_groups": len(cgroups), "functions": len(functions),
@@ -261,8 +253,39 @@ def collect(ws, project, dax: bool = False) -> dict:
                 "field_parameters": fparams, "relationships": rels, "power_query": pq, "security": security,
                 "reports": reports, "unused": {"analysis": "incomplete" if g.incomplete else "complete",
                                                "scope": g.reports, "summary": summary, "objects": unused[:300]},
-                "changelog": changelog[-20:]})
+                "changelog": changelog, "changelog_skipped": skipped,
+                "changelog_status": "INCOMPLETE" if skipped else "COMPLETE"})
     return doc
+
+
+def _changelog(ws, project) -> tuple[list[dict], int]:
+    """Keep well-formed lines for this project. A bad line is counted and never copied into the doc."""
+    path = os.path.join(ws.pbz_dir, "push-log.jsonl")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return [], 0
+    kept, skipped = [], 0
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            skipped += 1
+            continue
+        if not isinstance(entry, dict) or entry.get("project") != project.name:
+            if not isinstance(entry, dict):
+                skipped += 1
+            continue
+        stamp, objects = entry.get("stamp"), entry.get("objects")
+        if not isinstance(stamp, str) or not isinstance(objects, list) or any(not isinstance(x, str) for x in objects):
+            skipped += 1
+            continue
+        kept.append({"stamp": stamp, "objects": objects[:30]})
+    return kept[-20:], skipped
 
 
 # ---------------------------------------------------------------- rendering
@@ -387,9 +410,11 @@ def render_md(d: dict) -> str:
                    [[k] + [s.get(st, 0) for st in usage.STATES] for k, s in sorted(u["summary"].items())])
     L += [f"- {x}" for x in u["objects"]] + ([""] if u["objects"] else [])
     L += ["## Change log", ""]
+    if d.get("changelog_status") == "INCOMPLETE":
+        L += [f"INCOMPLETE: {int(d.get('changelog_skipped') or 0)} line(s) skipped.", ""]
     for e in reversed(d["changelog"]):
         L += [f"- {e['stamp']}: " + "; ".join(e["objects"])]
-    if not d["changelog"]:
+    if not d["changelog"] and d.get("changelog_status") != "INCOMPLETE":
         L += ["_(no pushes recorded)_"]
     return "\n".join(L) + "\n"
 
@@ -485,9 +510,13 @@ def render_html(d: dict) -> str:
                                                          for k, s in sorted(u["summary"].items())])
             + ("<ul>" + "".join(f"<li>{_h(x)}</li>" for x in u["objects"]) + "</ul>" if u["objects"] else ""))
     sec("Unused objects", body)
-    sec("Change log", "<ul>" + "".join(f"<li>{_h(e['stamp'])}: {_h('; '.join(e['objects']))}</li>"
-                                       for e in reversed(d["changelog"])) + "</ul>" if d["changelog"]
-        else "<p><em>(no pushes recorded)</em></p>")
+    note = ""
+    if d.get("changelog_status") == "INCOMPLETE":
+        note = f"<p>INCOMPLETE: {_h(int(d.get('changelog_skipped') or 0))} line(s) skipped.</p>"
+    body = note + ("<ul>" + "".join(f"<li>{_h(e['stamp'])}: {_h('; '.join(e['objects']))}</li>"
+                                    for e in reversed(d["changelog"])) + "</ul>" if d["changelog"]
+                   else "<p><em>(no pushes recorded)</em></p>")
+    sec("Change log", body)
     css = ("body{font:14px/1.45 system-ui,sans-serif;margin:24px;max-width:1200px;color:#1b1f24;background:#fff}"
            "summary{cursor:pointer;font-weight:600;margin:6px 0}details details{margin-left:16px}"
            "table{border-collapse:collapse;margin:8px 0}th,td{border:1px solid #d0d7de;padding:3px 8px;text-align:left;"

@@ -54,7 +54,14 @@ jobs:
                     "atomic_refactor", "unused_atomic", "governance_atomic", "edit_refusals",
                     "repair_props_atomic", "bookmarks_atomic", "a11y_atomic", "style_atomic",
                     "author_atomic", "components_atomic",
-                    "capabilities", "daxfmt", "cli_mcp_parity", "freshness_offline"
+                    "consumers_refusals", "images_atomic", "edit_dryrun", "scaffold_atomic",
+                    "modeling_atomic", "recipe_rollback", "writers_atomic",
+                    "capabilities", "daxfmt", "cli_mcp_parity", "freshness_offline",
+                    "writers_tmp_cleanup", "consumers_atomic", "synth_atomic", "handoff_atomic",
+                    "preview_atomic", "memscrub_atomic", "synthtest_honesty",
+                    "outcomes_mapping", "revert_atomic", "bpafix_atomic", "pull_refusal",
+                    "mirror_recovery_honesty", "push_boundary_honesty", "history_honesty",
+                    "synthtest_atomic", "memory_disclosure", "docs_changelog", "ci_registration"
           $failed = @()
           foreach ($t in $suites) {
             Write-Host "::group::test_$t"

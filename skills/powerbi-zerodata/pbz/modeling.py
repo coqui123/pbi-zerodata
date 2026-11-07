@@ -16,7 +16,7 @@ import re
 import uuid
 
 from . import deps, lexers, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 from .governance import _eol, _model, _q, _role, _write
 from .tokens import TOKEN_RE, apply_edits
 
@@ -180,12 +180,14 @@ def format_expression(ws, project, measure: str, dax: str | None, upgrade: bool 
     m = model.measure(measure.strip().strip("[]"))
     if m is None or m.node is None:
         raise PbzError("NOT_FOUND", f"measure {measure}")
-    note = require_compat(mdef, "formatStringDefinition", upgrade) if dax is not None else None
     doc = model.docs[m.node.file]
     eol = _eol(doc.text)
     child = next((c for c in m.node.children if c.kind == "formatStringDefinition"), None)
     ind = "\t" * (m.node.indent + 1)
     edits = []
+    note = None
+    db_op = None
+    dropped = []
     if dax is None:
         if child is None:
             return {"verb": "format-expr", "measure": m.name, "result": "NOTHING_TO_CHANGE"}
@@ -198,6 +200,15 @@ def format_expression(ws, project, measure: str, dax: str | None, upgrade: bool 
         if d.unresolved:
             raise PbzError("UNKNOWN_REF", ", ".join(sorted({f"[{u.name}]" if not u.table else f"{u.table}[{u.name}]"
                                                            for u in d.unresolved})))
+        cur, _db = compat_level(mdef)
+        need = COMPAT["formatStringDefinition"]
+        if cur is not None and cur < need:
+            if not upgrade:
+                raise PbzError("COMPAT_LEVEL", f"formatStringDefinition needs compatibility level {need}; the model is at {cur}. "
+                                               "Pass --upgrade-compat to raise it (one way: older Desktop builds cannot open it)")
+            path, text, bom = compat_upgrade_text(mdef, "formatStringDefinition")
+            db_op = ("write", path, text, bom)
+            note = f"compatibility level raised from {cur} to {need}"
         if "\n" in body:
             text = f"{ind}formatStringDefinition ={eol}" + eol.join(ind + "\t" + ln.rstrip() for ln in body.splitlines() if ln.strip()) + eol
         else:
@@ -210,14 +221,15 @@ def format_expression(ws, project, measure: str, dax: str | None, upgrade: bool 
             trail = len(prefix) - len(prefix.rstrip("\r\n"))
             at = end - trail + (len(eol) if trail else 0)
             edits.append((at, at, text if trail else eol + text))
-        # Desktop refuses to open a measure with both a static formatString and a formatStringDefinition
-        # ("not supported scenario"), although TOM accepts it, so the dynamic format replaces the static one.
         from .props import _remove_prop
         dropped = _remove_prop(doc, m.node, "formatString")
         edits += dropped
-    _write(mdef, m.node.file, apply_edits(doc.text, edits))
+    path = os.path.join(mdef, *m.node.file.split("/"))
+    _t, bom = read_text(path)
+    ops = ([db_op] if db_op else []) + [("write", path, apply_edits(doc.text, edits), bom)]
+    commit_bytes(ops)
     out = {"verb": "format-expr", "measure": m.name, "result": "REMOVED" if dax is None else "SET",
-           "files": [_rel(project, m.node.file)] + (["database.tmdl (compatibility level)"] if note else []),
+           "files": [_rel(project, m.node.file)] + ([_rel(project, "database.tmdl")] if note else []),
            "next": "pbz diff, pbz push; check the format on fake data with pbz synth (it can return any text)"}
     if dax is not None and dropped:
         out["replaced"] = "formatString (a measure cannot have both; Desktop refuses to open the model)"
@@ -269,13 +281,26 @@ def function_add(ws, project, name: str, params: str, body: str, upgrade: bool =
     if _fn(model, name) is not None or model.measure(name) or model.table(name):
         raise PbzError("NAME_TAKEN", name)
     _check_body(model, params, body)
-    note = require_compat(mdef, "function", upgrade)
+    note = None
+    ops = []
+    cur, _db = compat_level(mdef)
+    need = COMPAT["function"]
+    if cur is not None and cur < need:
+        if not upgrade:
+            raise PbzError("COMPAT_LEVEL", f"function needs compatibility level {need}; the model is at {cur}. "
+                                           "Pass --upgrade-compat to raise it (one way: older Desktop builds cannot open it)")
+        path, text, bom = compat_upgrade_text(mdef, "function")
+        ops.append(("write", path, text, bom))
+        note = f"compatibility level raised from {cur} to {need}"
     path = os.path.join(mdef, FN_FILE)
     text = read_text(path)[0] if os.path.exists(path) else ""
+    bom = read_text(path)[1] if os.path.exists(path) else b""
     eol = _eol(text) if text else ("\r\n" if any("\r\n" in d.text for d in model.docs.values()) else "\n")
     new = (text.rstrip("\r\n") + eol + eol if text.strip() else "") + _fn_text(name, params, body, eol, _tag())
-    _write(mdef, FN_FILE, new)
-    out = {"verb": "function", "action": "add", "function": name, "files": [_rel(project, FN_FILE)],
+    ops.append(("write", path, new, bom))
+    commit_bytes(ops)
+    out = {"verb": "function", "action": "add", "function": name,
+           "files": [_rel(project, FN_FILE)] + ([_rel(project, "database.tmdl")] if note else []),
            "next": "pbz diff, pbz push (TOM validates the function); call it as " + f"{name}(...)"}
     if note:
         out["note"] = note
@@ -339,8 +364,12 @@ def function_rename(ws, project, name: str, new: str) -> dict:
     line_off, line = tmdl._lines(doc.text)[node.line]
     m = re.match(r"^(\t*function\s+)('(?:[^']|'')*'|[^\s=]+)", line)
     edits.setdefault(node.file, []).append((line_off + m.start(2), line_off + m.end(2), _q(new)))
+    ops = []
     for rel, eds in edits.items():
-        _write(mdef, rel, apply_edits(model.docs[rel].text, sorted(set(eds))))
+        path = os.path.join(mdef, *rel.split("/"))
+        _t, bom = read_text(path)
+        ops.append(("write", path, apply_edits(model.docs[rel].text, sorted(set(eds))), bom))
+    commit_bytes(ops)
     calls = sum(len(v) for v in edits.values()) - 1
     return {"verb": "function", "action": "rename", "from": node.name, "to": new, "calls_fixed": calls,
             "files": sorted(_rel(project, r) for r in edits), "next": "pbz diff, pbz push"}

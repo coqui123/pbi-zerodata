@@ -25,6 +25,23 @@ COVERAGE = ("FULL", "PARTIAL")
 PREDICATE_RUNS = ("OFF", "DONE", "PARTIAL")
 PREDICATES = ("time_part", "fractional", "long_text")
 SAVED = ".pbz/memory.json"
+CLOSED_CLASS = {"ENGINE_UNAVAILABLE", "TIMEOUT", "NOT_READY", "PROTOCOL_ERROR", "BUDGET", "NOT_AVAILABLE"}
+
+
+def _disclosure(ws) -> str:
+    pol = policy_mod.load(ws)
+    return "shape" if pol.get("disclosure", "shape") == "shape" else "strict"
+
+
+def _strip_bands(body: dict) -> dict:
+    """Drop size and share bands at every level. Predicates and names stay."""
+    def walk(value):
+        if isinstance(value, dict):
+            return {k: walk(v) for k, v in value.items() if k not in ("size_band", "share_band")}
+        if isinstance(value, list):
+            return [walk(v) for v in value]
+        return value
+    return walk(body)
 
 
 def _path(ws) -> str:
@@ -120,16 +137,18 @@ def run(ws, project, predicates: bool = True) -> dict:
     Desktop does not hold the project, else the engine's error class); returns a BUDGET verdict when the daily probe
     budget is spent."""
     pol = policy_mod.load(ws)
-    # anything but an explicit "shape" is treated as strict (fail closed on a malformed policy)
-    disclosure = "shape" if pol.get("disclosure", "shape") == "shape" else "strict"
+    disclosure = _disclosure(ws)
     port = desktop.require_port(project)
     if not checks.spend(ws, "probes"):
         return {"verb": "memory", "status": "BUDGET", "note": "daily probe budget reached; the user can reset it"}
     res = engine_call("memory", {"private_dir": ws.private, "port": port, "disclosure": disclosure,
                                  "predicates": bool(predicates)}, timeout=1800)
     if not isinstance(res, dict) or res.get("ok") is not True:
-        raise PbzError(str((res or {}).get("class") or "ENGINE_UNAVAILABLE"))
+        klass = res.get("class") if isinstance(res, dict) else None
+        raise PbzError(klass if klass in CLOSED_CLASS else "ENGINE_UNAVAILABLE")
     body = closed(res)
+    if disclosure != "shape":
+        body = _strip_bands(body)
     doc = {"verb": "memory", "project": project.name,
            "saved_at": dt.datetime.now().replace(microsecond=0).isoformat(),
            "mirror_rev": _rev(ws, project), "disclosure": disclosure, **body}
@@ -150,10 +169,13 @@ def load(ws, project) -> dict | None:
         return None
     saved_rev = doc.get("mirror_rev") if isinstance(doc.get("mirror_rev"), str) else None
     current = _rev(ws, project)
+    disclosure = _disclosure(ws)
+    body = closed(doc)
+    if disclosure != "shape":
+        body = _strip_bands(body)
     out = {"verb": "memory", "project": project.name,
            "saved_at": doc.get("saved_at") if isinstance(doc.get("saved_at"), str) else None,
-           "mirror_rev": saved_rev,
-           "disclosure": "shape" if doc.get("disclosure") == "shape" else "strict", **closed(doc)}
+           "mirror_rev": saved_rev, "disclosure": disclosure, **body}
     out["stale"] = saved_rev is None or current is None or saved_rev != current
     out["saved"] = SAVED
     return out

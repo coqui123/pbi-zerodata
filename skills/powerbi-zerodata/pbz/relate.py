@@ -8,7 +8,7 @@ import re
 import uuid
 
 from . import lexers, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 from .tokens import apply_edits
 
 REF = (re.compile(r"^\s*'((?:[^']|'')+)'\s*\[(.+)\]\s*$"), re.compile(r"^\s*([^\[\]']+?)\s*\[(.+)\]\s*$"))
@@ -18,6 +18,12 @@ def _model(project):
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    for path in tmdl.tmdl_files(mdef):
+        rel = os.path.relpath(path, project.ws.mirror).replace("\\", "/")
+        try:
+            read_text(path)
+        except (OSError, UnicodeError):
+            raise PbzError("REFUSED", rel) from None
     return mdef, tmdl.load_model(mdef)
 
 
@@ -69,9 +75,9 @@ def _rel_path(mdef: str) -> tuple[str, str, bytes]:
     return path, "", b""
 
 
-def add(ws, project, from_ref: str, to_ref: str, inactive: bool = False, both: bool = False,
-        many_to_many: bool = False, force: bool = False) -> dict:
-    mdef, model = _model(project)
+def plan_add(model, text: str, from_ref: str, to_ref: str, inactive: bool = False, both: bool = False,
+             many_to_many: bool = False, force: bool = False) -> tuple[str, dict]:
+    """Plan one relationship onto `text` and the in-memory model. Does not write."""
     a, b = _col(model, from_ref), _col(model, to_ref)
     if a.table.lower() == b.table.lower():
         raise PbzError("BAD_REQUEST", "both columns are in the same table")
@@ -82,7 +88,6 @@ def add(ws, project, from_ref: str, to_ref: str, inactive: bool = False, both: b
     if not inactive and _active_path(model, a.table, b.table):
         raise PbzError("AMBIGUOUS_PATH", "the tables are already connected by active relationships; add it --inactive "
                                          "and activate it with USERELATIONSHIP")
-    path, text, bom = _rel_path(mdef)
     eol = "\r\n" if "\r\n" in text else "\n"
     name = str(uuid.uuid4())
     lines = [f"relationship {name}"]
@@ -94,16 +99,41 @@ def add(ws, project, from_ref: str, to_ref: str, inactive: bool = False, both: b
         lines.append("\ttoCardinality: many")
     lines += [f"\tfromColumn: {_endpoint(a)}", f"\ttoColumn: {_endpoint(b)}"]
     block = eol.join(lines) + eol
-    write_text(path, (text.rstrip("\r\n") + eol + eol if text.strip() else "") + block, bom)
+    new = (text.rstrip("\r\n") + eol + eol if text.strip() else "") + block
+    model.relationships.append(tmdl.Relationship(
+        name, a.table, a.name, b.table, b.name, both, not inactive, None))
     label = f"{a.table}[{a.name}] -> {b.table}[{b.name}]"
-    return {"verb": "relationship", "action": "added", "relationship": label, "name": name,
-            "checks": {"types_match": a.data_type.lower() == b.data_type.lower(), "active": not inactive,
-                       "cross_filter": "both" if both else "single", "cardinality": "many-many" if many_to_many else "many-one"},
-            "verify": f"pbz check: unique on {b.table}[{b.name}], no_orphans from {a.table}[{a.name}] (Desktop open)",
-            "next": "pbz diff, pbz push"}
+    return new, {"relationship": label, "name": name,
+                 "checks": {"types_match": a.data_type.lower() == b.data_type.lower(), "active": not inactive,
+                            "cross_filter": "both" if both else "single",
+                            "cardinality": "many-many" if many_to_many else "many-one"},
+                 "verify": f"pbz check: unique on {b.table}[{b.name}], no_orphans from {a.table}[{a.name}] (Desktop open)"}
 
 
-def remove(ws, project, from_ref: str, to_ref: str) -> dict:
+def _mirror_rel(ws, path: str) -> str:
+    return os.path.relpath(path, ws.mirror).replace("\\", "/")
+
+
+def _apply(path: str, bom: bytes, body: str, dry_run: bool, out: dict, rel: str) -> dict:
+    out["files"] = [rel]
+    if dry_run:
+        out["result"] = "DRY_RUN"
+        return out
+    commit_bytes([("write", path, body, bom)])
+    return out
+
+
+def add(ws, project, from_ref: str, to_ref: str, inactive: bool = False, both: bool = False,
+        many_to_many: bool = False, force: bool = False, dry_run: bool = False) -> dict:
+    mdef, model = _model(project)
+    path, text, bom = _rel_path(mdef)
+    new, info = plan_add(model, text, from_ref, to_ref, inactive, both, many_to_many, force)
+    out = {"verb": "relationship", "action": "added", "relationship": info["relationship"], "name": info["name"],
+           "checks": info["checks"], "verify": info["verify"], "next": "pbz diff, pbz push"}
+    return _apply(path, bom, new, dry_run, out, _mirror_rel(ws, path))
+
+
+def remove(ws, project, from_ref: str, to_ref: str, dry_run: bool = False) -> dict:
     mdef, model = _model(project)
     a, b = _col(model, from_ref), _col(model, to_ref)
     hits = _find(model, a, b)
@@ -114,12 +144,13 @@ def remove(ws, project, from_ref: str, to_ref: str) -> dict:
     s, e = tmdl.block_span(doc, r.node)
     path = os.path.join(mdef, *r.node.file.split("/"))
     _t, bom = read_text(path)
-    write_text(path, apply_edits(doc.text, [(s, e, "")]), bom)
-    return {"verb": "relationship", "action": "removed", "relationship": f"{a.table}[{a.name}] -> {b.table}[{b.name}]",
-            "next": "pbz unused / pbz validate (measures using USERELATIONSHIP on it break), pbz diff, pbz push"}
+    out = {"verb": "relationship", "action": "removed", "relationship": f"{a.table}[{a.name}] -> {b.table}[{b.name}]",
+           "next": "pbz unused / pbz validate (measures using USERELATIONSHIP on it break), pbz diff, pbz push"}
+    return _apply(path, bom, apply_edits(doc.text, [(s, e, "")]), dry_run, out, _mirror_rel(ws, path))
 
 
-def set_(ws, project, from_ref: str, to_ref: str, active: bool | None = None, both: bool | None = None) -> dict:
+def set_(ws, project, from_ref: str, to_ref: str, active: bool | None = None, both: bool | None = None,
+         dry_run: bool = False) -> dict:
     mdef, model = _model(project)
     a, b = _col(model, from_ref), _col(model, to_ref)
     hits = _find(model, a, b)
@@ -149,11 +180,12 @@ def set_(ws, project, from_ref: str, to_ref: str, active: bool | None = None, bo
         eds += tmdl.prop_edit(sub, node, "crossFilteringBehavior", "bothDirections")
     edits_block = apply_edits(edits_block, sorted(eds)) if eds else edits_block
     if edits_block == block:
-        return {"verb": "relationship", "action": "unchanged", "relationship": f"{a.table}[{a.name}] -> {b.table}[{b.name}]"}
+        return {"verb": "relationship", "action": "unchanged",
+                "relationship": f"{a.table}[{a.name}] -> {b.table}[{b.name}]", "files": []}
     path = os.path.join(mdef, *r.node.file.split("/"))
     _t, bom = read_text(path)
-    write_text(path, doc.text[:s] + edits_block + doc.text[e:], bom)
-    return {"verb": "relationship", "action": "updated", "relationship": f"{a.table}[{a.name}] -> {b.table}[{b.name}]",
-            "active": active if active is not None else r.active,
-            "cross_filter": ("both" if both else "single") if both is not None else ("both" if r.both else "single"),
-            "next": "pbz diff, pbz push"}
+    out = {"verb": "relationship", "action": "updated", "relationship": f"{a.table}[{a.name}] -> {b.table}[{b.name}]",
+           "active": active if active is not None else r.active,
+           "cross_filter": ("both" if both else "single") if both is not None else ("both" if r.both else "single"),
+           "next": "pbz diff, pbz push"}
+    return _apply(path, bom, doc.text[:s] + edits_block + doc.text[e:], dry_run, out, _mirror_rel(ws, path))
