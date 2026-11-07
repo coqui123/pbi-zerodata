@@ -222,6 +222,23 @@ from a brand image, plot-area images (Microsoft's validator rejects the nested f
 Not built this round: staging a whole cascade on a disposable mirror copy, moving every writer onto
 `commit_bytes`, a CI glob, native interactions, Power Query authoring, semantic merge, an RLS harness.
 
+## Round 11 (2026-11-07): more atomic writers
+
+- Property sets, `repair` (including a present malformed page, visual, bookmark or `pages.json`,
+  which is refused on apply and on dry-run), bookmark add/remove, tab order, phone layout,
+  visual and canvas style, `add page` / `add visual` (with a planned custom-visual registration
+  and a planned drillthrough Back button) and `copy page` / `copy visual` each validate first,
+  then call `commit_bytes` once. A clean rollback is `FAILED`. Empty directories may remain;
+  no orphan files and no `.pbz-tmp` remain.
+- Mutation discovery for tab order, phone layout and style parses candidate documents before a
+  helper can skip or rename a bad one. Style strictness is opt-in, so bookmarks, filters and
+  button links keep the previous discovery. A refusal names the mirror-relative path only.
+- New offline suites: `repair_props_atomic`, `bookmarks_atomic`, `a11y_atomic`, `style_atomic`,
+  `author_atomic`, `components_atomic`.
+
+Not built this round: relationship, filter and interaction `--dry-run`, native interactions,
+Power Query authoring, semantic merge, an RLS harness, VPAX, screenshots, empty-directory cleanup.
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,

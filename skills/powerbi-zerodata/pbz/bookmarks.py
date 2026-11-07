@@ -8,7 +8,7 @@ import json
 import os
 import secrets
 
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 from .tokens import TOKEN_RE
 
 SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition"
@@ -21,8 +21,15 @@ def _bdir(project) -> str:
 def _meta(project) -> tuple[str, dict, bytes]:
     path = os.path.join(_bdir(project), "bookmarks.json")
     if os.path.exists(path):
-        text, bom = read_text(path)
-        return path, json.loads(text), bom
+        rel = os.path.relpath(path, project.ws.mirror).replace("\\", "/")
+        try:
+            text, bom = read_text(path)
+            meta = json.loads(text)
+        except (OSError, ValueError, UnicodeDecodeError):
+            raise PbzError("REFUSED", rel)
+        if not isinstance(meta, dict):
+            raise PbzError("REFUSED", rel)
+        return path, meta, bom
     return path, {"$schema": f"{SCHEMA}/bookmarksMetadata/1.0.0/schema.json", "items": []}, b""
 
 
@@ -93,10 +100,12 @@ def add(ws, project, name: str, page: str, hide: list[str] | None = None, show: 
     bm = {"$schema": f"{SCHEMA}/bookmark/{ver}/schema.json", "displayName": name, "name": bid, "options": options,
           "explorationState": {"version": "1.3", "activeSection": pid, "sections": {pid: {"visualContainers": containers}}}}
     path = os.path.join(_bdir(project), bid + ".bookmark.json")
-    write_text(path, json.dumps(bm, indent=2, ensure_ascii=False) + "\n")
     mpath, meta, bom = _meta(project)
     meta.setdefault("items", []).append({"name": bid})
-    write_text(mpath, json.dumps(meta, indent=2, ensure_ascii=False) + "\n", bom)
+    commit_bytes([
+        ("write", path, json.dumps(bm, indent=2, ensure_ascii=False) + "\n", b""),
+        ("write", mpath, json.dumps(meta, indent=2, ensure_ascii=False) + "\n", bom),
+    ])
     return {"verb": "bookmark", "action": "add", "name": bid, "display_name": name, "page": vis[0]["page"],
             "hidden": sorted(k for k, v in containers.items() if "display" in v["singleVisual"]),
             "files": [os.path.relpath(p, ws.mirror).replace("\\", "/") for p in (path, mpath)],
@@ -106,7 +115,6 @@ def add(ws, project, name: str, page: str, hide: list[str] | None = None, show: 
 def remove(ws, project, ref: str) -> dict:
     bid = find(project, ref)
     path = os.path.join(_bdir(project), bid + ".bookmark.json")
-    os.remove(path)
     mpath, meta, bom = _meta(project)
     items = []
     for it in meta.get("items") or []:
@@ -116,7 +124,10 @@ def remove(ws, project, ref: str) -> dict:
             it = dict(it, children=[c for c in it["children"] if c != bid])
         items.append(it)
     meta["items"] = items
-    write_text(mpath, json.dumps(meta, indent=2, ensure_ascii=False) + "\n", bom)
+    commit_bytes([
+        ("delete", path),
+        ("write", mpath, json.dumps(meta, indent=2, ensure_ascii=False) + "\n", bom),
+    ])
     return {"verb": "bookmark", "action": "remove", "name": bid,
             "files": [os.path.relpath(p, ws.mirror).replace("\\", "/") for p in (path, mpath)],
             "next": "pbz validate (buttons that pointed at it are flagged), then pbz push --reload"}

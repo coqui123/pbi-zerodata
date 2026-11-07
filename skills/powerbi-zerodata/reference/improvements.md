@@ -108,6 +108,9 @@ A write that `commit_bytes` rolls back completely is `FAILED` (exit 1), not
 file. `smoke` parses the report, its pages and its visuals before spending the daily budget; an
 unreadable file is `INVALID` and an unknown page is `NOT_FOUND`, both before any spend. A cascade
 removal that already committed earlier rounds reports `PARTIAL` (exit 5) and keeps that restore point.
+Round 11 puts property sets, repair, bookmarks, tab order, phone layout, style, page and visual
+adds, and page and visual copies on the same single `commit_bytes`. A present malformed document
+those edits must read is `REFUSED` with a mirror-relative path before any write.
 `--diagnostic` explicitly permits check-result collection without assertion failure exit codes.
 Do not interpret an artifact being generated as validation passing. Unexpected CLI exceptions
 return a protected diagnostic ID rather than echoing potentially sensitive traceback text.

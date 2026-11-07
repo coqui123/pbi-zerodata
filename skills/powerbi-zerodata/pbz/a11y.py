@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import collections
 import json
+import math
 import os
 import re
 
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 from .tokens import TOKEN_RE
 
 MOBILE_SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainerMobileState"
@@ -68,6 +69,86 @@ def _select_pages(project, page: str | None) -> list:
         if not pages:
             raise PbzError("NOT_FOUND", f"page {page}")
     return pages
+
+
+def _rel(project, path: str) -> str:
+    return os.path.relpath(path, project.ws.mirror).replace("\\", "/")
+
+
+def _require_json(project, path: str) -> tuple[dict, str, bytes]:
+    """Parse a document a mutation will use. The detail is the mirror-relative path only."""
+    rel = _rel(project, path)
+    try:
+        text, bom = read_text(path)
+        doc = json.loads(text)
+    except (OSError, ValueError, UnicodeDecodeError):
+        raise PbzError("REFUSED", rel)
+    if not isinstance(doc, dict):
+        raise PbzError("REFUSED", rel)
+    return doc, text, bom
+
+
+def _mutation_visuals(project, page_dir: str) -> list[dict]:
+    """Every visual on the page. A present but unreadable visual or phone layout is refused, not skipped."""
+    out = []
+    vdir = os.path.join(page_dir, "visuals")
+    if not os.path.isdir(vdir):
+        return out
+    for vid in sorted(os.listdir(vdir)):
+        path = os.path.join(vdir, vid, "visual.json")
+        if not os.path.isfile(path):
+            continue
+        doc, text, bom = _require_json(project, path)
+        body = doc.get("visual") if isinstance(doc.get("visual"), dict) else None
+        vt = body.get("visualType") if body else ("group" if "visualGroup" in doc else "?")
+        pos = doc.get("position") if isinstance(doc.get("position"), dict) else {}
+        mobile = os.path.join(vdir, vid, "mobile.json")
+        mobile_doc = None
+        if os.path.isfile(mobile):
+            mobile_doc = _require_json(project, mobile)[0]
+        out.append({"id": vid, "type": vt, "doc": doc, "text": text, "bom": bom, "body": body or {}, "pos": pos,
+                    "path": path, "hidden": doc.get("isHidden") is True, "group": doc.get("parentGroupName") or "",
+                    "mobile": mobile, "mobile_doc": mobile_doc})
+    return out
+
+
+def _mutation_page(project, page: str):
+    """The named page plus every visual on it, parsed before any helper can skip a bad document."""
+    root = os.path.join(project.mirror_report, "definition", "pages")
+    if not os.path.isdir(root):
+        raise PbzError("NO_MIRROR", "run `pbz pull` first (no report pages in the mirror)")
+    hits = []
+    for pid in sorted(os.listdir(root)):
+        pj = os.path.join(root, pid, "page.json")
+        if not os.path.isfile(pj):
+            continue
+        forced = page.lower() == pid.lower()
+        if forced:
+            doc, _text, _bom = _require_json(project, pj)
+        else:
+            try:
+                doc = json.loads(read_text(pj)[0])
+                if not isinstance(doc, dict):
+                    raise ValueError
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+        name = doc.get("displayName") or pid
+        if forced or page.lower() in (pid.lower(), str(name).lower()):
+            hits.append((pid, name, doc, os.path.join(root, pid)))
+    if not hits:
+        raise PbzError("NOT_FOUND", f"page {page}")
+    pid, pname, pjson, pdir = hits[0]
+    return pid, pname, pjson, pdir, _mutation_visuals(project, pdir)
+
+
+def _phone_pos(pos: str) -> tuple[float, float, float, float]:
+    try:
+        x, y, w, h = [float(t) for t in pos.split(",")]
+    except ValueError:
+        raise PbzError("BAD_REQUEST", "--pos is x,y,width,height")
+    if not all(math.isfinite(n) for n in (x, y, w, h)) or w <= 0 or h <= 0 or x < 0 or y < 0:
+        raise PbzError("BAD_REQUEST", "phone positions are non-negative with a positive size")
+    return x, y, w, h
 
 
 def _visuals(page_dir: str) -> list[dict]:
@@ -300,23 +381,23 @@ def audit(ws, project, page: str | None = None, min_font: float = 9.0) -> dict:
 
 def fix_tab_order(ws, project, page: str) -> dict:
     """Rewrite position.tabOrder in reading order (visible visuals first, hidden ones after)."""
-    (pid, pname, _pj, pdir), = _select_pages(project, page)[:1] or [(None, None, None, None)]
-    vis = _visuals(pdir)
+    _pid, pname, _pj, _pdir, vis = _mutation_page(project, page)
     shown = [v for v in vis if not v["hidden"]]
     hidden = [v for v in vis if v["hidden"]]
     order = reading_order(shown) + reading_order(hidden)
     by_id = {v["id"]: v for v in vis}
-    changed = []
+    changed, ops = [], []
     for i, vid in enumerate(order):
         v = by_id[vid]
         new = i * 1000
         if _num(v["pos"].get("tabOrder"), -1) == new:
             continue
-        text, bom = read_text(v["path"])
-        doc = json.loads(text)
+        doc = json.loads(v["text"])
         doc.setdefault("position", {})["tabOrder"] = new
-        write_text(v["path"], json.dumps(doc, indent=2, ensure_ascii=False) + "\n", bom)
+        ops.append(("write", v["path"], json.dumps(doc, indent=2, ensure_ascii=False) + "\n", v["bom"]))
         changed.append(vid)
+    if ops:
+        commit_bytes(ops)
     return {"verb": "a11y", "action": "fix-tab-order", "page": pname, "order": order, "changed": changed,
             "files": [os.path.relpath(by_id[i]["path"], ws.mirror).replace("\\", "/") for i in changed],
             **({"next": "pbz validate, then pbz push --reload"} if changed else {})}
@@ -343,8 +424,7 @@ def mobile(ws, project, page: str, visual: str, pos: str | None = None, remove: 
     """Phone layout of one visual (`visual`) or of every visual on the page (`all`): `pos` x,y,w,h,
     or automatic placement (stacked full width below the visuals already laid out, in reading order);
     `remove` drops it."""
-    (pid, pname, _pj, pdir), = _select_pages(project, page)[:1]
-    vis = _visuals(pdir)
+    _pid, pname, _pj, _pdir, vis = _mutation_page(project, page)
     by_id = {v["id"]: v for v in vis}
     if visual == "all":
         pick = [by_id[i] for i in reading_order([v for v in vis if not v["hidden"] and v["type"] != "group"])]
@@ -357,50 +437,42 @@ def mobile(ws, project, page: str, visual: str, pos: str | None = None, remove: 
         pick = [v]
     if pos and len(pick) != 1:
         raise PbzError("BAD_REQUEST", "--pos places one visual: name it")
+    placed = _phone_pos(pos) if pos else None
     files, done = [], []
     if remove:
-        for v in pick:
-            if os.path.exists(v["mobile"]):
-                os.remove(v["mobile"])
-                files.append(os.path.relpath(v["mobile"], ws.mirror).replace("\\", "/"))
-                done.append(v["id"])
+        ops = [("delete", v["mobile"]) for v in pick if os.path.isfile(v["mobile"])]
+        if ops:
+            commit_bytes(ops)
+        for kind, path in ops:
+            files.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
+            done.append(os.path.basename(os.path.dirname(path)))
         return {"verb": "mobile", "page": pname, "removed": done, "files": files}
     ver = _mobile_version(project)
     bottom = 0.0
     for v in vis:
-        if os.path.exists(v["mobile"]) and v not in pick:
-            try:
-                p = json.loads(read_text(v["mobile"])[0]).get("position") or {}
-            except ValueError:
-                continue
+        if v["mobile_doc"] is not None and v not in pick:
+            p = v["mobile_doc"].get("position") or {}
             bottom = max(bottom, _num(p.get("y")) + _num(p.get("height")))
+    ops = []
     for v in pick:
-        if pos:
-            try:
-                x, y, w, h = [float(t) for t in pos.split(",")]
-            except ValueError:
-                raise PbzError("BAD_REQUEST", "--pos is x,y,width,height")
-            if w <= 0 or h <= 0 or x < 0 or y < 0:
-                raise PbzError("BAD_REQUEST", "phone positions are non-negative with a positive size")
+        if placed:
+            x, y, w, h = placed
         else:
             dw, dh = _num(v["pos"].get("width"), 300), _num(v["pos"].get("height"), 200)
             w = float(PHONE_WIDTH)
             h = float(min(480, max(60, round(PHONE_WIDTH * dh / dw) if dw > 0 else 200)))
             x, y = 0.0, bottom + (8 if bottom else 0)
             bottom = y + h
-        doc = {}
-        if os.path.exists(v["mobile"]):
-            try:
-                doc = json.loads(read_text(v["mobile"])[0])
-            except ValueError:
-                doc = {}
+        doc = dict(v["mobile_doc"] or {})
         doc["$schema"] = doc.get("$schema") or f"{MOBILE_SCHEMA}/{ver}/schema.json"
         position = {"x": x, "y": y, "z": _num(v["pos"].get("z")), "width": w, "height": h}
         if _num(v["pos"].get("tabOrder"), -1) >= 0:
             position["tabOrder"] = _num(v["pos"].get("tabOrder"))
         doc["position"] = position
-        write_text(v["mobile"], json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+        ops.append(("write", v["mobile"], json.dumps(doc, indent=2, ensure_ascii=False) + "\n", b""))
         files.append(os.path.relpath(v["mobile"], ws.mirror).replace("\\", "/"))
         done.append({"visual": v["id"], "box": [int(x), int(y), int(w), int(h)]})
+    if ops:
+        commit_bytes(ops)
     return {"verb": "mobile", "page": pname, "placed": done, "files": files,
             "next": "pbz validate, then pbz push --reload; check the phone layout in Desktop (View > Mobile layout)"}

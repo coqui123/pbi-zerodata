@@ -25,7 +25,7 @@ import shutil
 import zipfile
 
 from . import pbir
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 
 KINDS = {0: "grouping", 1: "measure", 2: "either", "grouping": "grouping", "measure": "measure",
          "groupingormeasure": "either", "either": "either"}
@@ -402,16 +402,18 @@ def _append(text: str, key: str, item) -> str:
     return text[:root.start + 1] + "\n  " + json.dumps(key) + ": [\n    " + _indent_block(body, "    ") + "\n  ]\n" + text[root.end - 1:]
 
 
-def _register_in_mirror(project, guid: str, kind: str, resource_file: str = "") -> tuple[str, str]:
-    """Add the registration to the mirror's report.json. Returns (visualType, change) where change is
-    'added' or 'present'."""
-    text, bom, root = _report_json(project.mirror_report)
+def plan_registration(project, guid: str, kind: str, resource_file: str = "") -> tuple[str, str, tuple | None]:
+    """Plan the report.json registration. Returns (visualType, 'added'|'present', write op or None).
+
+    Does not write. Callers that touch other files commit this op with them.
+    """
+    text, bom, _root = _report_json(project.mirror_report)
     reg = registrations(project.mirror_report)
     vtype = guid + ORG if kind == "organizational" else guid
     if vtype in reg:
         if reg[vtype]["kind"] != kind:
             raise PbzError("CONFLICT", f"{vtype} is already registered as {reg[vtype]['kind']}")
-        return vtype, "present"
+        return vtype, "present", None
     if kind == "public":
         if guid in reg:
             raise PbzError("CONFLICT", f"{guid} is registered as {reg[guid]['kind']}")
@@ -429,8 +431,17 @@ def _register_in_mirror(project, guid: str, kind: str, resource_file: str = "") 
     else:
         raise PbzError("BAD_REQUEST", "register as public, private or organizational")
     pbir.parse_json(new)  # still valid JSON
-    write_text(os.path.join(project.mirror_report, "definition", "report.json"), new, bom)
-    return vtype, "added"
+    path = os.path.join(project.mirror_report, "definition", "report.json")
+    return vtype, "added", ("write", path, new, bom)
+
+
+def _register_in_mirror(project, guid: str, kind: str, resource_file: str = "") -> tuple[str, str]:
+    """Add the registration to the mirror's report.json. Returns (visualType, change) where change is
+    'added' or 'present'."""
+    vtype, change, op = plan_registration(project, guid, kind, resource_file)
+    if op:
+        commit_bytes([op])
+    return vtype, change
 
 
 # ---------------------------------------------------------------- verbs
@@ -554,7 +565,9 @@ def register_pending(project, pending: tuple | None) -> str | None:
     if not pending:
         return None
     guid, how, resource = pending
-    vtype, change = _register_in_mirror(project, guid, how, resource)
+    vtype, change, op = plan_registration(project, guid, how, resource)
+    if op:
+        commit_bytes([op])
     return f"registered {vtype} as {how} in report.json" if change == "added" else None
 
 

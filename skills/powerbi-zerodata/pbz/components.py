@@ -24,21 +24,46 @@ import json
 import os
 
 from . import author, filters
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 from .layout import LABELS
 from .tokens import TOKEN_RE
 
 
-def _load(path: str) -> tuple[dict, bytes]:
-    text, bom = read_text(path)
+def _load(ws, path: str) -> tuple[dict, bytes]:
+    rel = _rel(ws, path)
     try:
-        return json.loads(text), bom
-    except ValueError:
-        raise PbzError("BAD_REQUEST", f"{os.path.basename(path)} is not valid JSON")
+        text, bom = read_text(path)
+        doc = json.loads(text)
+    except (OSError, ValueError, UnicodeDecodeError):
+        raise PbzError("REFUSED", rel)
+    if not isinstance(doc, dict):
+        raise PbzError("REFUSED", rel)
+    return doc, bom
 
 
-def _dump(path: str, doc: dict, bom: bytes = b"") -> None:
-    write_text(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n", bom)
+def _read_blob(ws, path: str) -> tuple[str, bytes]:
+    try:
+        return read_text(path)
+    except (OSError, UnicodeDecodeError):
+        raise PbzError("REFUSED", _rel(ws, path))
+
+
+def _json_text(doc: dict) -> str:
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+def _require_pages(ws, rdir: str) -> None:
+    """Parse pages.json and every page.json before a helper can raise a raw parser error."""
+    pdir = os.path.join(rdir, "definition", "pages")
+    meta_p = os.path.join(pdir, "pages.json")
+    if os.path.isfile(meta_p):
+        _load(ws, meta_p)
+    if not os.path.isdir(pdir):
+        return
+    for pid in os.listdir(pdir):
+        pj = os.path.join(pdir, pid, "page.json")
+        if os.path.isfile(pj):
+            _load(ws, pj)
 
 
 def _rel(ws, path: str) -> str:
@@ -125,6 +150,7 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
     if not new_name.strip() or TOKEN_RE.search(new_name):
         raise PbzError("BAD_REQUEST", "the copy needs a plain display name")
     rdir = project.mirror_report
+    _require_pages(ws, rdir)
     pdir, meta_p, meta, pages = author._pages(rdir)
     if not os.path.isdir(pdir):
         raise PbzError("NO_MIRROR", "run `pbz pull` first (no report pages in the mirror)")
@@ -139,7 +165,7 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
     dst_dir = os.path.join(pdir, new_pid)
     vis = _page_visuals(pdir, src)
     vmap = {vid: _fresh(taken_visuals) for vid, _p in vis}
-    pdoc, pbom = _load(os.path.join(src_dir, "page.json"))
+    pdoc, pbom = _load(ws, os.path.join(src_dir, "page.json"))
     pdoc = copy.deepcopy(pdoc)
     src_display = str(pdoc.get("displayName") or src)
     pdoc["name"] = new_pid
@@ -169,8 +195,14 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
             pdoc["visualInteractions"] = kept
         else:
             pdoc.pop("visualInteractions")
-    files = [os.path.join(dst_dir, "page.json")]
-    _dump(files[0], pdoc, pbom)
+    ops: list[tuple] = []
+    files = []
+
+    def plan(path: str, text: str, bom: bytes) -> None:
+        ops.append(("write", path, text, bom))
+        files.append(path)
+
+    plan(os.path.join(dst_dir, "page.json"), _json_text(pdoc), pbom)
     for cur, dirs, fs in os.walk(src_dir):  # other page-level files (not page.json, not visuals) as they are
         rel = os.path.relpath(cur, src_dir)
         if rel.split(os.sep)[0] == "visuals":
@@ -180,11 +212,9 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
             if rel == "." and f == "page.json":
                 continue
             src_f = os.path.join(cur, f)
-            dst_f = os.path.join(dst_dir, rel, f)
-            text, bom = read_text(src_f)
-            write_text(dst_f, text, bom)
-            files.append(dst_f)
-    sync, retargeted, vfilters = {}, 0, 0
+            text, bom = _read_blob(ws, src_f)
+            plan(os.path.join(dst_dir, rel, f), text, bom)
+    sync, retargeted, vfilters, kept_sync = {}, 0, 0, False
     refs = {src, src_display}
     for vid, path in vis:
         vsrc = os.path.dirname(path)
@@ -195,7 +225,7 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
                 s_f = os.path.join(cur, f)
                 d_f = os.path.join(vdst, rel, f)
                 if rel == "." and f == "visual.json":
-                    v, bom = _load(s_f)
+                    v, bom = _load(ws, s_f)
                     v = copy.deepcopy(v)
                     v["name"] = vmap[vid]
                     if v.get("parentGroupName") in vmap:
@@ -203,22 +233,23 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
                     vfilters += len(_rename_filters(v, taken_filters))
                     body = v.get("visual") if isinstance(v.get("visual"), dict) else {}
                     sg = body.get("syncGroup")
-                    if independent_slicers and isinstance(sg, dict) and isinstance(sg.get("groupName"), str):
-                        sync.setdefault(sg["groupName"], f"{sg['groupName']}_{new_pid[:8]}")
-                        sg["groupName"] = sync[sg["groupName"]]
+                    if isinstance(sg, dict) and isinstance(sg.get("groupName"), str):
+                        kept_sync = True
+                        if independent_slicers:
+                            sync.setdefault(sg["groupName"], f"{sg['groupName']}_{new_pid[:8]}")
+                            sg["groupName"] = sync[sg["groupName"]]
                     retargeted += _retarget(body, refs, new_pid)
-                    _dump(d_f, v, bom)
+                    plan(d_f, _json_text(v), bom)
                 else:
-                    text, bom = read_text(s_f)
-                    write_text(d_f, text, bom)
-                files.append(d_f)
+                    text, bom = _read_blob(ws, s_f)
+                    plan(d_f, text, bom)
     order = list(meta.get("pageOrder") or [])
     pos = order.index(anchor) + 1 if anchor in order else len(order)
     order.insert(pos, new_pid)
     meta["pageOrder"] = order
     _t, mbom = read_text(meta_p) if os.path.exists(meta_p) else ("", b"")
-    _dump(meta_p, meta, mbom)
-    files.append(meta_p)
+    plan(meta_p, _json_text(meta), mbom)
+    commit_bytes(ops)
     out = {"verb": "copy", "kind": "page", "from": src_display, "page": new_name.strip(), "id": new_pid,
            "position": pos, "visuals": len(vis), "filters_renamed": len(fmap) + vfilters,
            "files": sorted({_rel(ws, f) for f in files}),
@@ -231,7 +262,7 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
         out["interactions_dropped"] = dropped
     if sync:
         out["sync_groups"] = "renamed (independent of the originals)"
-    elif any(isinstance(((_load(p)[0].get("visual") or {}).get("syncGroup")), dict) for _v, p in vis):
+    elif kept_sync:
         out["sync_groups"] = "kept (the copies stay in sync with the original slicers)"
     marks = _bookmarks_on(rdir, src)
     out["notes"] = [f"bookmarks are not copied ({marks} on the source page)" if marks else "bookmarks are not copied"]
@@ -252,13 +283,14 @@ def _num(v, default=0.0) -> float:
 
 def copy_visual(ws, project, page: str, visual: str, to_page: str | None = None, pos: str | None = None) -> dict:
     rdir = project.mirror_report
+    _require_pages(ws, rdir)
     pdir, _mp, _meta, pages = author._pages(rdir)
     if not os.path.isdir(pdir):
         raise PbzError("NO_MIRROR", "run `pbz pull` first (no report pages in the mirror)")
     src_pid = author._find_page(pages, page)
     dst_pid = author._find_page(pages, to_page) if to_page else src_pid
     top = _resolve_visual(pdir, src_pid, visual)
-    docs = {vid: _load(p) for vid, p in _page_visuals(pdir, src_pid)}
+    docs = {vid: _load(ws, p) for vid, p in _page_visuals(pdir, src_pid)}
     members = [top]
     if "visualGroup" in docs[top][0]:
         frontier = [top]
@@ -273,7 +305,7 @@ def copy_visual(ws, project, page: str, visual: str, to_page: str | None = None,
     tpos = docs[top][0].get("position") or {}
     x0, y0 = _num(tpos.get("x")), _num(tpos.get("y"))
     w, h = _num(tpos.get("width"), 300.0), _num(tpos.get("height"), 200.0)
-    existing = [(d.get("position") or {}) for d, _b in (_load(p) for _v, p in _page_visuals(pdir, dst_pid))]
+    existing = [(d.get("position") or {}) for d, _b in (_load(ws, p) for _v, p in _page_visuals(pdir, dst_pid))]
     placed = "given"
     if pos:
         try:
@@ -295,6 +327,17 @@ def copy_visual(ws, project, page: str, visual: str, to_page: str | None = None,
     tbase = max((_num(p.get("tabOrder")) for p in existing), default=0.0) + 1000
     zmin = min(_num((docs[m][0].get("position") or {}).get("z")) for m in members)
     tmin = min(_num((docs[m][0].get("position") or {}).get("tabOrder")) for m in members)
+    extras: dict[str, list[tuple[str, str, bytes]]] = {}
+    for vid in members:
+        root = os.path.join(pdir, src_pid, "visuals", vid)
+        for cur, _dirs, fs in os.walk(root):  # mobile.json and friends, read before any write
+            rel = os.path.relpath(cur, root)
+            for f in fs:
+                if rel == "." and f == "visual.json":
+                    continue
+                text, fb = _read_blob(ws, os.path.join(cur, f))
+                extras.setdefault(vid, []).append((os.path.join(rel, f), text, fb))
+    ops: list[tuple] = []
     files, renamed = [], 0
     for vid in members:
         doc, bom = docs[vid]
@@ -315,17 +358,13 @@ def copy_visual(ws, project, page: str, visual: str, to_page: str | None = None,
             p["tabOrder"] = tbase + _num(p.get("tabOrder")) - tmin
         renamed += len(_rename_filters(v, taken_filters))
         dst = os.path.join(pdir, dst_pid, "visuals", vmap[vid], "visual.json")
-        _dump(dst, v, bom)
+        ops.append(("write", dst, _json_text(v), bom))
         files.append(dst)
-        for cur, _dirs, fs in os.walk(os.path.join(pdir, src_pid, "visuals", vid)):  # mobile.json and friends
-            rel = os.path.relpath(cur, os.path.join(pdir, src_pid, "visuals", vid))
-            for f in fs:
-                if rel == "." and f == "visual.json":
-                    continue
-                text, fb = read_text(os.path.join(cur, f))
-                d_f = os.path.join(pdir, dst_pid, "visuals", vmap[vid], rel, f)
-                write_text(d_f, text, fb)
-                files.append(d_f)
+        for rel_name, text, fb in extras.get(vid, []):
+            d_f = os.path.join(pdir, dst_pid, "visuals", vmap[vid], rel_name)
+            ops.append(("write", d_f, text, fb))
+            files.append(d_f)
+    commit_bytes(ops)
     tp = (docs[top][0].get("visual") or {}).get("visualType") if isinstance(docs[top][0].get("visual"), dict) else "group"
     out = {"verb": "copy", "kind": "visual", "type": tp or "group", "from": {"page": pages[src_pid].get("displayName", src_pid), "visual": top},
            "page": pages[dst_pid].get("displayName", dst_pid), "id": vmap[top], "copied": len(members),

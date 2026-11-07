@@ -12,7 +12,7 @@ import re
 import secrets
 
 from . import images, pbir, tmdl, visuals
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 from .tokens import TOKEN_RE
 
 SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition"
@@ -75,6 +75,8 @@ def add_page(ws, project, name: str, width: int | None = None, height: int | Non
         raise PbzError("NO_MIRROR", "run `pbz pull` first (no report pages in the mirror)")
     if any(str(p.get("displayName", "")).lower() == name.lower() for p in pages.values()):
         raise PbzError("NAME_TAKEN", f"page {name}")
+    if after:
+        _find_page(pages, after)  # unknown anchor refuses before any write
     ver = _versions(rdir).get("page", "2.1.0")
     pid = _id()
     width = width or (320 if tooltip else 1280)
@@ -104,26 +106,40 @@ def add_page(ws, project, name: str, width: int | None = None, height: int | Non
         page["filterConfig"] = {"filters": flts}
         page["pageBinding"] = {"name": _id(), "type": "Drillthrough", "referenceScope": "Default",
                                "parameters": [{"name": _id(), "boundFilter": f["name"], "fieldExpr": f["field"]} for f in flts]}
-    write_text(os.path.join(pdir, pid, "page.json"), json.dumps(page, indent=2, ensure_ascii=False) + "\n")
+    page_path = os.path.join(pdir, pid, "page.json")
     order = list(meta.get("pageOrder") or [])
-    pos = order.index(_find_page(pages, after)) + 1 if after else len(order)
+    anchor = _find_page(pages, after) if after else None
+    pos = order.index(anchor) + 1 if anchor is not None else len(order)
     order.insert(pos, pid)
     meta["pageOrder"] = order
     _t, bom = read_text(meta_p) if os.path.exists(meta_p) else ("", b"")
-    write_text(meta_p, json.dumps(meta, indent=2) + "\n", bom)
-    files = [os.path.relpath(p, ws.mirror).replace("\\", "/") for p in (os.path.join(pdir, pid, "page.json"), meta_p)]
+    ops: list[tuple] = [
+        ("write", page_path, json.dumps(page, indent=2, ensure_ascii=False) + "\n", b""),
+        ("write", meta_p, json.dumps(meta, indent=2) + "\n", bom),
+    ]
+    files = [os.path.relpath(p, ws.mirror).replace("\\", "/") for p in (page_path, meta_p)]
     out = {"verb": "add", "kind": "page", "page": name, "id": pid, "position": pos, "files": files,
            "next": f"pbz add visual <type> --page \"{name}\" --field ..., then pbz validate / pbz push"}
     if tooltip:
         out["type"] = "tooltip"
         out["next"] = f"pbz add visual ... --page \"{name}\", then pbz link <page> <visual> --tooltip \"{name}\""
     if drillthrough:
-        btn = add_visual(ws, project, "actionButton", name, [], pos="16,16,96,40")
-        link(ws, project, name, btn["id"], back=True)
+        btn, btn_ops = add_visual(ws, project, "actionButton", name, [], pos="16,16,96,40",
+                                  _commit=False, _extra_pages={pid: page})
+        bpath, btext = btn_ops[0][1], btn_ops[0][2]
+        bdoc = json.loads(btext)
+        body = bdoc["visual"]
+        body.setdefault("visualContainerObjects", {})["visualLink"] = [{"properties": {
+            "show": {"expr": {"Literal": {"Value": "true"}}},
+            "type": {"expr": {"Literal": {"Value": "'Back'"}}},
+        }}]
+        ops.append(("write", bpath, json.dumps(bdoc, indent=2, ensure_ascii=False) + "\n", b""))
+        ops.extend(btn_ops[1:])
         out.update(type="drillthrough", drill_on=[filters._label(f) for f in flts], back_button=btn["id"])
-        out["files"] += btn["files"]
+        out["files"] = files + btn["files"]
         out["next"] = (f"pbz add visual ... --page \"{name}\"; a button elsewhere can open it with "
                        f"pbz link <page> <button> --drillthrough \"{name}\"")
+    commit_bytes(ops)
     return out
 
 
@@ -279,7 +295,8 @@ def _lit(text: str) -> dict:
 
 def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str | None = None,
                title: str | None = None, text: str | None = None, image: str | None = None,
-               fit: str | None = None, alt: str | None = None) -> dict:
+               fit: str | None = None, alt: str | None = None, *, _commit: bool = True,
+               _extra_pages: dict | None = None):
     for s in (title, text, alt):
         if s and TOKEN_RE.search(s):
             raise PbzError("BAD_REQUEST", "mirror tokens cannot be used in titles, text or alt text")
@@ -289,6 +306,8 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
     model = tmdl.load_model(mdef)
     rdir = project.mirror_report
     pdir, _mp, _meta, pages = _pages(rdir)
+    if _extra_pages:
+        pages.update(_extra_pages)
     pid = _find_page(pages, page)
     vtype, contract, source, notes, pending = visuals.resolve(ws, project, vtype)
     item = None
@@ -376,10 +395,13 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
     container = {"$schema": f"{SCHEMA}/visualContainer/{ver}/schema.json", "name": vid,
                  "position": {"x": x, "y": y, "z": z, "height": h, "width": w, "tabOrder": tab}, "visual": visual}
     path = os.path.join(vdir, vid, "visual.json")
-    write_text(path, json.dumps(container, indent=2, ensure_ascii=False) + "\n")
-    note = visuals.register_pending(project, pending)  # only once the visual itself is valid
-    if note:
-        notes.append(note)
+    visual_text = json.dumps(container, indent=2, ensure_ascii=False) + "\n"
+    ops: list[tuple] = [("write", path, visual_text, b"")]
+    if pending:
+        reg_type, change, reg_op = visuals.plan_registration(project, pending[0], pending[1], pending[2])
+        if change == "added" and reg_op:
+            notes.append(f"registered {reg_type} as {pending[1]} in report.json")
+            ops.append(reg_op)
     files = [os.path.relpath(path, ws.mirror).replace("\\", "/")]
     if any(n.startswith("registered") for n in notes):
         files.append(os.path.relpath(os.path.join(rdir, "definition", "report.json"), ws.mirror).replace("\\", "/"))
@@ -396,4 +418,7 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
         out["custom"] = {"roles_from": source, **({"notes": notes} if notes else {})}
         if vtype in ("deneb7E15AEF80B9E4D4F8E12924291ECE89A",) or "vega" in (contract.get("objects") or {}):
             out["custom"]["setup"] = "spec-driven visual: write its spec in Desktop (it shows a landing page until then)"
+    if not _commit:
+        return out, ops
+    commit_bytes(ops)
     return out

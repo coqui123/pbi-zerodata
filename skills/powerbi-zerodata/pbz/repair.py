@@ -7,15 +7,26 @@ import json
 import os
 
 from . import pbir, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 
 
-def _load(path):
+def _rel(ws, path: str) -> str:
+    return os.path.relpath(path, ws.mirror).replace("\\", "/")
+
+
+def _load(ws, path):
+    """Parse a report document. Missing files are absent; a present file that cannot be read is refused."""
+    if not os.path.lexists(path):
+        return None, None, b""
+    rel = _rel(ws, path)
     try:
         text, bom = read_text(path)
-        return json.loads(text), text, bom
+        data = json.loads(text)
     except (OSError, ValueError, UnicodeDecodeError):
-        return None, None, b""
+        raise PbzError("REFUSED", rel)
+    if not isinstance(data, dict):
+        raise PbzError("REFUSED", rel)
+    return data, text, bom
 
 
 def _dump(data, old_text: str) -> str:
@@ -99,7 +110,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
     model = tmdl.load_model(os.path.join(project.mirror_model, "definition")) if fields else None
     for pid in page_ids:
         pp = os.path.join(pdir, pid, "page.json")
-        page, ptext, pbom = _load(pp)
+        page, ptext, pbom = _load(ws, pp)
         if page is None:
             continue
         changed = False
@@ -114,7 +125,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
         groups = set()
         loaded = {}
         for vid in vids:
-            v, vtext, vbom = _load(os.path.join(vdir, vid, "visual.json"))
+            v, vtext, vbom = _load(ws, os.path.join(vdir, vid, "visual.json"))
             if v is not None:
                 loaded[vid] = (v, vtext, vbom)
                 if "visualGroup" in v:
@@ -157,7 +168,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
         if changed:
             stage(pp, page, ptext, pbom)
     mp = os.path.join(pdir, "pages.json")
-    meta, mtext, mbom = _load(mp)
+    meta, mtext, mbom = _load(ws, mp)
     if isinstance(meta, dict):
         order = meta.get("pageOrder") or []
         new = []
@@ -179,7 +190,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
     if os.path.isdir(bdir):
         files = sorted(f[:-len(".bookmark.json")] for f in os.listdir(bdir) if f.endswith(".bookmark.json"))
         bp = os.path.join(bdir, "bookmarks.json")
-        bm, btext, bbom = _load(bp)
+        bm, btext, bbom = _load(ws, bp)
         if isinstance(bm, dict):
             items, listed, changed = [], set(), False
             for it in bm.get("items") or []:
@@ -207,7 +218,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
                 fix("BOOKMARK_LIST", "bookmarks/bookmarks.json", "bookmark list matched to the bookmark files")
         for f in files:
             path = os.path.join(bdir, f + ".bookmark.json")
-            b, text, bom = _load(path)
+            b, text, bom = _load(ws, path)
             if not isinstance(b, dict):
                 continue
             es = b.get("explorationState") or {}
@@ -240,9 +251,8 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
     if lineage:
         _lineage(project, fix, writes)
     _format_conflicts(project, fix, writes)
-    if not dry_run:
-        for path, (text, bom) in writes.items():
-            write_text(path, text, bom)
+    if writes and not dry_run:
+        commit_bytes([("write", path, text, bom) for path, (text, bom) in writes.items()])
     return {"verb": "repair", "project": project.name, "result": ("DRY_RUN" if dry_run else "REPAIRED") if fixes else "NOTHING_TO_REPAIR",
             "fixes": fixes, "files": sorted(os.path.relpath(p, ws.mirror).replace("\\", "/") for p in writes),
             **({"next": "pbz validate, pbz diff, pbz push"} if fixes and not dry_run else {})}

@@ -19,7 +19,7 @@ import os
 import re
 
 from . import pbir, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 from .tokens import TOKEN_RE
 
 _CAT: dict | None = None
@@ -241,8 +241,61 @@ def _pages(project) -> tuple[str, list[tuple[str, str]]]:
     return pdir, out
 
 
-def targets(project, page: str | None, visual: str | None, vtype: str | None, all_: bool) -> list[dict]:
+def _mirror_rel(project, path: str) -> str:
+    return os.path.relpath(path, project.ws.mirror).replace("\\", "/")
+
+
+def _strict_documents(project, page: str | None, vtype: str | None, all_: bool, include_visuals: bool = True) -> None:
+    """Parse candidate page and visual documents before a helper can skip or rename a bad one.
+
+    Opt-in: bookmarks, filters and button links keep the lenient discovery in `targets`.
+    """
+    pdir = os.path.join(project.mirror_report, "definition", "pages")
+    if not os.path.isdir(pdir):
+        return
+    whole = page is None and bool(vtype or all_)
+    chosen = []
+    for pid in sorted(os.listdir(pdir)):
+        pj = os.path.join(pdir, pid, "page.json")
+        if not os.path.isfile(pj):
+            continue
+        rel = _mirror_rel(project, pj)
+        try:
+            doc = json.loads(read_text(pj)[0])
+            if not isinstance(doc, dict):
+                raise ValueError
+            name = doc.get("displayName") or pid
+        except (OSError, ValueError, UnicodeDecodeError):
+            if whole or (page and page.lower() == pid.lower()):
+                raise PbzError("REFUSED", rel)
+            continue
+        if page and page.lower() not in (pid.lower(), str(name).lower()):
+            continue
+        chosen.append(pid)
+    if not include_visuals:
+        return
+    for pid in chosen:
+        vdir = os.path.join(pdir, pid, "visuals")
+        if not os.path.isdir(vdir):
+            continue
+        for vid in sorted(os.listdir(vdir)):
+            path = os.path.join(vdir, vid, "visual.json")
+            if not os.path.isfile(path):
+                continue
+            rel = _mirror_rel(project, path)
+            try:
+                doc = json.loads(read_text(path)[0])
+                if not isinstance(doc, dict):
+                    raise ValueError
+            except (OSError, ValueError, UnicodeDecodeError):
+                raise PbzError("REFUSED", rel)
+
+
+def targets(project, page: str | None, visual: str | None, vtype: str | None, all_: bool,
+            strict: bool = False) -> list[dict]:
     from .layout import LABELS, _visuals
+    if strict:
+        _strict_documents(project, page, vtype, all_)
     pdir, pages = _pages(project)
     if page:
         pages = [p for p in pages if page.lower() in (p[0].lower(), str(p[1]).lower())]
@@ -339,7 +392,8 @@ def run(ws, project, page: str | None = None, visual: str | None = None, sets: l
     sets, unsets = list(sets or []), list(unsets or [])
     if not (sets or unsets or show):
         raise PbzError("BAD_REQUEST", "pass --set object.property=value, --unset object.property or --show")
-    tg = targets(project, page, visual, vtype, all_)
+    mutating = bool(sets or unsets)
+    tg = targets(project, page, visual, vtype, all_, strict=mutating)
     if series and len(tg) != 1:
         raise PbzError("BAD_REQUEST", "--series formats one visual: name it")
     model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
@@ -353,9 +407,23 @@ def run(ws, project, page: str | None = None, visual: str | None = None, sets: l
     from . import images
     img = lambda raw: images.resolve(ws, project, raw)  # noqa: E731
     changed, skipped, files, shown = [], [], [], []
+    loaded = []
     for t in tg:
-        text, bom = read_text(t["path"])
-        doc = json.loads(text)
+        rel = os.path.relpath(t["path"], ws.mirror).replace("\\", "/")
+        try:
+            text, bom = read_text(t["path"])
+            doc = json.loads(text)
+        except (OSError, ValueError, UnicodeDecodeError):
+            if mutating:
+                raise PbzError("REFUSED", rel)
+            raise
+        if not isinstance(doc, dict):
+            if mutating:
+                raise PbzError("REFUSED", rel)
+            continue
+        loaded.append((t, text, bom, doc, rel))
+    pending = []
+    for t, text, bom, doc, rel in loaded:
         body = doc.get("visual") if isinstance(doc.get("visual"), dict) else None
         if body is None:
             skipped.append({"visual": t["id"], "reason": "not a visual"})
@@ -402,11 +470,13 @@ def run(ws, project, page: str | None = None, visual: str | None = None, sets: l
                     raise
                 problems.append(err.detail or err.code)
         if done:
-            write_text(t["path"], json.dumps(doc, indent=2, ensure_ascii=False) + "\n", bom)
-            files.append(os.path.relpath(t["path"], ws.mirror).replace("\\", "/"))
+            pending.append((t["path"], json.dumps(doc, indent=2, ensure_ascii=False) + "\n", bom))
+            files.append(rel)
             changed.append({"page": t["page"], "visual": t["id"], "label": t["label"], "type": t["type"], "changes": done})
         if problems:
             skipped.append({"page": t["page"], "visual": t["id"], "type": t["type"], "reasons": sorted(set(problems))[:3]})
+    if pending:
+        commit_bytes([("write", path, new, bom) for path, new, bom in pending])
     out = {"verb": "style", "project": project.name, "changed": changed, "files": files}
     if skipped:
         out["skipped"] = skipped
@@ -456,6 +526,9 @@ def run_canvas(ws, project, page: str | None = None, sets: list[str] | None = No
             raise PbzError("NOT_FOUND", f"page {page}")
     elif not all_:
         raise PbzError("BAD_REQUEST", "--canvas formats one page (name it) or every page (--all)")
+    mutating = bool(sets or unsets)
+    if mutating:
+        _strict_documents(project, page, None, bool(all_), include_visuals=False)
     parsed = []
     for s in sets:
         key, eq, raw = s.partition("=")
@@ -466,10 +539,24 @@ def run_canvas(ws, project, page: str | None = None, sets: list[str] | None = No
     parsed.sort(key=lambda p: p[2] == "scaling")  # an image set in the same call comes first
     model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
     changed, files, shown, notes = [], [], [], []
+    loaded = []
     for pid, pname in pages:
         path = os.path.join(pdir, pid, "page.json")
-        text, bom = read_text(path)
-        doc = json.loads(text)
+        rel = os.path.relpath(path, ws.mirror).replace("\\", "/")
+        try:
+            text, bom = read_text(path)
+            doc = json.loads(text)
+        except (OSError, ValueError, UnicodeDecodeError):
+            if mutating:
+                raise PbzError("REFUSED", rel)
+            raise
+        if not isinstance(doc, dict):
+            if mutating:
+                raise PbzError("REFUSED", rel)
+            continue
+        loaded.append((path, pname, text, bom, doc, rel))
+    pending = []
+    for path, pname, text, bom, doc, rel in loaded:
         if show:
             shown.append({"page": pname, "properties": _canvas_rows(doc)})
         done = []
@@ -529,9 +616,11 @@ def run_canvas(ws, project, page: str | None = None, sets: list[str] | None = No
                 if not objects:
                     doc.pop("objects", None)
         if done:
-            write_text(path, json.dumps(doc, indent=2, ensure_ascii=False) + ("\n" if text.endswith("\n") else ""), bom)
-            files.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
+            pending.append((path, json.dumps(doc, indent=2, ensure_ascii=False) + ("\n" if text.endswith("\n") else ""), bom))
+            files.append(rel)
             changed.append({"page": pname, "changes": done})
+    if pending:
+        commit_bytes([("write", path, new, bom) for path, new, bom in pending])
     out = {"verb": "style", "target": "canvas", "project": project.name, "changed": changed, "files": files}
     if notes:
         out["notes"] = sorted(set(notes))

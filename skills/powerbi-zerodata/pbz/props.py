@@ -12,7 +12,7 @@ import os
 import re
 
 from . import tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 from .lexers import tmdl_name
 from .tokens import TOKEN_RE, apply_edits
 
@@ -221,12 +221,15 @@ def run(ws, project, target: str | None = None, sets: list[str] | None = None, u
         elif not target:
             skipped.append(label)
     files = []
+    ops = []
     for rel, eds in edits.items():
         files.append(f"{project.name}.SemanticModel/definition/{rel}")
         if not dry_run:
             path = os.path.join(mdef, *rel.split("/"))
             _t, bom = read_text(path)
-            write_text(path, apply_edits(model.docs[rel].text, sorted(set(eds))), bom)
+            ops.append(("write", path, apply_edits(model.docs[rel].text, sorted(set(eds))), bom))
+    if ops:
+        commit_bytes(ops)
     out = {"verb": "set", "project": project.name, "result": "DRY_RUN" if dry_run else ("CHANGED" if changed else "NOTHING_TO_CHANGE"),
            "changed": changed[:500], "files": sorted(files)}
     if len(changed) > 500:
