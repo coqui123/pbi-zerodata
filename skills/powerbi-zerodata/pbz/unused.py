@@ -9,12 +9,13 @@ import os
 import re
 
 from . import lexers, pbir, tmdl, usage
-from .common import PbzError, file_sha, read_text, sha, write_text
+from .common import PbzError, commit_bytes, file_sha, read_text, sha
 from .usage import key
 
 KIND_ORDER = ["table", "column", "measure", "hierarchy", "calc_item", "relationship", "m_query", "function",
               "report_measure", "role"]
 TRASH = ".pbz-trash"
+_STAMP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 
 def _index_summary(ws) -> dict:
@@ -217,17 +218,25 @@ def _tree(g, k, direction, depth, path) -> dict:
 
 def remove(ws, project, extra_reports=(), m_step: str = "remove", cascade: bool = False,
            only: list[str] | None = None, dry_run: bool = False) -> dict:
-    """Delete unused objects from the mirror. Repeats with --cascade until nothing new is unused."""
+    """Delete unused objects from the mirror. Each cascade round is one commit_bytes."""
     if m_step not in ("remove", "keep", "none"):
         raise PbzError("BAD_REQUEST", "--m-step must be remove, keep or none")
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    before: dict[str, str | None] = {}
+    tdir = os.path.join(ws.mirror, TRASH, stamp)
+    if not dry_run and os.path.lexists(tdir):
+        raise PbzError("BAD_REQUEST", "restore point already exists")
+    originals: dict[str, tuple[str | None, bytes]] = {}
+    manifest_files: dict[str, dict] = {}
+    backed: set[str] = set()
+    touched: list[str] = []
     removed, skipped = [], []
-    rounds = 0
+    committed = 0
     while True:
         g = usage.build(ws, project, extra_reports)
         g.translated = translated(project)
         if g.incomplete:
+            if committed:
+                return _partial(project, removed, skipped, committed, stamp)
             raise PbzError("INCOMPLETE", "a report file or a registered consumer could not be read or fully "
                                          "covered (see `pbz consumers list`); nothing removed")
         todo = []
@@ -244,75 +253,156 @@ def remove(ws, project, extra_reports=(), m_step: str = "remove", cascade: bool 
         rep = [r for r in g.report_objects if not r.get("referenced") and (
             (r["kind"] == "custom_visual" and (not only or "custom_visual" in only)) or
             (r["kind"] == "bookmark" and only and "bookmark" in only))]
-        if rounds and rep:
+        if committed and rep:
             rep = []  # report objects go in the first round only
         if not todo and not rep:
             break
-        rounds += 1
         changes = _plan(ws, project, g, todo, rep, m_step, skipped)
         if not changes:
             break
-        for rel, new in changes.items():
-            path = os.path.join(ws.mirror, *rel.split("/"))
-            if rel not in before:
-                before[rel] = read_text(path)[0] if os.path.exists(path) else None
-            if dry_run:
-                continue
-            if new is None:
-                if os.path.exists(path):
-                    os.remove(path)
-            else:
-                write_text(path, new, read_text(path)[1] if os.path.exists(path) else b"")
         whole = {g.objects[k].name.lower() for k in todo if k[0] == "table"}
-        removed += [f"{g.objects[k].kind} {g.objects[k].label()}" for k in todo
-                    if k[0] == "table" or g.objects[k].table.lower() not in whole] + \
-                   [f"{r['kind']} {r['id']}" for r in rep]
-        if dry_run or not cascade:
+        labels = [f"{g.objects[k].kind} {g.objects[k].label()}" for k in todo
+                  if k[0] == "table" or g.objects[k].table.lower() not in whole] + \
+                 [f"{r['kind']} {r['id']}" for r in rep]
+        for rel in changes:
+            if rel not in touched:
+                touched.append(rel)
+        if dry_run:
+            removed += labels
+            committed += 1
+            break
+        ops = _round_ops(ws, tdir, stamp, changes, originals, manifest_files, backed, removed + labels)
+        try:
+            commit_bytes(ops)
+        except PbzError as e:
+            if e.code == "FAILED" and committed:
+                return _partial(project, removed, skipped, committed, stamp)
+            raise
+        removed += labels
+        committed += 1
+        if not cascade:
             break
     if not removed:
         return {"verb": "unused-remove", "project": project.name, "result": "NOTHING_TO_REMOVE", "skipped": skipped}
     out = {"verb": "unused-remove", "project": project.name, "result": "DRY_RUN" if dry_run else "REMOVED",
-           "removed": removed, "skipped": skipped, "rounds": rounds,
-           "files": sorted(before)}
+           "removed": removed, "skipped": skipped, "rounds": committed,
+           "files": sorted(touched)}
     if not dry_run:
-        out["restore_point"] = _save_trash(ws, stamp, before, removed)
+        out["restore_point"] = stamp
         out["next"] = "pbz diff, then pbz push (or `pbz unused --restore " + stamp + "`)"
     return out
 
 
-def _save_trash(ws, stamp: str, before: dict, removed: list) -> str:
-    tdir = os.path.join(ws.mirror, TRASH, stamp)
-    files = {}
-    for rel, text in before.items():
-        path = os.path.join(ws.mirror, *rel.split("/"))
-        after = file_sha(path)
-        if text is not None:
-            write_text(os.path.join(tdir, "files", *rel.split("/")), text)
-        files[rel] = {"existed": text is not None, "after": after}
-    with open(os.path.join(tdir, "manifest.json"), "w", encoding="utf-8") as f:
-        json.dump({"stamp": stamp, "removed": removed, "files": files}, f, indent=1, ensure_ascii=False)
-    return stamp
+def _partial(project, removed, skipped, rounds, stamp) -> dict:
+    return {"verb": "unused-remove", "project": project.name, "result": "PARTIAL",
+            "removed": removed, "skipped": skipped, "rounds": rounds, "restore_point": stamp,
+            "note": "earlier rounds stay applied; this restore point returns pre-command bytes",
+            "next": "pbz unused --restore " + stamp}
+
+
+def _parts(rel: str) -> list[str]:
+    parts = rel.replace("\\", "/").split("/")
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise PbzError("BAD_REQUEST", "mirror path is not inside the project")
+    return parts
+
+
+def _under(root: str, path: str) -> bool:
+    root_n = os.path.normcase(os.path.abspath(root))
+    path_n = os.path.normcase(os.path.abspath(path))
+    return path_n == root_n or path_n.startswith(root_n + os.sep)
+
+
+def _round_ops(ws, tdir, stamp, changes, originals, manifest_files, backed, removed) -> list:
+    """Mirror edits, first-seen backups and the manifest, for one commit_bytes."""
+    mirror_ops, backup_ops = [], []
+    for rel, new in changes.items():
+        parts = _parts(rel)
+        path = os.path.join(ws.mirror, *parts)
+        if not _under(ws.mirror, path):
+            raise PbzError("BAD_REQUEST", "mirror path is not inside the project")
+        if rel not in originals:
+            if os.path.isfile(path):
+                originals[rel] = read_text(path)
+            else:
+                originals[rel] = (None, b"")
+        text0, bom0 = originals[rel]
+        bom_write = read_text(path)[1] if os.path.isfile(path) else b""
+        if new is None:
+            mirror_ops.append(("delete", path))
+            after = None
+        else:
+            mirror_ops.append(("write", path, new, bom_write))
+            after = sha(bom_write + new.encode("utf-8"))
+        manifest_files[rel] = {
+            "existed": text0 is not None,
+            "before": sha(bom0 + text0.encode("utf-8")) if text0 is not None else None,
+            "after": after,
+        }
+        if text0 is not None and rel not in backed:
+            bpath = os.path.join(tdir, "files", *parts)
+            backup_ops.append(("write", bpath, text0, bom0))
+            backed.add(rel)
+    body = json.dumps({"stamp": stamp, "removed": removed, "files": manifest_files},
+                      indent=1, ensure_ascii=False)
+    manifest = ("write", os.path.join(tdir, "manifest.json"), body, b"")
+    return mirror_ops + backup_ops + [manifest]
 
 
 def restore(ws, project, stamp: str) -> dict:
-    tdir = os.path.join(ws.mirror, TRASH, stamp)
+    if not isinstance(stamp, str) or not _STAMP_RE.fullmatch(stamp):
+        raise PbzError("BAD_REQUEST", "restore point id is not a single name")
+    trash = os.path.join(ws.mirror, TRASH)
+    tdir = os.path.join(trash, stamp)
+    if not _under(trash, tdir):
+        raise PbzError("BAD_REQUEST", "restore point id is not a single name")
     try:
         with open(os.path.join(tdir, "manifest.json"), encoding="utf-8") as f:
             man = json.load(f)
     except (OSError, ValueError):
         raise PbzError("NOT_FOUND", f"restore point {stamp}")
-    conflicts = [rel for rel, info in man["files"].items()
-                 if file_sha(os.path.join(ws.mirror, *rel.split("/"))) != info.get("after")]
+    files = man.get("files")
+    if not isinstance(files, dict):
+        raise PbzError("INVALID", "restore point is unreadable")
+    planned = []
+    seen = {}
+    conflicts = []
+    for rel, info in files.items():
+        if not isinstance(rel, str) or not isinstance(info, dict):
+            raise PbzError("INVALID", "restore point is unreadable")
+        parts = _parts(rel)
+        path = os.path.join(ws.mirror, *parts)
+        if not _under(ws.mirror, path):
+            raise PbzError("BAD_REQUEST", "restore path escapes the mirror")
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in seen:
+            raise PbzError("BAD_REQUEST", "restore paths collide")
+        seen[norm] = rel
+        if file_sha(path) != info.get("after"):
+            conflicts.append(rel)
+        planned.append((rel, parts, path, info))
     if conflicts:
         return {"verb": "unused-restore", "result": "CONFLICT", "files": conflicts,
                 "hint": "these mirror files changed after the removal (pull or push since?)"}
-    for rel, info in man["files"].items():
-        path = os.path.join(ws.mirror, *rel.split("/"))
-        if info["existed"]:
-            text = read_text(os.path.join(tdir, "files", *rel.split("/")))[0]
-            write_text(path, text, read_text(path)[1] if os.path.exists(path) else b"")
-        elif os.path.exists(path):
-            os.remove(path)
+    ops = []
+    for rel, parts, path, info in planned:
+        if info.get("existed"):
+            bpath = os.path.join(tdir, "files", *parts)
+            if not _under(os.path.join(tdir, "files"), bpath):
+                raise PbzError("BAD_REQUEST", "restore path escapes the mirror")
+            try:
+                text, bom = read_text(bpath)
+            except FileNotFoundError:
+                raise PbzError("NOT_FOUND", "restore backup is missing")
+            except (OSError, UnicodeError):
+                raise PbzError("INVALID", "restore backup is unreadable")
+            expect = info.get("before")
+            if expect is not None and sha(bom + text.encode("utf-8")) != expect:
+                raise PbzError("INVALID", "restore backup does not match the restore point")
+            ops.append(("write", path, text, bom))
+        else:
+            ops.append(("delete", path))
+    commit_bytes(ops)
     return {"verb": "unused-restore", "result": "RESTORED", "objects": man.get("removed", []),
             "next": "pbz diff (if the removal was already pushed, push again)"}
 

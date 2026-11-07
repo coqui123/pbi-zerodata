@@ -12,9 +12,11 @@ Interactions set how one visual affects another on its page: filter, highlight, 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
+from datetime import datetime as _dt
 
 from . import author, tmdl
 from .common import PbzError, read_text, write_text
@@ -51,22 +53,36 @@ def literal(raw: str, dtype: str) -> str:
         if t in ("int64", "integer", "whole"):
             return f"{int(raw)}L"
         if t in ("double", "number"):
-            v = float(raw)
-            return (str(int(v)) if v.is_integer() else repr(v)) + "D"
+            return _finite_literal(raw, "D", dtype)
         if t in ("decimal", "currency"):
-            v = float(raw)
-            return (str(int(v)) if v.is_integer() else repr(v)) + "M"
+            return _finite_literal(raw, "M", dtype)
     except ValueError:
-        raise PbzError("BAD_REQUEST", f"{raw} is not a number ({dtype} column)")
+        raise PbzError("BAD_REQUEST", f"value is not a number ({dtype} column)")
     if t == "boolean":
         if raw.lower() not in ("true", "false"):
-            raise PbzError("BAD_REQUEST", f"{raw}: use true or false")
+            raise PbzError("BAD_REQUEST", "use true or false")
         return raw.lower()
     if t == "datetime":
         if not re.match(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$", raw):
-            raise PbzError("BAD_REQUEST", f"{raw}: use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
+            raise PbzError("BAD_REQUEST", "use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
+        try:
+            if "T" not in raw:
+                _dt.strptime(raw, "%Y-%m-%d")
+            elif re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", raw):
+                _dt.strptime(raw, "%Y-%m-%dT%H:%M")
+            else:
+                _dt.strptime(raw, "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            raise PbzError("BAD_REQUEST", "use a real calendar date as YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
         return f"datetime'{raw if 'T' in raw else raw + 'T00:00:00'}'"
     return "'" + raw.replace("'", "''") + "'"
+
+
+def _finite_literal(raw: str, suffix: str, dtype: str) -> str:
+    v = float(raw)
+    if not math.isfinite(v):
+        raise PbzError("BAD_REQUEST", f"value is not a finite number ({dtype} column)")
+    return (str(int(v)) if v.is_integer() else repr(v)) + suffix
 
 
 def _ref(kind: str, source_or_entity: str, name: str, by_source: bool) -> dict:
@@ -83,7 +99,9 @@ def build(model, field: str, values_in: list[str] | None = None, values_out: lis
     used: set = set()
     a = _alias(table, used)
     out = {"name": _id(), "field": _ref(kind, table, name, False)}
-    if sum(bool(x) for x in (values_in, values_out, where, top)) > 1:
+    if (by or bottom) and top is None:
+        raise PbzError("BAD_REQUEST", "ranking modifiers need --top")
+    if sum(bool(x) for x in (values_in, values_out, where, top is not None)) > 1:
         raise PbzError("BAD_REQUEST", "one condition kind per filter: --in, --not-in, --where or --top")
     if values_in or values_out:
         if kind == "measure":
@@ -101,17 +119,17 @@ def build(model, field: str, values_in: list[str] | None = None, values_out: lis
         for w in where:
             m = re.match(r"^\s*(>=|<=|==|=|>|<)\s*(.+?)\s*$", w)
             if not m:
-                raise PbzError("BAD_REQUEST", f"{w}: use an operator and a value, for example \">= 100\"")
+                raise PbzError("BAD_REQUEST", "use an operator and a value, for example \">= 100\"")
             vt = "double" if kind == "measure" else dtype
             comps.append({"Comparison": {"ComparisonKind": OPS[m.group(1)], "Left": _ref(kind, a, name, True),
                                          "Right": {"Literal": {"Value": literal(m.group(2), vt)}}}})
         cond = comps[0] if len(comps) == 1 else {"And": {"Left": comps[0], "Right": comps[1]}}
         out.update(type="Advanced", filter={"Version": 2, "From": [{"Name": a, "Entity": table, "Type": 0}],
                                              "Where": [{"Condition": cond}]})
-    elif top:
+    elif top is not None:
         if kind == "measure":
             raise PbzError("BAD_REQUEST", "Top N filters a column by a measure: --top N --by [Measure]")
-        if not by or top < 1:
+        if not by or isinstance(top, bool) or not isinstance(top, int) or top < 1:
             raise PbzError("BAD_REQUEST", "--top needs a positive count and --by [Measure]")
         bk, bt, bn, _bd = author._parse_field(model, by)
         if bk != "measure":

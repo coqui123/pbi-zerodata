@@ -521,7 +521,7 @@ def _report(g: Graph, model, res, rname: str, rdir: str) -> None:
         rel = os.path.relpath(path, ddir).replace("\\", "/")
         try:
             files.append((rel, pbir.parse_json(read_text(path)[0])))
-        except (OSError, UnicodeDecodeError, pbir.JsonError):
+        except (OSError, UnicodeDecodeError, pbir.JsonError, IndexError):
             g.warnings.append({"code": "UNREADABLE_REPORT_FILE", "report": rname, "where": rel})
             g.incomplete = True
     pages = {}

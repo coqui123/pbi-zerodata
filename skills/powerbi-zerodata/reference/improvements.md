@@ -103,6 +103,11 @@ remain conservative after rollback.
 JSON includes an additive versioned `outcome` envelope. Exit codes: 0 successful operation,
 1 failed assertion/rolled-back operation, 2 invalid request, 3 blocked/inconclusive operation,
 4 unavailable capability, 5 partial application such as successful push followed by failed reload.
+A write that `commit_bytes` rolls back completely is `FAILED` (exit 1), not
+`LOCAL_STATE_UNAVAILABLE`. `RECOVERY_REQUIRED` stays blocked when that rollback cannot restore a
+file. `smoke` parses the report, its pages and its visuals before spending the daily budget; an
+unreadable file is `INVALID` and an unknown page is `NOT_FOUND`, both before any spend. A cascade
+removal that already committed earlier rounds reports `PARTIAL` (exit 5) and keeps that restore point.
 `--diagnostic` explicitly permits check-result collection without assertion failure exit codes.
 Do not interpret an artifact being generated as validation passing. Unexpected CLI exceptions
 return a protected diagnostic ID rather than echoing potentially sensitive traceback text.

@@ -101,6 +101,15 @@ class CliMcpParityTests(unittest.TestCase):
         self.assertIn("interactions", roots)
         self.assertIn("capabilities", roots)
 
+    def test_review_accept_stays_off_mcp(self):
+        review = self.commands["review"]
+        flags = {opt for action in review._actions for opt in action.option_strings}
+        self.assertIn("--accept", flags)
+        for tool in mcp.TOOLS:
+            if tool.verb[0] == "review":
+                exposed = {spec[0] for spec in tool.opts.values()}
+                self.assertNotIn("--accept", exposed)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,13 +22,15 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
     reload = out.get("reload")
     if out.get("result") == "PUSHED" and reload and reload != "RELOADED":
         status, code, rc = "PARTIAL", "APPLIED_RELOAD_FAILED", 5
+    elif out.get("result") == "PARTIAL":
+        status, code, rc = "PARTIAL", "PARTIAL", 5
     elif code in BLOCKED:
         status, rc = "BLOCKED", 3
     elif code in UNAVAILABLE:
         status, rc = "UNAVAILABLE", 4
     elif code in INVALID or out.get("spec_valid") is False:
         status, rc = "INVALID", 2
-    elif code == "ROLLED_BACK":
+    elif code == "ROLLED_BACK" or code == "FAILED":
         status, rc = "FAILED", 1
     elif out.get("ok") is False or out.get("error"):
         status, rc = "FAILED", 2

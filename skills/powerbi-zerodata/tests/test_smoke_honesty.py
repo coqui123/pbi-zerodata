@@ -328,5 +328,76 @@ class CultureMoveTests(unittest.TestCase):
         self.assertFalse(any(n.kind == "measure" and n.parent is not None and n.parent.name == "Src" for n in doc.nodes))
 
 
+class ParseBeforeSpendTests(unittest.TestCase):
+    def setUp(self):
+        self.model = tmdl.Model()
+        self.tm = type("TM", (), {"get": lambda self, _tok: None})()
+
+    def test_malformed_filter_is_partial(self):
+        visual = {"visual": {"visualType": "card", "query": {"queryState": {"Values": {"projections": [
+            {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"}}}]}}}},
+            "filterConfig": {"filters": [{"type": "Advanced", "filter": {"Where": {}}}]}
+        }
+        _dax, coverage = smoke.build_query(_parse(visual), _parse({}), self.model, self.tm)
+        self.assertEqual(coverage, "PARTIAL")
+
+    def test_field_only_filter_stays_full(self):
+        visual = {"visual": {"visualType": "card", "query": {"queryState": {"Values": {"projections": [
+            {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"}}}]}}}},
+            "filterConfig": {"filters": [{"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                                "Property": "Amount"}}}]}
+        }
+        _dax, coverage = smoke.build_query(_parse(visual), _parse({}), self.model, self.tm)
+        self.assertEqual(coverage, "FULL")
+
+    def test_invalid_datetime_is_not_full(self):
+        visual = {"visual": {"visualType": "tableEx", "query": {"queryState": {"Values": {"projections": [
+            {"field": _column("Sales", "When")}]}}}},
+            "filterConfig": {"filters": [{"filter": {"From": [{"Name": "s", "Entity": "Sales", "Type": 0}],
+                "Where": [{"Condition": {"Comparison": {
+                    "ComparisonKind": 1,
+                    "Left": {"Column": {"Expression": {"SourceRef": {"Source": "s"}}, "Property": "When"}},
+                    "Right": {"Literal": {"Value": "datetime'2020-02-31T15:04:05'"}}}}}]}}]}}
+        _dax, coverage = smoke.build_query(_parse(visual), _parse({}), self.model, self.tm)
+        self.assertNotEqual(coverage, "FULL")
+
+    def test_broken_visual_refuses_before_spend(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        ws = common.Workspace(str(root))
+        ws.private = str(root / "private")
+        (root / "Fix.pbip").write_text("{}")
+        project = common.Project(ws, "Fix")
+        page = Path(project.mirror_report) / "definition" / "pages" / "p1"
+        (page / "visuals" / "v1").mkdir(parents=True)
+        (page / "page.json").write_text(json.dumps({"name": "p1", "displayName": "Synthetic"}))
+        (page / "visuals" / "v1" / "visual.json").write_text("{")
+        os.makedirs(os.path.join(project.mirror_model, "definition"), exist_ok=True)
+        with patch("pbz.checks.spend", side_effect=AssertionError("spent")):
+            with self.assertRaises(common.PbzError) as caught:
+                smoke.run(ws, project)
+        self.assertEqual(caught.exception.code, "INVALID")
+        self.assertIn("visual.json", caught.exception.detail.replace("\\", "/"))
+
+    def test_unknown_page_is_not_found_before_spend(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        ws = common.Workspace(str(root))
+        ws.private = str(root / "private")
+        (root / "Fix.pbip").write_text("{}")
+        project = common.Project(ws, "Fix")
+        page = Path(project.mirror_report) / "definition" / "pages" / "p1"
+        (page / "visuals" / "v1").mkdir(parents=True)
+        (page / "page.json").write_text(json.dumps({"name": "p1", "displayName": "Synthetic"}))
+        (page / "visuals" / "v1" / "visual.json").write_text("{}")
+        os.makedirs(os.path.join(project.mirror_model, "definition"), exist_ok=True)
+        with patch("pbz.checks.spend", side_effect=AssertionError("spent")):
+            with self.assertRaises(common.PbzError) as caught:
+                smoke.run(ws, project, page="Nope")
+        self.assertEqual(caught.exception.code, "NOT_FOUND")
+
+
 if __name__ == "__main__":
     unittest.main()

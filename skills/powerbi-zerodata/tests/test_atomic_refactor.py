@@ -175,8 +175,9 @@ class AtomicRefactorTests(unittest.TestCase):
             return real(path, text, bom)
 
         with patch("pbz.common.write_text", boom):
-            with self.assertRaises(OSError):
+            with self.assertRaises(PbzError) as caught:
                 move.move_measure(ws, project, "Amount", "Metrics")
+            self.assertEqual(caught.exception.code, "FAILED")
         self.assertGreaterEqual(calls["n"], 2)
         self.assertEqual(_bytes(ws.mirror), before)
 
@@ -195,8 +196,9 @@ class AtomicRefactorTests(unittest.TestCase):
             return real_replace(src, dst)
 
         with patch("pbz.common.os.replace", boom):
-            with self.assertRaises(OSError):
+            with self.assertRaises(PbzError) as caught:
                 move.move_measure(ws, project, "Amount", "Metrics")
+            self.assertEqual(caught.exception.code, "FAILED")
         self.assertEqual(_bytes(ws.mirror), before)
         leftovers = list(Path(ws.mirror).rglob("*.pbz-tmp"))
         self.assertEqual(leftovers, [])

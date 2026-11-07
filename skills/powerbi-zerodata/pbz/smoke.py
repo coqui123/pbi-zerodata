@@ -1,6 +1,7 @@
 """Per-visual smoke test: build an approximate query from each visual's bindings and filters."""
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import re
@@ -30,18 +31,31 @@ def _date_dax(v: str) -> tuple[str | None, bool]:
     if not m:
         return None, False
     y, mo, d = int(m.group("y")), int(m.group("mo")), int(m.group("d"))
-    date = f"DATE({y}, {mo}, {d})"
-    # Group 0 is the whole match; look behind the matched string for a timezone suffix.
     offset = bool(re.search(r"(?:Z|[+-]\d{2}:\d{2})$", v.strip()))
     if m.group("h") is None:
-        return date, offset
+        if not _real_when(y, mo, d):
+            return None, True
+        return f"DATE({y}, {mo}, {d})", offset
     h, mi, s = int(m.group("h")), int(m.group("mi")), int(m.group("s") or 0)
+    if not _real_when(y, mo, d, h, mi, s):
+        return None, True
     frac = m.group("f")
     dropped = bool(frac and int(frac) != 0) or offset
     if h == mi == s == 0 and not dropped:
-        return date, False
+        return f"DATE({y}, {mo}, {d})", False
     # DATETIME() is not a DAX constructor; DATE + TIME is.
     return f"(DATE({y}, {mo}, {d}) + TIME({h}, {mi}, {s}))", dropped
+
+
+def _real_when(y, mo, d, h=None, mi=None, s=None) -> bool:
+    try:
+        if h is None:
+            dt.date(y, mo, d)
+        else:
+            dt.datetime(y, mo, d, h, mi, s)
+    except ValueError:
+        return False
+    return True
 
 
 def _lit_dax(raw: str, tm) -> tuple[str | None, bool]:
@@ -149,26 +163,41 @@ def _condition(cond, aliases, model, tm) -> tuple[list[str], bool]:
 def _filters(filter_config, model, tm) -> tuple[list[str], bool]:
     """DAX filter args for simple In / Comparison conditions; second value: something was skipped."""
     out, partial = [], False
+    if filter_config is None:
+        return out, partial
     if not isinstance(filter_config, pbir.JObj):
+        return out, True
+    if "filters" not in filter_config:
         return out, partial
     flist = filter_config.get("filters")
-    for f in flist.items if isinstance(flist, pbir.JArr) else []:
+    if not isinstance(flist, pbir.JArr):
+        return out, True
+    for f in flist.items:
         if not isinstance(f, pbir.JObj):
+            partial = True
             continue
         kind = f.get("type")
         if isinstance(kind, pbir.JStr) and kind.value in _UNSUPPORTED_FILTER_TYPES:
             partial = True
             continue
+        if "filter" not in f:
+            continue
         flt = f.get("filter")
         if not isinstance(flt, pbir.JObj):
+            partial = True
             continue
         aliases = {}
         frm = flt.get("From")
         for e in frm.items if isinstance(frm, pbir.JArr) else []:
             if isinstance(e, pbir.JObj) and isinstance(e.get("Name"), pbir.JStr) and isinstance(e.get("Entity"), pbir.JStr):
                 aliases[e.get("Name").value] = e.get("Entity").value
+        if "Where" not in flt:
+            continue
         where = flt.get("Where")
-        for w in where.items if isinstance(where, pbir.JArr) else []:
+        if not isinstance(where, pbir.JArr):
+            partial = True
+            continue
+        for w in where.items:
             produced, skipped = _condition(w.get("Condition") if isinstance(w, pbir.JObj) else None, aliases, model, tm)
             partial = partial or skipped
             out.extend(produced)
@@ -186,18 +215,33 @@ def _interactions(root) -> bool:
 SLICER_TYPES = {"slicer", "advancedSlicerVisual", "slicerFilter", "fieldParameter"}
 
 
+def _mirror_rel(root: str, path: str) -> str:
+    return os.path.relpath(path, root).replace("\\", "/")
+
+
+def _read_pbir(path: str, rel: str):
+    try:
+        text = read_text(path)[0]
+    except (OSError, UnicodeError) as e:
+        raise PbzError("INVALID", rel) from e
+    try:
+        return pbir.parse_json(text)
+    except (pbir.JsonError, ValueError, IndexError) as e:
+        raise PbzError("INVALID", rel) from e
+
+
 def _page_has_slicers(page_dir: str) -> bool:
     vdir = os.path.join(page_dir, "visuals")
     if not os.path.isdir(vdir):
         return False
+    mirror = page_dir
+    for _ in range(4):
+        mirror = os.path.dirname(mirror)
     for vid in os.listdir(vdir):
         path = os.path.join(vdir, vid, "visual.json")
         if not os.path.isfile(path):
             continue
-        try:
-            root = pbir.parse_json(read_text(path)[0])
-        except (OSError, pbir.JsonError, ValueError):
-            continue
+        root = _read_pbir(path, _mirror_rel(mirror, path))
         v = root.get("visual") if isinstance(root, pbir.JObj) else None
         vt = v.get("visualType") if isinstance(v, pbir.JObj) else None
         if isinstance(vt, pbir.JStr) and vt.value in SLICER_TYPES:
@@ -262,34 +306,45 @@ def build_query(visual_root, page_root, model, tm, report_root=None, page_has_sl
 
 def run(ws, project, page: str | None = None) -> dict:
     from .checks import spend
+    pages_dir = os.path.join(project.mirror_report, "definition", "pages")
+    if not os.path.isdir(pages_dir):
+        raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    mirror = os.path.dirname(project.mirror_report)
+    report_path = os.path.join(project.mirror_report, "definition", "report.json")
+    report_root = _read_pbir(report_path, _mirror_rel(mirror, report_path)) if os.path.isfile(report_path) else None
+    loaded = []
+    matched = page is None
+    for pid in sorted(os.listdir(pages_dir)):
+        pdir = os.path.join(pages_dir, pid)
+        pjson = os.path.join(pdir, "page.json")
+        if not os.path.isfile(pjson):
+            continue
+        proot = _read_pbir(pjson, _mirror_rel(mirror, pjson))
+        pname = proot.get("displayName").value if isinstance(proot, pbir.JObj) and isinstance(proot.get("displayName"), pbir.JStr) else pid
+        if not page or page in (pid, pname):
+            matched = True
+        has_slicers = _page_has_slicers(pdir)
+        visuals = []
+        vdir = os.path.join(pdir, "visuals")
+        for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+            vjson = os.path.join(vdir, vid, "visual.json")
+            if not os.path.isfile(vjson):
+                continue
+            visuals.append((vid, _read_pbir(vjson, _mirror_rel(mirror, vjson))))
+        loaded.append((pid, pname, proot, has_slicers, visuals))
+    if page and not matched:
+        raise PbzError("NOT_FOUND", f"page {page}")
     if not spend(ws, "smoke"):
         return {"verb": "smoke", "status": "BUDGET", "note": "daily smoke budget reached; the user can reset it"}
     port = desktop.require_port(project)
     tm = tokens.TokenMap(ws.private)
     mdef = os.path.join(project.mirror_model, "definition")
     model = tmdl.load_model(mdef)
-    pages_dir = os.path.join(project.mirror_report, "definition", "pages")
-    if not os.path.isdir(pages_dir):
-        raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    report_path = os.path.join(project.mirror_report, "definition", "report.json")
-    report_root = pbir.parse_json(read_text(report_path)[0]) if os.path.isfile(report_path) else None
     items, rows = [], []
-    for pid in sorted(os.listdir(pages_dir)):
-        pdir = os.path.join(pages_dir, pid)
-        pjson = os.path.join(pdir, "page.json")
-        if not os.path.isfile(pjson):
-            continue
-        proot = pbir.parse_json(read_text(pjson)[0])
-        pname = proot.get("displayName").value if isinstance(proot.get("displayName"), pbir.JStr) else pid
+    for pid, pname, proot, has_slicers, visuals in loaded:
         if page and page not in (pid, pname):
             continue
-        vdir = os.path.join(pdir, "visuals")
-        has_slicers = _page_has_slicers(pdir)
-        for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
-            vjson = os.path.join(vdir, vid, "visual.json")
-            if not os.path.isfile(vjson):
-                continue
-            vroot = pbir.parse_json(read_text(vjson)[0])
+        for vid, vroot in visuals:
             v = vroot.get("visual")
             vt = v.get("visualType").value if isinstance(v, pbir.JObj) and isinstance(v.get("visualType"), pbir.JStr) else "?"
             # Slicer visuals themselves are not cross-filtered by sibling slicers into their own query.

@@ -192,7 +192,7 @@ def commit_bytes(ops: list[tuple]) -> None:
         if restore_fail:
             raise PbzError("RECOVERY_REQUIRED",
                            "commit rolled back incompletely: " + ", ".join(restore_fail[:12])) from first
-        raise
+        raise PbzError("FAILED", "write failed; mirror rolled back, no file changed") from first
 
 
 def sha(text_or_bytes) -> str:

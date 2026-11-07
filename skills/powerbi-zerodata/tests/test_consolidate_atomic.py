@@ -96,8 +96,9 @@ class ConsolidateAtomicTests(unittest.TestCase):
             return real(path, text, bom)
 
         with patch("pbz.common.write_text", boom):
-            with self.assertRaises(OSError):
+            with self.assertRaises(PbzError) as caught:
                 consolidate.merge(ws, project, "Copy", "Keep")
+            self.assertEqual(caught.exception.code, "FAILED")
         self.assertGreaterEqual(calls["n"], 2)
         self.assertEqual(_bytes(ws.mirror), before)
         self.assertEqual(list(Path(ws.mirror).rglob("*.pbz-tmp")), [])
@@ -129,8 +130,9 @@ class ConsolidateAtomicTests(unittest.TestCase):
             return real(path, text, bom)
 
         with patch("pbz.common.write_text", boom):
-            with self.assertRaises(OSError):
+            with self.assertRaises(PbzError) as caught:
                 consolidate.calc_group(ws, project, measures=["[A YTD]", "[B YTD]", "[C YTD]"], name="Time Variants")
+            self.assertEqual(caught.exception.code, "FAILED")
         self.assertEqual(_bytes(ws.mirror), before)
         self.assertFalse(os.path.exists(os.path.join(
             project.mirror_model, "definition", "tables", "Time Variants.tmdl")))

@@ -202,6 +202,26 @@ Microsoft's report-authoring guidance:
 Not building: image previews or descriptions for the agent (images can show data), theme generation
 from a brand image, plot-area images (Microsoft's validator rejects the nested form there).
 
+## Round 10 (2026-11-06): hardening
+
+- `commit_bytes` reports `FAILED` (exit 1) after a complete rollback of the files that transaction
+  touched. `RECOVERY_REQUIRED` stays blocked when that restore itself fails. This is still a
+  caught-OSError rollback, not crash-proof multi-process atomicity.
+- `unused --remove` and `--restore` plan each cascade round, then commit it once. A later round that
+  cannot be analyzed, or whose write rolls back, is `PARTIAL`: earlier rounds stay applied and the
+  restore point returns pre-command bytes. It does not say nothing was removed.
+- Culture, perspective and role add/remove, and the multi-file culture and perspective writers,
+  commit their files together. A sanitized file name that another object already owns is refused.
+- `smoke` parses report, page and visual PBIR before spending the daily budget. An unreadable file
+  is `INVALID` and an unknown page is `NOT_FOUND`, both before any spend. A present but malformed
+  filter is `PARTIAL`. An impossible calendar or clock value is not `FULL`.
+- Filter and relationship edits refuse a non-positive Top N, ranking modifiers without Top N,
+  non-finite numbers, impossible datetimes, and opposing `--active`/`--inactive` or
+  `--both`/`--single` before any write. Refusals do not echo the rejected value.
+
+Not built this round: staging a whole cascade on a disposable mirror copy, moving every writer onto
+`commit_bytes`, a CI glob, native interactions, Power Query authoring, semantic merge, an RLS harness.
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,

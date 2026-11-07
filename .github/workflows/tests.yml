@@ -51,7 +51,8 @@ jobs:
                     "props", "modeling", "workflow", "components", "a11y", "synthedge", "audit",
                     "consolidate", "consolidate_atomic", "memory", "images", "improvement_core", "desktop_evidence",
                     "preview", "session_features", "consent", "smoke_honesty", "disclosure_gate",
-                    "atomic_refactor", "capabilities", "daxfmt", "cli_mcp_parity", "freshness_offline"
+                    "atomic_refactor", "unused_atomic", "governance_atomic", "edit_refusals",
+                    "capabilities", "daxfmt", "cli_mcp_parity", "freshness_offline"
           $failed = @()
           foreach ($t in $suites) {
             Write-Host "::group::test_$t"

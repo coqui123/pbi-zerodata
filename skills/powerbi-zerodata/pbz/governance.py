@@ -7,7 +7,7 @@ import os
 import re
 
 from . import deps, lexers, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text, write_text
 from .tokens import TOKEN_RE, apply_edits
 
 CODE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
@@ -33,6 +33,37 @@ def _rel(project, rel: str) -> str:
     return f"{project.name}.SemanticModel/definition/{rel}"
 
 
+def _write_op(mdef: str, rel: str, text: str) -> tuple:
+    path = os.path.join(mdef, *rel.split("/"))
+    bom = read_text(path)[1] if os.path.exists(path) else b""
+    return ("write", path, text, bom)
+
+
+def _commit(ops) -> None:
+    ops = [op for op in ops if op]
+    if ops:
+        commit_bytes(ops)
+
+
+def _commit_texts(mdef: str, planned: dict) -> None:
+    _commit([_write_op(mdef, rel, text) for rel, text in planned.items()])
+
+
+def _require_model_tmdl(mdef: str) -> None:
+    if not os.path.isfile(os.path.join(mdef, "model.tmdl")):
+        raise PbzError("NO_MIRROR", "model.tmdl is missing; run `pbz pull` first")
+
+
+def _destination(mdef: str, folder: str, name: str) -> str:
+    filename = _file_name(name)
+    if not filename or filename in (".", ".."):
+        raise PbzError("BAD_REQUEST", "that name is not a file name")
+    rel = f"{folder}/{filename}.tmdl"
+    if os.path.exists(os.path.join(mdef, *rel.split("/"))):
+        raise PbzError("NAME_TAKEN", "that file name is already used")
+    return rel
+
+
 def _write(mdef: str, rel: str, text: str) -> None:
     path = os.path.join(mdef, *rel.split("/"))
     bom = read_text(path)[1] if os.path.exists(path) else b""
@@ -43,11 +74,11 @@ def _eol(text: str) -> str:
     return "\r\n" if "\r\n" in text else "\n"
 
 
-def _ref_line(mdef: str, kind: str, name: str, add: bool) -> None:
-    """Add or drop `ref <kind> <name>` in model.tmdl."""
+def _ref_line(mdef: str, kind: str, name: str, add: bool):
+    """Plan `ref <kind> <name>` in model.tmdl. Does not write. None when the line is already right."""
     path = os.path.join(mdef, "model.tmdl")
-    if not os.path.exists(path):
-        return
+    if not os.path.isfile(path):
+        raise PbzError("NO_MIRROR", "model.tmdl is missing; run `pbz pull` first")
     text, bom = read_text(path)
     eol = _eol(text)
     pat = re.compile(rf"(?m)^ref {kind} ('(?:[^']|'')*'|\S+)[ \t]*(?:\r?\n|$)")
@@ -56,9 +87,10 @@ def _ref_line(mdef: str, kind: str, name: str, add: bool) -> None:
         refs = list(re.finditer(r"(?m)^ref \w+ .*$", text))
         line = f"ref {kind} {_q(name)}"
         new = text[:refs[-1].end()] + eol + line + text[refs[-1].end():] if refs else text.rstrip("\r\n") + eol + eol + line + eol
-        write_text(path, new, bom)
-    elif not add and hits:
-        write_text(path, apply_edits(text, [(m.start(), m.end(), "") for m in hits]), bom)
+        return ("write", path, new, bom)
+    if not add and hits:
+        return ("write", path, apply_edits(text, [(m.start(), m.end(), "") for m in hits]), bom)
+    return None
 
 
 def culture_docs(mdef: str) -> dict:
@@ -158,8 +190,7 @@ def culture_rename_texts(mdef: str, kind: str, table: str, old: str, new: str) -
 def culture_edits_rename(mdef: str, kind: str, table: str, old: str, new: str) -> list[str]:
     """Rename an object's translation entries in every mirrored culture file. Returns changed rels."""
     planned = culture_rename_texts(mdef, kind, table, old, new)
-    for rel, text in planned.items():
-        _write(mdef, rel, text)
+    _commit_texts(mdef, planned)
     return list(planned)
 
 
@@ -214,8 +245,7 @@ def culture_move_texts(mdef: str, src: str, dst: str, measure: str) -> dict[str,
 def culture_edits_move(mdef: str, src: str, dst: str, measure: str) -> list[str]:
     """Move a measure's translations from table src to table dst in every culture file."""
     planned = culture_move_texts(mdef, src, dst, measure)
-    for rel, text in planned.items():
-        _write(mdef, rel, text)
+    _commit_texts(mdef, planned)
     return list(planned)
 
 
@@ -251,33 +281,42 @@ def perspective_move_texts(mdef: str, src: str, dst: str, measure: str, texts: d
 def perspective_edits_move(mdef: str, src: str, dst: str, measure: str) -> list[str]:
     """Move a measure's perspective membership from perspectiveTable src to dst (created if missing)."""
     planned = perspective_move_texts(mdef, src, dst, measure)
-    for rel, text in planned.items():
-        _write(mdef, rel, text)
+    _commit_texts(mdef, planned)
     return list(planned)
 
 
 def culture_add(ws, project, code: str) -> dict:
     if not CODE_RE.match(code):
         raise PbzError("BAD_REQUEST", "culture code like de-DE or fr-FR")
+    mdef = os.path.join(project.mirror_model, "definition")
+    _require_model_tmdl(mdef)
     mdef, model = _model(project)
     rel = f"cultures/{code}.tmdl"
     if os.path.exists(os.path.join(mdef, *rel.split("/"))):
         raise PbzError("NAME_TAKEN", code)
     mname = model.model_node.name if model.model_node is not None else "Model"
-    _write(mdef, rel, f"cultureInfo {code}\n\n\ttranslations\n\n\t\tmodel {_q(mname)}\n")
-    _ref_line(mdef, "cultureInfo", code, True)
+    _commit([_write_op(mdef, rel, f"cultureInfo {code}\n\n\ttranslations\n\n\t\tmodel {_q(mname)}\n"),
+             _ref_line(mdef, "cultureInfo", code, True)])
     return {"verb": "culture", "action": "added", "culture": code, "files": [_rel(project, rel), _rel(project, "model.tmdl")],
             "next": f"pbz translate {code} <object> --caption ..., pbz culture missing {code}"}
 
 
 def culture_remove(ws, project, code: str) -> dict:
+    mdef = os.path.join(project.mirror_model, "definition")
+    _require_model_tmdl(mdef)
     mdef, _model_ = _model(project)
-    path = os.path.join(mdef, "cultures", f"{code}.tmdl")
+    rel = f"cultures/{code}.tmdl"
+    path = os.path.join(mdef, *rel.split("/"))
     if not os.path.exists(path):
         raise PbzError("NOT_FOUND", f"culture {code}")
-    os.remove(path)
-    _ref_line(mdef, "cultureInfo", code, False)
-    return {"verb": "culture", "action": "removed", "culture": code, "next": "pbz diff, pbz push"}
+    ref = _ref_line(mdef, "cultureInfo", code, False)
+    files = [_rel(project, rel)]
+    ops = [("delete", path)]
+    if ref:
+        ops.append(ref)
+        files.append(_rel(project, "model.tmdl"))
+    _commit(ops)
+    return {"verb": "culture", "action": "removed", "culture": code, "files": files, "next": "pbz diff, pbz push"}
 
 
 def _culture(mdef: str, code: str):
@@ -403,24 +442,34 @@ def _perspective(mdef: str, name: str):
 
 
 def perspective_add(ws, project, name: str) -> dict:
+    mdef = os.path.join(project.mirror_model, "definition")
+    _require_model_tmdl(mdef)
     mdef, model = _model(project)
     if TOKEN_RE.search(name) or not name.strip():
         raise PbzError("BAD_REQUEST", "a perspective needs a plain name")
     if any(p.lower() == name.lower() for p in model.perspectives):
         raise PbzError("NAME_TAKEN", name)
-    rel = f"perspectives/{_file_name(name)}.tmdl"
-    _write(mdef, rel, f"perspective {_q(name)}\n")
-    _ref_line(mdef, "perspective", name, True)
-    return {"verb": "perspective", "action": "added", "perspective": name, "files": [_rel(project, rel)],
+    rel = _destination(mdef, "perspectives", name)
+    _commit([_write_op(mdef, rel, f"perspective {_q(name)}\n"), _ref_line(mdef, "perspective", name, True)])
+    return {"verb": "perspective", "action": "added", "perspective": name,
+            "files": [_rel(project, rel), _rel(project, "model.tmdl")],
             "next": f"pbz perspective include \"{name}\" <objects...>"}
 
 
 def perspective_remove(ws, project, name: str) -> dict:
+    mdef = os.path.join(project.mirror_model, "definition")
+    _require_model_tmdl(mdef)
     mdef, _m = _model(project)
-    rel, _doc, _node = _perspective(mdef, name)
-    os.remove(os.path.join(mdef, *rel.split("/")))
-    _ref_line(mdef, "perspective", name, False)
-    return {"verb": "perspective", "action": "removed", "perspective": name, "next": "pbz diff, pbz push"}
+    rel, _doc, node = _perspective(mdef, name)
+    ref = _ref_line(mdef, "perspective", node.name, False)
+    files = [_rel(project, rel)]
+    ops = [("delete", os.path.join(mdef, *rel.split("/")))]
+    if ref:
+        ops.append(ref)
+        files.append(_rel(project, "model.tmdl"))
+    _commit(ops)
+    return {"verb": "perspective", "action": "removed", "perspective": node.name, "files": files,
+            "next": "pbz diff, pbz push"}
 
 
 PKIND = {"column": "perspectiveColumn", "measure": "perspectiveMeasure", "hierarchy": "perspectiveHierarchy"}
@@ -492,6 +541,8 @@ def _role(mdef: str, model, name: str):
 
 
 def role_add(ws, project, name: str, permission: str = "read") -> dict:
+    mdef = os.path.join(project.mirror_model, "definition")
+    _require_model_tmdl(mdef)
     mdef, model = _model(project)
     if permission not in ("read", "readRefresh", "refresh", "administrator", "none"):
         raise PbzError("BAD_REQUEST", "permission: read, readRefresh, refresh, administrator or none")
@@ -499,19 +550,27 @@ def role_add(ws, project, name: str, permission: str = "read") -> dict:
         raise PbzError("BAD_REQUEST", "a role needs a plain name")
     if any(r.lower() == name.lower() for r in model.role_nodes):
         raise PbzError("NAME_TAKEN", name)
-    rel = f"roles/{_file_name(name)}.tmdl"
-    _write(mdef, rel, f"role {_q(name)}\n\tmodelPermission: {permission}\n")
-    _ref_line(mdef, "role", name, True)
-    return {"verb": "role", "action": "added", "role": name, "files": [_rel(project, rel)],
+    rel = _destination(mdef, "roles", name)
+    _commit([_write_op(mdef, rel, f"role {_q(name)}\n\tmodelPermission: {permission}\n"),
+             _ref_line(mdef, "role", name, True)])
+    return {"verb": "role", "action": "added", "role": name,
+            "files": [_rel(project, rel), _rel(project, "model.tmdl")],
             "next": f"pbz role filter \"{name}\" <table> \"<DAX>\", then pbz push; members are usually assigned in the service"}
 
 
 def role_remove(ws, project, name: str) -> dict:
+    mdef = os.path.join(project.mirror_model, "definition")
+    _require_model_tmdl(mdef)
     mdef, model = _model(project)
     rel, _doc, node = _role(mdef, model, name)
-    os.remove(os.path.join(mdef, *rel.split("/")))
-    _ref_line(mdef, "role", node.name, False)
-    return {"verb": "role", "action": "removed", "role": node.name, "next": "pbz diff, pbz push"}
+    ref = _ref_line(mdef, "role", node.name, False)
+    files = [_rel(project, rel)]
+    ops = [("delete", os.path.join(mdef, *rel.split("/")))]
+    if ref:
+        ops.append(ref)
+        files.append(_rel(project, "model.tmdl"))
+    _commit(ops)
+    return {"verb": "role", "action": "removed", "role": node.name, "files": files, "next": "pbz diff, pbz push"}
 
 
 def role_filter(ws, project, name: str, table: str, dax: str | None) -> dict:
