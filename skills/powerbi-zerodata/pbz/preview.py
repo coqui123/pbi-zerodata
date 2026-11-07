@@ -375,6 +375,11 @@ def run(ws, project, page: str | None = None, spec=None) -> dict:
             fill[name] = round(_union_area(rects) / (region[2]*region[3]), 4)
             if fill[name] < minimum:
                 finding('REGION_UNDERUSED', region=name)
+        def rendering(kind):
+            return 'geometry_only' if kind in KNOWN_TYPES else 'unsupported'
+        capabilities = {'layout': 'geometry_only', 'text_fit': 'unsupported', 'interaction': 'unsupported',
+                        'custom_visuals': 'unsupported' if any(v['kind'] not in KNOWN_TYPES for v in live) else 'not_applicable'}
+        visual_capabilities = [{'id': v['id'], 'rendering': rendering(v['kind'])} for v in live]
         stem = hashlib.sha256(pid.encode('utf-8')).hexdigest()[:20]
         svg_path = _inside(output / (stem + '.svg'), mirror)
         metadata_path = _inside(output / (stem + '.json'), mirror)
@@ -385,6 +390,7 @@ def run(ws, project, page: str | None = None, spec=None) -> dict:
                   **({'background_receipt': asset['id'], 'background_sha256': asset['sha256'],
                       'background_binding': 'EXPLICIT_APPROVED_ASSET'} if asset else {}),
                   'custom_visual_rendering': 'UNSUPPORTED' if any(v['kind'] not in KNOWN_TYPES for v in live) else 'NOT_APPLICABLE',
+                  'capabilities': capabilities, 'visual_capabilities': visual_capabilities,
                   'size': [width,height], 'region_fill': fill, 'findings': current}
         _write(svg_path, svg, mirror)
         _write(metadata_path, json.dumps(record, indent=2) + '\n', mirror)

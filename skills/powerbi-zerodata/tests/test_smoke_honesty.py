@@ -53,7 +53,7 @@ class SmokeHonestyTests(unittest.TestCase):
         self.assertIsNotNone(dax)
         self.assertNotIn("TREATAS", dax)
 
-    def test_datetime_time_is_partial(self):
+    def test_datetime_time_is_preserved(self):
         visual = {"visual": {"visualType": "tableEx", "query": {"queryState": {"Values": {"projections": [
             {"field": _column("Sales", "When")}]}}}},
             "filterConfig": {"filters": [{"filter": {"From": [{"Name": "s", "Entity": "Sales", "Type": 0}],
@@ -62,9 +62,9 @@ class SmokeHonestyTests(unittest.TestCase):
                     "Left": {"Column": {"Expression": {"SourceRef": {"Source": "s"}}, "Property": "When"}},
                     "Right": {"Literal": {"Value": "datetime'2020-01-02T15:04:05'"}}}}}]}}]}}
         dax, coverage = smoke.build_query(_parse(visual), _parse({}), self.model, self.tm)
-        self.assertEqual(coverage, "PARTIAL")
-        self.assertIn("DATE(2020, 1, 2)", dax)
-        self.assertNotIn("15", dax)
+        self.assertEqual(coverage, "FULL")
+        self.assertIn("DATE(2020, 1, 2) + TIME(15, 4, 5)", dax)
+        self.assertNotIn("DATETIME(", dax)
 
     def test_protocol_error_on_malformed_engine_status(self):
         tmp = tempfile.TemporaryDirectory()
@@ -155,6 +155,143 @@ class SmokeHonestyTests(unittest.TestCase):
         self.assertEqual(stage, "EXECUTED")
         self.assertEqual(summary["outcome"], "INCOMPLETE")
         self.assertTrue(summary["partial_filters"])
+
+
+def _visual(filters=None):
+    visual = {"visual": {"visualType": "tableEx", "query": {"queryState": {"Values": {"projections": [
+        {"field": _column("Sales", "Region")}]}}}}}
+    if filters is not None:
+        visual["filterConfig"] = {"filters": filters}
+    return visual
+
+
+def _where(condition, source="s", entity="Sales"):
+    return {"filter": {"From": [{"Name": source, "Entity": entity, "Type": 0}],
+                       "Where": [{"Condition": condition}]}}
+
+
+def _col(source, name):
+    return {"Column": {"Expression": {"SourceRef": {"Source": source}}, "Property": name}}
+
+
+class SmokeFidelityTests(unittest.TestCase):
+    def setUp(self):
+        self.model = tmdl.Model()
+        self.tm = type("TM", (), {"get": lambda self, _tok: None})()
+
+    def query(self, visual, page=None, report=None):
+        return smoke.build_query(_parse(visual), _parse(page or {}), self.model, self.tm,
+                                 _parse(report) if report is not None else None)
+
+    def test_report_filter_is_applied(self):
+        report = {"filterConfig": {"filters": [_where({"In": {
+            "Expressions": [_col("s", "Region")],
+            "Values": [[{"Literal": {"Value": "'East'"}}]]}})]}}
+        dax, coverage = self.query(_visual(), report=report)
+        self.assertEqual(coverage, "FULL")
+        self.assertIn('TREATAS({"East"}, \'Sales\'[Region])', dax)
+
+    def test_unsupported_report_filter_is_partial(self):
+        report = {
+            "filterConfig": {
+                "filters": [
+                    {"type": "TopN", "filter": {"Where": [{"Condition": {"In": {}}}]}},
+                ],
+            },
+        }
+        dax, coverage = self.query(_visual(), report=report)
+        self.assertEqual(coverage, "PARTIAL")
+        self.assertNotIn("TREATAS", dax)
+        self.assertIn("SUMMARIZECOLUMNS", dax)
+
+    def test_run_loads_report_json_filter(self):
+        ws, project = SmokeHonestyTests._smoke_fixture(self)
+        report = {"filterConfig": {"filters": [_where({"In": {
+            "Expressions": [_col("s", "Region")],
+            "Values": [[{"Literal": {"Value": "'East'"}}]]}})]}}
+        (Path(project.mirror_report) / "definition" / "report.json").write_text(json.dumps(report))
+        seen = {}
+
+        def fake(_verb, payload, timeout=1800):
+            seen["dax"] = payload["visuals"][0]["dax"]
+            return {"ok": True, "visuals": [{"id": "p1/v1", "status": "OK"}]}
+
+        with patch("pbz.checks.spend", return_value=True), \
+             patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.smoke.engine_call", side_effect=fake):
+            out = smoke.run(ws, project)
+        self.assertIn('TREATAS({"East"}, \'Sales\'[Region])', seen["dax"])
+        self.assertEqual(out["visuals"][0]["status"], "OK")
+        self.assertEqual(out["visuals"][0]["coverage"], "FULL")
+        self.assertEqual(out["summary"]["executed"].get("OK"), 1)
+        self.assertEqual(out["summary"]["not_executed"], {})
+
+    def test_multicolumn_in_keeps_row_pairs(self):
+        cond = {"In": {"Expressions": [_col("s", "Region"), _col("s", "Qty")], "Values": [
+            [{"Literal": {"Value": "'A'"}}, {"Literal": {"Value": "1L"}}],
+            [{"Literal": {"Value": "'B'"}}, {"Literal": {"Value": "2L"}}]]}}
+        dax, coverage = self.query(_visual([_where(cond)]))
+        self.assertEqual(coverage, "FULL")
+        self.assertIn('TREATAS({("A", 1), ("B", 2)}, \'Sales\'[Region], \'Sales\'[Qty])', dax)
+        self.assertEqual(dax.count("TREATAS"), 1)
+        self.assertNotIn('TREATAS({"A", "B"}', dax)
+        self.assertNotIn("TREATAS({1, 2}", dax)
+
+    def test_broken_multicolumn_in_is_not_expanded(self):
+        cond = {"In": {"Expressions": [_col("s", "Region"), _col("s", "Qty")], "Values": [
+            [{"Literal": {"Value": "'A'"}}]]}}
+        dax, coverage = self.query(_visual([_where(cond)]))
+        self.assertEqual(coverage, "PARTIAL")
+        self.assertNotIn("TREATAS", dax)
+
+    def test_and_of_supported_conditions(self):
+        cond = {"And": {
+            "Left": {"Comparison": {"ComparisonKind": 1, "Left": _col("s", "Region"),
+                                    "Right": {"Literal": {"Value": "'A'"}}}},
+            "Right": {"In": {"Expressions": [_col("s", "Qty")],
+                             "Values": [[{"Literal": {"Value": "2L"}}]]}}}}
+        dax, coverage = self.query(_visual([_where(cond)]))
+        self.assertEqual(coverage, "FULL")
+        self.assertIn("KEEPFILTERS(FILTER(ALL('Sales'[Region]), 'Sales'[Region] > \"A\"))", dax)
+        self.assertIn("TREATAS({2}, 'Sales'[Qty])", dax)
+
+    def test_topn_measure_and_interaction_stay_partial(self):
+        top = self.query(_visual([{"type": "TopN", "filter": {"From": [], "Where": [{"Condition": {"In": {"Table": {}}}}]}}]))
+        self.assertEqual(top[1], "PARTIAL")
+        self.assertNotIn("TREATAS", top[0])
+        measure = {"Comparison": {"ComparisonKind": 2, "Left": {"Measure": {"Expression": {"SourceRef": {"Source": "s"}},
+                                                                            "Property": "Total"}},
+                                  "Right": {"Literal": {"Value": "10D"}}}}
+        dax, coverage = self.query(_visual([_where(measure)]))
+        self.assertEqual(coverage, "PARTIAL")
+        self.assertNotIn("Total", dax)
+        page = {"visualInteractions": [{"source": "a", "target": "b", "type": "DataFilter"}]}
+        dax, coverage = self.query(_visual(), page=page)
+        self.assertEqual(coverage, "PARTIAL")
+        self.assertIn("SUMMARIZECOLUMNS", dax)
+
+    def test_datetime_fraction_is_partial_but_keeps_the_clock(self):
+        cond = {"Comparison": {"ComparisonKind": 1, "Left": _col("s", "When"),
+                               "Right": {"Literal": {"Value": "datetime'2020-01-02T15:04:05.25'"}}}}
+        dax, coverage = self.query(_visual([_where(cond)]))
+        self.assertEqual(coverage, "PARTIAL")
+        self.assertIn("DATE(2020, 1, 2) + TIME(15, 4, 5)", dax)
+        self.assertNotIn("DATETIME(", dax)
+        self.assertNotIn("0.25", dax)
+
+    def test_datetime_offset_is_partial(self):
+        cond = {"Comparison": {"ComparisonKind": 1, "Left": _col("s", "When"),
+                               "Right": {"Literal": {"Value": "datetime'2020-01-02T15:04:05+05:00'"}}}}
+        dax, coverage = self.query(_visual([_where(cond)]))
+        self.assertEqual(coverage, "PARTIAL")
+        self.assertIn("DATE(2020, 1, 2) + TIME(15, 4, 5)", dax)
+        self.assertNotIn("+05", dax)
+
+    def test_sibling_slicer_forces_partial(self):
+        dax, coverage = smoke.build_query(
+            _parse(_visual()), _parse({}), self.model, self.tm, page_has_slicers=True)
+        self.assertEqual(coverage, "PARTIAL")
+        self.assertIsNotNone(dax)
 
 
 class CultureMoveTests(unittest.TestCase):

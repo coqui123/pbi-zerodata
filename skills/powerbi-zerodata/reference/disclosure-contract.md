@@ -1,7 +1,7 @@
 # Disclosure contract
 
 What an agent may see from pbz. This is the closed contract for Release 1. It does not add new
-derived outputs. Storage bands and the three memory predicates below are grandfathered as they
+derived outputs. The full slot allowlist tokenizer remains an R2 follow-up; Release 1 stays fail-closed without it. Storage bands and the three memory predicates below are grandfathered as they
 already ship; this note cites them and does not reopen that policy.
 
 Heuristic classification is **not** an OS boundary. Closed verdicts do **not** prove that a fact

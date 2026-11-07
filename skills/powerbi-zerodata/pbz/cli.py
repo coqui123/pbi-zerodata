@@ -115,7 +115,12 @@ def cmd_init(ws, project, a):
     return res
 
 
-def main(argv=None) -> int:
+def argument_parser():
+    """Argparse tree only. Contract tests use this; it does not run a command."""
+    return main(parser_only=True)
+
+
+def main(argv=None, *, parser_only: bool = False) -> int:
     for stream in (sys.stdout, sys.stderr):  # tokens and arrows must survive cp1252 consoles
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -130,33 +135,34 @@ def main(argv=None) -> int:
     ap.add_argument("--project", help="project name when the workspace holds several .pbip files")
     ap.add_argument("--workspace", help="workspace root (default: discover from the current folder)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("status")
+    sub.add_parser("capabilities", help="closed capability matrix: what pbz can and cannot certify")
+    sub.add_parser("status", help="workspace, mirror, sync, Desktop and engine")
     sub.add_parser("doctor", help="read-only OS-isolation checklist; changes nothing")
-    sub.add_parser("init")
+    sub.add_parser("init", help="create the policy, scan data-bearing files, and pull the first mirror")
     p = sub.add_parser("scan")
     p.add_argument("--dry-run", action="store_true")
-    p = sub.add_parser("pull")
+    p = sub.add_parser("pull", help="refresh the sanitized mirror from the real files")
     p.add_argument("--force", action="store_true", help="discard unpushed mirror edits")
     p.add_argument("--rebase", action="store_true", help="merge unpushed mirror edits onto the new real files")
     p = sub.add_parser("diff")
     p.add_argument("--patch", action="store_true")
-    p = sub.add_parser("push")
+    p = sub.add_parser("push", help="validate mirror edits, back up, then write the real files")
     p.add_argument("--reload", action="store_true", help="report-only change: reload the open Desktop")
     p.add_argument("--dry-run", action="store_true", help="validate only")
     p.add_argument("--only", nargs="+", metavar="PATH", help="push only these mirror files (globs or folder prefixes)")
     p = sub.add_parser("revert", help="discard mirror edits: files back to the last pull / push, or one object")
     p.add_argument("paths", nargs="*", help="mirror files (globs, folder prefixes); default all")
     p.add_argument("--object", help="one TMDL object: measure 'Table'[Name] (also column, hierarchy, partition, calculationItem)")
-    p = sub.add_parser("rename")
+    p = sub.add_parser("rename", help="rename a measure, column or table and fix references")
     p.add_argument("kind", choices=["measure", "column", "table"])
     p.add_argument("old")
     p.add_argument("new")
     p.add_argument("--table")
-    p = sub.add_parser("describe")
+    p = sub.add_parser("describe", help="data dictionary: the model, a table, a measure or a column")
     p.add_argument("target", nargs="?", help="table name, [Measure] or 'Table'[Column]; omit for a model overview")
     p = sub.add_parser("values")
     p.add_argument("column", help="'Table'[Column]")
-    sub.add_parser("validate")
+    sub.add_parser("validate", help="metadata checks on the mirror: lint, references, PBIR")
     p = sub.add_parser("preflight", help="full private staged validation without applying edits")
     p.add_argument("--only", nargs="+")
     p = sub.add_parser("recover", help="recover an interrupted push without overwriting later edits")
@@ -181,25 +187,25 @@ def main(argv=None) -> int:
     p.add_argument("target")
     p.add_argument("--purpose", choices=["requirements", "reference", "brand-asset", "other-source"], default="reference")
     p.add_argument("--attested", action="store_true", help="human confirms the entire file contains no sensitive data")
-    p = sub.add_parser("desktop")
+    p = sub.add_parser("desktop", help="Power BI Desktop without screenshots: status, open, close, reload")
     p.add_argument("action", choices=["status", "open", "close", "reload"])
     p.add_argument("--wait", type=int, default=240)
-    sub.add_parser("index")
+    sub.add_parser("index", help="build the column classification index in the open Desktop")
     p = sub.add_parser("refresh")
     p.add_argument("--tables", nargs="*")
-    sub.add_parser("health")
-    p = sub.add_parser("check")
+    sub.add_parser("health", help="objects in error in the open Desktop model (classes only)")
+    p = sub.add_parser("check", help="data-blind assertions against the open Desktop model")
     p.add_argument("spec", help="path to a checks JSON file, or inline JSON")
     p.add_argument("--validate-only", action="store_true", help="validate specification before spending disclosure budget")
     p.add_argument("--diagnostic", action="store_true", help="expected hypothesis differences are findings, not a failed gate")
-    p = sub.add_parser("probe")
+    p = sub.add_parser("probe", help="shape facts of a table: booleans and coarse buckets")
     p.add_argument("table")
     p.add_argument("--columns", nargs="*")
     p = sub.add_parser("snapshot")
     p.add_argument("action", choices=["save", "compare"])
     p.add_argument("name")
     p.add_argument("--spec", help="queries JSON file (compare reuses the saved spec when omitted)")
-    p = sub.add_parser("smoke")
+    p = sub.add_parser("smoke", help="approximate per-visual query: OK, EMPTY, UNSUPPORTED or ERROR")
     p.add_argument("--page")
     p = sub.add_parser("review", help="review packet: pending changes by release class, impact, revision-bound evidence, "
                                       "coverage (writes pbz-workspace/REVIEW.md)")
@@ -508,19 +514,24 @@ def main(argv=None) -> int:
     p = sub.add_parser("layout", help="text canvas map of report pages plus layout lint")
     p.add_argument("--page", help="page display name or id (draws its map)")
     p.add_argument("--no-map", action="store_true")
-    p = sub.add_parser("admin")
+    p = sub.add_parser("admin", help="human-only: reset the budget, allow a path, set a category, read the log")
     p.add_argument("action", choices=["budget-reset", "allow", "category", "synthetic", "log", "consumer-remove"])
     p.add_argument("value", nargs="?")
+    if parser_only:
+        return ap
     a = ap.parse_args(argv)
     if a.cmd == "mcp":
         from pbz import mcp
         return mcp.serve(a.workspace, a.project)
     try:
-        if a.cmd in ("check-schema", "doctor") or (a.cmd == "interactions" and a.action == "capabilities"):
+        if a.cmd in ("check-schema", "doctor", "capabilities") or (a.cmd == "interactions" and a.action == "capabilities"):
             from pbz import interactiontest
             from pbz.outcomes import envelope
             if a.cmd == "doctor":
                 out = cmd_doctor()
+            elif a.cmd == "capabilities":
+                from pbz.capabilities import matrix
+                out = matrix()
             elif a.cmd == "check-schema":
                 out = {"verb": "check-schema", "schema": checks.check_schema()}
             else:

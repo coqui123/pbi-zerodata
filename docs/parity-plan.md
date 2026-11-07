@@ -25,6 +25,9 @@ canary e2e. Deviations from the plan below:
   translation are skipped as manual removals (pbz reads the real culture files for names only). TOM
   on push also refuses a removal that would leave a dangling translation (verified).
 
+  **Current behavior:** Round 3 mirrors cultures, and rename, move and remove keep translations
+  when they are mirrored. Legacy mirrors without cultures still refuse rename and move with "run pbz pull".
+
 - BPA catalog: 53 model rules (42 on by default, 6 opinion, 5 data-derived and never run) and 21
   report rules (20 on, 1 opinion). Every rule citing `BPARules.json` uses the upstream rule id
   (checked against the file on 2026-11-04); other rules cite semantic-link-labs or are pbz's own.

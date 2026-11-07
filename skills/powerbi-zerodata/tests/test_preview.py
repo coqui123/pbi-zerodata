@@ -207,6 +207,25 @@ class PreviewTests(unittest.TestCase):
             asset.write_bytes(png(False))
             with self.assertRaises(PbzError):preview.run(self.ws,self.project,spec=spec)
 
+    def test_capability_labels_do_not_claim_native_fit_or_interaction(self):
+        self.visual('card', 'card', [20, 20, 100, 80])
+        self.visual('custom', 'CustomViz', [140, 20, 100, 80])
+        result = preview.run(self.ws, self.project)
+        page = result['pages'][0]
+        caps = page['capabilities']
+        self.assertEqual(caps['layout'], 'geometry_only')
+        self.assertEqual(caps['text_fit'], 'unsupported')
+        self.assertEqual(caps['interaction'], 'unsupported')
+        self.assertEqual(caps['custom_visuals'], 'unsupported')
+        by_id = {item['id']: item['rendering'] for item in page['visual_capabilities']}
+        self.assertEqual(by_id['card'], 'geometry_only')
+        self.assertEqual(by_id['custom'], 'unsupported')
+        stored = json.loads(Path(page['metadata']).read_text(encoding='utf-8'))
+        self.assertEqual(stored['capabilities'], caps)
+        blob = json.dumps(page)
+        self.assertNotIn('native_text_fit', blob)
+        self.assertNotIn('interaction_certified', blob)
+
 
 if __name__ == '__main__':
     unittest.main()

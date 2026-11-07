@@ -11,14 +11,71 @@ ENUMS = {"grain": {"project", "record", "role-month"}, "status_scope": {"open", 
          "date_basis": {"observed", "planned", "current", "snapshot"}}
 
 
-def capture(ws, project, max_age_hours=24):
+REFRESH = {"FRESH", "STALE", "UNKNOWN"}
+COVERAGE = {"COMPLETE", "PARTIAL"}
+_ENGINE_CLASS = {"ENGINE_UNAVAILABLE", "TIMEOUT", "NOT_READY", "BAD_REQUEST", "OTHER"}
+_NOTE = "Refresh does not certify source publication. Raw timestamps remain in protected storage."
+
+
+def _aware(instant: dt.datetime) -> dt.datetime:
+    if instant.tzinfo is None:
+        return instant.replace(tzinfo=dt.timezone.utc)
+    return instant.astimezone(dt.timezone.utc)
+
+
+def classify_partitions(partitions, *, now, max_age_hours) -> dict:
+    """Closed labels for partition refresh times. Raw timestamps are not returned.
+
+    Matches the engine rule: age <= max_age_hours is FRESH, older is STALE, missing or future is UNKNOWN.
+    No partitions is UNKNOWN / PARTIAL. Source publication is never inferred from a refresh time.
+    """
+    stale = unknown = any_part = False
+    now = _aware(now)
+    limit = dt.timedelta(hours=max_age_hours)
+    for part in partitions if isinstance(partitions, list) else []:
+        any_part = True
+        raw = part.get("refreshed") if isinstance(part, dict) else None
+        state = "UNKNOWN"
+        if isinstance(raw, str):
+            try:
+                instant = _aware(dt.datetime.fromisoformat(raw.replace("Z", "+00:00")))
+            except ValueError:
+                instant = None
+            if instant is not None:
+                age = now - instant
+                if age >= dt.timedelta(0):
+                    state = "FRESH" if age <= limit else "STALE"
+        stale = stale or state == "STALE"
+        unknown = unknown or state == "UNKNOWN"
+    refresh = "STALE" if stale else "UNKNOWN" if unknown or not any_part else "FRESH"
+    coverage = "PARTIAL" if unknown or not any_part else "COMPLETE"
+    return {"refresh": refresh, "source_publication": "UNKNOWN", "coverage": coverage}
+
+
+def _closed(refresh, coverage) -> dict:
+    if not isinstance(refresh, str) or refresh not in REFRESH:
+        refresh, coverage = "UNKNOWN", "PARTIAL"
+    if not isinstance(coverage, str) or coverage not in COVERAGE:
+        coverage = "PARTIAL"
+    return {"ok": True, "verb": "provenance", "refresh": refresh, "source_publication": "UNKNOWN",
+            "coverage": coverage, "note": _NOTE}
+
+
+def capture(ws, project, max_age_hours=24, now=None):
     if type(max_age_hours) is not int or not 1 <= max_age_hours <= 8760:
         raise PbzError("BAD_REQUEST", "max age must be 1..8760 hours")
     result = engine_call("provenance", {"private_dir": ws.private, "port": desktop.require_port(project),
                                       "max_age_hours": max_age_hours})
     if not result.get("ok"):
-        raise PbzError(result.get("class", "ENGINE_UNAVAILABLE"))
-    return result
+        klass = result.get("class")
+        if not isinstance(klass, str) or klass not in _ENGINE_CLASS:
+            raise PbzError("PROTOCOL_ERROR", "engine provenance failure class is not in the closed vocabulary")
+        raise PbzError(klass)
+    if "partitions" in result:
+        labels = classify_partitions(result.get("partitions"), now=now or dt.datetime.now(dt.timezone.utc),
+                                     max_age_hours=max_age_hours)
+        return _closed(labels["refresh"], labels["coverage"])
+    return _closed(result.get("refresh"), result.get("coverage"))
 
 
 def _instant(value):

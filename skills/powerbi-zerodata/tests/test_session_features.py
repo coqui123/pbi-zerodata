@@ -77,7 +77,7 @@ class Fixture(unittest.TestCase):
 
     def test_capability_commands_without_workspace(self):
         with patch('pbz.cli.find_workspace', side_effect=AssertionError('workspace discovery should not run')):
-            for args in [['check-schema'], ['interactions', 'capabilities']]:
+            for args in [['check-schema'], ['interactions', 'capabilities'], ['capabilities']]:
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
                     self.assertEqual(cli.main(args), 0)

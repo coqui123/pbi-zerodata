@@ -25,20 +25,27 @@ def col_dax(table: str, col: str) -> str:
 
 
 def _date_dax(v: str) -> tuple[str | None, bool]:
-    """DATE(...) for a date or midnight datetime. Second value: a clock time was dropped."""
+    """DATE, or DATE+TIME when a clock is present. Second value: precision was dropped (fraction/offset)."""
     m = _DT.fullmatch(v.strip())
     if not m:
         return None, False
-    dax = f"DATE({int(m.group('y'))}, {int(m.group('mo'))}, {int(m.group('d'))})"
+    y, mo, d = int(m.group("y")), int(m.group("mo")), int(m.group("d"))
+    date = f"DATE({y}, {mo}, {d})"
+    # Group 0 is the whole match; look behind the matched string for a timezone suffix.
+    offset = bool(re.search(r"(?:Z|[+-]\d{2}:\d{2})$", v.strip()))
     if m.group("h") is None:
-        return dax, False
+        return date, offset
+    h, mi, s = int(m.group("h")), int(m.group("mi")), int(m.group("s") or 0)
     frac = m.group("f")
-    midnight = int(m.group("h")) == int(m.group("mi")) == int(m.group("s") or 0) == 0 and not (frac and int(frac) != 0)
-    return dax, not midnight
+    dropped = bool(frac and int(frac) != 0) or offset
+    if h == mi == s == 0 and not dropped:
+        return date, False
+    # DATETIME() is not a DAX constructor; DATE + TIME is.
+    return f"(DATE({y}, {mo}, {d}) + TIME({h}, {mi}, {s}))", dropped
 
 
 def _lit_dax(raw: str, tm) -> tuple[str | None, bool]:
-    """(dax, time_truncated). time_truncated is true when a datetime clock time became DATE(...)."""
+    """(dax, precision_lost). precision_lost when fraction/offset is dropped from a datetime literal."""
     if tokens.TOKEN_RE.fullmatch(raw or ""):
         rec = tm.get(raw)
         if not rec or rec.get("kind") != "lit":
@@ -57,6 +64,88 @@ def _lit_dax(raw: str, tm) -> tuple[str | None, bool]:
     return None, False
 
 
+_UNSUPPORTED_FILTER_TYPES = {"TopN", "RelativeDate", "RelativeTime", "AdvancedRelativeDate"}
+
+
+def _cell_dax(cell, tm) -> tuple[str | None, bool]:
+    lit = cell.get("Literal") if isinstance(cell, pbir.JObj) else None
+    raw = lit.get("Value").value if isinstance(lit, pbir.JObj) and isinstance(lit.get("Value"), pbir.JStr) else None
+    if raw is None:
+        return None, False
+    return _lit_dax(raw, tm)
+
+
+def _column_ref(node, aliases, model):
+    ref = pbir.field_of(node, aliases, model)
+    if not ref or ref.kind not in ("column", "hierarchy") or not ref.table or not ref.name:
+        return None
+    return ref
+
+
+def _in_filter(inn, aliases, model, tm) -> tuple[str | None, bool]:
+    """One TREATAS. Multi-column rows stay paired; a broken row is omitted entirely."""
+    if not isinstance(inn, pbir.JObj) or "Table" in inn:
+        return None, True
+    exprs = inn.get("Expressions")
+    cols = [_column_ref(e, aliases, model) for e in (exprs.items if isinstance(exprs, pbir.JArr) else [])]
+    vals = inn.get("Values")
+    if not cols or any(c is None for c in cols) or not isinstance(vals, pbir.JArr) or not vals.items:
+        return None, True
+    rows, partial = [], False
+    for row in vals.items:
+        cells = row.items if isinstance(row, pbir.JArr) else None
+        if cells is None or len(cells) != len(cols):
+            return None, True
+        lits = []
+        for cell in cells:
+            d, trunc = _cell_dax(cell, tm)
+            partial = partial or trunc
+            if d is None:
+                return None, True
+            lits.append(d)
+        rows.append(lits)
+    targets = ", ".join(col_dax(c.table, c.name) for c in cols)
+    if len(cols) == 1:
+        body = ", ".join(r[0] for r in rows)
+    else:
+        body = ", ".join("(" + ", ".join(r) + ")" for r in rows)
+    return f"TREATAS({{{body}}}, {targets})", partial
+
+
+def _cmp_filter(cmp_, aliases, model, tm) -> tuple[str | None, bool]:
+    if not isinstance(cmp_, pbir.JObj):
+        return None, True
+    ref = _column_ref(cmp_.get("Left"), aliases, model)
+    right = cmp_.get("Right")
+    kind = cmp_.get("ComparisonKind")
+    op = CMP.get(kind.value if isinstance(kind, pbir.JLit) else None)
+    d, trunc = _cell_dax(right, tm)
+    if not ref or not op or d is None:
+        return None, True
+    c = col_dax(ref.table, ref.name)
+    return f"KEEPFILTERS(FILTER(ALL({c}), {c} {op} {d}))", trunc
+
+
+def _condition(cond, aliases, model, tm) -> tuple[list[str], bool]:
+    """Supported Comparison / In conditions, including a straightforward AND of those."""
+    if not isinstance(cond, pbir.JObj):
+        return [], True
+    if "And" in cond:
+        node = cond.get("And")
+        if not isinstance(node, pbir.JObj):
+            return [], True
+        left, lp = _condition(node.get("Left"), aliases, model, tm)
+        right, rp = _condition(node.get("Right"), aliases, model, tm)
+        return left + right, lp or rp
+    if "In" in cond:
+        expr, partial = _in_filter(cond.get("In"), aliases, model, tm)
+        return ([expr] if expr else []), partial
+    if "Comparison" in cond:
+        expr, partial = _cmp_filter(cond.get("Comparison"), aliases, model, tm)
+        return ([expr] if expr else []), partial
+    return [], True
+
+
 def _filters(filter_config, model, tm) -> tuple[list[str], bool]:
     """DAX filter args for simple In / Comparison conditions; second value: something was skipped."""
     out, partial = [], False
@@ -65,6 +154,10 @@ def _filters(filter_config, model, tm) -> tuple[list[str], bool]:
     flist = filter_config.get("filters")
     for f in flist.items if isinstance(flist, pbir.JArr) else []:
         if not isinstance(f, pbir.JObj):
+            continue
+        kind = f.get("type")
+        if isinstance(kind, pbir.JStr) and kind.value in _UNSUPPORTED_FILTER_TYPES:
+            partial = True
             continue
         flt = f.get("filter")
         if not isinstance(flt, pbir.JObj):
@@ -76,57 +169,43 @@ def _filters(filter_config, model, tm) -> tuple[list[str], bool]:
                 aliases[e.get("Name").value] = e.get("Entity").value
         where = flt.get("Where")
         for w in where.items if isinstance(where, pbir.JArr) else []:
-            cond = w.get("Condition") if isinstance(w, pbir.JObj) else None
-            if not isinstance(cond, pbir.JObj):
-                continue
-            if "In" in cond:
-                inn = cond.get("In")
-                exprs = inn.get("Expressions")
-                cols = [pbir.field_of(e, aliases, model) for e in (exprs.items if isinstance(exprs, pbir.JArr) else [])]
-                vals = inn.get("Values")
-                if len(cols) != 1 or not cols[0] or cols[0].kind not in ("column", "hierarchy") or not isinstance(vals, pbir.JArr):
-                    partial = True
-                    continue
-                if not vals.items:
-                    partial = True
-                    continue
-                lits = []
-                for row in vals.items:
-                    cell = row.items[0] if isinstance(row, pbir.JArr) and row.items else None
-                    lit = cell.get("Literal") if isinstance(cell, pbir.JObj) else None
-                    raw = lit.get("Value").value if isinstance(lit, pbir.JObj) and isinstance(lit.get("Value"), pbir.JStr) else None
-                    d, trunc = _lit_dax(raw, tm) if raw is not None else (None, False)
-                    if trunc:
-                        partial = True
-                    if d is None:
-                        partial = True
-                        break
-                    lits.append(d)
-                else:
-                    if lits:
-                        out.append(f"TREATAS({{{', '.join(lits)}}}, {col_dax(cols[0].table, cols[0].name)})")
-            elif "Comparison" in cond:
-                cmp_ = cond.get("Comparison")
-                f_ = pbir.field_of(cmp_.get("Left"), aliases, model)
-                right = cmp_.get("Right")
-                lit = right.get("Literal") if isinstance(right, pbir.JObj) else None
-                raw = lit.get("Value").value if isinstance(lit, pbir.JObj) and isinstance(lit.get("Value"), pbir.JStr) else None
-                kind = cmp_.get("ComparisonKind")
-                op = CMP.get(kind.value if isinstance(kind, pbir.JLit) else None)
-                d, trunc = _lit_dax(raw, tm) if raw is not None else (None, False)
-                if trunc:
-                    partial = True
-                if not f_ or f_.kind not in ("column", "hierarchy") or not op or d is None:
-                    partial = True
-                    continue
-                c = col_dax(f_.table, f_.name)
-                out.append(f"KEEPFILTERS(FILTER(ALL({c}), {c} {op} {d}))")
-            else:
-                partial = True
+            produced, skipped = _condition(w.get("Condition") if isinstance(w, pbir.JObj) else None, aliases, model, tm)
+            partial = partial or skipped
+            out.extend(produced)
     return out, partial
 
 
-def build_query(visual_root, page_root, model, tm) -> tuple[str | None, str]:
+def _interactions(root) -> bool:
+    if not isinstance(root, pbir.JObj):
+        return False
+    vi = root.get("visualInteractions")
+    return isinstance(vi, pbir.JArr) and bool(vi.items)
+
+
+# Default cross-filter from these siblings is never in the visual's own filterConfig.
+SLICER_TYPES = {"slicer", "advancedSlicerVisual", "slicerFilter", "fieldParameter"}
+
+
+def _page_has_slicers(page_dir: str) -> bool:
+    vdir = os.path.join(page_dir, "visuals")
+    if not os.path.isdir(vdir):
+        return False
+    for vid in os.listdir(vdir):
+        path = os.path.join(vdir, vid, "visual.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            root = pbir.parse_json(read_text(path)[0])
+        except (OSError, pbir.JsonError, ValueError):
+            continue
+        v = root.get("visual") if isinstance(root, pbir.JObj) else None
+        vt = v.get("visualType") if isinstance(v, pbir.JObj) else None
+        if isinstance(vt, pbir.JStr) and vt.value in SLICER_TYPES:
+            return True
+    return False
+
+
+def build_query(visual_root, page_root, model, tm, report_root=None, page_has_slicers=False) -> tuple[str | None, str]:
     v = visual_root.get("visual") if isinstance(visual_root, pbir.JObj) else None
     if not isinstance(v, pbir.JObj):
         return None, "UNSUPPORTED"
@@ -162,10 +241,15 @@ def build_query(visual_root, page_root, model, tm) -> tuple[str | None, str]:
                         groups.append(c)
     if bad_agg or (not groups and not measures):
         return None, "UNSUPPORTED"
-    fl, partial = _filters(visual_root.get("filterConfig"), model, tm)
-    pf, ppartial = _filters(page_root.get("filterConfig") if isinstance(page_root, pbir.JObj) else None, model, tm)
-    filters = fl + pf
-    coverage = "PARTIAL" if (skipped or partial or ppartial) else "FULL"
+    filters, partial = [], False
+    for root in (visual_root, page_root, report_root):
+        cfg = root.get("filterConfig") if isinstance(root, pbir.JObj) else None
+        part, skipped_part = _filters(cfg, model, tm)
+        filters.extend(part)
+        partial = partial or skipped_part
+    if _interactions(page_root) or _interactions(report_root) or page_has_slicers:
+        partial = True
+    coverage = "PARTIAL" if (skipped or partial) else "FULL"
     named = [f'"m{i}", {m}' for i, m in enumerate(measures)]
     if groups:
         args = ", ".join(groups + filters + named)
@@ -187,6 +271,8 @@ def run(ws, project, page: str | None = None) -> dict:
     pages_dir = os.path.join(project.mirror_report, "definition", "pages")
     if not os.path.isdir(pages_dir):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    report_path = os.path.join(project.mirror_report, "definition", "report.json")
+    report_root = pbir.parse_json(read_text(report_path)[0]) if os.path.isfile(report_path) else None
     items, rows = [], []
     for pid in sorted(os.listdir(pages_dir)):
         pdir = os.path.join(pages_dir, pid)
@@ -198,6 +284,7 @@ def run(ws, project, page: str | None = None) -> dict:
         if page and page not in (pid, pname):
             continue
         vdir = os.path.join(pdir, "visuals")
+        has_slicers = _page_has_slicers(pdir)
         for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
             vjson = os.path.join(vdir, vid, "visual.json")
             if not os.path.isfile(vjson):
@@ -205,7 +292,9 @@ def run(ws, project, page: str | None = None) -> dict:
             vroot = pbir.parse_json(read_text(vjson)[0])
             v = vroot.get("visual")
             vt = v.get("visualType").value if isinstance(v, pbir.JObj) and isinstance(v.get("visualType"), pbir.JStr) else "?"
-            dax, note = build_query(vroot, proot, model, tm)
+            # Slicer visuals themselves are not cross-filtered by sibling slicers into their own query.
+            dax, note = build_query(vroot, proot, model, tm, report_root,
+                                    page_has_slicers=has_slicers and vt not in SLICER_TYPES)
             row = {"page": pname, "visual": vid, "type": vt, "_pid": pid}
             if dax is None:
                 row["status"] = note if note in ("N/A", "UNSUPPORTED") else "UNSUPPORTED"
