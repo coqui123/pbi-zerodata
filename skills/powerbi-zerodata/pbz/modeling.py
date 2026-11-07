@@ -39,18 +39,29 @@ def compat_level(mdef: str) -> tuple[int | None, str]:
     return (int(m.group(1)) if m else None), path
 
 
+def compat_upgrade_text(mdef: str, feature: str) -> tuple[str, str, bytes] | None:
+    """(path, text, bom) that raises compatibilityLevel, or None if no write is needed. Does not write."""
+    need = COMPAT[feature]
+    cur, path = compat_level(mdef)
+    if cur is None or cur >= need:
+        return None
+    text, bom = read_text(path)
+    new = re.sub(r"(?m)^(\s*compatibilityLevel:\s*)\d+", lambda mm: mm.group(1) + str(need), text, count=1)
+    return path, new, bom
+
+
 def require_compat(mdef: str, feature: str, upgrade: bool) -> str | None:
     """Raise COMPAT_LEVEL unless the model's compatibility level supports the feature; with upgrade,
     raise the level (one way: older Desktop builds cannot open it) and return a note."""
     need = COMPAT[feature]
-    cur, path = compat_level(mdef)
+    cur, _path = compat_level(mdef)
     if cur is None or cur >= need:
         return None
     if not upgrade:
         raise PbzError("COMPAT_LEVEL", f"{feature} needs compatibility level {need}; the model is at {cur}. "
                                        "Pass --upgrade-compat to raise it (one way: older Desktop builds cannot open it)")
-    text, bom = read_text(path)
-    write_text(path, re.sub(r"(?m)^(\s*compatibilityLevel:\s*)\d+", lambda mm: mm.group(1) + str(need), text, count=1), bom)
+    path, text, bom = compat_upgrade_text(mdef, feature)
+    write_text(path, text, bom)
     return f"compatibility level raised from {cur} to {need}"
 
 

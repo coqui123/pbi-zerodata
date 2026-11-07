@@ -57,14 +57,14 @@ def _literal_guard(*texts: str) -> None:
             raise PbzError("BAD_REQUEST", "mirror tokens cannot be used as names or labels")
 
 
-def _write_table(project, mdef: str, model, name: str, text: str, model_flags: list[str] = ()) -> list[str]:
+def _plan_table(mdef: str, model, name: str, text: str, model_flags: list[str] = ()) -> list[tuple[str, str]]:
+    """New table file and its model.tmdl ref, as (path, text). Does not write."""
     rel = f"tables/{_file_name(name)}.tmdl"
     path = os.path.join(mdef, *rel.split("/"))
     if os.path.exists(path):
         raise PbzError("NAME_TAKEN", f"file {rel} exists")
     eol = "\r\n" if "\r\n" in (model.docs.get("model.tmdl").text if "model.tmdl" in model.docs else "") else "\n"
-    write_text(path, text.replace("\n", eol))
-    files = [f"{project.name}.SemanticModel/definition/{rel}"]
+    planned = [(path, text.replace("\n", eol))]
     mt = model.docs.get("model.tmdl")
     if mt is not None:
         refs = list(re.finditer(r"(?m)^ref table .*$", mt.text))
@@ -77,10 +77,20 @@ def _write_table(project, mdef: str, model, name: str, text: str, model_flags: l
         if model.model_node is not None:
             for flag in model_flags:
                 edits += tmdl.prop_edit(mt, model.model_node, flag, None)
-        mpath = os.path.join(mdef, "model.tmdl")
-        _t, bom = read_text(mpath)
-        write_text(mpath, apply_edits(mt.text, sorted(edits)), bom)
-        files.append(f"{project.name}.SemanticModel/definition/model.tmdl")
+        planned.append((os.path.join(mdef, "model.tmdl"), apply_edits(mt.text, sorted(edits))))
+    return planned
+
+
+def _write_table(project, mdef: str, model, name: str, text: str, model_flags: list[str] = ()) -> list[str]:
+    files = []
+    for path, body in _plan_table(mdef, model, name, text, model_flags):
+        rel = os.path.relpath(path, mdef).replace("\\", "/")
+        if os.path.basename(path) == "model.tmdl":
+            _t, bom = read_text(path)
+            write_text(path, body, bom)
+        else:
+            write_text(path, body)
+        files.append(f"{project.name}.SemanticModel/definition/{rel}")
     return files
 
 

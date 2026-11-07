@@ -49,7 +49,7 @@ jobs:
           $suites = "guard", "mirror", "parity", "bpa", "tools", "refactor", "authoring", "selfcontained",
                     "governance", "mcp", "synth", "consumers", "visuals", "style", "reportedit", "synthtest",
                     "props", "modeling", "workflow", "components", "a11y", "synthedge", "audit",
-                    "consolidate", "memory", "images", "improvement_core", "desktop_evidence",
+                    "consolidate", "consolidate_atomic", "memory", "images", "improvement_core", "desktop_evidence",
                     "preview", "session_features", "consent", "smoke_honesty", "disclosure_gate",
                     "atomic_refactor", "capabilities", "daxfmt", "cli_mcp_parity", "freshness_offline"
           $failed = @()

@@ -24,7 +24,7 @@ import re
 import uuid
 
 from . import deps, governance as gv, lexers, modeling as md, move, pbir, rename, scaffold, similar, tmdl, usage
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 from .tokens import TOKEN_RE, apply_edits
 
 MODEL_AREAS = ("measures", "calculated_columns", "calculation_items", "calculated_tables", "format_strings",
@@ -51,6 +51,15 @@ def _model(project):
 
 def _rel(project, rel: str) -> str:
     return f"{project.name}.SemanticModel/definition/{rel}"
+
+
+def _write_ops(items: list[tuple[str, str]]) -> list[tuple]:
+    """('write', path, text, bom) for commit_bytes. A missing path snapshots as None inside the commit."""
+    ops = []
+    for path, text in items:
+        bom = read_text(path)[1] if os.path.exists(path) else b""
+        ops.append(("write", path, text, bom))
+    return ops
 
 
 def _find_measure(model, ref: str):
@@ -290,7 +299,7 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
         raise PbzError("FORMAT_DIFFERS", f"[{d.name}] and [{t.name}] have different format strings: references would "
                                          f"show [{t.name}]'s format. Align them (pbz set / pbz format-expr) or pass --force")
     if d.name.lower() in rename.translated_names(project):
-        raise PbzError("UNSUPPORTED", "the measure has translations in cultures/ that the mirror does not hold: pull again")
+        raise PbzError("UNSUPPORTED", "cultures not in this mirror: run pbz pull")
 
     # ---- who binds the duplicate by name outside the scanned reports
     g = usage.build(ws, project)
@@ -362,46 +371,54 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
         for rel, text in gv.culture_edits_drop(mdef, [("measure", d.table, d.name)]).items():
             plan[os.path.join(mdef, *rel.split("/"))] = text
     # ---- reports: entities (move planner), properties and queryRefs (rename planner), report measures
-    refused, leftovers = [], []
+    refused, leftovers, bad = [], [], []
     olds = {f"{d.table}.{d.name}".lower(), f"{t.table}.{d.name}".lower()}
     for _rname, rdir in _report_dirs(ws, project):
         ddir = os.path.join(rdir, "definition")
         for path in pbir.report_files(rdir):
-            text0 = read_text(path)[0]
+            rel = os.path.relpath(path, ws.mirror).replace("\\", "/")
             try:
+                text0 = read_text(path)[0]
                 root = pbir.parse_json(text0)
-            except pbir.JsonError:
+            except (pbir.JsonError, IndexError, ValueError):
+                bad.append(rel)
                 continue
             fkind = usage._file_kind(os.path.relpath(path, ddir).replace("\\", "/"))
             text = text0
-            if cross:
-                a, no = move.pbir_move_edits(root, d.name, d.table, t.table)
-                if no:
-                    refused.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
-                    continue
-                if a:
-                    text = apply_edits(text, sorted(set(a)))
+            try:
+                if cross:
+                    a, no = move.pbir_move_edits(root, d.name, d.table, t.table)
+                    if no:
+                        refused.append(rel)
+                        continue
+                    if a:
+                        text = apply_edits(text, sorted(set(a)))
+                        root = pbir.parse_json(text)
+                b = rename.pbir_ref_edits(root, model, "measure", t.table, d.name, t.name)
+                if b:
+                    where = {f.prop_node.start: p for f, p in pbir.walk_fields_with_path(root, model) if f.prop_node is not None}
+                    for s, _e, _r in b:
+                        if s in where:
+                            area = _report_area(fkind, where[s])
+                            counts[area] = counts.get(area, 0) + 1
+                    text = apply_edits(text, sorted(set(b)))
                     root = pbir.parse_json(text)
-            b = rename.pbir_ref_edits(root, model, "measure", t.table, d.name, t.name)
-            if b:
-                where = {f.prop_node.start: p for f, p in pbir.walk_fields_with_path(root, model) if f.prop_node is not None}
-                for s, _e, _r in b:
-                    if s in where:
-                        area = _report_area(fkind, where[s])
-                        counts[area] = counts.get(area, 0) + 1
-                text = apply_edits(text, sorted(set(b)))
-                root = pbir.parse_json(text)
-            c = [(n.start, n.end, json.dumps(f"{t.table}.{t.name}", ensure_ascii=False))
-                 for key, n in pbir.string_nodes(root) if key not in FIELD_STRING_KEYS and n.value.lower() in olds]
-            if fkind == "extensions":
-                c += _report_measure_edits(root, d, t, counts)
-            if c:
-                text = apply_edits(text, sorted(set(c)))
-            if not alias and any(f.kind == "measure" and f.name.lower() == d.name.lower() and f.table.lower() in
-                                 (d.table.lower(), t.table.lower()) for f in pbir.walk_fields(pbir.parse_json(text), model)):
-                leftovers.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
+                c = [(n.start, n.end, json.dumps(f"{t.table}.{t.name}", ensure_ascii=False))
+                     for key, n in pbir.string_nodes(root) if key not in FIELD_STRING_KEYS and n.value.lower() in olds]
+                if fkind == "extensions":
+                    c += _report_measure_edits(root, d, t, counts)
+                if c:
+                    text = apply_edits(text, sorted(set(c)))
+                if not alias and any(f.kind == "measure" and f.name.lower() == d.name.lower() and f.table.lower() in
+                                     (d.table.lower(), t.table.lower()) for f in pbir.walk_fields(pbir.parse_json(text), model)):
+                    leftovers.append(rel)
+            except (pbir.JsonError, IndexError, ValueError):
+                bad.append(rel)
+                continue
             if text != text0:
                 plan[path] = text
+    if bad:
+        raise PbzError("REFUSED", "PBIR parse failed: " + ", ".join(sorted(set(bad))))
     if refused:
         raise PbzError("UNSUPPORTED", "a filter shares one source alias between this measure and other fields of "
                                       f"{d.table} in " + ", ".join(sorted(refused)) + ": edit those filters by hand "
@@ -411,8 +428,7 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
                          "message": f"references to [{d.name}] remain (pbz validate names them): fix them by hand"})
     files = sorted(os.path.relpath(p, ws.mirror).replace("\\", "/") for p in plan)
     if not dry_run:
-        for path, text in plan.items():
-            write_text(path, text, read_text(path)[1] if os.path.exists(path) else b"")
+        commit_bytes(_write_ops(list(plan.items())))
     rewritten = {k: v for k, v in counts.items() if v or k in MODEL_AREAS + REPORT_AREAS + ("perspectives", "translations")}
     out = {"verb": "consolidate", "action": "merge", "result": "DRY_RUN" if dry_run else "MERGED",
            "dup": f"[{d.name}]", "into": f"[{t.name}]", "tables": {"dup": d.table, "into": t.table},
@@ -636,21 +652,27 @@ def _date_grain(model) -> list[str]:
 
 
 def _implicit_visuals(ws, project, model) -> list[str]:
-    """Visuals that aggregate columns in their query (implicit measures; see BPA AVOID_IMPLICIT_MEASURES)."""
-    hits = []
+    """Visuals that aggregate columns in their query (implicit measures; see BPA AVOID_IMPLICIT_MEASURES).
+
+    An unreadable or unparsable visual refuses before any calc-group write.
+    """
+    hits, bad = [], []
     for rname, rdir in _report_dirs(ws, project):
         ddir = os.path.join(rdir, "definition")
         for path in pbir.report_files(rdir):
             rel = os.path.relpath(path, ddir).replace("\\", "/")
             if usage._file_kind(rel) != "visual":
                 continue
+            mirror_rel = os.path.relpath(path, ws.mirror).replace("\\", "/")
             try:
                 root = pbir.parse_json(read_text(path)[0])
-            except (OSError, UnicodeDecodeError, pbir.JsonError):
-                continue
-            if any(f.kind == "aggregation" and "queryState" in p for f, p in pbir.walk_fields_with_path(root, model)):
-                parts = rel.split("/")
-                hits.append(f"{rname} | {parts[1]} | {parts[3]}")
+                if any(f.kind == "aggregation" and "queryState" in p for f, p in pbir.walk_fields_with_path(root, model)):
+                    parts = rel.split("/")
+                    hits.append(f"{rname} | {parts[1]} | {parts[3]}")
+            except (OSError, UnicodeDecodeError, pbir.JsonError, IndexError, ValueError):
+                bad.append(mirror_rel)
+    if bad:
+        raise PbzError("REFUSED", "PBIR parse failed: " + ", ".join(sorted(set(bad))))
     return hits
 
 
@@ -732,16 +754,17 @@ def calc_group(ws, project, family: str | None = None, measures: list[str] | Non
     files += [_rel(project, rel) for rel in edits]
     if note:
         files.append(_rel(project, "database.tmdl"))
+    planned = scaffold._plan_table(mdef, model, name, text, model_flags=flags)
+    upgraded = md.compat_upgrade_text(mdef, "calculationGroup") if note else None
+    if upgraded is not None:
+        planned.append((upgraded[0], upgraded[1]))
+    for rel, eds in edits.items():
+        path = os.path.join(mdef, *rel.split("/"))
+        planned.append((path, apply_edits(model.docs[rel].text, sorted(eds))))
+    spec_text = json.dumps({"checks": checks}, indent=1, ensure_ascii=False) + "\n"
+    planned.append((spec_path, spec_text))
     if not dry_run:
-        if note:
-            md.require_compat(mdef, "calculationGroup", True)
-        scaffold._write_table(project, mdef, model, name, text, model_flags=flags)
-        for rel, eds in edits.items():
-            path = os.path.join(mdef, *rel.split("/"))
-            write_text(path, apply_edits(model.docs[rel].text, sorted(eds)), read_text(path)[1])
-        with open(spec_path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"checks": checks}, f, indent=1, ensure_ascii=False)
-            f.write("\n")
+        commit_bytes(_write_ops(planned))
     out = {"verb": "consolidate", "action": "calc-group", "result": "DRY_RUN" if dry_run else "CREATED",
            "family": fam["id"], "table": name, "column": column, "precedence": prec,
            "items": [{"item": tp["item"], "ordinal": i, "members": len(tp["members"])}
