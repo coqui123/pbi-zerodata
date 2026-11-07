@@ -11,7 +11,7 @@ import os
 import re
 import secrets
 
-from . import pbir, tmdl, visuals
+from . import images, pbir, tmdl, visuals
 from .common import PbzError, read_text, write_text
 from .tokens import TOKEN_RE
 
@@ -278,10 +278,11 @@ def _lit(text: str) -> dict:
 
 
 def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str | None = None,
-               title: str | None = None, text: str | None = None) -> dict:
-    for s in (title, text):
+               title: str | None = None, text: str | None = None, image: str | None = None,
+               fit: str | None = None, alt: str | None = None) -> dict:
+    for s in (title, text, alt):
         if s and TOKEN_RE.search(s):
-            raise PbzError("BAD_REQUEST", "mirror tokens cannot be used in titles or text")
+            raise PbzError("BAD_REQUEST", "mirror tokens cannot be used in titles, text or alt text")
     if not os.path.isdir(project.mirror_report):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     mdef = os.path.join(project.mirror_model, "definition")
@@ -290,8 +291,18 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
     pdir, _mp, _meta, pages = _pages(rdir)
     pid = _find_page(pages, page)
     vtype, contract, source, notes, pending = visuals.resolve(ws, project, vtype)
+    item = None
     if vtype == "image":
-        raise PbzError("BAD_REQUEST", "an image needs a registered image resource: add it in Desktop")
+        if not image:
+            raise PbzError("BAD_REQUEST", "an image visual needs --image <item>: register the file first "
+                                          "(pbz image add <file>, then pbz image list)")
+        item = images.resolve(ws, project, image)
+    elif image or fit:
+        raise PbzError("BAD_REQUEST", "--image and --fit are for image visuals; other visuals take images through "
+                                      "pbz style <page> <visual> --set <object>.image=<item>")
+    scaling = images.SCALING.get((fit or "fit").lower())
+    if scaling is None:
+        raise PbzError("BAD_REQUEST", f"{fit}: --fit is fit, fill or normal")
     roles = contract.get("roles") or []
     by_name = {r["name"].lower(): r for r in roles}
     names = ", ".join(r["name"] for r in roles) or "none"
@@ -326,6 +337,13 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
         except (OSError, ValueError):
             continue
     w, h = SIZES.get(vtype, (420, 300))
+    if item:  # the image's own proportions, at most 320 x 200 and never enlarged
+        px = images.pixels(ws, project, item)
+        if px:
+            k = min(320 / px[0], 200 / px[1], 1.0)
+            w, h = max(40, round(px[0] * k)), max(40, round(px[1] * k))
+        else:
+            w, h = 200, 200
     placed = "given"
     if pos:
         try:
@@ -344,10 +362,17 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
         visual["query"] = {"queryState": {r["name"]: state[r["name"]] for r in roles if r["name"] in state}}
     if vtype == "textbox":
         visual["objects"] = {"general": [{"properties": {"paragraphs": [{"textRuns": [{"value": text or ""}]}]}}]}
+    if item:  # a local file: general.imageUrl holds the ResourcePackageItem (Microsoft's image visual format)
+        visual["objects"] = {"general": [{"properties": {"imageUrl": images.ref_expr(item)}}],
+                             "imageScaling": [{"properties": {"imageScalingType": _lit(scaling)}}]}
     visual["drillFilterOtherVisuals"] = True
+    vco: dict = {}
     if title:  # container formatting lives inside "visual", next to "objects"
-        visual["visualContainerObjects"] = {"title": [{"properties": {"show": {"expr": {"Literal": {"Value": "true"}}},
-                                                                      "text": _lit(title)}}]}
+        vco["title"] = [{"properties": {"show": {"expr": {"Literal": {"Value": "true"}}}, "text": _lit(title)}}]
+    if alt:
+        vco["general"] = [{"properties": {"altText": _lit(alt)}}]
+    if vco:
+        visual["visualContainerObjects"] = vco
     container = {"$schema": f"{SCHEMA}/visualContainer/{ver}/schema.json", "name": vid,
                  "position": {"x": x, "y": y, "z": z, "height": h, "width": w, "tabOrder": tab}, "visual": visual}
     path = os.path.join(vdir, vid, "visual.json")
@@ -362,6 +387,11 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
            "box": [int(x), int(y), int(w), int(h)], "placement": placed,
            "roles": {r: len(v["projections"]) for r, v in state.items()}, "files": files,
            "next": "pbz layout --page <page>, pbz validate, then pbz push (--reload for report-only changes)"}
+    if item:
+        out["image"] = item
+        if not alt:
+            out["next"] = f'describe it for screen readers: pbz style "<page>" {vid} --set container.general.altText="..."; ' \
+                          + out["next"]
     if source != "core":
         out["custom"] = {"roles_from": source, **({"notes": notes} if notes else {})}
         if vtype in ("deneb7E15AEF80B9E4D4F8E12924291ECE89A",) or "vega" in (contract.get("objects") or {}):

@@ -53,7 +53,10 @@ def cmd_status(ws, project, a):
             files = {"tables": len([t for t in real.tables.values() if not t.private]),
                      "measures": len(real.all_measures())}
             loaded = {k: (res.get("objects") or {}).get(k) for k in files}
-            out["desktop"]["loaded_matches_files"] = loaded == files
+            # Object counts are diagnostics, never proof of expression/report identity.
+            out["desktop"]["loaded_matches_files"] = None
+            out["desktop"]["loaded_identity"] = "UNKNOWN"
+            out["desktop"]["object_counts_match"] = loaded == files
     settings = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
     try:
         with open(settings, encoding="utf-8") as f:
@@ -126,6 +129,30 @@ def main(argv=None) -> int:
     p = sub.add_parser("values")
     p.add_argument("column", help="'Table'[Column]")
     sub.add_parser("validate")
+    p = sub.add_parser("preflight", help="full private staged validation without applying edits")
+    p.add_argument("--only", nargs="+")
+    p = sub.add_parser("recover", help="recover an interrupted push without overwriting later edits")
+    p.add_argument("--transaction")
+    sub.add_parser("check-schema", help="JSON schema for assertion specifications")
+    p = sub.add_parser("preview", help="watermarked synthetic layout preview; never a real report screenshot")
+    p.add_argument("--page")
+    p.add_argument("--spec", help="layout region contract JSON")
+    p = sub.add_parser("interactions", help="interaction contracts with explicit native capability reporting")
+    p.add_argument("action", choices=["capabilities", "check"])
+    p.add_argument("spec", nargs="?")
+    p.add_argument("--mode", choices=["static", "native"], default="static")
+    p = sub.add_parser("freshness", help="private refresh provenance and matched counting/cutoff contracts")
+    p.add_argument("action", choices=["capture", "compare"])
+    p.add_argument("spec", nargs="?")
+    p.add_argument("--max-age-hours", type=int, default=24)
+    p = sub.add_parser("requirements", help="revision-bound requirement checks and human acceptance")
+    p.add_argument("action", choices=["import", "status", "verify", "accept"])
+    p.add_argument("target", nargs="?")
+    p = sub.add_parser("consent", help="per-file human verification and approval receipts")
+    p.add_argument("action", choices=["request", "status", "approve", "read"])
+    p.add_argument("target")
+    p.add_argument("--purpose", choices=["requirements", "reference", "brand-asset", "other-source"], default="reference")
+    p.add_argument("--attested", action="store_true", help="human confirms the entire file contains no sensitive data")
     p = sub.add_parser("desktop")
     p.add_argument("action", choices=["status", "open", "close", "reload"])
     p.add_argument("--wait", type=int, default=240)
@@ -135,6 +162,8 @@ def main(argv=None) -> int:
     sub.add_parser("health")
     p = sub.add_parser("check")
     p.add_argument("spec", help="path to a checks JSON file, or inline JSON")
+    p.add_argument("--validate-only", action="store_true", help="validate specification before spending disclosure budget")
+    p.add_argument("--diagnostic", action="store_true", help="expected hypothesis differences are findings, not a failed gate")
     p = sub.add_parser("probe")
     p.add_argument("table")
     p.add_argument("--columns", nargs="*")
@@ -241,6 +270,9 @@ def main(argv=None) -> int:
     p.add_argument("--pos", help="visual: x,y,width,height")
     p.add_argument("--title", help="visual: title text")
     p.add_argument("--text", help="textbox: text")
+    p.add_argument("--image", help="image visual: a registered image item (pbz image add <file> first)")
+    p.add_argument("--fit", help="image visual: fit (default), fill or normal")
+    p.add_argument("--alt", help="visual: alt text for screen readers")
     p.add_argument("--width", type=int, help="page: width (default 1280, tooltip pages 320)")
     p.add_argument("--height", type=int, help="page: height (default 720, tooltip pages 240)")
     p.add_argument("--hidden", action="store_true", help="page: hidden in view mode")
@@ -352,6 +384,13 @@ def main(argv=None) -> int:
     p.add_argument("--show", action="store_true", help="print the current formatting")
     p.add_argument("--list", action="store_true", help="formatting objects of --type (with --object: its properties)")
     p.add_argument("--object", help="with --list: one formatting object")
+    p.add_argument("--canvas", action="store_true",
+                   help="format the page itself: background.<p> and wallpaper.<p>, p = color, transparency (0-100), "
+                        "image (a registered image), scaling (fit, fill, normal); a page, or --all for every page")
+    p = sub.add_parser("image", help="report images: add a file (checked, staged, installed by push), list, remove")
+    p.add_argument("action", choices=["add", "list", "remove"])
+    p.add_argument("target", nargs="?", help="add: image file (.png .jpg .jpeg .gif .bmp .svg); remove: item name")
+    p.add_argument("--name", help="add: name for the item (default: the file name)")
     p = sub.add_parser("visual", help="visual catalog: built-in types and custom visuals (list, roles, import, register)")
     p.add_argument("action", choices=["list", "roles", "import", "register"])
     p.add_argument("target", nargs="?", help="roles: visual type; import: a .pbiviz file; register: the visual's guid")
@@ -449,6 +488,14 @@ def main(argv=None) -> int:
         from pbz import mcp
         return mcp.serve(a.workspace, a.project)
     try:
+        if a.cmd == "check-schema" or (a.cmd == "interactions" and a.action == "capabilities"):
+            from pbz import interactiontest
+            from pbz.outcomes import envelope
+            out = ({"verb": "check-schema", "schema": checks.check_schema()} if a.cmd == "check-schema"
+                   else interactiontest.capabilities())
+            out, rc = envelope(out)
+            emit(out)
+            return rc
         ws = find_workspace(a.workspace)
         project = ws.project(a.project) if a.cmd not in ("scan", "admin", "memscrub") or ws.projects else None
         if a.cmd == "status":
@@ -474,6 +521,41 @@ def main(argv=None) -> int:
         elif a.cmd == "validate":
             out = {"verb": "validate", "mode": "mirror (metadata only; push runs the full staged validation)",
                    "findings": validate.run_mirror(ws, project)}
+        elif a.cmd == "preflight":
+            out = mirror.preflight(ws, project, only=a.only)
+        elif a.cmd == "recover":
+            out = mirror.recover(ws, project, transaction_id=a.transaction)
+        elif a.cmd == "check-schema":
+            out = {"verb": "check-schema", "schema": checks.check_schema()}
+        elif a.cmd == "preview":
+            from pbz import preview
+            out = preview.run(ws, project, a.page, _spec(a.spec))
+        elif a.cmd == "interactions":
+            from pbz import interactiontest
+            out = interactiontest.capabilities() if a.action == "capabilities" else interactiontest.run(ws, project, a.spec, a.mode)
+        elif a.cmd == "freshness":
+            from pbz import freshness
+            out = freshness.capture(ws, project, a.max_age_hours) if a.action == "capture" else freshness.compare(a.spec)
+        elif a.cmd == "requirements":
+            from pbz import requirements
+            if a.action == "import":
+                out = requirements.import_spec(ws, project, a.target)
+            elif a.action == "status":
+                out = requirements.status(ws, project)
+            elif a.action == "verify":
+                out = requirements.verify(ws, project, a.target)
+            else:
+                out = requirements.accept(ws, project, a.target, human=_is_human())
+        elif a.cmd == "consent":
+            from pbz import consent
+            if a.action == "request":
+                out = consent.request(ws, a.target, a.purpose)
+            elif a.action == "status":
+                out = consent.status(ws, a.target)
+            elif a.action == "approve":
+                out = consent.approve(ws, a.target, human=_is_human(), attested=a.attested)
+            else:
+                out = consent.read(ws, a.target)
         elif a.cmd == "desktop":
             fn = {"status": desktop.status, "open": lambda p: desktop.open_(p, a.wait), "close": desktop.close,
                   "reload": lambda p: {"verb": "desktop", "reload": desktop.reload(p)}}[a.action]
@@ -485,7 +567,12 @@ def main(argv=None) -> int:
         elif a.cmd == "health":
             out = checks.health(ws, project)
         elif a.cmd == "check":
-            out = checks.run_checks(ws, project, _spec(a.spec) or {})
+            spec = _spec(a.spec) or {}
+            if a.validate_only:
+                validation = checks.validate_spec(spec)
+                out = {"verb": "check validate", **validation, "spec_valid": validation["valid"]}
+            else:
+                out = checks.run_checks(ws, project, spec)
         elif a.cmd == "probe":
             out = checks.probe(ws, project, a.table, a.columns)
         elif a.cmd == "snapshot":
@@ -579,7 +666,8 @@ def main(argv=None) -> int:
             else:
                 if not a.page:
                     raise PbzError("BAD_REQUEST", "--page is required for a visual")
-                out = author.add_visual(ws, project, a.name, a.page, a.field, a.pos, a.title, a.text)
+                out = author.add_visual(ws, project, a.name, a.page, a.field, a.pos, a.title, a.text, a.image, a.fit,
+                                        a.alt)
         elif a.cmd == "link":
             from pbz import author
             out = author.link(ws, project, a.page, a.visual, a.to_page, a.back, a.bookmark, a.drillthrough, a.url,
@@ -682,6 +770,21 @@ def main(argv=None) -> int:
                 if not a.page:
                     raise PbzError("BAD_REQUEST", "bookmark add needs --page")
                 out = bookmarks.add(ws, project, a.name, a.page, a.hide, a.show, a.only)
+        elif a.cmd == "style" and a.canvas:
+            from pbz import style
+            if a.visual or a.vtype or a.series or a.state or a.list:
+                raise PbzError("BAD_REQUEST", "--canvas formats pages: give a page (or --all), no visual or --type")
+            out = style.run_canvas(ws, project, a.page, a.sets, a.unsets, a.all, a.show)
+        elif a.cmd == "image":
+            from pbz import images
+            if a.action != "list" and not a.target:
+                raise PbzError("BAD_REQUEST", f"image {a.action} needs a target")
+            if a.action == "add":
+                out = images.add(ws, project, a.target, a.name)
+            elif a.action == "list":
+                out = images.list_(ws, project)
+            else:
+                out = images.remove(ws, project, a.target)
         elif a.cmd == "style":
             from pbz import style
             if a.list:
@@ -813,16 +916,44 @@ def main(argv=None) -> int:
         else:
             raise PbzError("BAD_REQUEST", a.cmd)
     except PbzError as e:
-        emit({"ok": False, "error": e.code, "detail": e.detail})
-        return 2
+        from pbz.outcomes import envelope
+        out, rc = envelope({"ok": False, "error": e.code, "detail": e.detail})
+        emit(out)
+        return rc
+    except (OSError, ValueError, UnicodeError):
+        # Paths, values and DPAPI internals must never leak through a Python traceback.
+        from pbz.outcomes import envelope
+        out, rc = envelope({"ok": False, "error": "LOCAL_STATE_UNAVAILABLE"})
+        emit(out)
+        return rc
+    except Exception:
+        # Unexpected failures can quote document values. Keep diagnostics private.
+        import traceback
+        import uuid
+        log_id = uuid.uuid4().hex
+        try:
+            dpapi.write_protected(os.path.join(ws.private, "diagnostics", log_id + ".bin"),
+                                 traceback.format_exc().encode("utf-8"))
+        except Exception:
+            log_id = None
+        from pbz.outcomes import envelope
+        error = {"ok": False, "error": "INTERNAL_ERROR"}
+        if log_id:
+            error["log_id"] = log_id
+        out, rc = envelope(error)
+        emit(out)
+        return rc
     if project is not None:  # revision-bound evidence for `pbz review` (verdict counts and ids only)
         from pbz import evidence
         try:
             evidence.record(ws, project, a.cmd, getattr(a, "action", None), out)
-        except (OSError, ValueError, PbzError):
-            pass
+        except (OSError, ValueError, TypeError, AttributeError, PbzError):
+            if isinstance(out, dict):
+                out["evidence_status"] = "NOT_RECORDED"
+    from pbz.outcomes import envelope
+    out, rc = envelope(out, diagnostic=getattr(a, "diagnostic", False))
     emit(out)
-    return 1 if isinstance(out, dict) and out.get("gate") == "FAIL" else 0
+    return rc
 
 
 def admin(ws, a) -> dict:

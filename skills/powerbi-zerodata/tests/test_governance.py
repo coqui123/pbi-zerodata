@@ -42,7 +42,7 @@ def main() -> int:
         res = mirror.push(ws, project, **kw)
         errs = [f for f in res.get("findings", []) if f["severity"] == "error"]
         check(res["result"] == "PUSHED" and not errs, f"push after {label}: {res.get('result')} {errs}")
-        check(not any(f["code"].startswith("TOM_") for f in res.get("findings", [])), f"TOM did not run after {label}")
+        check(not any(f["code"].startswith("TOM_") and f["code"] != "TOM_PASSED" for f in res.get("findings", [])), f"TOM did not run after {label}")
         return res
 
     tmp = tempfile.mkdtemp(prefix="pbzgov-")

@@ -136,9 +136,10 @@ def _formatting(add, items: list) -> None:
                                 f"({code if isinstance(code, str) else 'one of the listed values'})")
 
 
-def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
+def run(report_dir: str, prefix: str = "", has_package=None, has_image=None) -> list[dict]:
     """`has_package(name)`: is the private visual package present? Defaults to the report's own
-    CustomVisuals folder when it has one (staged real files); None skips the check."""
+    CustomVisuals folder when it has one (staged real files); None skips the check. `has_image(item)`:
+    is the registered image file present (in the report or staged)? None skips that check."""
     out: list[dict] = []
     if has_package is None and os.path.isdir(os.path.join(report_dir, "CustomVisuals")):
         has_package = lambda n: os.path.isfile(os.path.join(report_dir, "CustomVisuals", n, "package.json"))  # noqa: E731
@@ -328,6 +329,8 @@ def run(report_dir: str, prefix: str = "", has_package=None) -> list[dict]:
                         f"report measure {m.get('name')} defined twice")
                 seen.add(key)
     _custom_visuals(add, ddir, report_dir, instances, has_package)
+    from . import images
+    images.check(add, report_dir, has_image)
     _formatting(add, formatting)
     _links(add, ddir, page_ids, links)
     return out

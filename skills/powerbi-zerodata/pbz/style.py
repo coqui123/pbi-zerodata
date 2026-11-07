@@ -39,6 +39,10 @@ def prop_code(t):
     for k in ("bool", "numeric", "integer", "text", "dateTime", "variant"):
         if t.get(k):
             return k
+    if isinstance(t.get("image"), dict):  # {"image": {"subProperties": {name, url, scaling}}}
+        return "image"
+    if isinstance(t.get("misc"), dict) and t["misc"].get("imageUrl"):
+        return "imageUrl"
     if isinstance(t.get("fill"), dict) and "solid" in t["fill"]:
         return "color"
     e = t.get("enumeration")
@@ -141,9 +145,17 @@ def _color(raw: str, model) -> dict:
     return {"solid": {"color": _lit("'#" + h.upper() + "'")}}
 
 
-def encode(code, raw: str, model) -> dict:
-    """Formatting property value for one catalog type."""
+def encode(code, raw: str, model, image_ref=None) -> dict:
+    """Formatting property value for one catalog type. `image_ref(raw)` resolves a registered image item."""
     raw = raw.strip()
+    if code in ("image", "imageUrl"):
+        from . import images
+        if code == "imageUrl" and re.match(r"(?i)^https?://", raw):
+            return _lit(_text(raw))  # a public web image (it must load without sign-in)
+        if image_ref is None:
+            raise PbzError("UNSUPPORTED", "image properties need the image registry (pbz style)")
+        item = image_ref(raw)
+        return images.composite(item) if code == "image" else images.ref_expr(item)
     if code == "auto":  # custom visual object: no type information, infer from the value
         code = ("bool" if raw.lower() in BOOL else "color" if re.match(r"^#[0-9a-fA-F]{3,6}$|^theme:", raw)
                 else "numeric" if re.match(r"^-?\d+(\.\d+)?$", raw) else "text")
@@ -183,6 +195,12 @@ def encode(code, raw: str, model) -> dict:
 
 def decode(node) -> str:
     """Readable form of a stored property value (mirror text: tokens stay tokens)."""
+    from . import images
+    item = images.item_of(node)
+    if item is not None:
+        scal = ((node.get("image") or {}).get("scaling") if isinstance(node, dict) and isinstance(node.get("image"), dict)
+                else None)
+        return f"image:{item}" + (f" ({decode(scal).lower()})" if scal else "")
     if isinstance(node, dict):
         sol = node.get("solid")
         if isinstance(sol, dict):
@@ -332,6 +350,8 @@ def run(ws, project, page: str | None = None, visual: str | None = None, sets: l
             raise PbzError("BAD_REQUEST", f"{s}: use object.property=value")
         parsed.append(("set", *_parse_key(key), raw))
     parsed += [("unset", *_parse_key(k), None) for k in unsets]
+    from . import images
+    img = lambda raw: images.resolve(ws, project, raw)  # noqa: E731
     changed, skipped, files, shown = [], [], [], []
     for t in tg:
         text, bom = read_text(t["path"])
@@ -355,8 +375,18 @@ def run(ws, project, page: str | None = None, visual: str | None = None, sets: l
                 bucket = body.setdefault(section, {}) if op == "set" else body.get(section) or {}
                 entries = bucket.setdefault(obj, []) if op == "set" else bucket.get(obj) or []
                 e = _entry(entries, selector, op == "set")
+                if op == "set" and code == "image":
+                    # {"image": {name, url, scaling}}: Microsoft's validator reads a nested key that is also a
+                    # property of the same object (plotArea.url, fillCustom.url) as misplaced and rejects it
+                    pool = (catalog()["container"] if section == "visualContainerObjects"
+                            else _objects_for(ws, project, t["type"])[0] or {}).get(obj, {})
+                    clash = sorted(set(pool) & {"image", "name", "url", "scaling"} - {prop})
+                    if clash:
+                        raise PbzError("UNSUPPORTED", f"{obj}.{prop}: Microsoft's report validator rejects an image "
+                                                      f"here ({obj} also has a {', '.join(clash)} property); set this "
+                                                      "image in Desktop")
                 if op == "set":
-                    e.setdefault("properties", {})[prop] = encode(code, raw, model)
+                    e.setdefault("properties", {})[prop] = encode(code, raw, model, image_ref=img)
                     done.append(f"{'container.' if section == 'visualContainerObjects' else ''}{obj}.{prop}")
                 elif e is not None and prop in (e.get("properties") or {}):
                     del e["properties"][prop]
@@ -380,6 +410,131 @@ def run(ws, project, page: str | None = None, visual: str | None = None, sets: l
     out = {"verb": "style", "project": project.name, "changed": changed, "files": files}
     if skipped:
         out["skipped"] = skipped
+    if show:
+        out["formatting"] = shown
+    if changed:
+        out["next"] = "pbz validate, then pbz push --reload (report-only change)"
+    return out
+
+
+# ---------------------------------------------------------------- page canvas
+
+CANVAS_OBJECTS = {"background": "background", "canvas": "background", "wallpaper": "outspace", "outspace": "outspace"}
+CANVAS_LABEL = {"background": "background", "outspace": "wallpaper"}
+CANVAS_PROPS = ("color", "transparency", "image", "scaling")
+
+
+def _canvas_key(key: str) -> tuple[str, str]:
+    parts = key.strip().split(".")
+    if len(parts) != 2 or parts[0].lower() not in CANVAS_OBJECTS or parts[1] not in CANVAS_PROPS:
+        raise PbzError("BAD_REQUEST", f"{key}: page formatting is background.<p> or wallpaper.<p>, "
+                                      f"p = {', '.join(CANVAS_PROPS)}")
+    return CANVAS_OBJECTS[parts[0].lower()], parts[1]
+
+
+def _canvas_rows(doc: dict) -> list[str]:
+    rows = []
+    for obj in ("background", "outspace"):
+        for e in (doc.get("objects") or {}).get(obj) or []:
+            for prop, val in sorted(((e or {}).get("properties") or {}).items()):
+                rows.append(f"{CANVAS_LABEL[obj]}.{prop} = {decode(val)}")
+    return rows
+
+
+def run_canvas(ws, project, page: str | None = None, sets: list[str] | None = None, unsets: list[str] | None = None,
+               all_: bool = False, show: bool = False) -> dict:
+    """Page canvas formatting (page.json objects): background (canvas) and wallpaper (outspace) color,
+    transparency (0-100) and image (a registered image, with scaling fit, fill or normal)."""
+    from . import images
+    sets, unsets = list(sets or []), list(unsets or [])
+    if not (sets or unsets or show):
+        raise PbzError("BAD_REQUEST", "pass --set background.color=#RRGGBB (wallpaper.image=<item>, ...), --unset or --show")
+    pdir, pages = _pages(project)
+    if page:
+        pages = [p for p in pages if page.lower() in (p[0].lower(), str(p[1]).lower())]
+        if not pages:
+            raise PbzError("NOT_FOUND", f"page {page}")
+    elif not all_:
+        raise PbzError("BAD_REQUEST", "--canvas formats one page (name it) or every page (--all)")
+    parsed = []
+    for s in sets:
+        key, eq, raw = s.partition("=")
+        if not eq:
+            raise PbzError("BAD_REQUEST", f"{s}: use object.property=value")
+        parsed.append(("set", *_canvas_key(key), raw.strip()))
+    parsed += [("unset", *_canvas_key(k), None) for k in unsets]
+    parsed.sort(key=lambda p: p[2] == "scaling")  # an image set in the same call comes first
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+    changed, files, shown, notes = [], [], [], []
+    for pid, pname in pages:
+        path = os.path.join(pdir, pid, "page.json")
+        text, bom = read_text(path)
+        doc = json.loads(text)
+        if show:
+            shown.append({"page": pname, "properties": _canvas_rows(doc)})
+        done = []
+        for op, obj, prop, raw in parsed:
+            label = f"{CANVAS_LABEL[obj]}.{prop}"
+            objects = doc.setdefault("objects", {}) if op == "set" else doc.get("objects") or {}
+            entries = objects.setdefault(obj, []) if op == "set" else objects.get(obj) or []
+            e = _entry(entries, None, op == "set")
+            if op == "set":
+                props = e.setdefault("properties", {})
+                if prop == "color":
+                    if raw.lower().startswith("measure:"):
+                        raise PbzError("UNSUPPORTED", "Desktop does not evaluate field values for canvas or wallpaper "
+                                                      "colors: use #RRGGBB or theme:<n>")
+                    props["color"] = _color(raw, model)
+                elif prop == "transparency":
+                    try:
+                        ok = 0 <= float(raw) <= 100
+                    except ValueError:
+                        ok = False
+                    if not ok:
+                        raise PbzError("BAD_REQUEST", "transparency is 0 (opaque) to 100 (invisible)")
+                    props["transparency"] = _lit(_num(raw))
+                elif prop == "image":
+                    item = images.resolve(ws, project, raw)
+                    old = ((props.get("image") or {}).get("image") or {}).get("scaling")
+                    val = images.composite(item, None if old else "Fit")
+                    if old:
+                        val["image"]["scaling"] = old  # keep the fit the page had
+                    props["image"] = val
+                    if "transparency" not in props and not any(p[2] == "transparency" and p[0] == "set" and p[1] == obj
+                                                               for p in parsed):
+                        props["transparency"] = _lit("0D")
+                        notes.append(f"{CANVAS_LABEL[obj]}.transparency set to 0 so the image shows")
+                else:  # scaling of the image
+                    img = (props.get("image") or {}).get("image")
+                    if not isinstance(img, dict):
+                        raise PbzError("BAD_REQUEST", f"{CANVAS_LABEL[obj]} has no image: set {CANVAS_LABEL[obj]}.image first")
+                    mode = images.SCALING.get(raw.lower())
+                    if mode is None:
+                        raise PbzError("BAD_REQUEST", f"{raw}: scaling is fit, fill or normal")
+                    img["scaling"] = _lit(f"'{mode}'")
+                done.append(label)
+            elif e is not None:
+                props = e.get("properties") or {}
+                if prop == "scaling":
+                    img = (props.get("image") or {}).get("image")
+                    if isinstance(img, dict) and img.pop("scaling", None) is not None:
+                        done.append("-" + label)
+                elif prop in props:
+                    del props[prop]
+                    done.append("-" + label)
+                if not props and set(e) <= {"properties"}:
+                    entries.remove(e)
+                if not entries:
+                    objects.pop(obj, None)
+                if not objects:
+                    doc.pop("objects", None)
+        if done:
+            write_text(path, json.dumps(doc, indent=2, ensure_ascii=False) + ("\n" if text.endswith("\n") else ""), bom)
+            files.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
+            changed.append({"page": pname, "changes": done})
+    out = {"verb": "style", "target": "canvas", "project": project.name, "changed": changed, "files": files}
+    if notes:
+        out["notes"] = sorted(set(notes))
     if show:
         out["formatting"] = shown
     if changed:

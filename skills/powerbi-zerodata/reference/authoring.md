@@ -62,6 +62,72 @@ questions: check them with `pbz check` (`unique`, `no_orphans`) while Desktop is
   value-specific formatting.
 - `pbz style` formats visuals (titles, data labels, colors, fonts, axes, legends, borders, one
   series, button states), one at a time or every visual of a type: [style.md](style.md).
+- `--alt "<text>"` sets the alt text of any new visual (screen readers; `pbz a11y` checks it).
+
+## Themes, page backgrounds and images
+
+All of these are report-only edits: `pbz validate`, then `pbz push --reload` (Desktop may stay open),
+then `pbz handoff` so the user looks at the result.
+
+**Themes.** The mirror holds the report's theme files as JSON under
+`<Name>.Report/StaticResources/`: `SharedResources/BaseThemes/*.json` is Microsoft's base theme (never
+edit it; Desktop replaces it) and `RegisteredResources/<theme>.json` is the custom theme (colors,
+`textClasses` fonts, `visualStyles` defaults per visual type). Edit the custom theme like any mirror
+file. To add one: write the file, then register it in `definition/report.json`:
+`themeCollection.customTheme = {"name": "<theme>.json", "reportVersionAtImport": <copy of the base
+theme's>, "type": "RegisteredResources"}` plus an item `{"name": "<theme>.json", "path": "<theme>.json",
+"type": "CustomTheme"}` in the `RegisteredResources` package. The theme file's own `"name"` must be the
+same `<theme>.json`. Push runs Microsoft's report validator, which checks the registration, the JSON,
+value types (`dataColors` an array, positive font sizes) and the formatting object names in
+`visualStyles`. Images embedded in a theme (`"url": "data:image/..."`) show as `«payload:image#n»`:
+keep, move or delete the token, never type inside it.
+
+**Page canvas and wallpaper.** `pbz style <page> --canvas` (or `--all` for every page) edits the
+page's `background` (canvas) and `outspace` (wallpaper) objects:
+
+    pbz style "Overview" --canvas --set background.color=#F3F2F1 --set wallpaper.color=theme:0
+    pbz style "Overview" --canvas --set background.image=<item> --set background.scaling=fill
+    pbz style "Overview" --canvas --set background.transparency=20 --unset wallpaper.image --show
+
+Properties: `color` (`#RRGGBB` or `theme:<n>[:<shade %>]`; a measure is refused because Desktop does
+not evaluate field values for page colors), `transparency` (0 opaque to 100 invisible), `image` (a
+registered image item) and `scaling` (`fit`, `fill`, `normal`; default `fit`). Setting an image without
+a transparency sets the transparency to 0: Desktop's default canvas transparency hides a background
+image.
+
+**Images.** An image is a file in `StaticResources/RegisteredResources/`, registered in report.json
+(package `RegisteredResources`, item type `Image`, item name = path = file name) and referenced
+from formatting with a `ResourcePackageItem` expression (`PackageType` 1). The mirror never holds
+image files, and the guard blocks reading or copying them, because an image can show data (a
+screenshot, a pasted chart). pbz handles the bytes without showing them:
+
+- `pbz image add <file> [--name N]` reads the file inside pbz, checks the type from its header (PNG,
+  JPEG, GIF, BMP or SVG; an SVG with scripts, event handlers, embedded HTML or a DTD is refused;
+  10 MiB at most), stages a copy in the private store and registers the item in the mirror's
+  report.json. The item name follows Desktop: the file name plus unique digits. The output shows the
+  item, file kind, size and pixel size, never content. The same bytes added twice reuse the item.
+- Use it: `pbz style ... --canvas --set background.image=<item>` (or `wallpaper.image`),
+  `pbz add visual image --page <p> --image <item> [--fit fit|fill|normal] [--alt "..."]` (sized to the
+  image's proportions, at most 320 x 200, never enlarged), or an image property of a visual such as a
+  button's `fill.image` / `icon.image` (`--state default`), a card's `image.image`. `pbz style --list
+  --type <t> --object <o>` shows which properties take an `image` (a registered item) or an `imageUrl`
+  (a registered item or a public `https://` image URL). Objects that also have a `url` property
+  (`plotArea`, `fillCustom`) are refused: Microsoft's validator rejects the nested image form there,
+  so set those images in Desktop.
+- `pbz image list` shows every registered image: `staged` (installed by the next push), `present`
+  or `missing`, kind, size, pixels and where it is used; also `removed_on_push`, unregistered files and
+  references to unregistered items.
+- `pbz image remove <item>` (item or file name) unregisters an image nobody uses (`IN_USE` lists the
+  users otherwise). The next push deletes the file from the report, backed up with the push.
+- Push copies staged images into the staged report before validation and into the real report after
+  it, deletes the files of images whose registration was dropped, and reports `images_installed` /
+  `images_removed`. Deleting a visual's folder in the mirror removes the visual and its empty folder
+  on push; run `pbz repair` for interactions and bookmarks that pointed at it.
+- Checks (`pbz validate` and push): `PBIR_IMAGE_FLAT` (an image property written as
+  `image: {name, url}` instead of `image: {image: {name, url, scaling}}`; Desktop shows nothing),
+  `PBIR_IMAGE_NOT_REGISTERED`, `PBIR_IMAGE_MISSING` (no file in the report and none staged),
+  `PBIR_IMAGE_NAME` (an item name that is not a plain image file name), `PBIR_IMAGE_PATH`,
+  `PBIR_IMAGE_PACKAGE_TYPE`.
 
 ## Model properties: `pbz set` / `pbz get`
 

@@ -199,6 +199,21 @@ def main() -> int:
             res = r.pbz("add", "visual", vargs[0], "--page", "E2E Page", *vargs[1:])
             expect(res.get("verb") == "add" and res.get("placement") == "free_spot", f"add visual {vargs[0]}: {res}")
             made[vargs[0]] = res.get("id", "?")
+        # images: a staged PNG on the canvas, in an image visual and on a button; push installs the file
+        from test_images import png
+        logo = os.path.join(tmp, "E2E Logo.png")
+        with open(logo, "wb") as f:
+            f.write(png(240, 80))
+        res = r.pbz("image", "add", logo)
+        img = res.get("item", "?")
+        expect(res.get("result") == "STAGED", f"image add: {res}")
+        for args in (("style", "E2E Page", "--canvas", "--set", f"background.image={img}", "--set", "background.scaling=fit",
+                      "--set", "wallpaper.color=#F3F2F1"),
+                     ("add", "visual", "image", "--page", "E2E Page", "--image", img, "--alt", "E2E logo"),
+                     ("style", "E2E Page", made["actionButton"], "--state", "default", "--set", f"fill.image={img}"),
+                     ("image", "list")):
+            res = r.pbz(*args)
+            expect(res.get("verb") and res.get("ok") is not False, f"{' '.join(args)}: {res}")
         # pages, filters, interactions and links: Microsoft's validator checks them on push, Desktop on reopen
         for args in (("add", "page", "E2E Tip", "--tooltip"),
                      ("add", "page", "E2E Detail", "--drillthrough", "'Project'[Status]"),
@@ -264,7 +279,8 @@ def main() -> int:
         close_desktop(r)
         res = r.pbz("push")
         expect(res.get("result") == "PUSHED", f"push: {res}")
-        # Desktop must open the authored report (new page types, filters, links, formatting) cleanly
+        expect(img in (res.get("images_installed") or []), f"push did not install the image: {res.get('images_installed')}")
+        # Desktop must open the authored report (new page types, filters, links, formatting, images) cleanly
         res = r.pbz("desktop", "open", "--wait", "480", timeout=900)
         expect(res.get("open") and res.get("engine") == "READY", f"desktop reopen after authoring: {res}")
         res = r.pbz("health")

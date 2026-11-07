@@ -38,6 +38,10 @@ without company data entering the agent's context.
   families, repeated sub-expressions), each with evidence, fix and verification; baselines, waivers and a
   CI gate. `audit memory` adds VertiPaq storage bands from Desktop (bands only); `consolidate merge` and
   `consolidate calc-group` apply the consolidations with a check spec (`reference/audit.md`).
+- Themes, page backgrounds and images: custom theme JSON is edited in the mirror and checked on push;
+  `style --canvas` sets canvas and wallpaper color, transparency and image; `image add|list|remove`
+  stages image files without showing them and push installs them; `add visual image`. Images embedded
+  in themes, text or SVG measures become `«payload:image#n»` tokens (`reference/authoring.md`).
 - CI: `.github/workflows/tests.yml` runs the offline suites on every push (Desktop suites stay local).
 - `consumers`: register thin reports, PBIX, Excel workbooks, paginated reports, composite models, query
   exports or a scanner result so `unused` keeps what they use (`used_external`) and refuses removals
@@ -91,6 +95,7 @@ python skills/powerbi-zerodata/tests/test_synthedge.py  # edge-case synthetic da
 python skills/powerbi-zerodata/tests/test_audit.py      # audit rules, evidence, baselines, waivers, gate
 python skills/powerbi-zerodata/tests/test_consolidate.py # merge duplicates, calculation-group families (add --live for Desktop)
 python skills/powerbi-zerodata/tests/test_memory.py     # storage bands (add --live for Desktop)
+python skills/powerbi-zerodata/tests/test_images.py     # images, page canvas, embedded image tokens, push install
 python skills/powerbi-zerodata/tests/test_engine.py    # engine verbs + canary scan (needs Desktop)
 python skills/powerbi-zerodata/tests/test_e2e.py       # every verb on a fixture copy in Desktop, canary scan
 ```

@@ -83,7 +83,7 @@ def main() -> int:
     check(props.get(ws, project, "'Date'")["objects"][0].get("dataCategory") == "Time", "mark date table category")
     res = mirror.push(ws, project)
     errs = [f for f in res.get("findings", []) if f["severity"] == "error"]
-    check(res["result"] == "PUSHED" and not errs and not any(f["code"].startswith("TOM_") for f in res.get("findings", [])),
+    check(res["result"] == "PUSHED" and not errs and not any(f["code"].startswith("TOM_") and f["code"] != "TOM_PASSED" for f in res.get("findings", [])),
           f"push (TOM validates the TMDL): {res.get('result')} {errs}")
 
     if fails:

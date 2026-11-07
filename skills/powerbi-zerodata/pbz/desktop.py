@@ -42,6 +42,12 @@ def processes() -> list[dict]:
     return [{"pid": int(p["ProcessId"]), "cmd": p.get("CommandLine") or ""} for p in _json_list(out)]
 
 
+def _dirty_state(inst: dict) -> bool | None:
+    """Retain unknown; a missing bridge capability is never proof of clean state."""
+    values = [inst[k] for k in ("hasUnsavedChanges", "unsaved", "isDirty") if isinstance(inst.get(k), bool)]
+    return True if True in values else False if values else None
+
+
 def bridge_status() -> list[dict]:
     if not os.path.exists(BRIDGE):
         return []
@@ -56,9 +62,15 @@ def bridge_status() -> list[dict]:
         if not isinstance(inst, dict):
             continue
         pid = inst.get("pid") or inst.get("processId")
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
         paths = [str(v) for k, v in inst.items() if isinstance(v, str) and re.search(r"(?i)path|file", k)]
         out.append({"pid": int(pid) if pid else None, "paths": paths,
-                    "unsaved": bool(inst.get("hasUnsavedChanges") or inst.get("unsaved") or inst.get("isDirty"))})
+                    "unsaved": _dirty_state(inst)})
     return out
 
 
@@ -68,13 +80,17 @@ def _norm(p: str) -> str:
 
 def find_instance(project: Project) -> dict | None:
     target = _norm(project.pbip)
+    matches: dict[int, dict] = {}
     for inst in bridge_status():
         if any(_norm(p) == target for p in inst["paths"]):
-            return {"pid": inst["pid"], "via": "bridge", "unsaved": inst["unsaved"]}
+            matches[inst["pid"]] = {"pid": inst["pid"], "via": "bridge", "unsaved": inst["unsaved"]}
     for proc in processes():
-        if target in os.path.normcase(proc["cmd"]):
-            return {"pid": proc["pid"], "via": "process", "unsaved": None}
-    return None
+        args = [quoted or bare for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', proc["cmd"])]
+        if any(_norm(arg) == target for arg in args):
+            matches.setdefault(proc["pid"], {"pid": proc["pid"], "via": "process", "unsaved": None})
+    if len(matches) > 1:
+        raise PbzError("AMBIGUOUS_DESKTOP", "multiple Desktop instances match this project; close the extra instance")
+    return next(iter(matches.values()), None)
 
 
 def engine_port(pid: int) -> int | None:
@@ -105,58 +121,82 @@ def engine_port(pid: int) -> int | None:
     return None
 
 
+def _instance_status(project: Project, inst: dict | None, ready: bool = False) -> dict:
+    if not inst:
+        return {"verb": "desktop", "project": project.name, "open": False, "engine": "NOT_READY"}
+    return {"verb": "desktop", "project": project.name, "open": True, "pid": inst.get("pid"),
+            "via": inst.get("via"), "unsaved_changes": inst.get("unsaved"),
+            "engine": "READY" if ready else "NOT_READY"}
+
+
+def _ready(project: Project, inst: dict | None) -> bool:
+    port = engine_port(inst["pid"]) if inst and inst.get("pid") else None
+    if not port:
+        return False
+    res = engine_call("connect", {"private_dir": project.ws.private, "port": port}, timeout=30)
+    return res.get("ok") is True
+
+
 def status(project: Project) -> dict:
     inst = find_instance(project)
-    if not inst:
-        return {"verb": "desktop", "project": project.name, "open": False}
-    port = engine_port(inst["pid"]) if inst.get("pid") else None
-    return {"verb": "desktop", "project": project.name, "open": True, "pid": inst["pid"], "via": inst["via"],
-            "unsaved_changes": inst.get("unsaved"), "engine": "READY" if port else "NOT_READY"}
+    return _instance_status(project, inst, _ready(project, inst))
 
 
 def open_(project: Project, wait: int = 240) -> dict:
-    if find_instance(project):
-        return {**status(project), "action": "already_open"}
-    # the bridge's `open` cannot find the Store build of Desktop; the file association can
-    os.startfile(project.pbip)
-    deadline = time.time() + wait
-    while time.time() < deadline:
+    inst = find_instance(project)
+    already_open = inst is not None
+    if not already_open:
+        # File association supports the Store build as well as the desktop build.
+        os.startfile(project.pbip)
+    deadline = time.monotonic() + max(0, wait)
+    while True:
         inst = find_instance(project)
-        port = engine_port(inst["pid"]) if inst and inst.get("pid") else None
-        if port:
-            res = engine_call("connect", {"private_dir": project.ws.private, "port": port})
-            if res.get("ok") or res.get("class") == "ENGINE_UNAVAILABLE":
-                return {**status(project), "action": "opened"}
-        time.sleep(5)
-    return {**status(project), "action": "timeout"}
+        if _ready(project, inst):
+            return {**_instance_status(project, inst, True), "result": "READY",
+                    "action": "already_open" if already_open else "opened"}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {**_instance_status(project, inst), "result": "TIMEOUT", "action": "timeout"}
+        time.sleep(min(2, remaining))
 
 
 def close(project: Project, wait: int = 60) -> dict:
     inst = find_instance(project)
     if not inst:
-        return {"verb": "desktop", "project": project.name, "open": False, "action": "not_open"}
+        return {"verb": "desktop", "project": project.name, "open": False,
+                "action": "not_open", "result": "NOT_OPEN"}
+    # A close request cannot save or dismiss a modal. Never force-kill Desktop.
     pid = int(inst["pid"])
     _ps(f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ [void]$p.CloseMainWindow() }}")
-    deadline = time.time() + wait
-    while time.time() < deadline:
+    deadline = time.monotonic() + max(0, wait)
+    while True:
         alive = _ps(f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'alive' }}").strip()
         if not alive:
-            return {"verb": "desktop", "project": project.name, "open": False, "action": "closed"}
-        time.sleep(2)
-    return {"verb": "desktop", "project": project.name, "open": True, "action": "WAITING_ON_DIALOG",
-            "hint": "Desktop did not close; a Save prompt is probably open. Ask the user to answer it."}
+            return {"verb": "desktop", "project": project.name, "open": False,
+                    "action": "closed", "result": "CLOSED"}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"verb": "desktop", "project": project.name, "open": True,
+                    "action": "WAITING_ON_DIALOG", "result": "WAITING_ON_DIALOG", "reason": "UNKNOWN",
+                    "hint": "Desktop did not close. Ask the user to inspect pending dialogs; no dialog contents were read."}
+        time.sleep(min(2, remaining))
 
 
 def reload(project: Project) -> str:
+    """Legacy string contract, with fail-closed dirty-state checks at the operation boundary."""
     inst = find_instance(project)
     if not inst or not os.path.exists(BRIDGE):
         return "NOT_AVAILABLE"
-    p = subprocess.run([BRIDGE, "reload", "--pid", str(inst["pid"])], capture_output=True, timeout=180)
+    if inst.get("unsaved") is True:
+        return "DESKTOP_DIRTY"
+    if inst.get("unsaved") is not False:
+        return "DESKTOP_STATE_UNKNOWN"
     try:
+        p = subprocess.run([BRIDGE, "reload", "--pid", str(inst["pid"])], capture_output=True, timeout=180)
         data = json.loads(p.stdout.decode("utf-8", errors="replace") or "{}")
-    except ValueError:
-        data = {}
-    ok = p.returncode == 0 and not (isinstance(data, dict) and data.get("error"))
+    except (ValueError, subprocess.SubprocessError, OSError):
+        return "RELOAD_FAILED"
+    ok = p.returncode == 0 and isinstance(data, dict) and data.get("ok") is not False and not data.get("error")
     return "RELOADED" if ok else "RELOAD_FAILED"
 
 
@@ -174,6 +214,8 @@ def require_port(project: Project) -> int:
     from . import tmdl
     expected = set(tmdl.load_model(os.path.join(project.model_dir, "definition")).tables)
     live = set(res.get("tables", []))
-    if expected and live and not live <= expected | {t for t in live if t.startswith(("LocalDateTable_", "DateTableTemplate_"))}:
+    live_user = {t for t in live if not t.startswith(("LocalDateTable_", "DateTableTemplate_"))}
+    expected_user = {t for t in expected if not t.startswith(("LocalDateTable_", "DateTableTemplate_"))}
+    if not expected_user or live_user != expected_user:
         raise PbzError("ENGINE_MISMATCH", "the open model's tables differ from this project; refusing to query it")
     return port

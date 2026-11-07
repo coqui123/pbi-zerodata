@@ -53,6 +53,7 @@ public static class Program
         "ping" => Ctx.Ok("ping", new JsonObject { ["version"] = ContractVersion }),
         "connect" => ConnectVerb.Run(req, ctx),
         "health" => Health.Run(req, ctx),
+        "provenance" => Provenance.Run(req, ctx),
         "tmdl-validate" => TmdlValidate.Run(req, ctx),
         "refresh" => Refresh.Run(req, ctx),
         "compiles" => Compiles.Run(req, ctx),

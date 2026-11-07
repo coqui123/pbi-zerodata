@@ -44,6 +44,8 @@ If the workspace or any path you touch holds a Power BI project (*.pbip, *.Seman
 the sanitized mirror in pbz-workspace\\ through `pbz pull` / `pbz push`. Never open data files,
 real definition folders, .pbi caches, or query a Power BI engine or REST API directly; use pbz.
 Never screenshot Power BI. Never write data values (amounts, counts, names) into memory or notes.
+External files need exact-file `pbz consent` approval after the user verifies no sensitive data;
+read them only through the consent broker. Real model/report/cache/private paths stay prohibited.
 {END}
 """
 

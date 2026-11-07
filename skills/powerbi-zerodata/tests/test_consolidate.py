@@ -73,7 +73,7 @@ def main() -> int:
         res = mirror.push(ws, project)
         outputs.append(res)
         errs = [f for f in res.get("findings", []) if f["severity"] == "error"]
-        tom = [f["code"] for f in res.get("findings", []) if f["code"].startswith("TOM_")]
+        tom = [f["code"] for f in res.get("findings", []) if f["code"].startswith("TOM_") and f["code"] != "TOM_PASSED"]
         if "TOM_ENGINE_UNAVAILABLE" in tom:
             fails.append(f"push after {label}: ENGINE_UNAVAILABLE (the engine may be rebuilding): rerun the test")
         check(res["result"] == "PUSHED" and not errs and not tom, f"push after {label}: {res.get('result')} {errs} {tom}")

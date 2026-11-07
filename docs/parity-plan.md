@@ -179,6 +179,26 @@ bands), Power Query refresh-cost evidence, Direct Lake guardrails (needs a servi
 moves of calculated columns to Power Query. Not building: a VPAX export, a black-box cost score
 presented as speed, fix-all for BPA, similarity-based table merges.
 
+## Round 9 (2026-11-05): themes, page backgrounds and images
+
+Question: could agents change themes and images? Themes already worked (theme JSON is mirrored and
+Microsoft's validator checks it on push) but SKILL.md had no rules; images could not be placed at all
+(image files are not mirrored and the guard blocks them); an image embedded in a theme reached the
+mirror unhidden. Built, from Microsoft's core visual capabilities, the report-authoring validator and
+Microsoft's report-authoring guidance:
+- `«payload:image#n»`: `data:` URIs in report JSON and themes, and base64 images inside longer strings
+  (text boxes, Vega specs, SVG measures), are tokenized on pull and restored byte for byte on push.
+- `image add|list|remove`: header-checked files (PNG, JPEG, GIF, BMP, SVG without scripts or DTDs),
+  staged in the private store, registered in report.json, installed (and dropped ones deleted, backed
+  up) by push; checks for flat, unregistered, missing and unsafe image references.
+- `style --canvas`: canvas and wallpaper color, transparency, image and scaling; image-typed and
+  imageUrl-typed properties of visuals take a registered image (or a public URL); `add visual image`.
+- Fixes: push removes the folder a deleted visual leaves; tokens escaped by a JSON writer
+  (`«...»`) are still read as tokens and flagged if left over.
+- SKILL.md rules for themes, page colors and images.
+Not building: image previews or descriptions for the agent (images can show data), theme generation
+from a brand image, plot-area images (Microsoft's validator rejects the nested form there).
+
 ## 0. Ground rules
 
 - Every feature runs on metadata: the sanitized `pbz-workspace` mirror for anything the agent sees,

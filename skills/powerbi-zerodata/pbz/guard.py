@@ -105,7 +105,7 @@ MEMORY_DATA_PATTERNS = [
 
 REASONS = {
     "definition": "Real Power BI definition files are off-limits in zero-data mode. Run `pbz pull` and edit the sanitized mirror in pbz-workspace\\, then `pbz push`.",
-    "data_file": "Data-bearing file blocked in zero-data mode (data files, caches, images, documents, dumps). Ask the user, or use pbz verbs that return metadata only.",
+    "data_file": "Data-bearing file blocked in zero-data mode. For an external reference, use pbz consent request; ask the user to verify no sensitive data before approving the exact file. Read only through the consent broker. Model/report definitions, caches and private stores remain denied.",
     "global": "Power BI caches, Desktop and Measure Killer app data and the pbz private store are never readable by agents.",
     "engine": "Direct engine, REST or data access is blocked. Use pbz verbs (health, check, probe, snapshot, smoke, describe, values).",
     "admin": "`pbz admin` is for the user in their own terminal only.",
@@ -688,6 +688,7 @@ def session_context(root: str) -> str:
         f"Load the powerbi-zerodata skill before any Power BI work. CLI: \"{pbz}\". "
         "Edit only the sanitized mirror in pbz-workspace\\ (`pbz pull` first, `pbz push` to apply). "
         "Never open data files, real *.SemanticModel / *.Report folders, .pbi caches or query engines directly. "
+        "For external reference files, use pbz consent request; the user must verify no sensitive data before exact-file approval. "
         "The user verifies visuals (`pbz handoff`)."
     )
 

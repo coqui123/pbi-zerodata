@@ -29,7 +29,7 @@ from .common import PbzError
 ALLOWED = {"set", "rename", "move", "new", "relationship", "add", "style", "filter", "interaction", "link",
            "bookmark", "copy", "hierarchy", "format-expr", "function", "culture", "translate", "perspective", "role",
            "refresh-policy", "format", "repair", "bpa", "a11y", "mobile", "validate", "diff", "layout", "get",
-           "unused", "lineage", "describe"}
+           "unused", "lineage", "describe", "image"}
 
 
 def _snapshot(ws, project) -> dict[str, bytes]:

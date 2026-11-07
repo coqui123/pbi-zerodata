@@ -9,7 +9,7 @@ import subprocess
 from . import lint, pbir, pbircheck, tmdl
 from .classify import PII_IN_TEXT
 from .common import TOOLS_BIN, engine_call
-from .tokens import TOKEN_RE
+from .tokens import ESC_TOKEN_RE, TOKEN_RE
 
 REPORT_AUTHOR = os.path.join(TOOLS_BIN, "powerbi-report-author.cmd")
 
@@ -18,7 +18,7 @@ def retokenizer(tm, extra_prefixes=()):
     pairs = []
     for tok, rec in tm.data.get("tokens", {}).items():
         for v in [rec.get("value")] + list((rec.get("raws") or {}).values()):
-            if isinstance(v, (str, int, float)) and len(str(v).strip()) >= 3:
+            if isinstance(v, (str, int, float)) and str(v).strip():
                 pairs.append((str(v), tok))
     pairs.sort(key=lambda p: -len(p[0]))
 
@@ -28,8 +28,16 @@ def retokenizer(tm, extra_prefixes=()):
         for pre in extra_prefixes:
             msg = msg.replace(pre, "").replace(pre.replace("\\", "/"), "")
         for v, tok in pairs:
-            if v in msg:
-                msg = msg.replace(v, tok)
+            def replace(part):
+                if len(v.strip()) < 3:
+                    return re.sub(r"(?<!\w)" + re.escape(v) + r"(?!\w)", lambda _m: tok, part)
+                return part.replace(v, tok)
+            # Never rewrite digits or labels inside tokens produced by an earlier replacement.
+            parts, end = [], 0
+            for match in TOKEN_RE.finditer(msg):
+                parts.extend((replace(msg[end:match.start()]), match.group(0)))
+                end = match.end()
+            msg = "".join(parts) + replace(msg[end:])
         msg = PII_IN_TEXT.sub("«pii»", msg)
         return msg[:400]
 
@@ -74,6 +82,8 @@ def report_author(stage: str, project, scrub) -> list[dict]:
             continue  # e.g. schema download failed: retry offline
         res = []
         summary = data.get("data", {}) if isinstance(data, dict) else {}
+        if not isinstance(summary, dict):
+            summary = {}
         for d in _diagnostics(data):
             sev = str(d.get("severity") or d.get("level") or "error").lower()
             sev = "error" if sev.startswith("err") else ("warning" if sev.startswith("warn") else "info")
@@ -83,8 +93,17 @@ def report_author(stage: str, project, scrub) -> list[dict]:
         if summary.get("result") and summary.get("result") != "succeeded" and not res:
             res.append({"severity": "error", "code": "PBIR_INVALID", "where": "report",
                         "message": f"{summary.get('errorCount', '?')} error(s)"})
+        if p.returncode != 0 and not any(f["severity"] == "error" for f in res):
+            res.append({"severity": "error", "code": "REPORT_VALIDATOR_FAILED", "where": "report",
+                        "message": "validator returned an unsuccessful exit status"})
+        if not any(f["severity"] == "error" for f in res) and summary.get("result") != "succeeded":
+            res.append({"severity": "error", "code": "REPORT_VALIDATOR_RESPONSE", "where": "report",
+                        "message": "validator did not provide a recognized successful response"})
+        if not any(f["severity"] == "error" for f in res):
+            res.append({"severity": "info", "code": "REPORT_SCHEMA_NOT_RUN" if "--no-schema" in args else "REPORT_SCHEMA_PASSED",
+                        "where": "report", "message": "offline validation only" if "--no-schema" in args else "schema checked"})
         return res
-    return [{"severity": "info", "code": "REPORT_VALIDATOR_FAILED", "where": "report", "message": "could not run"}]
+    return [{"severity": "error", "code": "REPORT_VALIDATOR_FAILED", "where": "report", "message": "could not run"}]
 
 
 def field_refs(stage: str, project, model, scrub) -> list[dict]:
@@ -133,6 +152,8 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
     if os.path.isdir(mdef):
         res = engine_call("tmdl-validate", {"private_dir": ws.private, "folder": mdef}, timeout=300)
         if res.get("ok"):
+            if not res.get("errors") and not res.get("missing_refs"):
+                findings.append({"severity": "info", "code": "TOM_PASSED", "where": "model", "message": "TOM validation ran"})
             for e in res.get("errors", []):
                 findings.append({"severity": "error", "code": "TMDL_" + str(e.get("class", "OTHER")),
                                  "where": f"{e.get('file', '?')}:{e.get('line', '?')}", "message": scrub(e.get("message", ""))})
@@ -141,7 +162,7 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
             for f in res.get("orphan_files", []):
                 findings.append({"severity": "warning", "code": "TMDL_ORPHAN_FILE", "where": f, "message": "file not referenced"})
         else:
-            findings.append({"severity": "info", "code": "TOM_" + str(res.get("class", "UNAVAILABLE")),
+            findings.append({"severity": "error", "code": "TOM_" + str(res.get("class", "UNAVAILABLE")),
                              "where": "model", "message": "TMDL not checked by TOM"})
         model = tmdl.load_model(mdef)
         for f in lint.run(model):
@@ -154,14 +175,17 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
     rdir = os.path.join(stage, project.name + ".Report")
     if os.path.isdir(rdir):
         staged_pkg = lambda n: os.path.isfile(os.path.join(rdir, "CustomVisuals", n, "package.json"))  # noqa: E731
-        findings += [dict(f, message=scrub(f["message"])) for f in pbircheck.run(rdir, has_package=staged_pkg)]
+        staged_img = lambda n: os.path.isfile(os.path.join(rdir, "StaticResources", "RegisteredResources", n))  # noqa: E731
+        findings += [dict(f, message=scrub(f["message"]))
+                     for f in pbircheck.run(rdir, has_package=staged_pkg, has_image=staged_img)]
     findings += field_refs(stage, project, model, scrub)
     for cur, _dirs, files in os.walk(stage):
         for name in files:
             if name.lower().endswith((".tmdl", ".json", ".pbir", ".pbism")):
                 p = os.path.join(cur, name)
                 with open(p, encoding="utf-8", errors="replace") as f:
-                    if TOKEN_RE.search(f.read()):
+                    body = f.read()
+                    if TOKEN_RE.search(body) or ESC_TOKEN_RE.search(body):
                         findings.append({"severity": "error", "code": "UNRESOLVED_TOKEN",
                                          "where": os.path.relpath(p, stage).replace("\\", "/"), "message": "token left"})
     return findings
@@ -183,6 +207,7 @@ def run_mirror(ws, project) -> list[dict]:
     out = lint.run(model) + synthetic_marker(model)
     out += field_refs(ws.mirror, project, model, ident)
     if os.path.isdir(project.mirror_report):
-        from . import visuals
-        out += pbircheck.run(project.mirror_report, has_package=lambda n: visuals.package_present(ws, project, n))
+        from . import images, visuals
+        out += pbircheck.run(project.mirror_report, has_package=lambda n: visuals.package_present(ws, project, n),
+                             has_image=lambda n: images.present(ws, project, n))
     return out

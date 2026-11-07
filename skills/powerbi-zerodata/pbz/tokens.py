@@ -16,6 +16,13 @@ from .common import sha
 TOKEN_RE = re.compile(r"«[^«»\r\n]{1,300}»")
 FULL_JSON_TOKEN_RE = re.compile(r'"(«[^«»"\r\n]{1,300}»)"')
 BASE64_RE = re.compile(r"^[A-Za-z0-9+/=\s]{200,}$")
+# Embedded files (images in themes, buttons, image URLs; base64 blobs inside longer strings) are opaque
+# payloads: an image can show data, and its bytes are useless to read. A whole string that is a data: URI
+# becomes one token; a base64 data: URI inside a longer string (HTML, a DAX SVG template) is cut out.
+DATA_URI_RE = re.compile(r"(?i)^\s*data:(?:[a-z0-9.+-]+/[a-z0-9.+-]+)?(?:;[a-z0-9=.+_-]+)*,")  # not "Data: Q1"
+# A token written back by a JSON tool that escapes non-ASCII (\u00ab ... \u00bb): still a token.
+ESC_TOKEN_RE = re.compile(r"\\u00[aA][bB]((?:[^\"\\\r\n]|\\u[0-9a-fA-F]{4}){1,300}?#\d{1,7})\\u00[bB][bB]")
+EMBEDDED_B64_URI_RE = re.compile(r"(?i)data:[a-z0-9.+/-]*(?:;[a-z0-9.+=_-]+)*;base64,[A-Za-z0-9+/=]{16,}")
 
 COLUMN_VALUE_FUNCS = {"SELECTEDVALUE", "VALUES", "DISTINCT", "MAX", "MIN", "MAXA", "MINA", "FIRSTNONBLANK",
                       "LASTNONBLANK", "ALLSELECTED", "FILTERS"}
@@ -90,6 +97,14 @@ class TokenMap:
     def opaque(self, label: str, digest: str) -> str:
         """Token for a group key known only by HMAC (from engine output)."""
         return self._new(label + "@g", f"hmac\0{label}\0{digest}", {"kind": "hmac", "hmac": digest, "column": label, "raws": {}})
+
+
+def data_uri_label(uri: str) -> str:
+    return "payload:image" if uri.strip()[5:11].lower() == "image/" else "payload:data"
+
+
+def _overlaps(s: int, e: int, spans: list[tuple[int, int, str]]) -> bool:
+    return any(s < ue and e > us for us, ue, _r in spans)
 
 
 def apply_edits(text: str, edits: list[tuple[int, int, str]]) -> str:
@@ -422,8 +437,8 @@ def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
                     continue
                 col = b[:2] if isinstance(b, tuple) else None
                 in_row = isinstance(b, tuple) and len(b) == 3  # embedded table rows are data
-                small_ordinal = re.fullmatch(r"\d{1,3}", t.text) is not None  # sort orders, weights, flags
-                if t.kind == "num" and in_row and not small_ordinal:
+                # Embedded cells are data, even when their magnitude resembles a flag or ordinal.
+                if t.kind == "num" and in_row:
                     lab = clf.label(*col)
                     edits.append((t.start, t.end, tm.lit(lab, _num_value(t.text), "number", "tmdl", t.text)))
                     continue
@@ -442,9 +457,15 @@ def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
                                       tm.lit(label, t.value, "string", "tmdl", inner)))
                     else:
                         decoded, pos = _dq_map(inner)
+                        # an embedded image (a logo inside an SVG measure) is cut out; the template stays readable
+                        uris = [(t.start + 1 + pos[m.start()], t.start + 1 + pos[m.end()],
+                                 tm.raw(data_uri_label(m.group(0)), inner[pos[m.start()]:pos[m.end()]], "tmdl"))
+                                for m in EMBEDDED_B64_URI_RE.finditer(decoded)]
+                        edits += uris
                         for s, e, lab in clf.free_text(decoded):
                             rs, re_ = pos[s], pos[e]
-                            edits.append((t.start + 1 + rs, t.start + 1 + re_, tm.raw(lab, inner[rs:re_], "tmdl")))
+                            if not _overlaps(t.start + 1 + rs, t.start + 1 + re_, uris):
+                                edits.append((t.start + 1 + rs, t.start + 1 + re_, tm.raw(lab, inner[rs:re_], "tmdl")))
                 elif t.kind == "num" and col:
                     label = clf.literal(_num_value(t.text), "number", col)
                     if label:
@@ -564,36 +585,71 @@ def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
         return text
     edits: list[tuple[int, int, str]] = []
     handled: set[int] = set()
+
+    def whole_uri(node) -> None:  # the whole JSON string is one data: URI (theme image, image URL literal)
+        raw_full = text[node.start:node.end]
+        edits.append((node.start, node.end, '"' + tm.raw(data_uri_label(node.value.strip("'")), raw_full, "pbir_full") + '"'))
+
     for site in pbir.walk_literals(root, model):
         handled.add(site.node.start)
         value, vtype = pbir.decode_literal(site.raw)
         raw_full = text[site.node.start:site.node.end]
         if vtype == "string" and isinstance(value, str):
+            if DATA_URI_RE.match(value):
+                whole_uri(site.node)
+                continue
             spans = _deneb_values_spans(site.raw)
             if spans:
                 inner_raw = raw_full[1:-1]
                 decoded, pos = _decode_map(inner_raw)
+                deneb = []
                 for s, e in spans:
                     rs, re_ = pos[s] + 1, pos[e] + 1
-                    edits.append((site.node.start + rs, site.node.start + re_,
+                    deneb.append((site.node.start + rs, site.node.start + re_,
                                   tm.raw("payload:deneb", raw_full[rs:re_], "pbir_inner")))
+                edits.extend(deneb)
+                edits.extend(u for u in _uri_edits(text, site.node, tm) if not _overlaps(u[0], u[1], deneb))
                 continue
         label = None
         if vtype in ("string", "int", "double"):
             label = clf.literal(value, "string" if vtype == "string" else "number", site.column)
         if label:
             edits.append((site.node.start, site.node.end, '"' + tm.lit(label, value, vtype, "pbir_full", raw_full) + '"'))
-        elif vtype == "string" and site.column is None and isinstance(value, str):
-            _free_text_edits(text, site.node, value, clf, tm, edits, numbers=False)
+        elif vtype == "string" and isinstance(value, str):
+            uris = _uri_edits(text, site.node, tm)
+            edits.extend(uris)
+            if site.column is None:
+                _free_text_edits(text, site.node, value, clf, tm, edits, numbers=False, avoid=uris)
     for key, node in pbir.string_nodes(root):
-        if node.start in handled or key in STRUCTURAL_KEYS:
+        if node.start in handled:
+            continue
+        if DATA_URI_RE.match(node.value):
+            whole_uri(node)
+            continue
+        uris = _uri_edits(text, node, tm)
+        edits.extend(uris)
+        if key in STRUCTURAL_KEYS:
             continue
         numbers = key == "value" and '"textRuns"' in text
-        _free_text_edits(text, node, node.value, clf, tm, edits, numbers=numbers)
+        _free_text_edits(text, node, node.value, clf, tm, edits, numbers=numbers, avoid=uris)
     return apply_edits(text, edits)
 
 
-def _free_text_edits(text, node, value, clf, tm, edits, numbers):
+def _uri_edits(text, node, tm) -> list[tuple[int, int, str]]:
+    """Base64 data: URIs inside one JSON string (HTML, a Vega spec, an SVG) as inner payload tokens."""
+    inner_raw = text[node.start + 1:node.end - 1]
+    if "base64," not in inner_raw.lower():
+        return []
+    decoded, pos = _decode_map(inner_raw)
+    out = []
+    for m in EMBEDDED_B64_URI_RE.finditer(decoded):
+        rs, re_ = pos[m.start()], pos[m.end()]
+        out.append((node.start + 1 + rs, node.start + 1 + re_,
+                    tm.raw(data_uri_label(m.group(0)), inner_raw[rs:re_], "pbir_inner")))
+    return out
+
+
+def _free_text_edits(text, node, value, clf, tm, edits, numbers, avoid=()):
     spans = clf.free_text(value, numbers=numbers)
     if not spans:
         return
@@ -603,11 +659,25 @@ def _free_text_edits(text, node, value, clf, tm, edits, numbers):
         return
     for s, e, lab in spans:
         rs, re_ = pos[s], pos[e]
+        if avoid and _overlaps(node.start + 1 + rs, node.start + 1 + re_, list(avoid)):
+            continue
         edits.append((node.start + 1 + rs, node.start + 1 + re_, tm.raw(lab, inner_raw[rs:re_], "pbir_inner", value[s:e])))
 
 
 def detokenize_pbir(text: str, tm: TokenMap) -> tuple[str, list[str]]:
     unknown: list[str] = []
+
+    def esc(m):  # «...» escaped as «...» by a JSON writer: the same token
+        try:
+            tok = "«" + json.loads('"' + m.group(1) + '"') + "»"
+        except ValueError:
+            return m.group(0)
+        if tm.get(tok) is None:
+            unknown.append(tok)
+            return m.group(0)
+        return tok
+
+    text = ESC_TOKEN_RE.sub(esc, text)
 
     def full(m):
         tok = m.group(1)

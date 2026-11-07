@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 
@@ -15,6 +16,84 @@ ENGINE_KINDS = {"executes", "nonblank", "nonempty", "equal", "additive", "unique
                 "no_blank_keys", "sign", "subset"}
 ALL_KINDS = ENGINE_KINDS | {"differs", "filter_independent", "compiles"}
 EXPR_FIELDS = ("expr", "left", "right", "column", "from", "to", "of")
+
+CHECK_REQUIRED = {
+    **{k: ("expr",) for k in ("executes", "nonblank", "nonempty", "sign", "compiles")},
+    **{k: ("left", "right") for k in ("equal", "differs")},
+    **{k: ("column",) for k in ("unique", "no_blank_keys")},
+    "additive": ("expr", "by"), "no_orphans": ("from", "to"),
+    "subset": ("column", "of"), "filter_independent": ("expr", "column"),
+}
+
+
+def check_schema() -> dict:
+    """Public, dependency-free schema for check files. `subset.of` names a column."""
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+            "required": ["checks"], "properties": {"checks": {"type": "array", "items": {
+                "oneOf": [{"type": "object", "required": ["kind", *required], "properties": {
+                    "kind": {"const": kind}, "id": {"type": "string", "minLength": 1},
+                    **{k: {"type": "string", "minLength": 1} for k in EXPR_FIELDS},
+                    "table": {"type": "string", "minLength": 1},
+                    "by": {"type": "array", "items": {"type": "string", "minLength": 1},
+                           **({"minItems": 1} if kind == "additive" else {})},
+                    "where": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                    "tol": {"type": "number", "minimum": 0},
+                    "expect": {"type": "array", "items": {"enum": ["NEG", "ZERO", "POS", "BLANK"]}},
+                }} for kind, required in CHECK_REQUIRED.items()]}}}}
+
+
+def validate_spec(spec) -> dict:
+    """Check request shape before opening private stores or charging disclosure budget.
+
+    Diagnostics disclose field paths and closed messages, never submitted expressions/values.
+    Runtime DAX/object validity remains the engine's responsibility.
+    """
+    issues = []
+
+    def issue(index, field, message):
+        issues.append({"id": f"c{index + 1}", "path": f"checks[{index}].{field}",
+                       "message": message})
+
+    if not isinstance(spec, dict) or not isinstance(spec.get("checks"), list):
+        return {"valid": False, "findings": [{"id": "spec", "path": "checks",
+                                              "message": "checks must be an array"}]}
+    seen = set()
+    for index, check in enumerate(spec["checks"]):
+        if not isinstance(check, dict):
+            issue(index, "kind", "each check must be an object")
+            continue
+        ident = check.get("id", f"c{index + 1}")
+        if not isinstance(ident, str) or not ident.strip():
+            issue(index, "id", "id must be a nonempty string")
+        elif ident in seen:
+            issue(index, "id", "check ids must be unique")
+        else:
+            seen.add(ident)
+        kind = check.get("kind")
+        if not isinstance(kind, str) or kind not in CHECK_REQUIRED:
+            issue(index, "kind", "unknown check kind")
+            continue
+        for field in CHECK_REQUIRED[kind]:
+            value = check.get(field)
+            if field == "by":
+                if not isinstance(value, list) or not value:
+                    issue(index, field, "additive requires a nonempty grouping list")
+            elif not isinstance(value, str) or not value.strip():
+                issue(index, field, "required field must be a nonempty string")
+        for field in (*EXPR_FIELDS, "table"):
+            if field in check and (not isinstance(check[field], str) or not check[field].strip()):
+                issue(index, field, "field must be a nonempty string")
+        for field in ("where", "by"):
+            if field in check and (not isinstance(check[field], list) or
+                                   any(not isinstance(x, str) or not x.strip() for x in check[field])):
+                issue(index, field, "field must be an array of nonempty strings")
+        if "tol" in check and (isinstance(check["tol"], bool) or not isinstance(check["tol"], (int, float)) or
+                               (isinstance(check["tol"], float) and not math.isfinite(check["tol"])) or check["tol"] < 0):
+            issue(index, "tol", "tolerance must be a finite nonnegative number")
+        if "expect" in check and (kind != "sign" or not isinstance(check["expect"], list) or
+                                  any(x not in ("NEG", "ZERO", "POS", "BLANK") for x in check["expect"])):
+            issue(index, "expect", "sign expectations must use closed sign categories")
+    return {"valid": not issues, "findings": issues}
 
 
 def _state_path(ws) -> str:
@@ -173,6 +252,11 @@ def _rewrite(c: dict) -> tuple[dict | None, str | None]:
 
 
 def run_checks(ws, project, spec: dict) -> dict:
+    shape = validate_spec(spec)
+    if not shape["valid"]:
+        return {"verb": "check", "project": project.name, "spec_valid": False,
+                "results": [{"id": f["id"], "status": "ERROR", "class": "BAD_REQUEST",
+                             "field": f["path"], "note": f["message"]} for f in shape["findings"]]}
     pol = policy_mod.load(ws)
     budgets = pol.get("budgets", {})
     strict = pol.get("disclosure") == "strict"

@@ -13,7 +13,10 @@ Technical lessons only. No values.
   tables and columns; ask the user to press Refresh in Desktop for source data.
 - Publishing and service refresh are not available to agents here.
 - OneDrive can briefly lock folders; retry the push.
-- A custom theme survives publish only when imported through Desktop (Themes > Browse).
+- A custom theme survives publish only when registered the way Desktop does it: the theme file's
+  `"name"`, `themeCollection.customTheme.name` and the `RegisteredResources` item all carry the same
+  `<theme>.json` (a bare name breaks the theme in the service; push checks this). Editing an imported
+  theme in the mirror is fine; when in doubt the user imports a new one through Desktop (Themes > Browse).
 
 ## TMDL
 
@@ -48,6 +51,13 @@ Technical lessons only. No values.
 - Slicers: keep `responsive` false, header off, height at least 64 for range sliders.
 - Hierarchy slicer `expansionStates`: the leaf level omits `identityKeys`.
 - Keep each file's existing `$schema` URL; Desktop bumps versions itself.
+- Image properties nest twice: `"image": {"image": {"name", "url", "scaling"}}`; the flat form shows
+  nothing. `url` is a `ResourcePackageItem` (`PackageName: RegisteredResources`, `PackageType: 1`,
+  `ItemName` = the registered file name, extension included). An image visual takes it in
+  `general.imageUrl`. Microsoft's validator rejects the nested form in objects that also have a `url`
+  property (`plotArea`, `fillCustom`).
+- A canvas background image stays invisible at Desktop's default canvas transparency: set
+  `background.transparency` to 0. Canvas and wallpaper colors cannot come from a measure.
 - Deneb fields use the field's display name; layered sorts need an `op` (min/max/count).
   Validate specs structurally only; never inline data rows.
 - Python visuals run on Desktop's own Python; the script cannot contain apostrophes.

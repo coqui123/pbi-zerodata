@@ -345,12 +345,14 @@ class Classifier:
             spans.append((m.start(), m.end(), "pii"))
         if self.key:
             words = list(WORD_RE.finditer(text))
+            # Indexed titles have no four-word limit. Bound work without leaking long prose:
+            # an unusually large data-derived description is safer as an opaque token.
+            if self.hmac_to_col and len(words) > 256:
+                return [(0, len(text), "lit")]
             i = 0
             while i < len(words):
                 hit = None
-                for k in (4, 3, 2, 1):
-                    if i + k > len(words):
-                        continue
+                for k in range(len(words) - i, 0, -1):
                     s, e = words[i].start(), words[i + k - 1].end()
                     col = self.hmac_column(text[s:e])
                     if not col and k == 1 and self.word_hmac_to_col:
@@ -386,11 +388,10 @@ class Classifier:
                 if len(run) >= 2:
                     spans.append((m.start() + start, m.start() + run[-1].end(), "lit"))
         if numbers:
-            for m in re.finditer(r"[$€£]?\s?\d[\d,]*(?:\.\d+)?\s?[%KMB]?", text):
-                tok = m.group(0).strip()
-                digits = re.sub(r"\D", "", tok)
-                if len(digits) >= 3 and not re.fullmatch(r"(19|20)\d\d", digits) or re.search(r"[$€£%]", tok):
-                    spans.append((m.start() + (len(m.group(0)) - len(m.group(0).lstrip())), m.end(), "num"))
+            # Counts in descriptions/comments are data regardless of their magnitude. This
+            # path does not tokenize executable authored DAX/M constants or schema ordinals.
+            for m in re.finditer(r"(?<!\w)[$€£]?\s?[+-]?\d[\d,]*(?:\.\d+)?(?:[eE][+-]?\d+)?\s?[%KMB]?(?!\w)", text):
+                spans.append((m.start() + (len(m.group(0)) - len(m.group(0).lstrip())), m.end(), "num"))
         spans.sort()
         merged: list[tuple[int, int, str]] = []
         for s, e, lab in spans:

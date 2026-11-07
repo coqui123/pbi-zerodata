@@ -638,7 +638,7 @@ def main() -> int:
     outputs.append(pushed)
     check(pushed["result"] == "PUSHED" and not [f for f in pushed["findings"] if f["severity"] == "error"],
           f"push after removal: {pushed.get('result')} {pushed.get('findings')}")
-    check(not any(f["code"].startswith("TOM_") for f in pushed.get("findings", [])), "TOM validation did not run")
+    check(not any(f["code"] in {"TOM_FAILED", "TOM_UNAVAILABLE"} for f in pushed.get("findings", [])), "TOM validation did not run")
     casc = unused.remove(ws, project, cascade=True)
     outputs.append(casc)
     check("measure [Base Unused]" in casc.get("removed", []) and "column Sales[DueDateKey]" in casc.get("removed", []),

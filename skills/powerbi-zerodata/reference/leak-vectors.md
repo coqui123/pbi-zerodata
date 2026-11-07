@@ -17,6 +17,7 @@ deny rules, a broker CLI), not an OS security boundary.
 | Desktop app data: TempSaves, Backups, AutoRecovery, AnalysisServicesWorkspaces, Traces | guard denies `~\Microsoft\Power BI Desktop Store App\` and `%LOCALAPPDATA%\Microsoft\Power BI Desktop\` |
 | Measure Killer: `*.measurekiller` analysis files (user emails, column sizes), `%APPDATA%\Measure Killer\` (activity logs, save files, exports, deletion backups) | guard everywhere; Read deny rules after the next `install.py` run |
 | Source files, dumps, exports, images, PDFs, Office docs in the workspace | guard default denies + `pbz scan` policy entries |
+| Report images (`StaticResources/RegisteredResources/*.png` ...) and images embedded in JSON or DAX (`data:` URIs in themes, image URLs, text boxes, SVG measures) | image files are never mirrored and the guard denies reading or copying them; embedded images become `«payload:image#n»` tokens; `pbz image add` reads a file inside pbz, checks its header and prints only item name, kind, size and pixel size; push installs the bytes |
 | Filter / slicer / bookmark / selector literals in PBIR | tokenized in the mirror (column-bound) |
 | DATATABLE, `#table`, Enter Data blobs, RLS members, M literals | tokenized or payload markers |
 | Figures and names in descriptions, comments, titles, text boxes | free-text scan (`«num»`, `«lit»`, `«pii»`) |

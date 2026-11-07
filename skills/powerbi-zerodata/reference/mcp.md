@@ -36,7 +36,8 @@ and `project` (when the workspace holds several `.pbip` files), plus its own arg
 | `diff` | `patch` |
 | `push` | `reload`, `dry_run`, `only` |
 | `revert` | `paths`, `object` |
-| `style` | `page`, `visual`, `set`, `unset`, `type`, `all`, `series`, `state`, `show`, `list`, `object` |
+| `style` | `page`, `visual`, `set`, `unset`, `type`, `all`, `series`, `state`, `show`, `list`, `object`, `canvas` |
+| `image` | `action` (add / list / remove, required), `target`, `name` |
 | `link` | `page`, `visual` (required), `to_page`, `back`, `bookmark`, `drillthrough`, `url`, `tooltip`, `clear` |
 | `filter` | `action` (add / remove / list, required), `target`, `report`, `page`, `visual`, `values_in`, `values_out`, `where`, `top`, `by`, `bottom` |
 | `interaction` | `page`, `source`, `target`, `mode` (all required) |
@@ -72,7 +73,7 @@ and `project` (when the workspace holds several `.pbip` files), plus its own arg
 | `new` | `kind`, `name` (required), `start`, `end`, `relate`, `date`, `items`, `precedence`, `fields`, `labels` |
 | `relationship` | `action`, `from_col`, `to_col` (required), `inactive`, `active`, `both`, `single`, `many_to_many`, `force` |
 | `add_page` | `name` (required), `width`, `height`, `hidden`, `after`, `tooltip`, `drillthrough` |
-| `add_visual` | `type`, `page` (required), `fields`, `pos`, `title`, `text` |
+| `add_visual` | `type`, `page` (required), `fields`, `pos`, `title`, `text`, `image`, `fit`, `alt` |
 | `check` | `spec` (required, the checks object) |
 | `probe` | `table` (required), `columns` |
 | `snapshot` | `action`, `name` (required), `spec` |

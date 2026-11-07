@@ -69,59 +69,153 @@ def _append(ws, entry: dict) -> None:
 
 # ---------------------------------------------------------------- recording
 
+def _verdict(value) -> str:
+    value = str(value).upper()
+    allowed = {"PASS", "FAIL", "ERROR", "EMPTY", "UNSUPPORTED", "BUDGET", "SAME", "DIFF", "NEW", "MISSING",
+               "STALE_DATA", "OK", "N/A", "PUSHED", "DRY_RUN_OK", "INVALID", "RELOADED", "RELOAD_FAILED",
+               "ENGINE_UNAVAILABLE", "DESKTOP_DIRTY", "DESKTOP_STATE_UNKNOWN", "NOT_READY", "TIMEOUT",
+               "INCOMPLETE", "BLOCKED", "GENERATED", "UNKNOWN"}
+    if value in allowed:
+        return value
+    # Engine error classes are closed-vocabulary, never arbitrary diagnostic text.
+    if value.startswith("ERROR:") and value[6:] in {"SYNTAX", "UNKNOWN_OBJECT", "TYPE_MISMATCH", "CONVERSION",
+            "CIRCULAR", "DUPLICATE_KEY", "TIMEOUT", "ENGINE_UNAVAILABLE", "BAD_REQUEST", "OTHER"}:
+        return value
+    return "UNKNOWN"
+
+
 def _counts(items, key="status") -> dict:
     out: dict = {}
     for it in items or []:
         if isinstance(it, dict):
-            v = str(it.get(key, "?"))
+            v = _verdict(it.get(key, "UNKNOWN"))
             out[v] = out.get(v, 0) + 1
     return out
 
 
+def _outcome(statuses: list[str], empty: str = "INCOMPLETE") -> str:
+    statuses = [_verdict(x) for x in statuses]
+    if not statuses:
+        return empty
+    if any(x in ("FAIL", "ERROR", "INVALID", "DIFF", "RELOAD_FAILED") or x.startswith("ERROR:") for x in statuses):
+        return "FAIL"
+    if any(x in ("BUDGET", "ENGINE_UNAVAILABLE", "DESKTOP_DIRTY", "DESKTOP_STATE_UNKNOWN") for x in statuses):
+        return "BLOCKED"
+    if any(x not in ("PASS", "OK", "SAME", "RELOADED", "N/A") for x in statuses):
+        return "INCOMPLETE"
+    return "PASS"
+
+
+def _reload_ready(value) -> bool:
+    if isinstance(value, str):
+        return value == "RELOADED"
+    return isinstance(value, dict) and (value.get("ok") is True or value.get("result") == "RELOADED")
+
+
 def summarize(verb: str, action: str | None, out: dict) -> tuple[str, dict] | None:
-    """(stage, verdict summary) for verbs that prove something; None otherwise. Ids and counts only."""
-    if not isinstance(out, dict) or out.get("ok") is False:
+    """Summaries contain only outcomes, object/check identifiers and coarse counts."""
+    if not isinstance(out, dict):
         return None
+    blocked = out.get("status") or out.get("error") or out.get("class")
     if verb == "validate":
         f = out.get("findings") or []
-        return "PARSED", {"errors": sum(1 for x in f if x.get("severity") == "error"),
-                          "warnings": sum(1 for x in f if x.get("severity") == "warning")}
+        errors = sum(1 for x in f if x.get("severity") == "error")
+        return "PARSED", {"errors": errors, "warnings": sum(1 for x in f if x.get("severity") == "warning"),
+                          "outcome": "FAIL" if errors or out.get("ok") is False else "PASS"}
     if verb == "push" and out.get("result") in ("PUSHED", "DRY_RUN_OK", "INVALID"):
         f = out.get("findings") or []
-        return "BOUND", {"result": out["result"], "errors": sum(1 for x in f if x.get("severity") == "error"),
-                         "tom": not any(str(x.get("code", "")).startswith("TOM_") for x in f)}
+        errors = sum(1 for x in f if x.get("severity") == "error")
+        codes = {str(x.get("code", "")) for x in f}
+        tom_failed = any(str(x.get("code", "")).startswith(("TOM_", "TMDL_")) and
+                         x.get("severity") == "error" for x in f)
+        tom = "FAIL" if tom_failed else "PASS" if "TOM_PASSED" in codes else "NOT_RUN"
+        schema = "PASS" if "REPORT_SCHEMA_PASSED" in codes else "FAIL" if any(
+            x.get("code") == "PBIR" and x.get("severity") == "error" for x in f) else "NOT_RUN"
+        return "BOUND", {"result": out["result"], "errors": errors,
+                         "tom": True if tom == "PASS" else False if tom == "FAIL" else None,
+                         "validation": {"tom": tom, "report_schema": schema},
+                         "outcome": "FAIL" if errors or out["result"] == "INVALID" else
+                                    "PASS" if tom == schema == "PASS" else "INCOMPLETE"}
     if verb == "desktop" and action in ("open", "reload"):
-        ok = out.get("engine") == "READY" or (out.get("reload") or {}).get("ok") is True or out.get("ok") is True
-        return "LOADED", {"action": action, "ready": bool(ok)}
+        ready = (_reload_ready(out.get("reload")) if action == "reload" else out.get("engine") == "READY")
+        return "LOADED", {"action": action, "ready": ready,
+                          "outcome": "PASS" if ready else _outcome([str(blocked or out.get("result") or "NOT_READY")])}
+    if verb in ("health", "check", "snapshot", "smoke") and blocked in ("BUDGET", "ENGINE_UNAVAILABLE", "UNSUPPORTED"):
+        return "EXECUTED", {"outcome": _outcome([blocked]), "status": blocked, "executed": False}
+    if out.get("ok") is False:
+        return None
     if verb == "health":
         bad = out.get("errors") or out.get("objects_in_error") or []
-        return "EXECUTED", {"health_errors": len(bad) if isinstance(bad, list) else bad}
+        unprocessed = out.get("unprocessed_tables") or []
+        count = len(bad) if isinstance(bad, list) else bad
+        return "EXECUTED", {"health_errors": count, "unprocessed_tables": len(unprocessed),
+                            "outcome": "FAIL" if count else "INCOMPLETE" if unprocessed else "PASS", "executed": True}
     if verb == "check":
         res = out.get("results") or []
-        return "EXECUTED", {"checks": _counts(res), "ids": [r.get("id") for r in res if isinstance(r, dict)][:50]}
+        return "EXECUTED", {"checks": _counts(res), "ids": [r.get("id") for r in res if isinstance(r, dict)][:50],
+                            "outcome": _outcome([r.get("status", "UNKNOWN") for r in res]), "executed": bool(res)}
     if verb == "snapshot" and action == "compare":
-        return "EXECUTED", {"snapshot": out.get("name"), "queries": _counts(out.get("queries"), "result")}
+        res = out.get("queries") or []
+        return "EXECUTED", {"snapshot": out.get("name"), "queries": _counts(res, "result"),
+                            "outcome": _outcome([r.get("result", "UNKNOWN") for r in res]), "executed": bool(res)}
     if verb == "smoke":
-        return "EXECUTED", {"smoke": out.get("summary") if isinstance(out.get("summary"), dict) else _counts(out.get("visuals"))}
+        counts = out.get("summary") if isinstance(out.get("summary"), dict) else _counts(out.get("visuals"))
+        return "EXECUTED", {"smoke": counts, "outcome": _outcome(list(counts)), "executed": bool(counts)}
     if verb == "synth-test" and action == "run":
-        return "SYNTHETIC", {"test": out.get("name"), "result": out.get("result")}
-    if verb == "handoff":
-        return "HANDOFF", {"file": "HANDOFF.md"}
+        return "SYNTHETIC", {"test": out.get("name"), "result": out.get("result"),
+                             "outcome": _outcome([str(out.get("result", "UNKNOWN"))])}
+    if verb == "handoff" and out.get("file") and out.get("result") != "NOTHING_NEW":
+        return "HANDOFF", {"file": "HANDOFF.md", "outcome": "GENERATED"}
     return None
 
 
+def _scoped_summaries(verb: str, action: str | None, out: dict) -> list[tuple[str, str, dict]]:
+    base = summarize(verb, action, out)
+    if base is None:
+        return []
+    stage, summary = base
+    if verb == "check" and out.get("results"):
+        return [(stage, "check:" + str(r.get("id", "?")),
+                 {"id": r.get("id"), "status": _verdict(r.get("status", "UNKNOWN")),
+                  "outcome": _outcome([r.get("status", "UNKNOWN")]),
+                  "executed": r.get("status") not in ("BUDGET", "UNSUPPORTED")})
+                for r in out["results"] if isinstance(r, dict)]
+    if verb == "snapshot" and out.get("queries"):
+        return [(stage, "snapshot:" + str(out.get("name", "?")) + ":" + str(r.get("id", "?")),
+                 {"snapshot": out.get("name"), "id": r.get("id"), "result": _verdict(r.get("result", "UNKNOWN")),
+                  "outcome": _outcome([r.get("result", "UNKNOWN")]), "executed": True})
+                for r in out["queries"] if isinstance(r, dict)]
+    if verb == "smoke" and out.get("visuals"):
+        pages: dict[str, list] = {}
+        for r in out["visuals"]:
+            pages.setdefault(str(r.get("page", "?")), []).append(r)
+        return [(stage, "smoke:" + page,
+                 {"page": page, "smoke": _counts(rows), "partial_filters": any(bool(r.get("note")) for r in rows),
+                  "coverage": "QUERY_ONLY", "outcome": (
+                      "INCOMPLETE" if any(bool(r.get("note")) for r in rows) and
+                      _outcome([r.get("status", "UNKNOWN") for r in rows]) == "PASS" else
+                      _outcome([r.get("status", "UNKNOWN") for r in rows])), "executed": True})
+                for page, rows in pages.items()]
+    events = [(stage, verb + (":" + action if action else ""), summary)]
+    if verb == "push" and out.get("result") == "PUSHED" and "reload" in out:
+        ready = _reload_ready(out["reload"])
+        events.append(("LOADED", "desktop:reload", {"action": "reload", "ready": ready,
+                      "outcome": "PASS" if ready else _outcome([str(out["reload"])])}))
+    return events
+
+
 def record(ws, project, verb: str, action: str | None, out: dict) -> None:
-    s = summarize(verb, action, out)
-    if s is None or project is None:
+    events = _scoped_summaries(verb, action, out)
+    if not events or project is None:
         return
-    stage, summary = s
     try:
-        entry = {"ts": dt.datetime.now().replace(microsecond=0).isoformat(), "project": project.name, "stage": stage,
-                 "verb": verb + (f" {action}" if action else ""), "mirror_rev": mirror_rev(ws, project),
-                 "real_rev": real_rev(ws, project), "summary": summary}
+        shared = {"ts": dt.datetime.now().replace(microsecond=0).isoformat(), "project": project.name,
+                  "verb": verb + (f" {action}" if action else ""), "mirror_rev": mirror_rev(ws, project),
+                  "real_rev": real_rev(ws, project)}
     except (OSError, ValueError, PbzError):
         return
-    _append(ws, entry)
+    for stage, scope, summary in events:
+        _append(ws, {**shared, "stage": stage, "scope": scope, "summary": summary})
 
 
 # ---------------------------------------------------------------- release classes
@@ -167,8 +261,10 @@ NEXT = {
 def _status(e: dict | None, cur_m: str, cur_r: str, pending: bool, stage: str) -> str:
     if e is None:
         return "NOT_RUN"
+    if e.get("mirror_rev") != cur_m:
+        return "STALE"
     if stage == "PARSED":
-        return "CURRENT" if e.get("mirror_rev") == cur_m else "STALE"
+        return "CURRENT"
     if e.get("real_rev") != cur_r:
         return "STALE"
     if stage in ("LOADED", "EXECUTED", "HANDOFF", "HUMAN_ACCEPTED") and pending:
@@ -208,6 +304,8 @@ def review(ws, project, accept: bool = False) -> dict:
         _append(ws, {"ts": dt.datetime.now().replace(microsecond=0).isoformat(), "project": project.name,
                      "stage": "HUMAN_ACCEPTED", "verb": "review --accept", "mirror_rev": cur_m, "real_rev": cur_r,
                      "summary": {"accepted": True}})
+        from . import handoff
+        handoff.accept_generated(ws, project, cur_m, cur_r)
     try:
         ch = changes.run(ws, project, "last", "mirror")
     except PbzError:
@@ -237,12 +335,23 @@ def review(ws, project, accept: bool = False) -> dict:
     logic = [r["object"] for r in rows if r["class"] == "LOGIC" and r["kind"] == "measure"]
     latest: dict = {}
     for e in _entries(ws, project):
-        latest[e["stage"]] = e
+        latest[(e["stage"], e.get("scope") or e.get("verb", e["stage"]))] = e
     evidence = []
     for stage in STAGES:
-        e = latest.get(stage)
-        evidence.append({"stage": stage, "status": _status(e, cur_m, cur_r, pending, stage),
-                         **({"verb": e["verb"], "when": e["ts"], "summary": e.get("summary")} if e else {})})
+        scoped = [e for (st, _scope), e in latest.items() if st == stage]
+        items = [{"scope": e.get("scope") or e.get("verb"),
+                  "status": _status(e, cur_m, cur_r, pending, stage), "verb": e["verb"],
+                  "when": e["ts"], "summary": e.get("summary", {})} for e in scoped]
+        statuses = {i["status"] for i in items}
+        freshness = ("NOT_RUN" if not items else "CURRENT" if statuses == {"CURRENT"} else
+                     "PARTIAL" if "CURRENT" in statuses else "STALE")
+        newest = scoped[-1] if scoped else None
+        current = [i for i in items if i["status"] == "CURRENT"]
+        summary = (dict(items[0]["summary"]) if len(items) == 1 else
+                   {"scopes": len(items), "current_scopes": len(current),
+                    "outcomes": _counts([i["summary"] for i in current], "outcome")})
+        evidence.append({"stage": stage, "status": freshness, "items": items,
+                         **({"verb": newest["verb"], "when": newest["ts"], "summary": summary} if newest else {})})
     try:
         reg = consumers.load_registry(ws)["consumers"]
     except (OSError, ValueError):
@@ -254,8 +363,8 @@ def review(ws, project, accept: bool = False) -> dict:
            "changes": rows[:300], "evidence": evidence, "coverage": coverage,
            "next": [f"{c}: {NEXT[c]}" for c in CLASS_ORDER if c in by_class],
            "suggested_tests": _suggested_tests(ws, project, logic)}
-    path = os.path.join(ws.mirror, "REVIEW.md")
-    write_text(path, _markdown(out, ws, project, rows))
+    from . import handoff
+    out["packet"] = handoff.write_packet(ws, "REVIEW.md", _markdown(out, ws, project, rows), "reviews")
     out["file"] = "pbz-workspace/REVIEW.md"
     return out
 
@@ -280,6 +389,10 @@ def _markdown(out: dict, ws, project, rows: list[dict]) -> str:
     for e in out["evidence"]:
         L.append(f"| {e['stage']} | {e['status']} | {e.get('verb', '')} | {e.get('when', '')} | "
                  f"{json.dumps(e.get('summary'), ensure_ascii=False) if e.get('summary') else ''} |")
+    L += ["", "### Evidence by scope", "", "| Stage | Scope | Freshness | Outcome |", "|---|---|---|---|"]
+    for e in out["evidence"]:
+        for item in e.get("items", []):
+            L.append(f"| {e['stage']} | {item['scope']} | {item['status']} | {item['summary'].get('outcome', 'UNKNOWN')} |")
     L += ["", "## Coverage", "", f"- External consumers: {out['coverage']['external_consumers']}",
           f"- Human visual review: {out['coverage']['human_visual_review']} (`pbz review --accept` in a terminal)", ""]
     pages = sorted({r.get("page") for r in rows if r.get("side") == "report" and r.get("page")}

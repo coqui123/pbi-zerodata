@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import copy
 import difflib
 import json
 import os
 import shutil
+import uuid
 
 from . import desktop, policy as policy_mod, tmdl, tokens, validate
 from .classify import Classifier
@@ -61,8 +63,7 @@ def load_manifest(ws: Workspace, project: Project) -> dict:
 
 def save_manifest(ws: Workspace, project: Project, man: dict) -> None:
     os.makedirs(ws.private, exist_ok=True)
-    with open(manifest_path(ws, project), "w", encoding="utf-8") as f:
-        json.dump(man, f, indent=1)
+    write_text(manifest_path(ws, project), json.dumps(man, indent=1))
 
 
 def real_model(project: Project) -> tmdl.Model:
@@ -283,13 +284,195 @@ def _select(ch: dict, only: list[str] | None) -> tuple[dict, list[str]]:
     return picked, held
 
 
-def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False,
-         only: list[str] | None = None) -> dict:
+def _transaction_dir(ws, project) -> str:
+    return os.path.join(ws.private, "transactions", project.name)
+
+
+def _transaction_path(ws, project, entry) -> str:
+    """Resolve a journal target, rejecting traversal and symlink escapes before mutation."""
+    if entry.get("scope") not in ("workspace", "private"):
+        raise PbzError("RECOVERY_PATH", "unknown transaction path scope")
+    root = ws.root if entry["scope"] == "workspace" else ws.private
+    path = os.path.abspath(os.path.join(root, *entry["path"].split("/")))
+    allowed = ((project.model_dir, project.report_dir) if entry["scope"] == "workspace" else
+               (base_dir(ws, project), manifest_path(ws, project)))
+    canonical = os.path.normcase(os.path.realpath(path))
+    if not any(canonical == os.path.normcase(os.path.realpath(a)) or
+               canonical.startswith(os.path.normcase(os.path.realpath(a)) + os.sep) for a in allowed):
+        raise PbzError("RECOVERY_PATH", "transaction path is outside the project")
+    return path
+
+
+def pending_recovery(ws, project) -> list[dict]:
+    """Closed metadata only; journal payloads and backups remain private."""
+    out = []
+    directory = _transaction_dir(ws, project)
+    for name in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
+        if not os.path.isdir(os.path.join(directory, name)):
+            continue
+        path = os.path.join(directory, name, "journal.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                journal = json.load(f)
+        except (OSError, ValueError):
+            out.append({"id": name, "state": "UNREADABLE"})
+            continue
+        if journal.get("state") not in ("COMMITTED", "ROLLED_BACK"):
+            out.append({"id": name, "state": journal.get("state", "UNKNOWN")})
+    return out
+
+
+def _journal_save(directory, journal):
+    write_text(os.path.join(directory, "journal.json"), json.dumps(journal, indent=1))
+
+
+def _tree_files(directory):
+    return {os.path.relpath(os.path.join(cur, name), directory).replace("\\", "/")
+            for cur, _dirs, files in os.walk(directory) for name in files}
+
+
+def _copy_atomic(source, target):
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    temp = target + ".pbz-tmp"
+    try:
+        shutil.copyfile(source, temp)
+        os.replace(temp, target)
+    finally:
+        if os.path.isfile(temp):
+            os.remove(temp)
+
+
+def _begin_transaction(ws, project, stamp, targets):
+    directory = os.path.join(_transaction_dir(ws, project), stamp)
+    os.makedirs(directory, exist_ok=False)
+    entries = []
+    _journal_save(directory, {"version": 1, "state": "PREPARING", "entries": []})
+    for index, (scope, rel, expected) in enumerate(targets):
+        entry = {"scope": scope, "path": rel, "after": expected}
+        target = _transaction_path(ws, project, entry)
+        entry["before"] = file_sha(target)
+        if entry["before"] is not None:
+            backup = os.path.join(directory, "before", str(index))
+            os.makedirs(os.path.dirname(backup), exist_ok=True)
+            shutil.copy2(target, backup)
+            entry["backup"] = str(index)
+        entries.append(entry)
+    journal = {"version": 1, "state": "PREPARED", "entries": entries}
+    _journal_save(directory, journal)
+    return directory, journal
+
+
+def _restore_transaction(ws, project, directory, journal):
+    conflicts = []
+    # Check all targets before restoring any. Never overwrite a third-party change.
+    for entry in journal["entries"]:
+        target = _transaction_path(ws, project, entry)
+        if file_sha(target) not in (entry["before"], entry["after"]):
+            conflicts.append(entry["path"])
+        if "backup" in entry:
+            backup = os.path.realpath(os.path.join(directory, "before", entry["backup"]))
+            if not backup.startswith(os.path.realpath(directory) + os.sep) or file_sha(backup) != entry["before"]:
+                raise PbzError("RECOVERY_BACKUP", "transaction backup is missing or invalid")
+    if conflicts:
+        journal["state"] = "RECOVERY_REQUIRED"
+        _journal_save(directory, journal)
+        return {"result": "RECOVERY_CONFLICT", "conflicts": conflicts}
+    for entry in reversed(journal["entries"]):
+        target = _transaction_path(ws, project, entry)
+        if file_sha(target) == entry["before"]:
+            continue
+        if entry["before"] is None:
+            if os.path.isfile(target):
+                os.remove(target)
+        else:
+            with open(os.path.join(directory, "before", entry["backup"]), "rb") as f:
+                content = f.read()
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            temp = target + ".pbz-recover"
+            with open(temp, "wb") as f:
+                f.write(content)
+            os.replace(temp, target)
+    journal["state"] = "ROLLED_BACK"
+    _journal_save(directory, journal)
+    return {"result": "ROLLED_BACK"}
+
+
+def _process_alive(pid: int) -> bool:
+    # On Windows os.kill(pid, 0) can terminate a process. Query a read-only process
+    # handle instead; denied/unknown state remains conservatively alive.
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() != 87  # invalid PID; all other errors are unknown/alive
+        try:
+            code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def recover(ws, project, transaction_id: str | None = None) -> dict:
+    """Roll back interrupted, uncommitted pushes. Never resume a half-validated commit."""
+    if desktop.find_instance(project):
+        return {"verb": "recover", "result": "DESKTOP_OPEN"}
+    lock = os.path.join(_transaction_dir(ws, project), ".commit-lock")
+    stale_lock = False
+    if os.path.exists(lock):
+        try:
+            with open(lock) as f:
+                owner = int(f.read())
+            if owner <= 0:
+                raise ValueError()
+            if _process_alive(owner):
+                return {"verb": "recover", "result": "COMMIT_BUSY"}
+            stale_lock = True
+        except (OSError, ValueError):
+            return {"verb": "recover", "result": "RECOVERY_REQUIRED"}
+    pending = pending_recovery(ws, project)
+    if transaction_id is not None:
+        pending = [p for p in pending if p["id"] == transaction_id]
+    results = []
+    for item in pending:
+        directory = os.path.join(_transaction_dir(ws, project), item["id"])
+        try:
+            with open(os.path.join(directory, "journal.json"), encoding="utf-8") as f:
+                journal = json.load(f)
+            result = _restore_transaction(ws, project, directory, journal)
+        except (OSError, ValueError, KeyError, PbzError):
+            result = {"result": "RECOVERY_REQUIRED"}
+        results.append({"id": item["id"], **result})
+    failed = any(r["result"] != "ROLLED_BACK" for r in results)
+    if stale_lock and not failed:
+        os.remove(lock)
+    return {"verb": "recover", "result": "RECOVERY_REQUIRED" if failed
+            else "RECOVERED" if results or stale_lock else "NOTHING_TO_RECOVER", "transactions": results}
+
+
+def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False,
+         only: list[str] | None = None, preflight_only: bool = False) -> dict:
+    pending = pending_recovery(ws, project)
+    if pending:
+        return {"verb": "push", "result": "RECOVERY_REQUIRED", "transactions": pending}
     man = load_manifest(ws, project)
     if not man:
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     ch, held = _select(mirror_changes(ws, project, man), only)
-    if not any(ch.values()):
+    if not any(ch.values()) and not preflight_only:
         return {"verb": "push", "project": project.name, "result": "NOTHING_TO_PUSH",
                 **({"held_back": held} if held else {})}
     files = man.get("files", {})
@@ -309,14 +492,14 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
                 "hint": "real files changed since pull (Desktop save?). Run `pbz pull --rebase`."}
     model_touched = any(r.startswith(project.name + ".SemanticModel/") for r in touched)
     open_inst = desktop.find_instance(project)
-    if open_inst and (model_touched or not reload):
+    if not preflight_only and open_inst and (model_touched or not reload):
         return {"verb": "push", "project": project.name, "result": "DESKTOP_OPEN",
                 "hint": "close Desktop first (`pbz desktop close`), or use --reload for report-only changes"}
-    if open_inst and open_inst.get("unsaved"):
+    if not preflight_only and open_inst and open_inst.get("unsaved"):
         return {"verb": "push", "project": project.name, "result": "DESKTOP_DIRTY",
                 "hint": "Desktop has unsaved changes a reload would discard: ask the user to save (then pbz pull "
                         "--rebase) or close it"}
-    if model_touched and os.path.exists(os.path.join(project.model_dir, ".pbi", "unappliedChanges.json")):
+    if not preflight_only and model_touched and os.path.exists(os.path.join(project.model_dir, ".pbi", "unappliedChanges.json")):
         return {"verb": "push", "project": project.name, "result": "PENDING_PQ_CHANGES",
                 "hint": "Desktop holds Power Query edits that were never applied; applying them later would "
                         "overwrite these model changes. Ask the user to apply or discard them in Desktop, save, "
@@ -332,8 +515,9 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
     if unknown_all:
         return {"verb": "push", "project": project.name, "result": "UNKNOWN_TOKEN",
                 "tokens": sorted(set(unknown_all))}
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     stage = os.path.join(ws.private, "stage", stamp)
+    transaction = None
     try:
         for src in (project.model_dir, project.report_dir):
             if os.path.isdir(src):
@@ -347,11 +531,18 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
             p = os.path.join(stage, *rel.split("/"))
             if os.path.exists(p):
                 os.remove(p)
-        from . import visuals  # private custom visuals imported since the last push travel with it
+                _prune_empty(p, os.path.join(stage, rel.split("/")[0]))
+        from . import images, visuals  # private custom visuals and images staged since the last push travel with it
         srj = os.path.join(stage, project.name + ".Report", "definition", "report.json")
-        pkgs = visuals.pending_for(ws, read_text(srj)[0]) if os.path.exists(srj) else {}
+        new_rj = read_text(srj)[0] if os.path.exists(srj) else ""
+        pkgs = visuals.pending_for(ws, new_rj) if new_rj else {}
         if pkgs:
             visuals.install(pkgs, os.path.join(stage, project.name + ".Report"))
+        real_rj = os.path.join(project.report_dir, "definition", "report.json")
+        imgs_new = images.staged(ws, project, new_rj) if new_rj else {}
+        imgs_drop = images.dropped(read_text(real_rj)[0], new_rj) if new_rj and os.path.exists(real_rj) else []
+        images.install(imgs_new, os.path.join(stage, project.name + ".Report"))
+        images.delete(imgs_drop, os.path.join(stage, project.name + ".Report"))
         findings = validate.run_stage(ws, project, stage, tm)
         errors = [f for f in findings if f["severity"] == "error"]
         summary = []
@@ -363,16 +554,54 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
             mp = os.path.join(ws.mirror, *rel.split("/"))
             new = read_text(mp)[0] if os.path.exists(mp) else None
             summary += _object_summary(rel, old, new)
-        if errors or dry_run:
+        if errors or dry_run or preflight_only:
             return {"verb": "push", "project": project.name, "result": "INVALID" if errors else "DRY_RUN_OK",
                     "objects": summary, "findings": findings, **({"held_back": held} if held else {})}
         authored_before = {rel: (read_text(os.path.join(base_dir(ws, project), *rel.split("/")))[0]
                                  if os.path.exists(os.path.join(base_dir(ws, project), *rel.split("/"))) else None)
                            for rel in ch["changed"] + ch["added"]}
         authored_after = {rel: read_text(os.path.join(ws.mirror, *rel.split("/")))[0] for rel in ch["changed"] + ch["added"]}
+        # Include every resource file, not only its report.json registration, in recovery.
+        resource_paths = set()
+        for guid in pkgs:
+            prefix = f"{project.name}.Report/CustomVisuals/{guid}"
+            resource_paths.update(prefix + "/" + p for p in
+                                  _tree_files(os.path.join(project.report_dir, "CustomVisuals", guid)) |
+                                  _tree_files(os.path.join(stage, project.name + ".Report", "CustomVisuals", guid)))
+        resource_paths.update(f"{project.name}.Report/StaticResources/RegisteredResources/{item}"
+                              for item in set(imgs_new) | set(imgs_drop))
+        real_targets = {rel: file_sha(os.path.join(stage, *rel.split("/"))) for rel in set(touched) | resource_paths}
+        new_files = copy.deepcopy(files)
+        private_targets = {}
+        for rel in ch["changed"] + ch["added"]:
+            mp = os.path.join(ws.mirror, *rel.split("/"))
+            new_files[rel] = {"real": real_targets[rel], "mirror": file_sha(mp)}
+            private_targets[os.path.relpath(os.path.join(base_dir(ws, project), *rel.split("/")), ws.private).replace("\\", "/")] = file_sha(mp)
+        for rel in ch["deleted"]:
+            new_files.pop(rel, None)
+            private_targets[os.path.relpath(os.path.join(base_dir(ws, project), *rel.split("/")), ws.private).replace("\\", "/")] = None
+        expected_manifest = {**man, "files": new_files}
+        private_targets[os.path.relpath(manifest_path(ws, project), ws.private).replace("\\", "/")] = sha(json.dumps(expected_manifest, indent=1))
+        transaction = _begin_transaction(ws, project, stamp,
+                                         [("workspace", p, h) for p, h in sorted(real_targets.items())] +
+                                         [("private", p, h) for p, h in sorted(private_targets.items())])
+        directory, journal = transaction
+        if any(file_sha(_transaction_path(ws, project, e)) != e["before"] for e in journal["entries"]):
+            journal["state"] = "ROLLED_BACK"
+            _journal_save(directory, journal)
+            transaction = None
+            return {"verb": "push", "result": "CONFLICT", "hint": "project files changed during staging; pull and retry"}
+        journal["state"] = "APPLYING"
+        _journal_save(directory, journal)
+        # Conservative privacy accounting precedes mutation. Failed attempts may retain literal
+        # hashes, but recovery must never loosen disclosure budgets or lose authored literals.
+        from .checks import record_authored
+        record_authored(ws, authored_before, authored_after)
         backup = os.path.join(ws.private, "backups", stamp)
-        for rel in ch["changed"] + ch["deleted"]:
+        for rel in sorted(set(ch["changed"] + ch["deleted"]) | resource_paths):
             real = _real_path(ws, rel)
+            if not os.path.isfile(real):
+                continue
             dst = os.path.join(backup, *rel.split("/"))
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(real, dst)
@@ -380,8 +609,18 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
             write_text(_real_path(ws, rel), rtext, bom)
         for rel in ch["deleted"]:
             os.remove(_real_path(ws, rel))
-        installed = visuals.install(pkgs, project.report_dir, backup_dir=os.path.join(backup, project.name + ".Report")) if pkgs else []
-        visuals.clear_pending(ws, installed)
+            _prune_empty(_real_path(ws, rel), os.path.join(ws.root, rel.split("/")[0]))
+        # Commit staged resources by atomic file replacement as well; directory replacement
+        # could otherwise leave a partially copied package with an unrecognizable hash.
+        for rel in sorted(resource_paths):
+            target = _real_path(ws, rel)
+            source = os.path.join(stage, *rel.split("/"))
+            if os.path.isfile(source):
+                _copy_atomic(source, target)
+            elif os.path.isfile(target):
+                os.remove(target)
+                _prune_empty(target, project.report_dir)
+        installed, img_in, img_out = sorted(pkgs), sorted(imgs_new), sorted(imgs_drop)
         for rel in ch["changed"] + ch["added"]:
             mp = os.path.join(ws.mirror, *rel.split("/"))
             files[rel] = {"real": file_sha(_real_path(ws, rel)), "mirror": file_sha(mp)}
@@ -394,25 +633,93 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
                 os.remove(bp)
         man["files"] = files
         save_manifest(ws, project, man)
-        _log_push(ws, project, stamp, summary)
-        snapshot(ws, project, "push")
-        from .checks import record_authored
-        record_authored(ws, authored_before, authored_after)
+        journal["state"] = "COMMITTED"
+        _journal_save(directory, journal)
+        transaction = None  # Project and synchronization metadata have committed together.
+        warnings = []
+        for phase, operation in (
+            ("RESOURCE_CLEANUP", lambda: (visuals.clear_pending(ws, installed), images.clear_pending(ws, project, img_in))),
+            ("HISTORY", lambda: (_log_push(ws, project, stamp, summary), snapshot(ws, project, "push"))),
+        ):
+            try:
+                operation()
+            except (OSError, ValueError, PbzError):
+                warnings.append({"code": "POST_COMMIT_" + phase, "message": "commit succeeded; follow-up work is incomplete"})
         result = {"verb": "push", "project": project.name, "result": "PUSHED", "objects": summary,
                   "findings": findings, "backup": stamp}
         if installed:
             result["custom_visuals_installed"] = installed
+        if img_in:
+            result["images_installed"] = img_in
+        if img_out:
+            result["images_removed"] = img_out
         if held:
             result["held_back"] = held  # still pending in the mirror
+        if warnings:
+            result["warnings"] = warnings
         if reload and open_inst:
             result["reload"] = desktop.reload(project)
         return result
+    except BaseException:
+        if transaction is None:
+            raise
+        directory, journal = transaction
+        try:
+            restored = _restore_transaction(ws, project, directory, journal)
+        except (OSError, ValueError, PbzError):
+            restored = {"result": "RECOVERY_REQUIRED"}
+        return {"verb": "push", "project": project.name, **restored,
+                "error": "COMMIT_FAILED", "transaction": stamp,
+                "hint": "inspect recovery status before retrying; diagnostic content remains private"}
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
 
+def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False,
+         only: list[str] | None = None, preflight_only: bool = False) -> dict:
+    if dry_run or preflight_only:
+        return _push(ws, project, reload, dry_run, only, preflight_only)
+    directory = _transaction_dir(ws, project)
+    os.makedirs(directory, exist_ok=True)
+    lock = os.path.join(directory, ".commit-lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return {"verb": "push", "result": "RECOVERY_REQUIRED" if pending_recovery(ws, project) else "COMMIT_BUSY",
+                "hint": "another commit or an interrupted commit owns the project lock"}
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        return _push(ws, project, reload, dry_run, only, preflight_only)
+    finally:
+        os.remove(lock)
+
+
+def preflight(ws: Workspace, project: Project, only: list[str] | None = None) -> dict:
+    """Run the same private staged validators as push, without changing files or Desktop.
+
+    Unlike commit, preflight is safe while Desktop is open/dirty. It validates the saved
+    files plus mirror changes, not unsaved UI state. Conflict/token checks still apply.
+    """
+    result = push(ws, project, dry_run=True, only=only, preflight_only=True)
+    result["verb"] = "preflight"
+    if result.get("result") == "DRY_RUN_OK":
+        result["result"] = "PREFLIGHT_OK"
+    result["scope"] = "saved files plus selected mirror changes"
+    return result
+
+
 def _real_path(ws: Workspace, rel: str) -> str:
     return os.path.join(ws.root, *rel.split("/"))
+
+
+def _prune_empty(path: str, stop: str) -> None:
+    """Remove the folders a deleted file leaves empty (a deleted visual's folder), up to `stop`."""
+    stop = os.path.normcase(os.path.abspath(stop))
+    d = os.path.dirname(os.path.abspath(path))
+    while os.path.normcase(d).startswith(stop + os.sep) and os.path.isdir(d) and not os.listdir(d):
+        os.rmdir(d)
+        d = os.path.dirname(d)
 
 
 def revert(ws: Workspace, project: Project, paths: list[str] | None = None, obj: str | None = None) -> dict:

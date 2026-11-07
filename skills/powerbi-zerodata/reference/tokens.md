@@ -13,6 +13,7 @@ DAX, M and JSON structure are untouched, so diffs stay minimal.
 | `«pii#n»` | an email / UPN / role member |
 | `«num#n»` | a figure typed into free text (descriptions, comments, text boxes) |
 | `«payload:<where>#n»` | embedded data blobs (Enter Data base64, inline Deneb / Vega `values`) |
+| `«payload:image#n»` | an embedded image: a `data:` URI string in report JSON or a theme (theme backgrounds and icons, image URLs), or a base64 image inside a longer string (a text box, a Vega spec, an SVG measure); the rest of the string stays readable |
 | `«Table[Column]@g#n»` | a group key reported by a check, known only by hash (not usable in `where`) |
 
 Tokens are stable across pulls: the same value of the same column always gets the same token.
@@ -45,6 +46,9 @@ replaces the whole literal (`"Value": "«Person[Name]#4»"`).
 - Each token is restored to the exact raw text it replaced in that context, so an untouched
   file round-trips byte for byte. A token copied into a new place is encoded for that place.
 - A token that is not in the map (typo, invented) fails the push with `UNKNOWN_TOKEN`.
+- A JSON writer that escapes non-ASCII (Python `json.dump` default) turns `«x#1»` into
+  `«x#1»`; push still reads it as the token (an unknown one fails as `UNKNOWN_TOKEN`), and
+  staged validation flags any escaped token left over. Prefer `ensure_ascii=False`.
 - Files that could not round-trip at pull time are marked `lossy` and are not pushed; edit those
   objects in Desktop.
 - Plain literals you write are pushed as typed.
