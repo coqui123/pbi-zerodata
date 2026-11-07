@@ -139,9 +139,9 @@ def _culture_objects(doc, kind: str, table: str, name: str):
     return out
 
 
-def culture_edits_rename(mdef: str, kind: str, table: str, old: str, new: str) -> list[str]:
-    """Rename an object's translation entries in every mirrored culture file. Returns changed rels."""
-    changed = []
+def culture_rename_texts(mdef: str, kind: str, table: str, old: str, new: str) -> dict[str, str]:
+    """{rel: new text} renaming translation entries. Does not write."""
+    out = {}
     for rel, doc in culture_docs(mdef).items():
         edits = []
         lines = doc.text.splitlines(keepends=True)
@@ -151,9 +151,16 @@ def culture_edits_rename(mdef: str, kind: str, table: str, old: str, new: str) -
             if m:
                 edits.append((off + m.start(2), off + m.end(2), _q(new)))
         if edits:
-            _write(mdef, rel, apply_edits(doc.text, edits))
-            changed.append(rel)
-    return changed
+            out[rel] = apply_edits(doc.text, edits)
+    return out
+
+
+def culture_edits_rename(mdef: str, kind: str, table: str, old: str, new: str) -> list[str]:
+    """Rename an object's translation entries in every mirrored culture file. Returns changed rels."""
+    planned = culture_rename_texts(mdef, kind, table, old, new)
+    for rel, text in planned.items():
+        _write(mdef, rel, text)
+    return list(planned)
 
 
 def culture_edits_drop(mdef: str, objects: list[tuple]) -> dict[str, str]:
@@ -169,38 +176,57 @@ def culture_edits_drop(mdef: str, objects: list[tuple]) -> dict[str, str]:
     return out
 
 
-def culture_edits_move(mdef: str, src: str, dst: str, measure: str) -> list[str]:
-    """Move a measure's translations from table src to table dst in every culture file."""
-    changed = []
+def culture_move_texts(mdef: str, src: str, dst: str, measure: str) -> dict[str, str]:
+    """{rel: new text} moving every translation hit of a measure. Does not write."""
+    out = {}
     for rel, doc in culture_docs(mdef).items():
         hits = _culture_objects(doc, "measure", src, measure)
         if not hits:
             continue
         text = doc.text
-        s, e = tmdl.block_span(doc, hits[0])
-        block = text[s:e].rstrip("\r\n")
-        text = apply_edits(text, [(s, e, "")])
-        doc2 = tmdl.parse(rel, text)
-        model_node = hits[0].parent.parent
-        mnode = next((n for n in doc2.nodes if n.kind == "model" and n.name == model_node.name), None)
-        tnode = _child(mnode, "table", dst) if mnode is not None else None
-        if tnode is None and mnode is not None:
-            text = _append_child(text, doc2, mnode, f"{chr(9) * 3}table {_q(dst)}")
+        moved = False
+        for _ in range(len(hits)):
+            cur = tmdl.parse(rel, text) if moved else doc
+            left = _culture_objects(cur, "measure", src, measure)
+            if not left:
+                break
+            s, e = tmdl.block_span(cur, left[0])
+            block = text[s:e].rstrip("\r\n")
+            text = apply_edits(text, [(s, e, "")])
             doc2 = tmdl.parse(rel, text)
-            mnode = next(n for n in doc2.nodes if n.kind == "model" and n.name == model_node.name)
-            tnode = _child(mnode, "table", dst)
-        if tnode is None:
-            continue
-        text = _append_child(text, doc2, tnode, block)
+            model_node = left[0].parent.parent
+            mnode = next((n for n in doc2.nodes if n.kind == "model" and n.name == model_node.name), None)
+            tnode = _child(mnode, "table", dst) if mnode is not None else None
+            if tnode is None and mnode is not None:
+                text = _append_child(text, doc2, mnode, f"{chr(9) * 3}table {_q(dst)}")
+                doc2 = tmdl.parse(rel, text)
+                mnode = next(n for n in doc2.nodes if n.kind == "model" and n.name == model_node.name)
+                tnode = _child(mnode, "table", dst)
+            if tnode is None:
+                break
+            text = _append_child(text, doc2, tnode, block)
+            moved = True
+        if moved:
+            out[rel] = text
+    return out
+
+
+def culture_edits_move(mdef: str, src: str, dst: str, measure: str) -> list[str]:
+    """Move a measure's translations from table src to table dst in every culture file."""
+    planned = culture_move_texts(mdef, src, dst, measure)
+    for rel, text in planned.items():
         _write(mdef, rel, text)
-        changed.append(rel)
-    return changed
+    return list(planned)
 
 
-def perspective_edits_move(mdef: str, src: str, dst: str, measure: str) -> list[str]:
-    """Move a measure's perspective membership from perspectiveTable src to dst (created if missing)."""
-    changed = []
-    for rel, doc in ((r, d) for r, d in tmdl.load_model(mdef).docs.items() if r.startswith("perspectives/")):
+def perspective_move_texts(mdef: str, src: str, dst: str, measure: str, texts: dict | None = None) -> dict[str, str]:
+    """{rel: new text} moving perspective membership. `texts` overrides disk (planned TMDL). Does not write."""
+    if texts is None:
+        pairs = [(r, d) for r, d in tmdl.load_model(mdef).docs.items() if r.startswith("perspectives/")]
+    else:
+        pairs = [(r, tmdl.parse(r, t)) for r, t in texts.items() if r.startswith("perspectives/")]
+    out = {}
+    for rel, doc in pairs:
         text = doc.text
         moved = False
         for p in (n for n in doc.nodes if n.kind == "perspective"):
@@ -218,9 +244,16 @@ def perspective_edits_move(mdef: str, src: str, dst: str, measure: str) -> list[
             text = _append_child(text, d2, _child(p2, "perspectiveTable", dst), f"\t\tperspectiveMeasure {_q(measure)}")
             moved = True
         if moved:
-            _write(mdef, rel, text)
-            changed.append(rel)
-    return changed
+            out[rel] = text
+    return out
+
+
+def perspective_edits_move(mdef: str, src: str, dst: str, measure: str) -> list[str]:
+    """Move a measure's perspective membership from perspectiveTable src to dst (created if missing)."""
+    planned = perspective_move_texts(mdef, src, dst, measure)
+    for rel, text in planned.items():
+        _write(mdef, rel, text)
+    return list(planned)
 
 
 def culture_add(ws, project, code: str) -> dict:

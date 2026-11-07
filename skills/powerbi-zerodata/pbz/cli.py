@@ -29,6 +29,33 @@ def _is_human() -> bool:
         and not os.environ.get("CODEX_SANDBOX") and not os.environ.get("CODEX_MANAGED_BY_NPM")
 
 
+# The five steps in reference/leak-vectors.md (Hardening tier). Read-only; never applied here.
+ISOLATION = (
+    ("account", "Separate standard account for agent sessions"),
+    ("ntfs", "NTFS deny ACLs on real model, report, data and private folders"),
+    ("broker", "pbz runs as the data owner; the agent sees only closed output"),
+    ("network", "Firewall blocks the agent account from Power BI, Fabric and OData"),
+    ("disposable", "Windows Sandbox or a VM that holds only the mirror"),
+)
+DOCTOR_NOTE = ("heuristic mode is not OS-isolated; closed verdicts do not prove non-inference. "
+               "doctor does not change ACLs, accounts, firewall rules or brokers.")
+_DOCTOR_STATUS = {"configured", "unverified", "failed"}
+
+
+def cmd_doctor() -> dict:
+    """OS-isolation checklist. Defaults to unverified; no ACL, account, firewall or broker changes."""
+    items = []
+    for item_id, title in ISOLATION:
+        status = "unverified"
+        # Only a positive, privilege-free fact. Absence is unverified, not failed.
+        if item_id == "disposable" and os.environ.get("USERNAME", "").lower() == "wdagutilityaccount":
+            status = "configured"
+        if status not in _DOCTOR_STATUS:
+            status = "unverified"
+        items.append({"id": item_id, "title": title, "status": status})
+    return {"verb": "doctor", "isolation": items, "note": DOCTOR_NOTE}
+
+
 def cmd_status(ws, project, a):
     man = mirror.load_manifest(ws, project)
     out = {"verb": "status", "workspace": ws.root, "project": project.name,
@@ -104,6 +131,7 @@ def main(argv=None) -> int:
     ap.add_argument("--workspace", help="workspace root (default: discover from the current folder)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    sub.add_parser("doctor", help="read-only OS-isolation checklist; changes nothing")
     sub.add_parser("init")
     p = sub.add_parser("scan")
     p.add_argument("--dry-run", action="store_true")
@@ -488,11 +516,15 @@ def main(argv=None) -> int:
         from pbz import mcp
         return mcp.serve(a.workspace, a.project)
     try:
-        if a.cmd == "check-schema" or (a.cmd == "interactions" and a.action == "capabilities"):
+        if a.cmd in ("check-schema", "doctor") or (a.cmd == "interactions" and a.action == "capabilities"):
             from pbz import interactiontest
             from pbz.outcomes import envelope
-            out = ({"verb": "check-schema", "schema": checks.check_schema()} if a.cmd == "check-schema"
-                   else interactiontest.capabilities())
+            if a.cmd == "doctor":
+                out = cmd_doctor()
+            elif a.cmd == "check-schema":
+                out = {"verb": "check-schema", "schema": checks.check_schema()}
+            else:
+                out = interactiontest.capabilities()
             out, rc = envelope(out)
             emit(out)
             return rc

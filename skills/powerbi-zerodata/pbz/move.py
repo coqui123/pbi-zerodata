@@ -7,7 +7,7 @@ import json
 import os
 
 from . import lexers, pbir, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 from .tokens import apply_edits
 
 
@@ -93,6 +93,39 @@ def pbir_move_edits(root, measure: str, src: str, dst: str) -> tuple[list[tuple[
     return pedits, refused
 
 
+def _mirror_rel(ws, path: str) -> str:
+    return os.path.relpath(path, ws.mirror).replace("\\", "/")
+
+
+def plan_pbir(ws, report_dir, edit_fn) -> list[tuple]:
+    """Planned PBIR writes: (path, text, bom, rel). Raises before any write.
+
+    REFUSED lists files that do not parse. UNSUPPORTED lists shared-alias conflicts
+    (a From alias used by this measure and by other fields of its old table).
+    """
+    bad, shared, plans = [], [], []
+    for path in pbir.report_files(report_dir):
+        rel = _mirror_rel(ws, path)
+        text, bom = read_text(path)
+        try:
+            root = pbir.parse_json(text)
+        except (pbir.JsonError, IndexError, ValueError):
+            bad.append(rel)
+            continue
+        edits, file_refused = edit_fn(root, text)
+        if file_refused:
+            shared.append(rel)
+            continue
+        if edits:
+            plans.append((path, apply_edits(text, sorted(set(edits))), bom, rel))
+    if bad:
+        raise PbzError("REFUSED", "PBIR parse failed: " + ", ".join(sorted(set(bad))))
+    if shared:
+        raise PbzError("UNSUPPORTED", "a filter shares one source alias between this measure and other fields of "
+                       "its old table: " + ", ".join(sorted(set(shared))))
+    return plans
+
+
 def move_measure(ws, project, name: str, target: str) -> dict:
     from .rename import translated_names
     mdef = os.path.join(project.mirror_model, "definition")
@@ -110,7 +143,7 @@ def move_measure(ws, project, name: str, target: str) -> dict:
     if dst.columns.get(m.name) or any(c.lower() == m.name.lower() for c in dst.columns):
         raise PbzError("NAME_TAKEN", f"{dst.name} has a column named {m.name}")
     if m.name.lower() in translated_names(project):
-        raise PbzError("UNSUPPORTED", "the measure has translations in cultures/ (not mirrored): move it in Desktop")
+        raise PbzError("UNSUPPORTED", "cultures not in this mirror: run pbz pull")
     sdoc, ddoc = model.docs[src.file], model.docs[dst.file]
     s, e = tmdl.block_span(sdoc, m.node)
     block = sdoc.text[s:e]
@@ -130,32 +163,31 @@ def move_measure(ws, project, name: str, target: str) -> dict:
     edits.setdefault(src.file, []).append((s, e, ""))
     at, sep = _insert_point(ddoc, dst.node)
     edits.setdefault(dst.file, []).append((at, at, sep + block))
+    planned = dict(texts)
     for rel, eds in edits.items():
+        planned[rel] = apply_edits(texts[rel], sorted(eds))
+    pbir_plans = plan_pbir(ws, project.mirror_report,
+                           lambda root, _text: pbir_move_edits(root, m.name, src.name, dst.name))
+    from .governance import culture_move_texts, perspective_move_texts
+    cultures = culture_move_texts(mdef, src.name, dst.name, m.name)
+    perspectives = perspective_move_texts(mdef, src.name, dst.name, m.name, planned)
+    ops = []
+    for rel, text in planned.items():
+        final = perspectives.get(rel, text)
+        if final == texts[rel]:
+            continue
         path = os.path.join(mdef, *rel.split("/"))
         _t, bom = read_text(path)
-        write_text(path, apply_edits(texts[rel], sorted(eds)), bom)
+        ops.append(("write", path, final, bom))
         changed.append(f"{project.name}.SemanticModel/definition/{rel}")
-    # ---- PBIR
-    refused = []
-    for path in pbir.report_files(project.mirror_report):
-        text, bom = read_text(path)
-        try:
-            root = pbir.parse_json(text)
-        except pbir.JsonError:
-            continue
-        pedits, file_refused = pbir_move_edits(root, m.name, src.name, dst.name)
-        if file_refused:
-            refused.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
-        if pedits and not file_refused:
-            write_text(path, apply_edits(text, sorted(set(pedits))), bom)
-            changed.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
-    from .governance import culture_edits_move, perspective_edits_move
-    changed += [f"{project.name}.SemanticModel/definition/{r}" for r in culture_edits_move(mdef, src.name, dst.name, m.name)]
-    changed += [f"{project.name}.SemanticModel/definition/{r}" for r in perspective_edits_move(mdef, src.name, dst.name, m.name)]
-    out = {"verb": "move", "measure": m.name, "from": src.name, "to": dst.name, "files": sorted(set(changed)),
-           "next": "pbz diff, pbz validate, then pbz push"}
-    if refused:
-        out["manual"] = {"files": sorted(set(refused)),
-                         "reason": "a filter shares one source alias between this measure and other fields of its old table; "
-                                   "edit those filters by hand"}
-    return out
+    for rel, text in cultures.items():
+        path = os.path.join(mdef, *rel.split("/"))
+        _t, bom = read_text(path)
+        ops.append(("write", path, text, bom))
+        changed.append(f"{project.name}.SemanticModel/definition/{rel}")
+    for path, text, bom, rel in pbir_plans:
+        ops.append(("write", path, text, bom))
+        changed.append(rel)
+    commit_bytes(ops)
+    return {"verb": "move", "measure": m.name, "from": src.name, "to": dst.name, "files": sorted(set(changed)),
+            "next": "pbz diff, pbz validate, then pbz push"}

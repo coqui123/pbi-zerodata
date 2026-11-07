@@ -100,6 +100,8 @@ TOOLS = [
     Tool("consent_read", "Read only an unchanged file with a valid human no-sensitive-data attestation. Protected Power BI files stay denied.", ["consent", "read"],
          pos=[("id", S, True)]),
     Tool("status", "Workspace, mirror and sync state, Desktop, engine and guard.", ["status"]),
+    Tool("doctor", "Read-only OS-isolation checklist (five steps). Does not change ACLs, accounts, "
+                   "firewall rules or brokers. Heuristic mode is not OS-isolated.", ["doctor"]),
     Tool("init", "First use in a workspace: policy, scan of data-bearing files, first pull.", ["init"], read_only=False),
     Tool("scan", "Inventory data-bearing files and leaky scripts; extends the policy deny list.", ["scan"],
          opts={"dry_run": _f("--dry-run")}, read_only=False),

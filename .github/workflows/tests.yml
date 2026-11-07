@@ -50,7 +50,8 @@ jobs:
                     "governance", "mcp", "synth", "consumers", "visuals", "style", "reportedit", "synthtest",
                     "props", "modeling", "workflow", "components", "a11y", "synthedge", "audit",
                     "consolidate", "memory", "images", "improvement_core", "desktop_evidence",
-                    "preview", "session_features", "consent"
+                    "preview", "session_features", "consent", "smoke_honesty", "disclosure_gate",
+                    "atomic_refactor"
           $failed = @()
           foreach ($t in $suites) {
             Write-Host "::group::test_$t"

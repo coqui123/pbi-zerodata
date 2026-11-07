@@ -400,6 +400,53 @@ def _num_value(text: str):
 
 
 TRANSLATED_PROPS = ("caption", "description", "displayFolder")
+# Colon properties whose values are types, refs, enums or ids. Anything else that looks like free
+# text is tokenized whole: heuristic free-text screening must not leave an unknown property visible.
+STRUCTURAL_COLON_PROPS = TRANSLATED_PROPS + (
+    "dataType", "formatString", "displayFolder", "sourceColumn", "sortByColumn", "dataCategory",
+    "summarizeBy", "lineageTag", "sourceLineageTag", "alignment", "isAvailableInMdx", "isHidden",
+    "isKey", "isUnique", "isNullable", "fromColumn", "toColumn", "crossFilteringBehavior",
+    "joinOnDateBehavior", "fromCardinality", "toCardinality", "securityFilteringBehavior",
+    "relyOnReferentialIntegrity", "isActive", "mode", "column", "ordinal", "compatibilityLevel",
+    "culture", "defaultMode", "discourageImplicitMeasures", "queryGroup", "permission",
+    "modelPermission", "metadataPermission", "relationship", "modifiedTime", "state",
+)
+_ENUM_VALUE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_NUM_VALUE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_GUID_VALUE = re.compile(r"^[0-9a-fA-F-]{32,}$")
+# report / page / visualContainer schemas this build knows how to screen. Others are fail-closed.
+# Full URI prefix is required so a spoofed host with the same suffix cannot pass.
+PBIR_SCHEMA_PREFIX = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/"
+PBIR_SCHEMA_RE = re.compile(
+    r"^https://developer\.microsoft\.com/json-schemas/fabric/item/report/definition/"
+    r"(report|page|visualContainer)/(\d+\.\d+\.\d+)/schema\.json$")
+KNOWN_PBIR_SCHEMA = {
+    "report": frozenset({"3.3.0"}),
+    "page": frozenset({"2.1.0"}),
+    "visualContainer": frozenset({"2.4.0", "2.10.0"}),
+}
+
+
+def _literal_bearing(val: str) -> bool:
+    """Free text or a quoted literal, not an enum token, number or guid."""
+    v = val.strip()
+    if len(v) < 3 or v.lower() in ("true", "false", "none", "null"):
+        return False
+    if _NUM_VALUE.match(v) or _GUID_VALUE.match(v) or _ENUM_VALUE.match(v):
+        return False
+    return True
+
+
+def _pbir_schema_known(relpath: str, root) -> bool | None:
+    """True/False for report.json, page.json and visual.json; None for every other file."""
+    name = relpath.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    kind = {"report.json": "report", "page.json": "page", "visual.json": "visualContainer"}.get(name)
+    if kind is None or not isinstance(root, pbir.JObj):
+        return None
+    node = root.get("$schema")
+    sch = node.value.strip() if isinstance(node, pbir.JStr) else ""
+    m = PBIR_SCHEMA_RE.fullmatch(sch)
+    return bool(m and m.group(1) == kind and m.group(2) in KNOWN_PBIR_SCHEMA[kind])
 
 
 def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
@@ -479,6 +526,18 @@ def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
                 edits.append((reg.start + s, reg.start + e, tm.raw(lab, seg[s:e], "tmdl")))
         elif reg.kind == "member":
             edits.append((reg.start, reg.end, tm.raw("pii", seg, "tmdl")))
+    # Unknown `prop: value` lines are not expression regions. A heuristic miss must not leave them visible.
+    pos = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        pm = tmdl.PROP_RE.match(line)
+        # Unknown colon props: fail closed — tokenize any non-empty value (no short/word/number bypass).
+        if pm and pm.group("prop") not in STRUCTURAL_COLON_PROPS and pm.group("val").strip():
+            vs = pos + pm.start("val")
+            ve = vs + len(pm.group("val"))
+            if not _overlaps(vs, ve, edits):
+                edits.append((vs, ve, tm.raw("lit", pm.group("val"), "tmdl")))
+        pos += len(raw_line)
     return apply_edits(text, edits)
 
 
@@ -583,6 +642,15 @@ def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
         root = pbir.parse_json(text)
     except pbir.JsonError:
         return text
+    # Unknown report/page/visual schema: fail closed — only $schema stays; every other string is payload.
+    if _pbir_schema_known(relpath, root) is False:
+        blocked = []
+        for key, node in pbir.string_nodes(root):
+            if key == "$schema" or not (node.value or "").strip():
+                continue
+            raw_full = text[node.start:node.end]
+            blocked.append((node.start, node.end, '"' + tm.raw("payload:schema", raw_full, "pbir_full") + '"'))
+        return apply_edits(text, blocked)
     edits: list[tuple[int, int, str]] = []
     handled: set[int] = set()
 

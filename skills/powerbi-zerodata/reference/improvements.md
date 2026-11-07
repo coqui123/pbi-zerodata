@@ -81,6 +81,17 @@ and `refresh_cutoff`. Cutoffs must be timezone-aware ISO timestamps. Contract fi
 `work_type` (`Project`, `BAU`, `Admin`, `All`), `date_basis` (`observed`, `planned`, `current`,
 `snapshot`), and `definition_sha256`. Raw timestamps and business results are not echoed.
 
+## Disclosure contract
+
+What the agent may see is a closed list: metadata names and ids, fixed verdicts
+(`OK`, `EMPTY`, `ERROR`, `UNSUPPORTED`, `PROTOCOL_ERROR`, `BUDGET`, and the other codes in the
+contract), and the storage bands plus three memory predicates already shipped by `pbz audit memory`.
+Those derived outputs are grandfathered, not reopened. Heuristic mode is not OS-isolated, and a
+closed verdict does not prove a fact cannot be inferred. Private artifacts and excluded operations
+(native interactions, screenshots, real DAX dumps) are listed in
+[disclosure-contract.md](disclosure-contract.md). `pbz doctor` prints the five OS-isolation steps
+and does not change them.
+
 ## Commit safety and outcomes
 
 Push serializes commits and journals file/resource/base/manifest updates. Failed commits roll

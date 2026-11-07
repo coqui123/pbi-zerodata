@@ -6,7 +6,7 @@ import os
 import re
 
 from . import lexers, pbir, tmdl
-from .common import PbzError, read_text, write_text
+from .common import PbzError, commit_bytes, read_text
 from .tokens import apply_edits
 
 
@@ -52,7 +52,8 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
     ext = _external_users(ws, project, kind, home, old)
 
     changed = []
-    # ---- TMDL
+    ops = []
+    # ---- TMDL (planned; nothing is written until PBIR and cultures are planned too)
     for rel, doc in model.docs.items():
         text = doc.text
         edits = []
@@ -83,25 +84,23 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
                 if len(parts) == 2 and parts[0].lower() == home.lower() and parts[1].lower() == old.lower():
                     edits.append((m_.start(2), m_.end(2), f"{lexers.tmdl_name(parts[0])}.{lexers.tmdl_name(new)}"))
         if edits:
-            new_text = apply_edits(text, edits)
             path = os.path.join(mdef, *rel.split("/"))
             _t, bom = read_text(path)
-            write_text(path, new_text, bom)
+            ops.append(("write", path, apply_edits(text, edits), bom))
             changed.append(f"{project.name}.SemanticModel/definition/{rel}")
-    # ---- PBIR
-    rdir = project.mirror_report
-    for path in pbir.report_files(rdir):
-        text, bom = read_text(path)
-        try:
-            root = pbir.parse_json(text)
-        except pbir.JsonError:
-            continue
-        edits = pbir_ref_edits(root, model, kind, home, old, new)
-        if edits:
-            write_text(path, apply_edits(text, edits), bom)
-            changed.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
-    from .governance import culture_edits_rename
-    changed += [f"{project.name}.SemanticModel/definition/{r}" for r in culture_edits_rename(mdef, kind, home, old, new)]
+    from .move import plan_pbir
+    for path, text, bom, rel in plan_pbir(
+            ws, project.mirror_report,
+            lambda root, _text: (pbir_ref_edits(root, model, kind, home, old, new), False)):
+        ops.append(("write", path, text, bom))
+        changed.append(rel)
+    from .governance import culture_rename_texts
+    for rel, text in culture_rename_texts(mdef, kind, home, old, new).items():
+        path = os.path.join(mdef, *rel.split("/"))
+        _t, bom = read_text(path)
+        ops.append(("write", path, text, bom))
+        changed.append(f"{project.name}.SemanticModel/definition/{rel}")
+    commit_bytes(ops)
     return {"verb": "rename", "kind": kind, "table": home, "from": old, "to": new, "files": changed,
             "next": "pbz diff, then pbz push", **ext}
 
@@ -191,13 +190,14 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     if not new.strip() or new != new.strip() or any(c in new for c in "\r\n\t"):
         raise PbzError("BAD_REQUEST", "table names cannot be blank, padded or contain control characters")
     if any(n == old.lower() for n in translated_names(project)):
-        raise PbzError("UNSUPPORTED", "the table has translations in cultures/ (not mirrored): rename it in Desktop")
+        raise PbzError("UNSUPPORTED", "cultures not in this mirror: run pbz pull")
     if any(e.lower() == old.lower() for e in model.expressions):
         raise PbzError("AMBIGUOUS", f"a shared query is also named {old}")
     ext = _external_users(ws, project, "table", "", old)
     mdef = os.path.join(project.mirror_model, "definition")
     low = old.lower()
     changed, renamed_file = [], None
+    ops = []
     for rel, doc in model.docs.items():
         text = doc.text
         edits = []
@@ -258,21 +258,16 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         if rel == t.file and os.path.basename(rel)[:-5].lower() == low:
             target = "/".join(rel.split("/")[:-1] + [_safe_file(new) + ".tmdl"])
             if target != rel:
-                write_text(os.path.join(mdef, *target.split("/")), new_text, bom)
-                os.remove(path)
+                ops.append(("write", os.path.join(mdef, *target.split("/")), new_text, bom))
+                ops.append(("delete", path))
                 renamed_file = (rel, target)
                 changed.append(f"{project.name}.SemanticModel/definition/{target}")
                 continue
         if edits:
-            write_text(path, new_text, bom)
+            ops.append(("write", path, new_text, bom))
             changed.append(f"{project.name}.SemanticModel/definition/{rel}")
-    # ---- PBIR: entity names, From aliases, report-level measure entities, queryRef / metadata strings
-    for path in pbir.report_files(project.mirror_report):
-        text, bom = read_text(path)
-        try:
-            root = pbir.parse_json(text)
-        except pbir.JsonError:
-            continue
+
+    def _table_pbir(root, _text):
         edits = []
 
         def visit(node, key=""):
@@ -295,11 +290,19 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         for key, node in pbir.string_nodes(root):
             if key in ("queryRef", "metadata", "queryName") and node.value.lower().startswith(low + "."):
                 edits.append((node.start, node.end, json.dumps(new + node.value[len(old):], ensure_ascii=False)))
-        if edits:
-            write_text(path, apply_edits(text, sorted(set(edits))), bom)
-            changed.append(os.path.relpath(path, ws.mirror).replace("\\", "/"))
-    from .governance import culture_edits_rename
-    changed += [f"{project.name}.SemanticModel/definition/{r}" for r in culture_edits_rename(mdef, "table", "", old, new)]
+        return edits, False
+
+    from .move import plan_pbir
+    for path, text, bom, rel in plan_pbir(ws, project.mirror_report, _table_pbir):
+        ops.append(("write", path, text, bom))
+        changed.append(rel)
+    from .governance import culture_rename_texts
+    for rel, text in culture_rename_texts(mdef, "table", "", old, new).items():
+        path = os.path.join(mdef, *rel.split("/"))
+        _t, bom = read_text(path)
+        ops.append(("write", path, text, bom))
+        changed.append(f"{project.name}.SemanticModel/definition/{rel}")
+    commit_bytes(ops)
     out = {"verb": "rename", "kind": "table", "from": old, "to": new, "files": sorted(set(changed)),
            "next": "pbz diff, pbz validate, then pbz push", **ext}
     if renamed_file:

@@ -74,7 +74,7 @@ def _verdict(value) -> str:
     allowed = {"PASS", "FAIL", "ERROR", "EMPTY", "UNSUPPORTED", "BUDGET", "SAME", "DIFF", "NEW", "MISSING",
                "STALE_DATA", "OK", "N/A", "PUSHED", "DRY_RUN_OK", "INVALID", "RELOADED", "RELOAD_FAILED",
                "ENGINE_UNAVAILABLE", "DESKTOP_DIRTY", "DESKTOP_STATE_UNKNOWN", "NOT_READY", "TIMEOUT",
-               "INCOMPLETE", "BLOCKED", "GENERATED", "UNKNOWN"}
+               "INCOMPLETE", "BLOCKED", "GENERATED", "UNKNOWN", "PROTOCOL_ERROR"}
     if value in allowed:
         return value
     # Engine error classes are closed-vocabulary, never arbitrary diagnostic text.
@@ -97,13 +97,34 @@ def _outcome(statuses: list[str], empty: str = "INCOMPLETE") -> str:
     statuses = [_verdict(x) for x in statuses]
     if not statuses:
         return empty
-    if any(x in ("FAIL", "ERROR", "INVALID", "DIFF", "RELOAD_FAILED") or x.startswith("ERROR:") for x in statuses):
+    if any(x in ("FAIL", "ERROR", "PROTOCOL_ERROR", "INVALID", "DIFF", "RELOAD_FAILED") or x.startswith("ERROR:") for x in statuses):
         return "FAIL"
     if any(x in ("BUDGET", "ENGINE_UNAVAILABLE", "DESKTOP_DIRTY", "DESKTOP_STATE_UNKNOWN") for x in statuses):
         return "BLOCKED"
     if any(x not in ("PASS", "OK", "SAME", "RELOADED", "N/A") for x in statuses):
         return "INCOMPLETE"
     return "PASS"
+
+
+def _smoke_partial(rows) -> bool:
+    return any(isinstance(r, dict) and (r.get("coverage") == "PARTIAL" or bool(r.get("note"))) for r in rows)
+
+
+def _smoke_counts(summary, visuals) -> dict:
+    """Flatten executed / not_executed buckets, or a legacy status->count map, into verdict counts."""
+    if isinstance(summary, dict) and {"executed", "not_executed"} & set(summary):
+        counts: dict = {}
+        for part in ("executed", "not_executed"):
+            bucket = summary.get(part)
+            if isinstance(bucket, dict):
+                for k, v in bucket.items():
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        key = _verdict(k)
+                        counts[key] = counts.get(key, 0) + v
+        return counts
+    if isinstance(summary, dict) and summary and all(isinstance(v, int) and not isinstance(v, bool) for v in summary.values()):
+        return {_verdict(k): v for k, v in summary.items()}
+    return _counts(visuals)
 
 
 def _reload_ready(value) -> bool:
@@ -159,8 +180,14 @@ def summarize(verb: str, action: str | None, out: dict) -> tuple[str, dict] | No
         return "EXECUTED", {"snapshot": out.get("name"), "queries": _counts(res, "result"),
                             "outcome": _outcome([r.get("result", "UNKNOWN") for r in res]), "executed": bool(res)}
     if verb == "smoke":
-        counts = out.get("summary") if isinstance(out.get("summary"), dict) else _counts(out.get("visuals"))
-        return "EXECUTED", {"smoke": counts, "outcome": _outcome(list(counts)), "executed": bool(counts)}
+        counts = _smoke_counts(out.get("summary"), out.get("visuals"))
+        rows = out.get("visuals") or []
+        base = _outcome(list(counts))
+        # Partial coverage must not aggregate to PASS even when every executed status is OK.
+        if base == "PASS" and _smoke_partial(rows):
+            base = "INCOMPLETE"
+        return "EXECUTED", {"smoke": counts, "partial_filters": _smoke_partial(rows),
+                            "outcome": base, "executed": bool(counts)}
     if verb == "synth-test" and action == "run":
         return "SYNTHETIC", {"test": out.get("name"), "result": out.get("result"),
                              "outcome": _outcome([str(out.get("result", "UNKNOWN"))])}
@@ -190,9 +217,9 @@ def _scoped_summaries(verb: str, action: str | None, out: dict) -> list[tuple[st
         for r in out["visuals"]:
             pages.setdefault(str(r.get("page", "?")), []).append(r)
         return [(stage, "smoke:" + page,
-                 {"page": page, "smoke": _counts(rows), "partial_filters": any(bool(r.get("note")) for r in rows),
+                 {"page": page, "smoke": _counts(rows), "partial_filters": _smoke_partial(rows),
                   "coverage": "QUERY_ONLY", "outcome": (
-                      "INCOMPLETE" if any(bool(r.get("note")) for r in rows) and
+                      "INCOMPLETE" if _smoke_partial(rows) and
                       _outcome([r.get("status", "UNKNOWN") for r in rows]) == "PASS" else
                       _outcome([r.get("status", "UNKNOWN") for r in rows])), "executed": True})
                 for page, rows in pages.items()]

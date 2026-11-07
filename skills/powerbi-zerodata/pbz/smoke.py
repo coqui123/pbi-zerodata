@@ -14,30 +14,47 @@ NON_DATA = {"textbox", "image", "shape", "basicShape", "actionButton", "pageNavi
 AGG = {0: "SUM", 1: "AVERAGE", 2: "COUNTA", 3: "MIN", 4: "MAX", 5: "DISTINCTCOUNT", 6: "MEDIAN",
        7: "STDEV.P", 8: "VAR.P"}
 CMP = {0: "=", 1: ">", 2: ">=", 3: "<", 4: "<="}
+ENGINE_STATUS = {"OK", "EMPTY", "ERROR"}
+_DT = re.compile(r"(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})"
+                 r"(?:[T ](?P<h>\d{2}):(?P<mi>\d{2})(?::(?P<s>\d{2})(?:\.(?P<f>\d+))?)?)?"
+                 r"(?:Z|[+-]\d{2}:\d{2})?")
 
 
 def col_dax(table: str, col: str) -> str:
     return f"{dax_table_name(table)}[{col.replace(']', ']]')}]"
 
 
-def _lit_dax(raw: str, tm) -> str | None:
+def _date_dax(v: str) -> tuple[str | None, bool]:
+    """DATE(...) for a date or midnight datetime. Second value: a clock time was dropped."""
+    m = _DT.fullmatch(v.strip())
+    if not m:
+        return None, False
+    dax = f"DATE({int(m.group('y'))}, {int(m.group('mo'))}, {int(m.group('d'))})"
+    if m.group("h") is None:
+        return dax, False
+    frac = m.group("f")
+    midnight = int(m.group("h")) == int(m.group("mi")) == int(m.group("s") or 0) == 0 and not (frac and int(frac) != 0)
+    return dax, not midnight
+
+
+def _lit_dax(raw: str, tm) -> tuple[str | None, bool]:
+    """(dax, time_truncated). time_truncated is true when a datetime clock time became DATE(...)."""
     if tokens.TOKEN_RE.fullmatch(raw or ""):
         rec = tm.get(raw)
         if not rec or rec.get("kind") != "lit":
-            return None
+            return None, False
         v, vtype = rec.get("value"), rec.get("vtype")
     else:
         v, vtype = pbir.decode_literal(raw)
     if vtype == "string":
-        return dax_string(str(v))
+        return dax_string(str(v)), False
     if vtype in ("int", "double", "number"):
-        return str(v)
+        return str(v), False
     if vtype == "bool":
-        return "TRUE()" if v else "FALSE()"
+        return ("TRUE()" if v else "FALSE()"), False
     if vtype == "datetime" and isinstance(v, str):
-        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", v)
-        return f"DATE({int(m.group(1))}, {int(m.group(2))}, {int(m.group(3))})" if m else None
-    return None
+        return _date_dax(v)
+    return None, False
 
 
 def _filters(filter_config, model, tm) -> tuple[list[str], bool]:
@@ -70,12 +87,17 @@ def _filters(filter_config, model, tm) -> tuple[list[str], bool]:
                 if len(cols) != 1 or not cols[0] or cols[0].kind not in ("column", "hierarchy") or not isinstance(vals, pbir.JArr):
                     partial = True
                     continue
+                if not vals.items:
+                    partial = True
+                    continue
                 lits = []
                 for row in vals.items:
                     cell = row.items[0] if isinstance(row, pbir.JArr) and row.items else None
                     lit = cell.get("Literal") if isinstance(cell, pbir.JObj) else None
                     raw = lit.get("Value").value if isinstance(lit, pbir.JObj) and isinstance(lit.get("Value"), pbir.JStr) else None
-                    d = _lit_dax(raw, tm) if raw is not None else None
+                    d, trunc = _lit_dax(raw, tm) if raw is not None else (None, False)
+                    if trunc:
+                        partial = True
                     if d is None:
                         partial = True
                         break
@@ -91,7 +113,9 @@ def _filters(filter_config, model, tm) -> tuple[list[str], bool]:
                 raw = lit.get("Value").value if isinstance(lit, pbir.JObj) and isinstance(lit.get("Value"), pbir.JStr) else None
                 kind = cmp_.get("ComparisonKind")
                 op = CMP.get(kind.value if isinstance(kind, pbir.JLit) else None)
-                d = _lit_dax(raw, tm) if raw is not None else None
+                d, trunc = _lit_dax(raw, tm) if raw is not None else (None, False)
+                if trunc:
+                    partial = True
                 if not f_ or f_.kind not in ("column", "hierarchy") or not op or d is None:
                     partial = True
                     continue
@@ -113,6 +137,8 @@ def build_query(visual_root, page_root, model, tm) -> tuple[str | None, str]:
     q = v.get("query")
     qs = q.get("queryState") if isinstance(q, pbir.JObj) else None
     groups, measures = [], []
+    skipped = False
+    bad_agg = False
     if isinstance(qs, pbir.JObj):
         for _role, rnode in qs.pairs:
             projs = rnode.get("projections") if isinstance(rnode, pbir.JObj) else None
@@ -120,29 +146,34 @@ def build_query(visual_root, page_root, model, tm) -> tuple[str | None, str]:
                 fld = p.get("field") if isinstance(p, pbir.JObj) else None
                 ref = pbir.field_of(fld, {}, model)
                 if not ref or not ref.table:
+                    skipped = True
                     continue
                 if ref.kind == "measure":
                     measures.append(f"[{ref.name.replace(']', ']]')}]")
                 elif ref.kind == "aggregation":
-                    measures.append(f"{AGG.get(ref.function, 'COUNTA')}({col_dax(ref.table, ref.name)})")
+                    fn = AGG.get(ref.function)
+                    if not fn:
+                        bad_agg = True
+                        continue
+                    measures.append(f"{fn}({col_dax(ref.table, ref.name)})")
                 elif ref.kind in ("column", "hierarchy") and ref.name:
                     c = col_dax(ref.table, ref.name)
                     if c not in groups:
                         groups.append(c)
-    if not groups and not measures:
+    if bad_agg or (not groups and not measures):
         return None, "UNSUPPORTED"
     fl, partial = _filters(visual_root.get("filterConfig"), model, tm)
     pf, ppartial = _filters(page_root.get("filterConfig") if isinstance(page_root, pbir.JObj) else None, model, tm)
     filters = fl + pf
-    note = "filters partial" if (partial or ppartial) else ""
+    coverage = "PARTIAL" if (skipped or partial or ppartial) else "FULL"
     named = [f'"m{i}", {m}' for i, m in enumerate(measures)]
     if groups:
         args = ", ".join(groups + filters + named)
-        return f"EVALUATE TOPN(1, SUMMARIZECOLUMNS({args}))", note
+        return f"EVALUATE TOPN(1, SUMMARIZECOLUMNS({args}))", coverage
     row = f'ROW({", ".join(named)})'
     inner = f"CALCULATETABLE({row}, {', '.join(filters)})" if filters else row
     cond = " || ".join(f"NOT ISBLANK([m{i}])" for i in range(len(measures)))
-    return f"EVALUATE FILTER({inner}, {cond})", note
+    return f"EVALUATE FILTER({inner}, {cond})", coverage
 
 
 def run(ws, project, page: str | None = None) -> dict:
@@ -177,26 +208,63 @@ def run(ws, project, page: str | None = None) -> dict:
             dax, note = build_query(vroot, proot, model, tm)
             row = {"page": pname, "visual": vid, "type": vt, "_pid": pid}
             if dax is None:
-                row["status"] = note
+                row["status"] = note if note in ("N/A", "UNSUPPORTED") else "UNSUPPORTED"
+                row["coverage"] = "NONE"
             else:
                 items.append({"id": f"{pid}/{vid}", "dax": dax})
-                if note:
-                    row["note"] = note
+                row["coverage"] = note if note in ("FULL", "PARTIAL") else "PARTIAL"
             rows.append(row)
+    ENGINE_CLASS = {"SYNTAX", "UNKNOWN_OBJECT", "TYPE_MISMATCH", "CONVERSION", "CIRCULAR",
+                    "DUPLICATE_KEY", "TIMEOUT", "ENGINE_UNAVAILABLE", "BAD_REQUEST", "OTHER"}
     if items:
         res = engine_call("smoke", {"private_dir": ws.private, "port": port, "visuals": items}, timeout=1800)
         if not res.get("ok"):
-            raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
-        by_id = {r.get("id"): r for r in res.get("visuals", [])}
+            klass = res.get("class")
+            if not isinstance(klass, str) or klass not in ENGINE_CLASS | {"ENGINE_UNAVAILABLE", "TIMEOUT", "NOT_READY"}:
+                raise PbzError("PROTOCOL_ERROR", "engine smoke failure class is not in the closed vocabulary")
+            raise PbzError(klass)
+        raw_visuals = res.get("visuals")
+        if not isinstance(raw_visuals, list):
+            raise PbzError("PROTOCOL_ERROR", "engine smoke visuals must be a list")
+        by_id: dict = {}
+        dup_ids: set[str] = set()
+        for r in raw_visuals:
+            if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+                continue
+            rid = r["id"]
+            if rid in by_id:
+                dup_ids.add(rid)
+                continue
+            by_id[rid] = r
         for row in rows:
             if "status" in row:
                 continue
-            r = by_id.get(f"{row['_pid']}/{row['visual']}") or {}
-            row["status"] = r.get("status", "ERROR")
-            if r.get("class"):
-                row["class"] = r["class"]
-    counts = {}
+            key = f"{row['_pid']}/{row['visual']}"
+            if key in dup_ids or key not in by_id:
+                row["status"] = "PROTOCOL_ERROR"
+                continue
+            r = by_id[key]
+            status = r.get("status")
+            if not isinstance(status, str) or status not in ENGINE_STATUS:
+                row["status"] = "PROTOCOL_ERROR"
+                continue
+            row["status"] = status
+            klass = r.get("class")
+            if klass is None:
+                continue
+            if isinstance(klass, str) and klass in ENGINE_CLASS:
+                row["class"] = klass
+            else:
+                row["status"] = "PROTOCOL_ERROR"
+    executed, not_executed = {}, {}
     for row in rows:
         row.pop("_pid", None)
-        counts[row["status"]] = counts.get(row["status"], 0) + 1
-    return {"verb": "smoke", "project": project.name, "summary": counts, "visuals": rows}
+        # PROTOCOL_ERROR is a protocol fault on an attempted execution, not a successful verdict.
+        bucket = executed if row["status"] in ENGINE_STATUS else not_executed
+        if row["status"] == "PROTOCOL_ERROR":
+            bucket = not_executed
+        bucket[row["status"]] = bucket.get(row["status"], 0) + 1
+    from .outcomes import envelope
+    out, _rc = envelope({"verb": "smoke", "project": project.name,
+                         "summary": {"executed": executed, "not_executed": not_executed}, "visuals": rows})
+    return out

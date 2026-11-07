@@ -132,6 +132,69 @@ def write_text(path: str, text: str, bom: bytes = b"") -> None:
     os.replace(tmp, path)
 
 
+def commit_bytes(ops: list[tuple]) -> None:
+    """Apply ('write', path, text, bom) and ('delete', path) as one mirror edit.
+
+    Snapshots each path's bytes first (missing -> None), same idea as a recipe
+    snapshot or a push journal, but only for files this call touches. On failure,
+    restores those snapshots and removes leftover `.pbz-tmp` files so a later
+    step cannot leave an earlier write or temp behind.
+    """
+    snap: dict[str, bytes | None] = {}
+    for op in ops:
+        path = op[1]
+        if path in snap:
+            continue
+        try:
+            with open(path, "rb") as f:
+                snap[path] = f.read()
+        except FileNotFoundError:
+            snap[path] = None
+    done: list[str] = []
+    try:
+        for op in ops:
+            kind, path = op[0], op[1]
+            if kind == "write":
+                write_text(path, op[2], op[3] if len(op) > 3 else b"")
+            elif kind == "delete":
+                if os.path.lexists(path):
+                    os.remove(path)
+            else:
+                raise PbzError("BAD_REQUEST", "unknown file operation")
+            done.append(path)
+    except OSError as first:
+        restore_fail = []
+        touched = list(dict.fromkeys(list(reversed(done)) + list(snap.keys())))
+        for path in touched:
+            tmp = path + ".pbz-tmp"
+            try:
+                if os.path.lexists(tmp):
+                    os.remove(tmp)
+            except OSError as e:
+                restore_fail.append(f"{tmp}:{type(e).__name__}")
+            if path not in snap:
+                continue
+            data = snap[path]
+            try:
+                if data is None:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                else:
+                    parent = os.path.dirname(path)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+                    restore = path + ".pbz-restore"
+                    with open(restore, "wb") as f:
+                        f.write(data)
+                    os.replace(restore, path)
+            except OSError as e:
+                restore_fail.append(f"{path}:{type(e).__name__}")
+        if restore_fail:
+            raise PbzError("RECOVERY_REQUIRED",
+                           "commit rolled back incompletely: " + ", ".join(restore_fail[:12])) from first
+        raise
+
+
 def sha(text_or_bytes) -> str:
     b = text_or_bytes.encode("utf-8") if isinstance(text_or_bytes, str) else text_or_bytes
     return hashlib.sha256(b).hexdigest()

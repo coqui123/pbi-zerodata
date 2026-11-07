@@ -16,6 +16,8 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
     known = BLOCKED | UNAVAILABLE | INVALID | {"ROLLED_BACK"}
     code = next((c for c in candidates if isinstance(c, str) and c in known),
                 str(out.get("error") or out.get("result") or out.get("status") or out.get("action") or "OK"))
+    query_rows = [r for r in out.get("results", []) + out.get("queries", []) if isinstance(r, dict)]
+    visual_rows = [r for r in out.get("visuals") or [] if isinstance(r, dict)]
     status, rc = "SUCCEEDED", 0
     reload = out.get("reload")
     if out.get("result") == "PUSHED" and reload and reload != "RELOADED":
@@ -34,11 +36,11 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
         status, code, rc = "FAILED", "GATE_FAILED", 1
     elif any(f.get("severity") == "error" for f in out.get("findings", []) if isinstance(f, dict)):
         status, code, rc = "INVALID", "VALIDATION_FAILED", 2
-    elif any(r.get("status") in {"FAIL", "ERROR"} or r.get("result") in {"DIFF", "ERROR"}
-             for r in out.get("results", []) + out.get("queries", []) if isinstance(r, dict)):
+    elif any(r.get("status") in {"FAIL", "ERROR"} or r.get("result") in {"DIFF", "ERROR"} for r in query_rows) \
+            or any(r.get("status") in {"ERROR", "PROTOCOL_ERROR", "FAIL"} for r in visual_rows):
         status, code, rc = ("FINDINGS", "DIAGNOSTIC_FINDINGS", 0) if diagnostic else ("FAILED", "ASSERTION_FAILED", 1)
     elif any(r.get("status") in {"EMPTY", "UNSUPPORTED", "BUDGET"} or r.get("result") in {"STALE_DATA", "ERROR"}
-             for r in out.get("results", []) + out.get("queries", []) if isinstance(r, dict)):
+             for r in query_rows):
         status, code, rc = "BLOCKED", "INCONCLUSIVE_EVIDENCE", 3
     elif out.get("status") == "BUDGET":
         status, code, rc = "BLOCKED", "BUDGET", 3
