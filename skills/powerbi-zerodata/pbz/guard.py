@@ -198,6 +198,7 @@ def ancestors(path: str):
 _ROOT: dict[str, str | None] = {}
 _SYN: dict[str, bool] = {}
 _POL: dict[str, dict] = {}
+_PRIVATE: dict[str, object] = {"stamp": None, "roots": []}
 
 
 def find_root(path: str) -> str | None:
@@ -234,10 +235,133 @@ def rel(path: str, root: str) -> str:
     return path[len(root):].lstrip("/") if path.startswith(root + "/") or path == root else path
 
 
+def _node_ident(path: str):
+    """Identity tuple for stamp walks. Index 1 is True, False (missing), or a failure tag.
+
+    A reparse/symlink whose target cannot be read, or an lstat that fails for a
+    reason other than absence, is marked so alias closure reports incomplete
+    instead of treating the node as an ordinary non-link.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return (norm(path), False)
+    except OSError:
+        return (norm(path), "lstat_failed")
+    link = None
+    tag = getattr(info, "st_reparse_tag", 0)
+    if tag or os.path.islink(path):
+        try:
+            link = os.readlink(path)
+        except OSError:
+            return (norm(path), "readlink_failed", info.st_dev, info.st_ino,
+                    tag, info.st_nlink, None)
+    return (norm(path), True, info.st_dev, info.st_ino, tag, info.st_nlink, link)
+
+
+def _stamp_alias_closure(path: str, parts: list, *, budget: int = 256) -> bool:
+    """Stamp `path`, every lexical ancestor to the root, and every alias target.
+
+    Returns True when the closure finished; False when the BFS budget ran out.
+    A partial stamp must not authorize memo reuse. lstat/readlink only.
+    """
+    queue = [os.path.abspath(path)]
+    seen: set[str] = set()
+    remaining = budget
+    while queue:
+        if remaining <= 0:
+            return False
+        remaining -= 1
+        node = queue.pop(0)
+        cur = node
+        while True:
+            key = norm(cur)
+            if key not in seen:
+                seen.add(key)
+                ident = _node_ident(cur)
+                parts.append(ident)
+                status = ident[1] if len(ident) > 1 else False
+                if status in ("lstat_failed", "readlink_failed"):
+                    return False
+                if status is True and len(ident) >= 7 and ident[6] is not None:
+                    nxt = ident[6]
+                    if not os.path.isabs(nxt):
+                        nxt = os.path.join(os.path.dirname(cur), nxt)
+                    queue.append(os.path.normpath(nxt))
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    return True
+
+
+def _private_stamp(raws: list[str]) -> tuple[tuple, bool]:
+    """Identity of each configured root and every alias reachable from its path.
+
+    Returns `(stamp_parts, complete)`. Incomplete traversal must not reuse the
+    process memo. Uses lstat/readlink only — never realpath.
+    """
+    parts = []
+    complete = True
+    for raw in raws:
+        expanded = os.path.expanduser(raw)
+        parts.append(norm(raw))
+        if not os.path.isabs(expanded):
+            parts.append(_node_ident(os.getcwd()))
+        if not _stamp_alias_closure(expanded, parts):
+            complete = False
+    return tuple(parts), complete
+
+
+def _private_roots() -> list[str]:
+    """Default store plus PBZ_PRIVATE_ROOT, each as a lexical path and a resolved path when it exists.
+
+    Resolving the configured root protects its canonical target. The lexical path is kept as well,
+    so the alias itself stays denied. A missing root is normalized without being treated as a link.
+    The resolved list is reused only when the alias-closure stamp completed and still matches.
+    A partial stamp never authorizes memo reuse.
+    """
+    raws = [PRIVATE_ROOT]
+    configured = (os.environ.get("PBZ_PRIVATE_ROOT") or "").strip()
+    if configured:
+        raws.append(os.path.expanduser(configured))
+    stamp_parts, complete = _private_stamp(raws)
+    stamp = (tuple(norm(raw) for raw in raws), stamp_parts)
+    if complete and _PRIVATE["stamp"] == stamp:
+        return _PRIVATE["roots"]  # type: ignore[return-value]
+    found: list[str] = []
+    for raw in raws:
+        lexical = norm(raw)
+        if lexical not in found:
+            found.append(lexical)
+        if not os.path.lexists(raw):
+            continue
+        try:
+            resolved = norm(os.path.realpath(raw))
+        except OSError:
+            continue
+        if resolved and resolved not in found:
+            found.append(resolved)
+    if complete:
+        _PRIVATE["stamp"] = stamp
+        _PRIVATE["roots"] = found
+    else:
+        # Incomplete closure: return fresh roots but do not cache them.
+        _PRIVATE["stamp"] = None
+        _PRIVATE["roots"] = None
+    return found
+
+
+def _under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + "/")
+
+
 def global_denied(path: str) -> bool:
     for d in GLOBAL_DENY_DIRS:
-        nd = norm(d)
-        if path == nd or path.startswith(nd + "/"):
+        if _under(path, norm(d)):
+            return True
+    for root in _private_roots():
+        if _under(path, root):
             return True
     return any(re.search(p, path) for p in GLOBAL_DENY_PATTERNS)
 
@@ -541,7 +665,7 @@ def policy_loosened(old: dict, new: dict) -> bool:
     for key in ("deny", "deny_scripts", "sensitive_hosts", "sensitive_columns"):
         if not set(old.get(key, [])) <= set(new.get(key, [])):
             return True
-    for key in ("allow", "category_columns", "reveal_columns"):
+    for key in ("allow", "category_columns", "reveal_columns", "memory_dirs"):
         if not set(new.get(key, [])) <= set(old.get(key, [])):
             return True
     ob, nb = old.get("budgets", {}) or {}, new.get("budgets", {}) or {}

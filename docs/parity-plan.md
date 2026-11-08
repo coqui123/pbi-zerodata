@@ -578,3 +578,11 @@ akhilannan/pbir-utils, JonathanJihwanKim/pbi-lineage-lenz / pbip-lineage-explore
 pbip-documenter, ViciusLio/pbi-semantic-doc, sql-bi/Vpax-Obfuscator and VertiPaq-Analyzer,
 microsoft/powerquery-parser. Measure Killer: concepts and published formulas only; its grade labels
 are its branding (and "Power BI Pro" is a Microsoft SKU), so labels are configurable.
+
+## Round 15 parity
+
+CLI and MCP share the same refusal path: `UNSAFE_PATH`, `REFUSED`, `HUMAN_ONLY`,
+`ENGINE_UNAVAILABLE`, `RECOVERY_REQUIRED` and `FAILED` keep their existing exit codes. MCP runs
+the CLI, so a non-human `memscrub --show` is `HUMAN_ONLY` with no scrubbed text. Policy writes,
+push journals and synthetic publish still prepare before they replace. A failed replace leaves
+the previous bytes. This is not a claim that a crash mid-replace is atomic.

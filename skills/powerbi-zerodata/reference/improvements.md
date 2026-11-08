@@ -96,7 +96,9 @@ and does not change them.
 
 Push serializes commits and journals file/resource/base/manifest updates. Failed commits roll
 back only their own writes; unexpected concurrent edits cause `RECOVERY_CONFLICT` instead of
-overwriting them. `pbz recover [--transaction ID]` is explicit, requires Desktop closed, and does
+overwriting them. That rollback runs when Python handles the exception. A killed process or a
+power loss can still leave a partial commit; the journal records the interrupted attempt and
+is not a write-ahead log of every byte. `commit_bytes` has the same exception-only guarantee. `pbz recover [--transaction ID]` is explicit, requires Desktop closed, and does
 not expose journal content. A corrupt journal blocks safely for remediation. Disclosure ledgers
 remain conservative after rollback.
 
@@ -135,6 +137,19 @@ An unreadable history snapshot is listed as `UNREADABLE` and is not deleted. Str
 disclosure strips size and share bands from a live result and from a previously saved shape-mode
 cache. A docs change log skips a bad line, reports `INCOMPLETE` and the skip count, and does
 not copy that line into JSON, Markdown or HTML.
+Round 15 keeps writer temps exclusive: a short or zero-progress write fails, the temp identity is
+checked before replace, and only that temp is removed. `root` / `roots` are optional and
+keyword-only; a junction at `.pbz` or the policy file is `UNSAFE_PATH`, while a junction above
+the workspace root is not. Policy writes are anchored at the workspace root. PBIR parsing stops
+at depth 128. An unknown report, page or visual object keeps a Fabric `$schema` and opaques
+every other top-level key and value; a non-object root and malformed JSON are `REFUSED` and are
+not published raw. Embedded specs that cannot be recognized are opaque as a whole literal.
+Consent stays exact-file. `memscrub --show` is human-only after the path checks, with no
+scrubbed text on the agent path. CJK names without separators are not found in free text.
+Synthetic rejection stays the fixed token `SYNTH_VALIDATE_REJECTED` with no count or class list.
+None of this is crash-proof: a killed process can still leave a temp, and OS isolation is still
+the checklist in leak-vectors.md.
+
 
 `--diagnostic` explicitly permits check-result collection without assertion failure exit codes.
 Do not interpret an artifact being generated as validation passing. Unexpected CLI exceptions

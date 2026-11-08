@@ -138,10 +138,12 @@ def offline(fails: list) -> None:
     with open(mdef, "a", encoding="utf-8", newline="") as f:
         f.write("\n\tmeasure 'Synth Test Added' = [Total Sales] * 2\n")
     r = synthtest.run(ws, project, "sales")
-    check(r["result"] == "SAME" and "model" in r["drift"] and "synth_stale" in r["drift"]
+    check(r["result"] == "NOT_COMPARABLE" and "model" in r["drift"] and "synth_stale" in r["drift"]
           and "synth" not in r["drift"], f"model drift: {r}")
+    stale_file = synthtest._path(ws, "stale")
     s = synthtest.save(ws, project, "stale", measures=["[Total Sales]"])
-    check("older than the mirror model" in s.get("warning", ""), f"stale save not warned: {s}")
+    check(s.get("result") == "NOT_COMPARABLE" and s.get("error") == "STALE_EVIDENCE"
+          and not os.path.exists(stale_file), f"stale save must not write a file: {s}")
     write_info(built=(dt.datetime.now() + dt.timedelta(seconds=5)).isoformat(timespec="seconds"))  # rebuilt after the edit
     r = synthtest.run(ws, project, "sales")
     check("synth_stale" not in r.get("drift", {}) and "model" in r["drift"], f"fresh rebuild: {r}")
@@ -154,9 +156,10 @@ def offline(fails: list) -> None:
     p = synthtest.run(ws, project, "positional")["queries"][0]
     check(p["result"] == "DIFF" and p["cells"][0]["key"] == 0, f"positional compare: {p}")
     lst = synthtest.list_(ws)
-    check({t["name"] for t in lst["tests"]} == {"sales", "stale", "positional"}, f"list: {lst}")
-    check(synthtest.remove(ws, "stale")["result"] == "REMOVED", "remove")
+    check({t["name"] for t in lst["tests"]} == {"sales", "positional"}, f"list: {lst}")
     refused(synthtest.remove, ws, "stale", code="NOT_FOUND")
+    check(synthtest.remove(ws, "positional")["result"] == "REMOVED", "remove")
+    refused(synthtest.remove, ws, "positional", code="NOT_FOUND")
     refused(synthtest.run, ws, project, "nope", code="NOT_FOUND")
     os.remove(os.path.join(sroot, ".pbz", "policy.json"))
     refused(synthtest.run, ws, project, "sales", code="UNSAFE")

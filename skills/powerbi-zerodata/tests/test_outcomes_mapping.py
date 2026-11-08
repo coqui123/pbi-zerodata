@@ -28,6 +28,7 @@ CASES = [
      "BLOCKED", "INCONCLUSIVE_EVIDENCE", 3),
     ({"ok": False, "error": "LOCAL_STATE_UNAVAILABLE"}, "BLOCKED", "LOCAL_STATE_UNAVAILABLE", 3),
     ({"ok": False, "error": "INTERNAL_ERROR"}, "FAILED", "INTERNAL_ERROR", 1),
+    ({"result": "OTHER"}, "FAILED", "OTHER", 1),
 ]
 
 

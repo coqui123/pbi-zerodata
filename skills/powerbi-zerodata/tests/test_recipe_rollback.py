@@ -98,10 +98,10 @@ class RecipeRollbackTests(unittest.TestCase):
         ])
         real = common.commit_bytes
 
-        def boom(ops, private=False):
+        def boom(ops, private=False, *, root=None, roots=None, **_kw):
             if any(op[0] == "write_bytes" for op in ops):
                 raise PbzError("FAILED", "SECRET_RESTORE_PATH")
-            return real(ops, private=private)
+            return real(ops, private=private, root=root, roots=roots)
 
         with patch("pbz.recipes.commit_bytes", boom):
             with self.assertRaises(PbzError) as caught:

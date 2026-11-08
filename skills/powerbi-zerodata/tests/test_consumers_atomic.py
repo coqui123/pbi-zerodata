@@ -57,10 +57,10 @@ class ConsumersAtomicTests(unittest.TestCase):
         before = self._reg()
         real = common.write_text
 
-        def boom(path, text, bom=b""):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
             if path.endswith("c2.json"):
                 raise OSError("cache")
-            return real(path, text, bom)
+            return real(path, text, bom, root=root)
 
         with patch("pbz.common.write_text", boom):
             with self.assertRaises(PbzError) as caught:
@@ -97,10 +97,10 @@ class ConsumersAtomicTests(unittest.TestCase):
                     "connectionString": "Data Source=localhost;Initial Catalog=Parity"}}}, f)
         real = common.write_text
 
-        def boom(path, text, bom=b""):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
             if path.endswith("c2.json"):
                 raise OSError("second")
-            return real(path, text, bom)
+            return real(path, text, bom, root=root)
 
         with patch("pbz.common.write_text", boom):
             with self.assertRaises(PbzError) as caught:

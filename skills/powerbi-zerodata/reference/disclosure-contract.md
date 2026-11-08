@@ -83,3 +83,7 @@ A run of `OK` / `PASS` / `SAME` means the asked question was answered inside the
 not mean the underlying values are hidden from inference, and it does not mean the OS isolation
 checklist in [leak-vectors.md](leak-vectors.md) is in place. Heuristic mode (no `pbz index`) misses
 literals the index would catch. `pbz doctor` reports that checklist and does not change it.
+Round 15 does not add agent-visible validation statistics. A rejected synthetic build names only
+`SYNTH_VALIDATE_REJECTED`. `memscrub --show` is human-only and does not return scrubbed text to
+an agent. CJK names that are not separated by spaces may stay unmatched in free text even when
+an exact index entry exists.

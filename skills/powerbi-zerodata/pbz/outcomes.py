@@ -35,7 +35,7 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
     """Keep existing fields while giving callers one canonical status and exit code."""
     out = dict(out)
     candidates = [out.get(k) for k in ("result", "status", "action", "error")]
-    known = BLOCKED | UNAVAILABLE | INVALID | {"ROLLED_BACK", "FAILED", "INTERNAL_ERROR"}
+    known = BLOCKED | UNAVAILABLE | INVALID | {"ROLLED_BACK", "FAILED", "INTERNAL_ERROR", "OTHER"}
     code = next((c for c in candidates if isinstance(c, str) and (c in known or _exec_error(c))),
                 str(out.get("error") or out.get("result") or out.get("status") or out.get("action") or "OK"))
     query_rows = [r for r in out.get("results", []) + out.get("queries", []) if isinstance(r, dict)]
@@ -49,6 +49,9 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
         status, code, rc = "PARTIAL", "PARTIAL", 5
     elif code == "INTERNAL_ERROR" or out.get("error") == "INTERNAL_ERROR":
         status, code, rc = "FAILED", "INTERNAL_ERROR", 1
+    elif code == "OTHER":
+        # Engine catch-all. Exit 1 is the shipped FAILED code; OTHER is not a success.
+        status, rc = "FAILED", 1
     elif code in BLOCKED:
         status, rc = "BLOCKED", 3
     elif code in UNAVAILABLE:

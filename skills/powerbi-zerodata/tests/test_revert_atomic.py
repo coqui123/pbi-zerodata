@@ -54,11 +54,11 @@ class RevertAtomicTests(unittest.TestCase):
         real = common.write_text
         seen = {"n": 0}
 
-        def wrapped(path, text, bom=b""):
+        def wrapped(path, text, bom=b"", *, root=None, **_kw):
             seen["n"] += 1
             if seen["n"] >= 2:
                 raise OSError("second write")
-            return real(path, text, bom)
+            return real(path, text, bom, root=root)
 
         with patch("pbz.common.write_text", wrapped):
             with self.assertRaises(common.PbzError) as caught:

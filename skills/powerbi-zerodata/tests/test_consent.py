@@ -16,7 +16,7 @@ import zlib
 
 SKILL=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(SKILL))
-from pbz import consent  # noqa: E402
+from pbz import consent, guard  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 
 
@@ -199,6 +199,30 @@ class ConsentTests(unittest.TestCase):
         self.private.mkdir(exist_ok=True)
         private=self.private/'anything.txt';private.write_text('FAKE',encoding='utf-8')
         with self.assertRaises(PbzError):consent.request(self.ws,str(private))
+
+    def test_canonical_private_alias_cannot_receive_consent(self):
+        real = self.private
+        real.mkdir()
+        note = real / "note.txt"
+        note.write_text("SYNTHETIC", encoding="utf-8")
+        alias = Path(self.tmp.name) / "alias-private"
+        try:
+            os.symlink(real, alias, target_is_directory=True)
+        except OSError:
+            import subprocess
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(real)], capture_output=True)
+            if made.returncode != 0:
+                self.skipTest("directory alias unavailable")
+        self.ws.private = str(alias)
+        with self.assertRaises(PbzError) as raised:
+            consent.request(self.ws, str(note))
+        self.assertEqual(raised.exception.code, "PROTECTED_SOURCE")
+        self.assertFalse((real / "source-consents").exists())
+        pending = consent.request(self.ws, str(self.source()))
+        self.assertEqual(pending["status"], "PENDING")
+        with patch.dict(os.environ, {"PBZ_PRIVATE_ROOT": str(alias)}):
+            self.assertTrue(guard.global_denied(guard.norm(str(note))))
+            self.assertFalse(guard.global_denied(guard.norm(str(self.root / "requirements.txt"))))
 
     def test_symlink_and_hardlink_aliases_are_never_approved(self):
         p=self.source();link=self.root/'alias.txt'

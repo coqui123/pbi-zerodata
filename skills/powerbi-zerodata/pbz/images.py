@@ -23,9 +23,10 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import xml.etree.ElementTree as ET
 
-from .common import PbzError, commit_bytes, read_text, write_text
+from .common import PbzError, _contained, _reparse_link, commit_bytes, read_text, remove_file, replace_bytes, write_text
 
 PACKAGE = "RegisteredResources"
 PACKAGE_TYPE = 1
@@ -450,12 +451,23 @@ def add(ws, project, path: str, name: str | None = None) -> dict:
     ops.append(("write_bytes", os.path.join(pend, item), data))
     _register(doc, item)
     ops.append(("write", rjson, _render(text, doc), bom))
-    commit_bytes(ops, private=True)
+    _commit(ws, project, ops)
     out = {"verb": "image", "action": "add", "result": "STAGED", "item": item, "display_name": display_name(item),
            **facts, "files": [rel], "next": _next(item)}
     if size > LARGE_BYTES:
         out["warning"] = "large image: every report viewer downloads it; compress it if you can"
     return out
+
+
+def _commit(ws, project, ops: list[tuple]) -> None:
+    """Private pending files and mirror report.json each stay inside their own root."""
+    roots = {}
+    private = os.path.abspath(ws.private)
+    home = os.path.abspath(project.root)
+    for op in ops:
+        path = os.path.abspath(op[1])
+        roots[op[1]] = ws.private if path == private or path.startswith(private + os.sep) else home
+    commit_bytes(ops, private=True, roots=roots)
 
 
 def _next(item: str) -> str:
@@ -512,7 +524,7 @@ def remove(ws, project, item: str) -> dict:
     was_staged = os.path.isfile(pend)
     if was_staged:
         ops.append(("delete", pend))
-    commit_bytes(ops, private=True)
+    _commit(ws, project, ops)
     out = {"verb": "image", "action": "remove", "item": item, "files": [rel]}
     out["next"] = ("unstaged; nothing to push for the file" if was_staged else
                    "pbz push deletes the file from the report (backed up with the push)")
@@ -533,36 +545,82 @@ def dropped(old_text: str, new_text: str) -> list[str]:
     return sorted(i for i in set(registered(old_text)) - set(registered(new_text)) if valid_item(i))
 
 
-def install(files: dict[str, str], report_dir: str, backup_dir: str | None = None) -> list[str]:
+def _preflight(path: str, root: str | None) -> None:
+    """Refuse a link or a junction below `root` before any byte of `path` is read."""
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(path, root)
+
+
+def install(files: dict[str, str], report_dir: str, backup_dir: str | None = None, *,
+            root: str | None = None) -> list[str]:
     rr = _rr_dir(report_dir)
-    done = []
+    planned = []
     for item, src in sorted(files.items()):
         if not valid_item(item):
             continue
-        os.makedirs(rr, exist_ok=True)
         dst = os.path.join(rr, item)
-        if os.path.isfile(dst) and backup_dir:
-            bdst = os.path.join(backup_dir, "StaticResources", PACKAGE, item)
+        bdst = os.path.join(backup_dir, "StaticResources", PACKAGE, item) if backup_dir else None
+        _preflight(dst, root)
+        _preflight(src, root)
+        if bdst is not None:
+            _preflight(bdst, root)
+        planned.append((item, src, dst, bdst))
+    done = []
+    for item, src, dst, bdst in planned:
+        _preflight(dst, root)
+        _preflight(src, root)
+        exists = os.path.lexists(dst)
+        if exists:
+            _preflight(dst, root)
+            info = os.lstat(dst)
+            if not stat.S_ISREG(info.st_mode) or _reparse_link(dst):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        if exists and bdst is not None:
+            _preflight(bdst, root)
             os.makedirs(os.path.dirname(bdst), exist_ok=True)
-            shutil.copy2(dst, bdst)
-        shutil.copyfile(src, dst + ".pbz-tmp")
-        os.replace(dst + ".pbz-tmp", dst)
+            with open(dst, "rb") as f:
+                payload = f.read()
+            replace_bytes(bdst, payload, root=root)
+        elif not exists:
+            os.makedirs(rr, exist_ok=True)
+        with open(src, "rb") as f:
+            payload = f.read()
+        replace_bytes(dst, payload, root=root)
         done.append(item)
     return done
 
 
-def delete(items: list[str], report_dir: str, backup_dir: str | None = None) -> list[str]:
+def delete(items: list[str], report_dir: str, backup_dir: str | None = None, *,
+           root: str | None = None) -> list[str]:
     rr = _rr_dir(report_dir)
-    done = []
+    planned = []
     for item in items:
-        p = os.path.join(rr, item)
-        if not valid_item(item) or not os.path.isfile(p):
+        if not valid_item(item):
             continue
-        if backup_dir:
-            bdst = os.path.join(backup_dir, "StaticResources", PACKAGE, item)
+        p = os.path.join(rr, item)
+        bdst = os.path.join(backup_dir, "StaticResources", PACKAGE, item) if backup_dir else None
+        _preflight(p, root)
+        if bdst is not None:
+            _preflight(bdst, root)
+        if not os.path.lexists(p):
+            continue
+        if _reparse_link(p):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        info = os.lstat(p)
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        planned.append((item, p, bdst))
+    done = []
+    for item, p, bdst in planned:
+        _preflight(p, root)
+        if bdst is not None:
+            _preflight(bdst, root)
             os.makedirs(os.path.dirname(bdst), exist_ok=True)
-            shutil.copy2(p, bdst)
-        os.remove(p)
+            with open(p, "rb") as f:
+                payload = f.read()
+            replace_bytes(bdst, payload, root=root)
+        remove_file(p, root=root)
         done.append(item)
     return done
 
@@ -571,7 +629,7 @@ def clear_pending(ws, project, items) -> None:
     for i in items:
         p = os.path.join(_pending_dir(ws, project), i)
         if valid_item(i) and os.path.isfile(p):
-            os.remove(p)
+            remove_file(p, root=_pending_dir(ws, project))
 
 
 # ---------------------------------------------------------------- checks (pbircheck)

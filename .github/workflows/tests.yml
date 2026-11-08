@@ -61,7 +61,8 @@ jobs:
                     "preview_atomic", "memscrub_atomic", "synthtest_honesty",
                     "outcomes_mapping", "revert_atomic", "bpafix_atomic", "pull_refusal",
                     "mirror_recovery_honesty", "push_boundary_honesty", "history_honesty",
-                    "synthtest_atomic", "memory_disclosure", "docs_changelog", "ci_registration"
+                    "synthtest_atomic", "memory_disclosure", "docs_changelog", "ci_registration",
+                    "policy_atomic"
           $failed = @()
           foreach ($t in $suites) {
             Write-Host "::group::test_$t"

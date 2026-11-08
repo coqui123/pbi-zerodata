@@ -60,11 +60,11 @@ def _boom():
     real = common.write_text
     calls = {"n": 0}
 
-    def wrapped(path, text, bom=b""):
+    def wrapped(path, text, bom=b"", *, root=None, **_kw):
         calls["n"] += 1
         if calls["n"] >= 2:
             raise OSError("disk")
-        return real(path, text, bom)
+        return real(path, text, bom, root=root)
 
     return calls, wrapped
 

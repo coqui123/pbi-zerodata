@@ -139,7 +139,7 @@ class EditDryRunTests(unittest.TestCase):
         before = _bytes(ws.mirror)
         real = common.write_text
 
-        def boom(path, text, bom=b""):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
             raise OSError("disk")
 
         with patch("pbz.common.write_text", boom):

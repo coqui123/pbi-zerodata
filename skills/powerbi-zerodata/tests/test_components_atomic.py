@@ -65,11 +65,11 @@ class ComponentsAtomicTests(unittest.TestCase):
         real = common.write_text
         calls = {"n": 0}
 
-        def boom(path, text, bom=b""):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
             calls["n"] += 1
             if calls["n"] >= 2:
                 raise OSError("disk")
-            return real(path, text, bom)
+            return real(path, text, bom, root=root)
 
         with patch("pbz.common.write_text", boom):
             with self.assertRaises(PbzError) as caught:
@@ -97,11 +97,11 @@ class ComponentsAtomicTests(unittest.TestCase):
         real = common.write_text
         calls = {"n": 0}
 
-        def boom(path, text, bom=b""):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
             calls["n"] += 1
             if calls["n"] >= 2:
                 raise OSError("disk")
-            return real(path, text, bom)
+            return real(path, text, bom, root=root)
 
         with patch("pbz.common.write_text", boom):
             with self.assertRaises(PbzError) as caught:

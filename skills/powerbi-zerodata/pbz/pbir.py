@@ -58,7 +58,7 @@ _WS = " \t\r\n"
 _NUM_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 
 
-def parse_json(text: str):
+def parse_json(text: str, max_depth: int = 128):
     pos = 0
     n = len(text)
 
@@ -68,8 +68,8 @@ def parse_json(text: str):
         return i
 
     def string(i):
-        if text[i] != '"':
-            raise JsonError(f"expected string at {i}")
+        if i >= n or text[i] != '"':
+            raise JsonError("expected string")
         j = i + 1
         while j < n:
             c = text[j]
@@ -77,11 +77,17 @@ def parse_json(text: str):
                 j += 2
                 continue
             if c == '"':
-                return JStr(json.loads(text[i:j + 1]), i, j + 1), j + 1
+                try:
+                    decoded = json.loads(text[i:j + 1])
+                except json.JSONDecodeError:
+                    raise JsonError("invalid string") from None
+                return JStr(decoded, i, j + 1), j + 1
             j += 1
         raise JsonError("unterminated string")
 
-    def value(i):
+    def value(i, depth=0):
+        if depth > max_depth:
+            raise JsonError("nesting")
         i = ws(i)
         if i >= n:
             raise JsonError("unexpected end")
@@ -94,31 +100,31 @@ def parse_json(text: str):
                 j = ws(j)
                 k, j = string(j)
                 j = ws(j)
-                if text[j] != ":":
-                    raise JsonError(f"expected : at {j}")
-                v, j = value(j + 1)
+                if j >= n or text[j] != ":":
+                    raise JsonError("expected colon")
+                v, j = value(j + 1, depth + 1)
                 pairs.append((k, v))
                 j = ws(j)
-                if text[j] == ",":
+                if j < n and text[j] == ",":
                     j += 1
                     continue
-                if text[j] == "}":
+                if j < n and text[j] == "}":
                     return JObj(pairs, i, j + 1), j + 1
-                raise JsonError(f"expected , or }} at {j}")
+                raise JsonError("expected comma or object end")
         if c == "[":
             items, j = [], ws(i + 1)
             if j < n and text[j] == "]":
                 return JArr(items, i, j + 1), j + 1
             while True:
-                v, j = value(j)
+                v, j = value(j, depth + 1)
                 items.append(v)
                 j = ws(j)
-                if text[j] == ",":
+                if j < n and text[j] == ",":
                     j += 1
                     continue
-                if text[j] == "]":
+                if j < n and text[j] == "]":
                     return JArr(items, i, j + 1), j + 1
-                raise JsonError(f"expected , or ] at {j}")
+                raise JsonError("expected comma or array end")
         if c == '"':
             return string(i)
         for word in ("true", "false", "null"):
@@ -127,7 +133,7 @@ def parse_json(text: str):
         m = _NUM_RE.match(text, i)
         if m:
             return JLit(m.group(0), i, m.end()), m.end()
-        raise JsonError(f"unexpected char at {i}")
+        raise JsonError("unexpected token")
 
     node, pos = value(pos)
     if ws(pos) != n:

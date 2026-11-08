@@ -116,17 +116,14 @@ class SynthtestHonestyTests(unittest.TestCase):
             f.write('{"version": 1, "consumers": []}\n')
         argv = ["--workspace", self.ws.root, "--project", "Parity", "consumers", "add",
                 "--label", "notes", "--object", "[Total Sales]"]
-        real_open = open
 
-        def bad_open(path, *args, **kwargs):
-            if isinstance(path, str) and path.endswith(".pbz-restore"):
-                raise OSError(SECRET)
-            return real_open(path, *args, **kwargs)
-
-        def boom(path, text, bom=b""):
+        def bad_restore(path, data, *, root=None, **_kw):
             raise OSError(SECRET)
 
-        with patch("pbz.common.write_text", boom), patch("builtins.open", bad_open):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
+            raise OSError(SECRET)
+
+        with patch("pbz.common.write_text", boom), patch("pbz.common.replace_bytes", bad_restore):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 rc = cli.main(argv)

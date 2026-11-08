@@ -152,7 +152,10 @@ class PreviewTests(unittest.TestCase):
         try:
             (self.mirror/'previews').symlink_to(outside,target_is_directory=True)
         except (OSError,NotImplementedError):
-            self.skipTest('Creating symlinks is unavailable')
+            import subprocess
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(self.mirror/'previews'), str(outside)], capture_output=True)
+            if made.returncode != 0:
+                self.skipTest('Creating symlinks is unavailable')
         with self.assertRaises(PbzError) as raised:
             preview.run(self.ws,self.project)
         self.assertEqual(raised.exception.code,'UNSAFE_PATH')
@@ -163,12 +166,20 @@ class PreviewTests(unittest.TestCase):
         out=self.mirror/'previews';out.mkdir()
         outside=Path(self.tmp.name)/'important.txt';outside.write_text('KEEP',encoding='utf-8')
         name=hashlib.sha256(b'p1').hexdigest()[:20]+'.svg.pbz-tmp'
+        link=out/name
         try:
-            (out/name).symlink_to(outside)
+            link.symlink_to(outside)
         except (OSError,NotImplementedError):
-            self.skipTest('Creating symlinks is unavailable')
-        with self.assertRaises(PbzError):preview.run(self.ws,self.project)
+            import subprocess
+            holder=Path(self.tmp.name)/'hold';holder.mkdir()
+            (holder/'kept.txt').write_text('KEEP',encoding='utf-8')
+            made=subprocess.run(["cmd","/c","mklink","/J",str(link),str(holder)],capture_output=True)
+            if made.returncode!=0:
+                self.skipTest('Creating symlinks is unavailable')
+            outside=holder/'kept.txt'
+        preview.run(self.ws,self.project)
         self.assertEqual(outside.read_text(encoding='utf-8'),'KEEP')
+        self.assertTrue(link.exists())
 
     def test_outline_extents_checked_without_exempting_control(self):
         obj=self.visual('button','actionButton',[2,5,96,30])

@@ -70,16 +70,76 @@ def is_pii_column(column: str) -> bool:
     return bool(w & PII_WORDS) and not (w & CATEGORY_WORDS)
 
 
+def _digit_run(value: str) -> str | None:
+    """Strip a separator-or-digit string. None when it is empty, a decimal, or a date.
+
+    Bare digit runs are accepted. Separators and a leading plus are optional.
+    """
+    s = value.strip()
+    if not s or not _PHONE_CHARS.fullmatch(s) or _DECIMAL_VALUE.fullmatch(s) or _ISO_DATE.fullmatch(s) \
+            or _NUM_DATE.fullmatch(s):
+        return None
+    return "".join(ch for ch in s if ch.isdigit())
+
+
+def looks_like_phone(value: str) -> bool:
+    """A phone-shaped string: 10 to 15 digits, bare or with separators / a leading plus.
+
+    An ISO date, a numeric date, and a single decimal are not phones. 16+ digit
+    card or account runs are looks_like_long_digits, not phones.
+    """
+    digits = _digit_run(value)
+    return digits is not None and 10 <= len(digits) <= 15
+
+
+def looks_like_long_digits(value: str) -> bool:
+    """Separator-or-digit string with 16 or more digits that is not an ISO or numeric date."""
+    digits = _digit_run(value)
+    return digits is not None and len(digits) >= 16
+
+
+def _pii_number_spans(text: str) -> list[tuple[int, int]]:
+    """In-text spans accepted by looks_like_phone or looks_like_long_digits.
+
+    Dates and decimals fail those checks and stay visible. A run is bounded so a paragraph
+    of ordinary numbers is not swallowed whole.
+    """
+    out: list[tuple[int, int]] = []
+    for m in _PII_NUM_RUN.finditer(text):
+        raw = m.group()
+        lead = len(raw) - len(raw.lstrip())
+        core = raw.strip()
+        while core and not core[-1].isdigit() and not (
+                looks_like_phone(core) or looks_like_long_digits(core)):
+            core = core[:-1]
+        if core and (looks_like_phone(core) or looks_like_long_digits(core)):
+            start = m.start() + lead
+            out.append((start, start + len(core)))
+    return out
+
+
+def _nonlatin(text: str) -> bool:
+    return any(ch.isalpha() and not ch.isascii() for ch in text)
+
+
 def is_id_column(column: str) -> bool:
     # "No" counts only as a trailing separate word ("Project No"), not inside "YesorNo"
     return bool(name_words(column) & (ID_WORDS - {"no"})) or bool(re.search(r"(?i)(?:^|[\s_.#-])no\.?$", column))
 
 
-PII_VALUE = re.compile(r"(?i)^[\w.+'-]+@[\w-]+(\.[\w-]+)+$|^\+?[\d\s().-]{10,}$")
+_EMAIL_VALUE = re.compile(r"(?i)^[\w.+'-]+@[\w-]+(\.[\w-]+)+$")
+_PHONE_CHARS = re.compile(r"^\+?[\d\s().-]+$")
+_DECIMAL_VALUE = re.compile(r"^[+-]?\d+\.\d+$")
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?$")
+_NUM_DATE = re.compile(r"^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}$")
+# Letters of any script, for exact index matches. Latin WORD_RE stays the heuristic tokenizer.
+INDEX_WORD = re.compile(r"[^\W\d_]+(?:['’\-][^\W\d_]+)*")
 # format patterns stay readable under the strict literal policy (FORMAT() codes, number formats)
 FORMATISH = re.compile(r"(?i)^(?:(?:yyyy|yy|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|nn|ss|s|q|am/pm|a/p|tt)[\s\-/.:,]*)+$"
                        r"|^[#0.,%\s$€£¥+()\-]+$|^(?:general|long|short) (?:date|time)$|^(?:true|false)$")
 PII_IN_TEXT = re.compile(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+")
+# Bounded phone / long-digit candidates. The classifiers decide; this only limits the scan.
+_PII_NUM_RUN = re.compile(r"(?<![\w])\+?[\d\s().-]{10,64}(?!\d)")
 NAME_LIKE = re.compile(r"^[A-Z][a-z'À-ɏ-]+(?: [A-Z][a-z'À-ɏ.-]+){1,3}$")
 WORD_RE = re.compile(r"[A-Za-z0-9À-ɏ][\w'&.À-ɏ-]*")
 NUMERIC_TYPES = {"int64", "double", "decimal", "currency", "number"}
@@ -264,6 +324,8 @@ class Classifier:
     def _fits_kind(self, text: str, kind: str) -> bool:
         s = text.strip()
         nwords = len(WORD_RE.findall(s))
+        if _nonlatin(s):
+            nwords = max(nwords, len(INDEX_WORD.findall(s)))
         if kind == "title":
             return nwords >= 2 and len(s) >= 8
         if kind == "identifier":
@@ -278,19 +340,31 @@ class Classifier:
         if not self.key or value is None or not isinstance(value, str):
             return None
         s = value.strip()
-        if len(s) < 4 or sum(ch.isalpha() for ch in s) < 3 or s.lower() in self.model_names:
+        nonlatin = _nonlatin(s)
+        # Latin length and word-shape gates reject short indexed non-Latin names (2–4 letters).
+        # An exact HMAC hit is the only reason a non-Latin value is hidden; nothing is guessed.
+        min_len = 2 if nonlatin else 4
+        min_alpha = 2 if nonlatin else 3
+        if len(s) < min_len or sum(ch.isalpha() for ch in s) < min_alpha or s.lower() in self.model_names:
             return None
-        if len(WORD_RE.findall(s)) < 2 and not self._specific(s) \
+        # Latin single words still need the specific/proper-noun gate. Non-Latin and uncased
+        # scripts have no title case to test; an exact index hit is the only reason to hide them.
+        if not nonlatin and len(WORD_RE.findall(s)) < 2 and not self._specific(s) \
                 and not (s[:1].isupper() and is_proper_noun(s)):
             return None
         col = self.hmac_to_col.get(dpapi.hmac_hex(self.key, value))
-        if col and self._fits_kind(value, self.col_kind.get(col, "person")):
+        if not col:
+            return None
+        if nonlatin:
+            return col
+        if self._fits_kind(value, self.col_kind.get(col, "person")):
             return col
         return None
 
     def literal(self, value, vtype: str, column: tuple | None) -> str | None:
         """Token label for a literal that must be hidden, or None to keep it."""
-        if vtype == "string" and isinstance(value, str) and PII_VALUE.match(value.strip()):
+        if vtype == "string" and isinstance(value, str) and (
+                _EMAIL_VALUE.match(value.strip()) or looks_like_phone(value) or looks_like_long_digits(value)):
             return "pii"
         if self.strict:
             return self._strict_literal(value, vtype, column)
@@ -339,12 +413,23 @@ class Classifier:
         return any(w.lower() not in COMMON_WORDS and w.lower() not in self.model_words for w in v.split())
 
     def free_text(self, text: str, numbers: bool = False) -> list[tuple[int, int, str]]:
-        """Spans of free text (descriptions, titles, text boxes, comments) to hide."""
+        """Spans of free text (descriptions, titles, text boxes, comments) to hide.
+
+        CJK and other scripts without word separators are matched only as a whole indexed token.
+        A name glued to neighboring letters (no boundary) is not split out; that is not guessed.
+        """
         spans: list[tuple[int, int, str]] = []
         for m in PII_IN_TEXT.finditer(text):
             spans.append((m.start(), m.end(), "pii"))
+        for s, e in _pii_number_spans(text):
+            if not any(s < b and e > a for a, b, _lab in spans):
+                spans.append((s, e, "pii"))
         if self.key:
             words = list(WORD_RE.finditer(text))
+            taken = [(m.start(), m.end()) for m in words]
+            extra = [m for m in INDEX_WORD.finditer(text)
+                     if _nonlatin(m.group()) and not any(m.start() < b and m.end() > a for a, b in taken)]
+            words = sorted(words + extra, key=lambda m: m.start())
             # Indexed titles have no four-word limit. Bound work without leaking long prose:
             # an unusually large data-derived description is safer as an opaque token.
             if self.hmac_to_col and len(words) > 256:
@@ -359,9 +444,11 @@ class Classifier:
                         # a lone name part: capitalized, 4+ letters, and either not an English word
                         # or a known first/last name ("Patty"), never a model word
                         core = dpapi.word_core(text[s:e])
-                        if sum(ch.isalpha() for ch in core) >= 4 and core[:1].isupper() \
+                        titled = core[:1].isupper() or _nonlatin(core)
+                        need = 2 if _nonlatin(core) else 4
+                        if sum(ch.isalpha() for ch in core) >= need and titled \
                                 and core.lower() not in self.model_words and core.lower() not in self.model_names \
-                                and (not is_common_word(core) or is_proper_noun(core)):
+                                and (not is_common_word(core) or is_proper_noun(core) or _nonlatin(core)):
                             col = self.word_hmac_to_col.get(dpapi.hmac_hex(self.key, core))
                     if col:
                         hit = (s, e, col, k)

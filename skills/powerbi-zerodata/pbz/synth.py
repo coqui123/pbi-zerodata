@@ -20,10 +20,11 @@ import os
 import random
 import re
 import shutil
+import stat
 import uuid
 
 from . import desktop, deps, dpapi, lexers, pbir, tmdl
-from .common import PbzError, Project, Workspace, commit_bytes, engine_call, read_text, write_text
+from .common import PbzError, Project, Workspace, _reparse_link, commit_bytes, engine_call, read_text, write_bytes, write_text
 from .tokens import TOKEN_RE, apply_edits
 
 MARKER = "PBZ_SYNTHETIC"
@@ -191,11 +192,10 @@ class _Pools:
             self.add(key, token)
 
 
-def _collect_pools(model, project, lo, hi) -> _Pools:
+def _collect_pools(model, report_texts, lo, hi) -> _Pools:
     pools = _Pools(model, lo, hi)
     texts = [d.text for d in model.docs.values()]
-    for path in pbir.report_files(project.mirror_report):
-        texts.append(read_text(path)[0])
+    texts.extend(report_texts)
     for text in texts:  # every column-bound token anywhere in the mirror
         for tok in TOKEN_RE.findall(text):
             m = LABEL_RE.match(tok)
@@ -228,10 +228,10 @@ def _collect_pools(model, project, lo, hi) -> _Pools:
                         if sig[j].kind == "str":
                             pools.add(refs[i - 1], sig[j].value)
                         j += 1
-    for path in pbir.report_files(project.mirror_report):  # visible report filter / slicer labels
+    for text in report_texts:  # visible report filter / slicer labels, from the checked capture
         try:
-            root = pbir.parse_json(read_text(path)[0])
-        except (pbir.JsonError, OSError, UnicodeDecodeError):
+            root = pbir.parse_json(text)
+        except (pbir.JsonError, UnicodeDecodeError):
             continue
         for site in pbir.walk_literals(root, model):
             if site.column:
@@ -653,6 +653,191 @@ def _report_edits(text: str, pools: _Pools) -> str:
     return apply_edits(text, edits) if edits else text
 
 
+# Closed engine ErrorClass names. Anything else, including MISSING_FILE, is OTHER.
+# The agent sees only the fixed token SYNTH_VALIDATE_REJECTED, never a count or class list.
+_VALIDATION_CLASSES = {
+    "SYNTAX", "UNKNOWN_OBJECT", "TYPE_MISMATCH", "CONVERSION", "CIRCULAR",
+    "DUPLICATE_KEY", "TIMEOUT", "ENGINE_UNAVAILABLE", "BAD_REQUEST", "OTHER",
+}
+_VALIDATION_CODE = "SYNTH_VALIDATE_REJECTED"
+_VALIDATION_DETAIL = (
+    "synthetic validation rejected the candidate; the destination was not replaced; "
+    + _VALIDATION_CODE
+)
+
+
+def _validation_classes(res: dict) -> list[str]:
+    """Enum-validated classes only. Paths, line numbers and engine text are dropped."""
+    classes = []
+    for item in res.get("errors") or []:
+        if not isinstance(item, dict):
+            classes.append("OTHER")
+            continue
+        kind = item.get("class")
+        classes.append(kind if isinstance(kind, str) and kind in _VALIDATION_CLASSES else "OTHER")
+    for _ref in res.get("missing_refs") or []:
+        classes.append("OTHER")
+    return classes
+
+
+def _validation_envelope(res) -> None:
+    """Refuse a response that is not a validation envelope. No engine text is copied out."""
+    if not isinstance(res, dict) or not isinstance(res.get("ok"), bool):
+        raise PbzError("ENGINE_UNAVAILABLE",
+                       "synthetic validation is unavailable; the destination was not replaced")
+    for key in ("errors", "missing_refs"):
+        # Present null or non-list collections must not authorize publication.
+        if key in res and not isinstance(res[key], list):
+            raise PbzError("ENGINE_UNAVAILABLE",
+                           "synthetic validation is unavailable; the destination was not replaced")
+    kind = res.get("class")
+    if kind is not None and (not isinstance(kind, str) or kind not in _VALIDATION_CLASSES):
+        # Unknown top-level classes must not authorize publication (even when ok is true).
+        raise PbzError("ENGINE_UNAVAILABLE",
+                       "synthetic validation is unavailable; the destination was not replaced")
+
+
+_CACHE_DIRS = {".pbi", "daxqueries", "tmdlscripts", "node_modules"}
+
+
+def _source_error() -> PbzError:
+    return PbzError("UNSAFE_PATH", "synthetic source is outside the mirror")
+
+
+def _source_id(path: str) -> tuple:
+    """Identity of one regular, unlinked file. Links and hardlinks are refused before a read."""
+    if _reparse_link(path):
+        raise _source_error()
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise _source_error() from None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise _source_error()
+    return (info.st_dev, info.st_ino, info.st_size, getattr(info, "st_mtime_ns", info.st_mtime), info.st_nlink)
+
+
+def _within_mirror(path: str, boundary: str) -> None:
+    """`path` and every ancestor below `boundary` must stay inside `boundary`. Links below it are refused.
+
+    `boundary` is the trusted workspace/mirror root. Junctions above it remain allowed.
+    """
+    boundary_abs = os.path.abspath(boundary)
+    try:
+        # Trust the supplied workspace boundary even when opened through a junction
+        # (Dev Drive / redirected profile). Only components strictly below it are policed.
+        boundary_real = os.path.realpath(boundary_abs)
+    except OSError:
+        raise _source_error() from None
+    current = os.path.abspath(path)
+    for _ in range(64):
+        below = os.path.normcase(current) != os.path.normcase(boundary_abs)
+        if below and _reparse_link(current):
+            raise _source_error()
+        try:
+            real = os.path.realpath(current)
+            if os.path.normcase(os.path.commonpath([real, boundary_real])) != os.path.normcase(boundary_real):
+                raise _source_error()
+        except ValueError:
+            raise _source_error() from None
+        if not below:
+            return
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    raise _source_error()
+
+
+def _inventory_source(root: str, boundary: str) -> list[tuple[str, tuple]]:
+    """Permitted files under a model or report tree. Caches are not inventoried and are not read."""
+    _within_mirror(root, boundary)
+    if _reparse_link(root) or not os.path.isdir(root):
+        raise _source_error()
+    found = []
+    for cur, dirs, names in os.walk(root, followlinks=False):
+        _within_mirror(cur, boundary)
+        kept = []
+        for name in dirs:
+            path = os.path.join(cur, name)
+            if name.lower() in _CACHE_DIRS:
+                continue
+            _within_mirror(path, boundary)
+            if _reparse_link(path) or not os.path.isdir(path):
+                raise _source_error()
+            kept.append(name)
+        dirs[:] = kept
+        for name in names:
+            path = os.path.join(cur, name)
+            _within_mirror(path, boundary)
+            rel = os.path.relpath(path, root).replace("\\", "/")
+            found.append((rel, _source_id(path)))
+    return found
+
+
+def _capture_source(root: str, boundary: str) -> dict[str, bytes]:
+    """Read each inventoried file from the handle that was checked, not from the path name.
+
+    The opened file must still be the inventoried regular file (same device and inode, one link)
+    and its ancestors must still sit inside `boundary`. The path is not trusted after open.
+    """
+    captured = {}
+    for rel, ident in _inventory_source(root, boundary):
+        path = os.path.join(root, *rel.split("/"))
+        _within_mirror(path, boundary)
+        if _source_id(path) != ident:
+            raise _source_error()
+        try:
+            handle = open(path, "rb")
+        except OSError:
+            raise _source_error() from None
+        try:
+            try:
+                info = os.fstat(handle.fileno())
+            except OSError:
+                raise _source_error() from None
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise _source_error()
+            opened = (info.st_dev, info.st_ino, info.st_size,
+                      getattr(info, "st_mtime_ns", info.st_mtime), info.st_nlink)
+            if opened != ident:
+                raise _source_error()
+            _within_mirror(path, boundary)
+            data = handle.read()
+        finally:
+            handle.close()
+        if len(data) != ident[2]:
+            raise _source_error()
+        captured[rel] = data
+    return captured
+
+
+def _decode_captured(data: bytes) -> tuple[str, bytes]:
+    bom = b""
+    if data.startswith(b"\xef\xbb\xbf"):
+        bom, data = data[:3], data[3:]
+    return data.decode("utf-8"), bom
+
+
+def _model_texts(captured: dict[str, bytes]) -> dict[str, str]:
+    texts = {}
+    prefix = "definition/"
+    for rel, data in captured.items():
+        norm = rel.replace("\\", "/")
+        if norm.lower().startswith(prefix) and norm.lower().endswith(".tmdl"):
+            texts[norm[len(prefix):]] = _decode_captured(data)[0]
+    return texts
+
+
+def _report_texts(captured: dict[str, bytes]) -> list[str]:
+    out = []
+    for rel, data in captured.items():
+        norm = rel.replace("\\", "/")
+        if norm.lower().startswith("definition/") and norm.lower().endswith(".json"):
+            out.append(_decode_captured(data)[0])
+    return out
+
+
 def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> dict:
     """edge: the edge-case profile (see `_edge`); literal calculated tables are faked as well.
 
@@ -665,6 +850,8 @@ def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> di
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     if not os.path.isdir(project.mirror_report):
         raise PbzError("UNSUPPORTED", "the mirror has no report; Desktop opens a PBIP only with one")
+    model_bytes = _capture_source(project.mirror_model, ws.root)
+    report_bytes = _capture_source(project.mirror_report, ws.root)
     rows = max(10, min(int(rows), 5000))
     sp = synth_project(ws, project)
     root = sp.ws.root
@@ -679,9 +866,9 @@ def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> di
             raise PbzError("UNSAFE", "not a pbz synthetic folder; refusing to touch it")
     if os.path.exists(stage):
         raise PbzError("REFUSED", "synthetic staging path is already present")
-    model = tmdl.load_model(src)
+    model = tmdl.load_model(src, _model_texts(model_bytes))
     lo, hi = _date_range(model)
-    pools = _collect_pools(model, project, lo, hi)
+    pools = _collect_pools(model, _report_texts(report_bytes), lo, hi)
     plan = [t for t in model.tables.values() if _rewrite_table(t) or (edge and _literal_table(t))]
     gen = _generate(model, pools, rows, seed, plan)
     edge_notes: dict = {}
@@ -702,22 +889,22 @@ def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> di
     try:
         os.makedirs(stage)
         created = True
-        _write_candidate(ws, project, staged, texts, pools, rows, seed, edge, rows_by_table)
+        _write_candidate(ws, project, staged, texts, pools, rows, seed, edge, rows_by_table,
+                         model_bytes, report_bytes)
         res = engine_call("tmdl-validate", {"private_dir": ws.private,
                                             "folder": os.path.join(staged.model_dir, "definition")}, timeout=300)
         if not isinstance(res, dict):
             raise PbzError("ENGINE_UNAVAILABLE",
                            "synthetic validation is unavailable; the destination was not replaced")
-        errors = [{"file": e.get("file"), "line": e.get("line"), "class": e.get("class")}
-                  for e in res.get("errors", []) if isinstance(e, dict)]
-        errors += [{"file": f, "class": "MISSING_FILE"} for f in res.get("missing_refs", []) or []]
+        _validation_envelope(res)
+        classes = _validation_classes(res)
         unavailable = (res.get("class") == "ENGINE_UNAVAILABLE"
-                       or (res.get("ok") is not True and not errors and not res.get("errors")))
+                       or (res.get("ok") is not True and not classes and not res.get("errors")))
         if unavailable:
             raise PbzError("ENGINE_UNAVAILABLE",
                            "synthetic validation is unavailable; the destination was not replaced")
-        if not res.get("ok") or errors:
-            raise PbzError("REFUSED", "synthetic validation rejected the candidate; the destination was not replaced")
+        if not res.get("ok") or classes:
+            raise PbzError("REFUSED", _VALIDATION_DETAIL)
         _publish_candidate(stage, root, owned)
     finally:
         _drop_stage(stage, created)
@@ -730,38 +917,54 @@ def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> di
     return out
 
 
-def _write_candidate(ws, project, sp, texts, pools, rows, seed, edge, rows_by_table) -> None:
-    """Write a complete candidate under `sp` (the staging project). Does not touch the destination."""
+def _write_captured(root: str, dest_root: str, rel: str, data: bytes) -> None:
+    write_bytes(os.path.join(dest_root, *rel.replace("\\", "/").split("/")), data, root=root)
+
+
+def _write_candidate(ws, project, sp, texts, pools, rows, seed, edge, rows_by_table,
+                     model_bytes: dict[str, bytes], report_bytes: dict[str, bytes]) -> None:
+    """Write a complete candidate from the checked capture. The live mirror is not copied or re-read."""
     root = sp.ws.root
     os.makedirs(os.path.join(root, ".pbz"), exist_ok=True)
-    shutil.copytree(project.mirror_model, sp.model_dir, ignore=shutil.ignore_patterns("*.tmdl"))
+    for rel, data in model_bytes.items():
+        norm = rel.replace("\\", "/")
+        if norm.lower().startswith("definition/") and norm.lower().endswith(".tmdl"):
+            continue
+        _write_captured(root, sp.model_dir, norm, data)
     for rel, text in texts.items():
-        write_text(os.path.join(sp.model_dir, "definition", *rel.split("/")), text)
-    expr = os.path.join(sp.model_dir, "definition", "expressions.tmdl")
-    if os.path.exists(expr):
-        os.remove(expr)  # shared M queries: nothing uses them once every partition is calculated
-    shutil.copytree(project.mirror_report, sp.report_dir)
-    for path in pbir.report_files(sp.report_dir):
-        text, bom = read_text(path)
-        new = _report_edits(text, pools)
-        if new != text:
-            write_text(path, new, bom)
-    pbir_file = os.path.join(sp.report_dir, "definition.pbir")
-    if os.path.exists(pbir_file):
-        ref, bom = read_text(pbir_file)
-        data = json.loads(ref)
-        data["datasetReference"] = {"byPath": {"path": f"../{sp.name}.SemanticModel"}}
-        write_text(pbir_file, json.dumps(data, indent=2) + "\n", bom)
+        if rel.replace("\\", "/").lower() == "expressions.tmdl":
+            continue  # shared M queries: nothing uses them once every partition is calculated
+        write_text(os.path.join(sp.model_dir, "definition", *rel.split("/")), text, root=root)
+    for rel, data in report_bytes.items():
+        norm = rel.replace("\\", "/")
+        path = os.path.join(sp.report_dir, *norm.split("/"))
+        if norm.lower().startswith("definition/") and norm.lower().endswith(".json"):
+            text, bom = _decode_captured(data)
+            write_text(path, _report_edits(text, pools), bom, root=root)
+            continue
+        if os.path.basename(norm).lower() == "definition.pbir":
+            text, bom = _decode_captured(data)
+            try:
+                doc = json.loads(text)
+            except ValueError:
+                _write_captured(root, sp.report_dir, norm, data)
+            else:
+                if isinstance(doc, dict):
+                    doc["datasetReference"] = {"byPath": {"path": f"../{sp.name}.SemanticModel"}}
+                    write_text(path, json.dumps(doc, indent=2) + "\n", bom, root=root)
+                else:
+                    _write_captured(root, sp.report_dir, norm, data)
+            continue
+        _write_captured(root, sp.report_dir, norm, data)
     write_text(sp.pbip, json.dumps({
         "$schema": "https://developer.microsoft.com/json-schemas/fabric/pbip/pbipProperties/1.0.0/schema.json",
         "version": "1.0", "artifacts": [{"report": {"path": f"{sp.name}.Report"}}],
-        "settings": {"enableAutoRecovery": False}}, indent=2) + "\n")
-    with open(os.path.join(root, ".pbz", "policy.json"), "w", encoding="utf-8") as f:
-        json.dump({"synthetic": True}, f, indent=1)
-    with open(os.path.join(root, ".pbz", "synth.json"), "w", encoding="utf-8") as f:
-        json.dump({"source_project": project.name, "built": dt.datetime.now().isoformat(timespec="seconds"),
-                   "rows": rows, "seed": seed, "tables": rows_by_table, "profile": "edge" if edge else "standard"},
-                  f, indent=1)
+        "settings": {"enableAutoRecovery": False}}, indent=2) + "\n", root=root)
+    write_text(os.path.join(root, ".pbz", "policy.json"), json.dumps({"synthetic": True}, indent=1), root=root)
+    write_text(os.path.join(root, ".pbz", "synth.json"), json.dumps(
+        {"source_project": project.name, "built": dt.datetime.now().isoformat(timespec="seconds"),
+         "rows": rows, "seed": seed, "tables": rows_by_table, "profile": "edge" if edge else "standard"},
+        indent=1), root=root)
 
 
 def _publish_candidate(stage: str, dest: str, owned: bool) -> None:
@@ -784,7 +987,7 @@ def _publish_candidate(stage: str, dest: str, owned: bool) -> None:
                 if rel not in staged:
                     ops.append(("delete", path))
     try:
-        commit_bytes(ops, private=True)
+        commit_bytes(ops, private=True, root=dest)
     except Exception:
         # First publish: dest was not a directory before this commit, so the leftover is ours.
         # An owned rebuild is restored by commit_bytes and must not be removed here.
@@ -868,9 +1071,12 @@ def query(ws, project, dax: str, max_rows: int = 500) -> dict:
         raise PbzError("ENGINE_UNAVAILABLE", "the synthetic model's engine is not ready yet")
     res = engine_call("synth-query", {"private_dir": ws.private, "port": port, "dax": dax, "max_rows": max_rows},
                       timeout=300)
+    if not isinstance(res, dict) or not isinstance(res.get("ok"), bool):
+        raise PbzError("ENGINE_UNAVAILABLE", "the synthetic model's engine is not ready yet")
     if not res.get("ok"):
-        raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"),
-                       "refused or failed (synthetic marker, calculated partitions and DAX are checked)")
+        kind = res.get("class")
+        code = kind if isinstance(kind, str) and kind in _VALIDATION_CLASSES else "OTHER"
+        raise PbzError(code, "refused or failed (synthetic marker, calculated partitions and DAX are checked)")
     return {"verb": "synth-query", "project": sp.name, "columns": res.get("columns", []), "rows": res.get("rows", []),
             "truncated": res.get("truncated", False), "data": "synthetic"}
 

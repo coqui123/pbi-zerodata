@@ -11,7 +11,7 @@ import os
 import re
 
 from . import dpapi, lexers, pbir, tmdl
-from .common import sha
+from .common import PbzError, sha
 
 TOKEN_RE = re.compile(r"«[^«»\r\n]{1,300}»")
 FULL_JSON_TOKEN_RE = re.compile(r'"(«[^«»"\r\n]{1,300}»)"')
@@ -410,6 +410,7 @@ STRUCTURAL_COLON_PROPS = TRANSLATED_PROPS + (
     "relyOnReferentialIntegrity", "isActive", "mode", "column", "ordinal", "compatibilityLevel",
     "culture", "defaultMode", "discourageImplicitMeasures", "queryGroup", "permission",
     "modelPermission", "metadataPermission", "relationship", "modifiedTime", "state",
+    "defaultPowerBIDataSourceVersion", "sourceQueryCulture", "groupByColumn",
 )
 _ENUM_VALUE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 _NUM_VALUE = re.compile(r"^-?\d+(?:\.\d+)?$")
@@ -532,11 +533,19 @@ def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
         line = raw_line.rstrip("\r\n")
         pm = tmdl.PROP_RE.match(line)
         # Unknown colon props: fail closed — tokenize any non-empty value (no short/word/number bypass).
+        # Schema enums and refs stay in STRUCTURAL_COLON_PROPS so the mirror remains valid TMDL.
         if pm and pm.group("prop") not in STRUCTURAL_COLON_PROPS and pm.group("val").strip():
             vs = pos + pm.start("val")
             ve = vs + len(pm.group("val"))
             if not _overlaps(vs, ve, edits):
                 edits.append((vs, ve, tm.raw("lit", pm.group("val"), "tmdl")))
+        # Captions, descriptions and folders are names, but a phone or email inside them is not.
+        elif pm and pm.group("prop") in TRANSLATED_PROPS and pm.group("val"):
+            vs = pos + pm.start("val")
+            val = pm.group("val")
+            for s, e, lab in clf.free_text(val, numbers=pm.group("prop") == "description"):
+                if not _overlaps(vs + s, vs + e, edits):
+                    edits.append((vs + s, vs + e, tm.raw(lab, val[s:e], "tmdl")))
         pos += len(raw_line)
     return apply_edits(text, edits)
 
@@ -599,10 +608,24 @@ def _json_escape(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)[1:-1]
 
 
-def _deneb_values_spans(decoded: str) -> list[tuple[int, int]]:
-    """Spans (in the decoded PBIR literal string) of inline data arrays inside a Vega/Deneb spec."""
-    if not (decoded.startswith("'") and decoded.endswith("'")) or '"$schema"' not in decoded and '"data"' not in decoded:
-        return []
+class _DenebMalformed:
+    """Embedded Vega/Deneb text that is not valid JSON. The whole literal stays opaque."""
+
+
+_DENEB_MALFORMED = _DenebMalformed()
+
+
+def _deneb_values_spans(decoded: str):
+    """Spans of inline data arrays inside a Vega/Deneb spec, or a malformed marker.
+
+    None means this literal is not an embedded spec. A malformed spec is not treated as
+    ordinary text: the caller opaques the whole literal instead of publishing its values.
+    """
+    if not (decoded.startswith("'") and decoded.endswith("'")):
+        return None
+    quoted_obj = decoded[1:].lstrip().startswith("{")
+    if '"$schema"' not in decoded and '"data"' not in decoded and not quoted_obj:
+        return None
     inner_pos, inner = [], []
     i = 1
     while i < len(decoded) - 1:
@@ -619,7 +642,7 @@ def _deneb_values_spans(decoded: str) -> list[tuple[int, int]]:
     try:
         root = pbir.parse_json(spec)
     except pbir.JsonError:
-        return []
+        return _DENEB_MALFORMED
     spans = []
 
     def visit(node):
@@ -637,20 +660,43 @@ def _deneb_values_spans(decoded: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _opaque_unknown_object(text: str, root: pbir.JObj, tm: TokenMap) -> str:
+    """Keep a known Fabric `$schema`. Every other top-level key and value is one raw token.
+
+    Numeric and boolean canaries are opaque, and detokenize restores the original slices.
+    """
+    edits = []
+
+    def tok(node) -> str:
+        raw = text[node.start:node.end]
+        return '"' + tm.raw("payload:schema", raw, "pbir_full") + '"'
+
+    schema_kept = False
+    for key, value in root.pairs:
+        recognized = key.value == "$schema" and isinstance(value, pbir.JStr) and \
+            PBIR_SCHEMA_RE.fullmatch(value.value.strip()) is not None
+        if recognized:
+            schema_kept = True
+            continue
+        if key.value != "$schema":
+            edits.append((key.start, key.end, tok(key)))
+        edits.append((value.start, value.end, tok(value)))
+    if not schema_kept and not edits:
+        return text
+    return apply_edits(text, edits)
+
+
 def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
     try:
         root = pbir.parse_json(text)
     except pbir.JsonError:
-        return text
-    # Unknown report/page/visual schema: fail closed — only $schema stays; every other string is payload.
+        raise PbzError("REFUSED", "malformed report JSON") from None
+    name = relpath.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if name in ("report.json", "page.json", "visual.json") and not isinstance(root, pbir.JObj):
+        raise PbzError("REFUSED", "malformed report JSON")
+    # Unknown report/page/visual object: fail closed. `$schema` stays when it is a Fabric URI.
     if _pbir_schema_known(relpath, root) is False:
-        blocked = []
-        for key, node in pbir.string_nodes(root):
-            if key == "$schema" or not (node.value or "").strip():
-                continue
-            raw_full = text[node.start:node.end]
-            blocked.append((node.start, node.end, '"' + tm.raw("payload:schema", raw_full, "pbir_full") + '"'))
-        return apply_edits(text, blocked)
+        return _opaque_unknown_object(text, root, tm)
     edits: list[tuple[int, int, str]] = []
     handled: set[int] = set()
 
@@ -667,6 +713,10 @@ def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
                 whole_uri(site.node)
                 continue
             spans = _deneb_values_spans(site.raw)
+            if spans is _DENEB_MALFORMED:
+                edits.append((site.node.start, site.node.end,
+                              '"' + tm.raw("payload:deneb", raw_full, "pbir_full") + '"'))
+                continue
             if spans:
                 inner_raw = raw_full[1:-1]
                 decoded, pos = _decode_map(inner_raw)
@@ -717,19 +767,69 @@ def _uri_edits(text, node, tm) -> list[tuple[int, int, str]]:
     return out
 
 
+def _sq_unquote(decoded: str) -> tuple[str, list[int]] | None:
+    """PBIR single-quoted literal -> (unquoted text, decoded index of each unquoted char).
+
+    Doubled single quotes collapse to one apostrophe. The last map entry is the exclusive end
+    (the closing quote). None when `decoded` is not one quoted literal.
+    """
+    if len(decoded) < 2 or decoded[0] != "'" or decoded[-1] != "'":
+        return None
+    out, mp = [], []
+    i, end = 1, len(decoded) - 1
+    while i < end:
+        if decoded[i] == "'" and i + 1 < end and decoded[i + 1] == "'":
+            out.append("'")
+            mp.append(i)
+            i += 2
+            continue
+        if decoded[i] == "'":
+            return None
+        out.append(decoded[i])
+        mp.append(i)
+        i += 1
+    mp.append(end)
+    return "".join(out), mp
+
+
+def _value_to_decoded(decoded: str, value: str) -> list[int] | None:
+    """Map indexes in the unquoted literal `value` onto `decoded` (JSON-unescaped) text."""
+    if decoded == value:
+        return list(range(len(decoded) + 1))
+    unq = _sq_unquote(decoded)
+    if unq is not None and unq[0] == value:
+        return unq[1]
+    return None
+
+
 def _free_text_edits(text, node, value, clf, tm, edits, numbers, avoid=()):
-    spans = clf.free_text(value, numbers=numbers)
-    if not spans:
+    """Hide free-text spans inside one JSON string.
+
+    `value` is the unquoted literal (PBIR decode) or the JSON string itself. Spans are mapped
+    through doubled single quotes and JSON escapes so an email, phone or name is not dropped
+    when the raw text is longer than the screened value.
+    """
+    if not isinstance(value, str) or not value:
         return
     inner_raw = text[node.start + 1:node.end - 1]
     decoded, pos = _decode_map(inner_raw)
-    if decoded != value:
+    mapping = _value_to_decoded(decoded, value)
+    if mapping is None:
+        return
+    spans = clf.free_text(value, numbers=numbers)
+    if not spans:
         return
     for s, e, lab in spans:
-        rs, re_ = pos[s], pos[e]
+        if s < 0 or e >= len(mapping):
+            continue
+        ds, de = mapping[s], mapping[e]
+        if ds < 0 or de >= len(pos):
+            continue
+        rs, re_ = pos[ds], pos[de]
         if avoid and _overlaps(node.start + 1 + rs, node.start + 1 + re_, list(avoid)):
             continue
-        edits.append((node.start + 1 + rs, node.start + 1 + re_, tm.raw(lab, inner_raw[rs:re_], "pbir_inner", value[s:e])))
+        edits.append((node.start + 1 + rs, node.start + 1 + re_,
+                      tm.raw(lab, inner_raw[rs:re_], "pbir_inner", value[s:e])))
 
 
 def detokenize_pbir(text: str, tm: TokenMap) -> tuple[str, list[str]]:

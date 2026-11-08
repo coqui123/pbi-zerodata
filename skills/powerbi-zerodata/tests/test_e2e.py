@@ -291,10 +291,16 @@ def main() -> int:
         expect(r.pbz("handoff").get("verb") == "handoff", "handoff")
         memdir = os.path.join(tmp, "memory")
         os.makedirs(memdir)
+        pol_path = os.path.join(ws_dir, ".pbz", "policy.json")
+        pol = json.loads(open(pol_path, encoding="utf-8").read()) if os.path.exists(pol_path) else {}
+        pol["memory_dirs"] = [memdir]
+        os.makedirs(os.path.dirname(pol_path), exist_ok=True)
+        with open(pol_path, "w", encoding="utf-8") as f:
+            json.dump(pol, f)
         with open(os.path.join(memdir, "note.md"), "w", encoding="utf-8") as f:
             f.write(f"Owner {person} logged {hours_value} hours; 42% blank; cost $1,234; contact {email}.\n")
         res = r.pbz("memscrub", "--dir", memdir, "--show", "note.md")
-        expect("scrubbed_text" in res, f"memscrub: {res}")
+        expect(res.get("error") == "HUMAN_ONLY" and "scrubbed_text" not in res, f"memscrub: {res}")
     finally:
         close_desktop(r)
 

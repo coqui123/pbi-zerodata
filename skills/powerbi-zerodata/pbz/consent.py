@@ -97,6 +97,30 @@ def _load(ws, consent_id: str) -> dict:
         raise PbzError("CONSENT_INVALID", "consent receipt failed verification")
 
 
+def _canonical_existing(root: str) -> str:
+    """Lexical private root, plus its resolved path when that path exists. Does not invent a target."""
+    lexical = guard.norm(os.path.abspath(os.path.expanduser(root)))
+    if not os.path.lexists(root):
+        return lexical
+    try:
+        return guard.norm(os.path.realpath(root))
+    except OSError:
+        return lexical
+
+
+def _under_private(candidate: str, private_root: str) -> bool:
+    """True when the already-resolved candidate is the private root or inside it.
+
+    Both the configured path and its canonical alias are checked. A path that only shares a
+    string prefix of the root is not inside it.
+    """
+    roots = [guard.norm(os.path.abspath(os.path.expanduser(private_root)))]
+    resolved = _canonical_existing(private_root)
+    if resolved not in roots:
+        roots.append(resolved)
+    return any(candidate == root or candidate.startswith(root + "/") for root in roots)
+
+
 def _source(ws, value: str) -> Path:
     if not isinstance(value, str) or not value or value.startswith(("\\\\", "//")):
         raise PbzError("UNSAFE_PATH", "consent requires a local regular file")
@@ -121,8 +145,7 @@ def _source(ws, value: str) -> Path:
     if any(":" in part for part in path.parts if part != path.anchor):
         raise PbzError("UNSAFE_PATH", "alternate streams cannot receive consent")
     normalized = guard.norm(str(path))
-    private = os.path.normcase(os.path.abspath(ws.private)).replace("\\", "/")
-    if normalized == private or normalized.startswith(private + "/") or guard.global_denied(normalized) \
+    if _under_private(normalized, ws.private) or guard.global_denied(normalized) \
             or guard.self_protected(normalized):
         raise PbzError("PROTECTED_SOURCE", "protected storage cannot receive consent")
     if path.suffix.lower() in DENIED_EXTS or path.name.casefold() in (".env", "cache.abf.stale"):

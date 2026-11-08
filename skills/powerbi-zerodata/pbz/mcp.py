@@ -453,7 +453,7 @@ TOOLS = [
                "by": ("--by", D(L, "'Table'[Column] grouping"), "append"),
                "replace": ("--replace", B, "flag"), "tol": ("--tol", N, "value")},
          read_only=False, timeout=900),
-    Tool("memscrub", "Preview memory notes with figures and names removed (applying is human-only).", ["memscrub"],
+    Tool("memscrub", "Preview which memory notes would change (counts only). Showing scrubbed text and applying are human-only.", ["memscrub"],
          opts={"dir": ("--dir", D(S, "memory folder"), "value"),
                "show": ("--show", D(S, "one file to show scrubbed"), "value")}, need=["dir"]),
 ]

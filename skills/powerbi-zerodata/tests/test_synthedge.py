@@ -76,7 +76,8 @@ def offline(fails: list) -> None:
     mirror.pull(ws, project)
     model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
     lo, hi = synth._date_range(model)
-    pools = synth._collect_pools(model, project, lo, hi)
+    pools = synth._collect_pools(
+        model, synth._report_texts(synth._capture_source(project.mirror_report, ws.root)), lo, hi)
     plan = [t for t in model.tables.values() if synth._rewrite_table(t)]
 
     # ---------------------------------------------------------------- edge rows

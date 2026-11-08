@@ -89,6 +89,251 @@ class PullRefusalTests(unittest.TestCase):
         self.assertTrue(no_tmp(self.ws.root))
         self.assertTrue(no_tmp(self.ws.private))
 
+    def test_malformed_pbir_refuses_before_publish(self):
+        from pbz import tokens
+        files = mirror.project_files(self.project)
+        rel, real = next((rel, real) for rel, real in files if rel.lower().endswith("/visual.json"))
+        with open(real, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"name": "CANARY-SECRET",}')
+        before_m = file_map(self.ws.mirror)
+        before_base = file_map(mirror.base_dir(self.ws, self.project))
+        before_man = file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project)))
+        before_tm = file_map(os.path.dirname(tokens.TokenMap(self.ws.private).path))
+        with self.assertRaises(common.PbzError) as caught:
+            mirror.pull(self.ws, self.project, force=True)
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(caught.exception.detail, rel)
+        self.assertNotIn("CANARY-SECRET", str(caught.exception))
+        self.assertEqual(file_map(self.ws.mirror), before_m)
+        self.assertEqual(file_map(mirror.base_dir(self.ws, self.project)), before_base)
+        self.assertEqual(file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project))), before_man)
+        self.assertEqual(file_map(os.path.dirname(tokens.TokenMap(self.ws.private).path)), before_tm)
+        blob = b"".join(file_map(self.ws.mirror).values())
+        self.assertNotIn(b"CANARY-SECRET", blob)
+
+    def test_deep_nesting_refuses_without_echo(self):
+        files = mirror.project_files(self.project)
+        rel, real = next((rel, real) for rel, real in files if rel.lower().endswith("/page.json"))
+        text = '{"a":' * 200 + '"CANARY-NEST"' + "}" * 200
+        with open(real, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        before_m = file_map(self.ws.mirror)
+        with self.assertRaises(common.PbzError) as caught:
+            mirror.pull(self.ws, self.project, force=True)
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertNotIn("CANARY-NEST", str(caught.exception))
+        self.assertEqual(file_map(self.ws.mirror), before_m)
+
+    def test_non_object_pbir_root_is_refused(self):
+        from pbz import tokens
+        files = mirror.project_files(self.project)
+        rel, real = next(pair for pair in files if pair[0].lower().endswith(("/report.json", "/page.json", "/visual.json")))
+        with open(real, "w", encoding="utf-8", newline="\n") as f:
+            f.write("[918273, true]")
+        before_m = file_map(self.ws.mirror)
+        before_base = file_map(mirror.base_dir(self.ws, self.project))
+        before_man = file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project)))
+        before_tm = file_map(os.path.dirname(tokens.TokenMap(self.ws.private).path))
+        with self.assertRaises(common.PbzError) as caught:
+            mirror.pull(self.ws, self.project, force=True)
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(caught.exception.detail, rel)
+        self.assertNotIn("918273", str(caught.exception))
+        self.assertEqual(file_map(self.ws.mirror), before_m)
+        self.assertEqual(file_map(mirror.base_dir(self.ws, self.project)), before_base)
+        self.assertEqual(file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project))), before_man)
+        self.assertEqual(file_map(os.path.dirname(tokens.TokenMap(self.ws.private).path)), before_tm)
+
+    def test_parent_junction_under_mirror_refuses_publish(self):
+        import subprocess
+        outside = os.path.join(self.tmp.name, "pull-outside")
+        os.makedirs(outside)
+        before_out = file_map(outside)
+        report = os.path.join(self.ws.mirror, self.project.name + ".Report")
+        definition = os.path.join(report, "definition")
+        # Move definition aside and replace with a junction to outside.
+        held = definition + ".held"
+        os.rename(definition, held)
+        try:
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", definition, outside], capture_output=True)
+        except OSError:
+            os.rename(held, definition)
+            self.skipTest("creating a junction is unavailable")
+        if made.returncode != 0:
+            os.rename(held, definition)
+            self.skipTest("creating a junction is unavailable")
+        before_m = file_map(self.ws.mirror)
+        before_base = file_map(mirror.base_dir(self.ws, self.project))
+        before_man = file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project)))
+        with self.assertRaises(common.PbzError) as caught:
+            mirror.pull(self.ws, self.project, force=True)
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+        self.assertEqual(file_map(outside), before_out)
+        self.assertEqual(file_map(self.ws.mirror), before_m)
+        self.assertEqual(file_map(mirror.base_dir(self.ws, self.project)), before_base)
+        self.assertEqual(file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project))), before_man)
+        self.assertTrue(no_tmp(outside))
+        self.assertTrue(no_tmp(self.ws.mirror))
+        # cleanup junction so TemporaryDirectory can remove the tree
+        os.rmdir(definition)
+        os.rename(held, definition)
+
+    def test_stale_symlink_delete_preflight_keeps_maps(self):
+        files = mirror.project_files(self.project)
+        safe_rel, safe_real = next(
+            (rel, real) for rel, real in files if rel.lower().endswith(".tmdl"))
+        stale_rel, stale_real = next(
+            (rel, real) for rel, real in files
+            if rel != safe_rel and rel.lower().endswith((".json", ".tmdl")))
+        outside = os.path.join(self.tmp.name, "stale-outside")
+        os.makedirs(outside)
+        secret = os.path.join(outside, "CANARY-STALE.bin")
+        with open(secret, "wb") as f:
+            f.write(b"CANARY-STALE")
+        # Remove the real source so pull treats the mirror copy as stale.
+        os.remove(stale_real)
+        stale_mirror = os.path.join(self.ws.mirror, *stale_rel.split("/"))
+        if os.path.exists(stale_mirror):
+            os.remove(stale_mirror)
+        try:
+            os.symlink(secret, stale_mirror)
+        except OSError:
+            self.skipTest("file symlink is unavailable")
+        with open(safe_real, "ab") as f:
+            f.write(b"\n")
+        before_m = file_map(self.ws.mirror)
+        before_base = file_map(mirror.base_dir(self.ws, self.project))
+        before_man = file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project)))
+        before_out = file_map(outside)
+        with self.assertRaises(common.PbzError) as caught:
+            mirror.pull(self.ws, self.project, force=True)
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+        self.assertEqual(file_map(self.ws.mirror), before_m)
+        self.assertEqual(file_map(mirror.base_dir(self.ws, self.project)), before_base)
+        self.assertEqual(file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project))), before_man)
+        self.assertEqual(file_map(outside), before_out)
+        self.assertTrue(no_tmp(self.ws.mirror))
+        self.assertTrue(no_tmp(outside))
+
+    def test_rebase_input_under_junction_is_refused_before_read(self):
+        import subprocess
+        from unittest.mock import patch
+        files = mirror.project_files(self.project)
+        rel, real = next((r, p) for r, p in files if r.lower().endswith(".tmdl"))
+        # Edit the mirror so rebase wants to keep/merge this path, then change real.
+        mpath = os.path.join(self.ws.mirror, *rel.split("/"))
+        with open(mpath, "ab") as f:
+            f.write(b"\n")
+        with open(real, "ab") as f:
+            f.write(b"\n")
+        parent = os.path.dirname(mpath)
+        outside = os.path.join(self.tmp.name, "rebase-out")
+        os.makedirs(outside)
+        # Canary at the basename rebase would open through the junctioned parent.
+        secret = os.path.join(outside, os.path.basename(mpath))
+        with open(secret, "wb") as f:
+            f.write(b"CANARY-REBASE")
+        secret_id = (os.lstat(secret).st_dev, os.lstat(secret).st_ino)
+        held = parent + ".held"
+        os.rename(parent, held)
+        try:
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", parent, outside], capture_output=True)
+        except OSError:
+            os.rename(held, parent)
+            self.skipTest("creating a junction is unavailable")
+        if made.returncode != 0:
+            os.rename(held, parent)
+            self.skipTest("creating a junction is unavailable")
+        external_opens = []
+        external_reads = []
+        real_open = open
+
+        def watch(path, *args, **kwargs):
+            handle = real_open(path, *args, **kwargs)
+            try:
+                info = os.fstat(handle.fileno())
+                if (info.st_dev, info.st_ino) == secret_id:
+                    external_opens.append(str(path))
+                    orig_read = handle.read
+
+                    def tracked(*a, **k):
+                        external_reads.append(b"read")
+                        return orig_read(*a, **k)
+
+                    handle.read = tracked
+            except OSError:
+                pass
+            return handle
+
+        # Positive control: opening the junctioned mirror path reaches the canary.
+        with patch("builtins.open", watch):
+            with open(mpath, "rb") as probe:
+                probe.read()
+        self.assertEqual(len(external_opens), 1)
+        self.assertEqual(external_reads, [b"read"])
+        external_opens.clear()
+        external_reads.clear()
+
+        before_m = file_map(self.ws.mirror)
+        before_base = file_map(mirror.base_dir(self.ws, self.project))
+        before_man = file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project)))
+        before_out = file_map(outside)
+        try:
+            with patch("builtins.open", watch):
+                with self.assertRaises(common.PbzError) as caught:
+                    mirror.pull(self.ws, self.project, rebase=True)
+            self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+            self.assertEqual(external_opens, [])
+            self.assertEqual(external_reads, [])
+            self.assertNotIn("CANARY-REBASE", str(caught.exception))
+            self.assertEqual(file_map(self.ws.mirror), before_m)
+            self.assertEqual(file_map(mirror.base_dir(self.ws, self.project)), before_base)
+            self.assertEqual(file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project))), before_man)
+            self.assertEqual(file_map(outside), before_out)
+            self.assertTrue(no_tmp(self.ws.mirror))
+            self.assertTrue(no_tmp(outside))
+        finally:
+            os.rmdir(parent)
+            os.rename(held, parent)
+
+    def test_aliased_source_report_root_is_refused(self):
+        import subprocess
+        from pbz import tokens
+        outside = os.path.join(self.tmp.name, "src-out")
+        os.makedirs(os.path.join(outside, "definition"))
+        canary = os.path.join(outside, "definition", "report.json")
+        with open(canary, "w", encoding="utf-8") as f:
+            f.write('{"name":"CANARY-SOURCE"}')
+        report = self.project.report_dir
+        held = report + ".held"
+        os.rename(report, held)
+        try:
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", report, outside], capture_output=True)
+        except OSError:
+            os.rename(held, report)
+            self.skipTest("creating a junction is unavailable")
+        if made.returncode != 0:
+            os.rename(held, report)
+            self.skipTest("creating a junction is unavailable")
+        before_m = file_map(self.ws.mirror)
+        before_base = file_map(mirror.base_dir(self.ws, self.project))
+        before_man = file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project)))
+        before_tm = file_map(os.path.dirname(tokens.TokenMap(self.ws.private).path))
+        before_out = file_map(outside)
+        try:
+            with self.assertRaises(common.PbzError) as caught:
+                mirror.pull(self.ws, self.project, force=True)
+            self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+            self.assertNotIn("CANARY-SOURCE", str(caught.exception))
+            self.assertEqual(file_map(self.ws.mirror), before_m)
+            self.assertEqual(file_map(mirror.base_dir(self.ws, self.project)), before_base)
+            self.assertEqual(file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project))), before_man)
+            self.assertEqual(file_map(os.path.dirname(tokens.TokenMap(self.ws.private).path)), before_tm)
+            self.assertEqual(file_map(outside), before_out)
+        finally:
+            os.rmdir(report)
+            os.rename(held, report)
+
 
 if __name__ == "__main__":
     unittest.main()

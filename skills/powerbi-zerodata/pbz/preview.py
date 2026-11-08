@@ -49,7 +49,9 @@ def _read(path: Path, mirror: Path) -> dict:
 
 def _write(path: Path, text: str, mirror: Path):
     _inside(path, mirror)
-    _inside(Path(str(path) + '.pbz-tmp'), mirror)
+    parent = path.parent
+    if parent.exists():
+        _inside(parent, mirror)
     write_text(str(path), text)
 
 

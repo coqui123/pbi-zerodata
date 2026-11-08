@@ -19,6 +19,7 @@ sys.path.insert(0, SKILL)
 from pbz import bpa, common, mirror  # noqa: E402
 
 SECRETS = ["Zed Quill", "jane.doe@example.invalid", "918273"]
+SCHEMA_R = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/report/3.3.0/schema.json"
 SCHEMA_V = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json"
 SCHEMA_P = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/page/2.1.0/schema.json"
 SCHEMA_B = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/bookmark/1.4.0/schema.json"
@@ -306,7 +307,7 @@ def build(root):
     r = os.path.join(root, "Bpa.Report")
     wjson(os.path.join(r, "definition.pbir"), {"version": "4.0", "datasetReference": {"byPath": {"path": "../Bpa.SemanticModel"}}})
     rd = os.path.join(r, "definition")
-    wjson(os.path.join(rd, "report.json"), {"publicCustomVisuals": ["fakeVisual1234", "usedVisual5678"]})
+    wjson(os.path.join(rd, "report.json"), {"$schema": SCHEMA_R, "publicCustomVisuals": ["fakeVisual1234", "usedVisual5678"]})
     wjson(os.path.join(rd, "reportExtensions.json"), {"name": "extension", "entities": [
         {"name": "Sales", "measures": [{"name": "Report Measure", "dataType": "Double", "expression": "[Total Amount] * 2"}]}]})
     wjson(os.path.join(rd, "pages", "pages.json"), {"pageOrder": list(PAGES), "activePageName": "p_over"})

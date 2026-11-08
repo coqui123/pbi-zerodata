@@ -101,7 +101,7 @@ class ImageAtomicTests(unittest.TestCase):
         before = self._maps(ws, project)
         real = common.write_text
 
-        def boom(path, text, bom=b""):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
             raise OSError("disk")
 
         with patch("pbz.common.write_text", boom):
@@ -115,18 +115,15 @@ class ImageAtomicTests(unittest.TestCase):
 
     def test_recovery_output_has_no_paths_bytes_or_exception_text(self):
         ws, project, png = self._project()
-        real_open = open
 
-        def bad_open(path, *args, **kwargs):
-            if isinstance(path, str) and path.endswith(".pbz-restore"):
-                raise OSError(SECRET)
-            return real_open(path, *args, **kwargs)
+        def bad_restore(path, data, *, root=None, **_kw):
+            raise OSError(SECRET)
 
-        def boom(path, text, bom=b""):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
             raise OSError(SECRET)
 
         argv = ["--workspace", ws.root, "--project", "Mini", "image", "add", png]
-        with patch("pbz.common.write_text", boom), patch("builtins.open", bad_open):
+        with patch("pbz.common.write_text", boom), patch("pbz.common.replace_bytes", bad_restore):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 rc = cli.main(argv)

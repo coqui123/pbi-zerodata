@@ -62,10 +62,10 @@ class PreviewAtomicTests(unittest.TestCase):
         before = _files(self.ws.mirror)
         real = common.write_text
 
-        def boom(path, text, bom=b""):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
             if second in path.replace("\\", "/"):
                 raise OSError("second")
-            return real(path, text, bom)
+            return real(path, text, bom, root=root)
 
         with patch("pbz.common.write_text", boom):
             with self.assertRaises(PbzError) as caught:

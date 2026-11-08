@@ -75,11 +75,11 @@ class HandoffAtomicTests(unittest.TestCase):
         real = common.write_text
         seen = {"n": 0}
 
-        def boom(path, text, bom=b""):
+        def boom(path, text, bom=b"", *, root=None, **_kw):
             seen["n"] += 1
             if seen["n"] > 1:
                 raise OSError("mid")
-            return real(path, text, bom)
+            return real(path, text, bom, root=root)
 
         with patch("pbz.evidence.mirror_rev", return_value="m"), patch("pbz.evidence.real_rev", return_value="r"), \
                 patch("pbz.common.write_text", boom):
