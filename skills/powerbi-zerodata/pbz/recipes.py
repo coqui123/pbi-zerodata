@@ -68,17 +68,14 @@ def _subst(arg: str, params: dict) -> str:
     return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", rep, arg)
 
 
-def load(spec: str) -> dict:
-    text = spec
-    if not spec.lstrip().startswith("{"):
-        if not os.path.isfile(spec):
-            raise PbzError("NOT_FOUND", "recipe file")
-        with open(spec, encoding="utf-8-sig") as f:
-            text = f.read()
-    try:
-        r = json.loads(text)
-    except ValueError:
+def load(spec: str, *, root: str | None = None) -> dict:
+    if not isinstance(spec, str):
         raise PbzError("BAD_REQUEST", "a recipe is JSON")
+    if spec.lstrip().startswith("{") or os.path.lexists(spec):
+        from . import control
+        r = control.load_spec(spec, root=root)
+    else:
+        raise PbzError("NOT_FOUND", "recipe file")
     if not isinstance(r, dict) or not isinstance(r.get("steps"), list) or not r["steps"]:
         raise PbzError("BAD_REQUEST", "a recipe needs a non-empty steps list")
     for i, s in enumerate(r["steps"], 1):
@@ -149,7 +146,7 @@ def _call(ws, project, verb: str, args: list[str]) -> tuple[int, dict]:
 
 def run(ws, project, spec: str, params: dict | None = None, dry_run: bool = False) -> dict:
     from . import cli, validate
-    r = load(spec)
+    r = load(spec, root=ws.root)
     params = {**(r.get("params") or {}), **(params or {})}
     limits = r.get("limits") or {}
     resolved = _prepare(ws, project, r["steps"], params)

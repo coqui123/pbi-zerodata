@@ -12,8 +12,9 @@ import uuid
 
 from . import desktop, policy as policy_mod, tmdl, tokens, validate
 from .classify import Classifier
-from .common import (PbzError, Project, Workspace, _contained, _reparse_link, commit_bytes, file_sha,
-                    read_text, remove_file, replace_bytes, sha, write_text)
+from .common import (PbzError, Project, Workspace, _contained, _reparse_link, anchor_mirror, append_checked,
+                    commit_bytes, file_sha, pbz_state_path, preflight_regular, read_text, remove_file,
+                    replace_bytes, sha, write_text)
 
 SKIP_DIRS = {".pbi", "daxqueries", "tmdlscripts", "customvisuals", "node_modules"}  # cultures: mirrored, see tokens
 JSON_EXT = (".json", ".pbir", ".pbism", ".platform")
@@ -232,6 +233,9 @@ def _read_prepared(path: str, rel: str):
 
 
 def pull(ws: Workspace, project: Project, force: bool = False, rebase: bool = False) -> dict:
+    # The mirror root and the guide are checked before recovery scans, mirror walks or pull mutations.
+    anchor_mirror(ws)
+    preflight_regular(os.path.join(ws.mirror, "MIRROR.md"), root=ws.mirror)
     # Force and rebase do not bypass an interrupted commit.
     gate = _pull_blocked(ws, project)
     if gate:
@@ -735,6 +739,8 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
 
 def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False,
          only: list[str] | None = None, preflight_only: bool = False) -> dict:
+    # The push log is checked before any project mutation. A later append failure stays a warning.
+    preflight_push_log(ws)
     pending = pending_recovery(ws, project)
     if pending:
         return {"verb": "push", "result": "RECOVERY_REQUIRED", "transactions": pending}
@@ -988,6 +994,7 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
 
 def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False,
          only: list[str] | None = None, preflight_only: bool = False) -> dict:
+    preflight_push_log(ws)
     if dry_run or preflight_only:
         return _push(ws, project, reload, dry_run, only, preflight_only)
     directory = _transaction_dir(ws, project)
@@ -1219,13 +1226,23 @@ def history_texts(ws: Workspace, project: Project, stamp: str) -> dict[str, str]
     return {rel: read_text(os.path.join(hdir, "blobs", h + ".txt"))[0] for rel, h in files.items()}
 
 
+def preflight_push_log(ws: Workspace) -> str:
+    """Refuse an aliased or hardlinked push log before push mutates the project. No content is read."""
+    path = pbz_state_path(ws, "push-log.jsonl")
+    preflight_regular(path, root=ws.root)
+    return path
+
+
 def _log_push(ws: Workspace, project: Project, stamp: str, summary: list[str]) -> None:
-    os.makedirs(ws.pbz_dir, exist_ok=True)
-    with open(os.path.join(ws.pbz_dir, "push-log.jsonl"), "a", encoding="utf-8") as f:
-        f.write(json.dumps({"stamp": stamp, "project": project.name, "objects": summary}) + "\n")
+    path = pbz_state_path(ws, "push-log.jsonl")
+    line = json.dumps({"stamp": stamp, "project": project.name, "objects": summary}) + "\n"
+    append_checked(path, line, root=ws.root)
 
 
 def _write_guide(ws: Workspace, mode: str) -> None:
+    anchor_mirror(ws)
+    path = os.path.join(ws.mirror, "MIRROR.md")
+    preflight_regular(path, root=ws.mirror)
     text = f"""# pbz-workspace (sanitized mirror)
 
 Edit these files instead of the real project folders. They are the real TMDL and PBIR files with
@@ -1242,4 +1259,4 @@ Classification mode: **{mode}** ({'engine value index' if mode == 'index' else '
 
 Loop: `pbz pull` -> edit -> `pbz diff` -> `pbz push` -> `pbz desktop open` -> `pbz health` / `pbz check` -> `pbz handoff`.
 """
-    write_text(os.path.join(ws.mirror, "MIRROR.md"), text)
+    write_text(path, text, root=ws.mirror)

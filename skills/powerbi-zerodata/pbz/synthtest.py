@@ -95,25 +95,21 @@ def _dax_ok(dax) -> bool:
     return bool(re.match(r"(?i)^(define|evaluate)\b", text))
 
 
-def _spec_queries(spec) -> list[dict]:
+def _object_spec(spec, root, *, missing: str):
+    if isinstance(spec, dict):
+        return spec
+    if not isinstance(spec, str):
+        raise PbzError("BAD_REQUEST", missing)
+    if spec.lstrip().startswith("{") or os.path.lexists(spec):
+        from . import control
+        return control.load_spec(spec, root=root)
+    raise PbzError("BAD_REQUEST", missing)
+
+
+def _spec_queries(spec, root=None) -> list[dict]:
     if spec is None:
         return []
-    data = spec
-    if isinstance(spec, str):
-        s = spec.strip()
-        if s.startswith("{"):
-            try:
-                data = json.loads(s)
-            except ValueError:
-                raise PbzError("BAD_REQUEST", "the spec is not valid JSON")
-        elif os.path.isfile(s):
-            try:
-                with open(s, encoding="utf-8-sig") as f:
-                    data = json.load(f)
-            except ValueError:
-                raise PbzError("BAD_REQUEST", "the spec file is not valid JSON")
-        else:
-            raise PbzError("BAD_REQUEST", "the spec is a JSON object or a .json file")
+    data = _object_spec(spec, root, missing="the spec is a JSON object or a .json file")
     queries = data.get("queries") if isinstance(data, dict) else None
     if not isinstance(queries, list) or not queries:
         raise PbzError("BAD_REQUEST", 'the spec needs {"queries": [{"id": ..., "dax": "EVALUATE ..."}]}')
@@ -252,7 +248,7 @@ def save(ws, project, name: str, spec=None, measures: list[str] | None = None, b
     path = _path(ws, name)
     if os.path.exists(path) and not replace:
         raise PbzError("NAME_TAKEN", f"synth test {name} exists: pass --replace or pick another name")
-    queries = _spec_queries(spec)
+    queries = _spec_queries(spec, ws.root)
     if measures:
         queries.append(measure_query(project, measures, by))
     elif by:
@@ -377,23 +373,8 @@ CHECK_KINDS = {"executes", "nonblank", "nonempty", "equal", "differs", "filter_i
 MAX_EXAMPLES = 10
 
 
-def _spec_checks(spec) -> list[dict]:
-    data = spec
-    if isinstance(spec, str):
-        s = spec.strip()
-        if s.startswith("{"):
-            try:
-                data = json.loads(s)
-            except ValueError:
-                raise PbzError("BAD_REQUEST", "the spec is not valid JSON")
-        elif os.path.isfile(s):
-            try:
-                with open(s, encoding="utf-8-sig") as f:
-                    data = json.load(f)
-            except ValueError:
-                raise PbzError("BAD_REQUEST", "the spec file is not valid JSON")
-        else:
-            raise PbzError("BAD_REQUEST", 'pass {"checks": [...]} as JSON or a .json file')
+def _spec_checks(spec, root=None) -> list[dict]:
+    data = _object_spec(spec, root, missing='pass {"checks": [...]} as JSON or a .json file')
     checks = data.get("checks") if isinstance(data, dict) else None
     if not isinstance(checks, list) or not checks:
         raise PbzError("BAD_REQUEST", 'the spec needs {"checks": [{"id", "kind", ...}]} (the pbz check format)')
@@ -616,7 +597,7 @@ def _check_one(ws, project, model, c: dict) -> dict:
 def check(ws, project, spec) -> dict:
     """`pbz check` specs evaluated on the synthetic copy only, with counterexamples: the data are fake, so
     failing groups, both sides of a comparison, duplicate and orphan values are shown."""
-    checks = _spec_checks(spec)
+    checks = _spec_checks(spec, ws.root)
     info = synth.build_info(ws, project)  # UNSAFE unless the synthetic copy exists; no query before this
     model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
     results = []

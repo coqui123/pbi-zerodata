@@ -165,6 +165,8 @@ def _source(ws, value: str) -> Path:
 def _bytes(ws, path: str) -> tuple[Path, bytes]:
     canonical = _source(ws, path)
     before = canonical.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise PbzError("UNSAFE_PATH", "consent requires an unlinked regular file")
     if before.st_size > MAX_FILE_BYTES:
         raise PbzError("TOO_LARGE", "source exceeds the consent read limit")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -172,9 +174,19 @@ def _bytes(ws, path: str) -> tuple[Path, bytes]:
         fd = os.open(str(canonical), flags)
         with os.fdopen(fd, "rb") as f:
             opened = os.fstat(f.fileno())
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                    or opened.st_dev != before.st_dev or opened.st_ino != before.st_ino):
+                raise PbzError("SOURCE_CHANGED", "source changed while being inspected; request consent again")
+            if opened.st_size > MAX_FILE_BYTES:
+                raise PbzError("TOO_LARGE", "source exceeds the consent read limit")
+            again = _source(ws, str(canonical))
+            if again != canonical:
+                raise PbzError("SOURCE_CHANGED", "source changed while being inspected; request consent again")
             data = f.read(MAX_FILE_BYTES + 1)
             after = os.fstat(f.fileno())
         current = _source(ws, str(canonical)).stat()
+    except PbzError:
+        raise
     except OSError:
         raise PbzError("SOURCE_UNAVAILABLE", "source file is unavailable")
     signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)

@@ -92,8 +92,8 @@ def _instant(value):
         raise PbzError("BAD_REQUEST", "cutoffs must be timezone-aware ISO timestamps") from None
 
 
-def compare(spec):
-    data = control.load(spec)
+def compare(spec, root=None):
+    data = control.load(spec, root=root)
     control.keys(data, {"version", "left", "right"}, {"left", "right"})
     sides = []
     for side in [data["left"], data["right"]]:

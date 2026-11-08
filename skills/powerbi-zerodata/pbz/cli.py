@@ -12,7 +12,7 @@ if __package__ in (None, ""):
     __package__ = "pbz"
 
 from pbz import checks, describe, desktop, dpapi, handoff, memscrub, mirror, policy, rename, scan, smoke, validate  # noqa: E402
-from pbz.common import PbzError, emit, engine_call, file_sha, find_workspace  # noqa: E402
+from pbz.common import PbzError, emit, engine_call, file_sha, find_workspace, pbz_state_path  # noqa: E402
 
 
 def _preview_spec(ws, arg: str | None):
@@ -37,13 +37,11 @@ def _preview_spec(ws, arg: str | None):
     return str(resolved)
 
 
-def _spec(arg: str | None) -> dict | None:
+def _spec(arg: str | None, ws=None) -> dict | None:
     if not arg:
         return None
-    if os.path.exists(arg):
-        with open(arg, encoding="utf-8-sig") as f:
-            return json.load(f)
-    return json.loads(arg)
+    from pbz import control
+    return control.load_spec(arg, root=ws.root if ws is not None else None)
 
 
 def _is_human() -> bool:
@@ -110,6 +108,7 @@ def cmd_status(ws, project, a):
 
 
 def cmd_init(ws, project, a):
+    pbz_state_path(ws)
     os.makedirs(ws.pbz_dir, exist_ok=True)
     if not os.path.exists(ws.policy_path):
         policy.save(ws, policy.load(ws))
@@ -603,7 +602,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             out = interactiontest.capabilities() if a.action == "capabilities" else interactiontest.run(ws, project, a.spec, a.mode)
         elif a.cmd == "freshness":
             from pbz import freshness
-            out = freshness.capture(ws, project, a.max_age_hours) if a.action == "capture" else freshness.compare(a.spec)
+            out = freshness.capture(ws, project, a.max_age_hours) if a.action == "capture" else freshness.compare(a.spec, ws.root)
         elif a.cmd == "requirements":
             from pbz import requirements
             if a.action == "import":
@@ -635,7 +634,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
         elif a.cmd == "health":
             out = checks.health(ws, project)
         elif a.cmd == "check":
-            spec = _spec(a.spec) or {}
+            spec = _spec(a.spec, ws) or {}
             if a.validate_only:
                 validation = checks.validate_spec(spec)
                 out = {"verb": "check validate", **validation, "spec_valid": validation["valid"]}
@@ -644,7 +643,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
         elif a.cmd == "probe":
             out = checks.probe(ws, project, a.table, a.columns)
         elif a.cmd == "snapshot":
-            spec = _spec(a.spec) or (checks.saved_spec(ws, a.name) if a.action == "compare" else None)
+            spec = _spec(a.spec, ws) or (checks.saved_spec(ws, a.name) if a.action == "compare" else None)
             if not spec:
                 raise PbzError("BAD_REQUEST", "--spec required")
             out = checks.snapshot(ws, project, a.action, a.name, spec)
@@ -810,7 +809,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             from pbz import recipes
             params = dict(p.split("=", 1) for p in a.param if "=" in p)
             if a.action == "check":
-                r = recipes.load(a.spec)
+                r = recipes.load(a.spec, root=ws.root)
                 out = {"verb": "recipe", "action": "check", "recipe": r.get("recipe", "unnamed"),
                        "steps": [s["verb"] for s in r["steps"]], "result": "VALID"}
             else:

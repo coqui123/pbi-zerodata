@@ -149,6 +149,14 @@ scrubbed text on the agent path. CJK names without separators are not found in f
 Synthetic rejection stays the fixed token `SYNTH_VALIDATE_REJECTED` with no count or class list.
 None of this is crash-proof: a killed process can still leave a temp, and OS isolation is still
 the checklist in leak-vectors.md.
+Round 16 anchors `.pbz` state at the workspace root and refuses a junction at the mirror
+before that directory is used as a writer root. Spec files, including recipe and synth-test
+inputs, are a regular single link checked on the opened handle before the first byte; a
+`.pbz`, model, report or protected path is refused with a fixed message. Consent rechecks
+that handle before reading. A requirement proof is current only when its mirror revision
+and saved-real revision still match, and only registered check ids are stored. Rollback
+remains best-effort after an exception. A killed process can still leave a temp, and this
+is not a claim of OS isolation.
 
 
 `--diagnostic` explicitly permits check-result collection without assertion failure exit codes.

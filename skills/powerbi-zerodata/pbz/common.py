@@ -279,6 +279,150 @@ def _contained(path: str, root: str | None) -> None:
     raise PbzError("UNSAFE_PATH", "refusing to write through a link")
 
 
+def _workspace_root(ws) -> str:
+    """Absolute workspace root. Infer from `.pbz` or mirror when `ws.root` is absent (test fixtures)."""
+    root = getattr(ws, "root", None)
+    if root is not None:
+        return os.path.abspath(root)
+    pbz = getattr(ws, "pbz_dir", None)
+    if pbz is not None and os.path.normcase(os.path.basename(os.path.abspath(pbz))) == ".pbz":
+        return os.path.dirname(os.path.abspath(pbz))
+    mirror = getattr(ws, "mirror", None)
+    if mirror is not None and os.path.normcase(os.path.basename(os.path.abspath(mirror))) == os.path.normcase(MIRROR_DIR):
+        return os.path.dirname(os.path.abspath(mirror))
+    raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+
+def pbz_state_path(ws, *parts: str) -> str:
+    """A path under `<workspace>/.pbz`.
+
+    Refuse a reparse point on `.pbz` itself and on the leaf. When either already
+    exists, containment is checked against the workspace root, so a junction at
+    `.pbz` is not its own trust root. Ancestors above the workspace stay unchecked.
+    """
+    root = _workspace_root(ws)
+    pbz = os.path.join(root, ".pbz")
+    path = os.path.join(pbz, *parts) if parts else pbz
+    if _reparse_link(pbz) or (os.path.normcase(path) != os.path.normcase(pbz) and _reparse_link(path)):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    if os.path.lexists(pbz) or os.path.lexists(path):
+        _contained(path, root)
+    return path
+
+
+def anchor_mirror(ws) -> str:
+    """Refuse a junction or symlink at the mirror directory before it is used as a trust root.
+
+    `_contained` trusts the root it is given, so passing `ws.mirror` does not see a reparse
+    point whose path is exactly the mirror. Ancestors above the workspace stay unchecked.
+    """
+    mirror = os.path.abspath(ws.mirror)
+    root = _workspace_root(ws)
+    expected = os.path.abspath(os.path.join(root, MIRROR_DIR))
+    if os.path.normcase(mirror) != os.path.normcase(expected) or _reparse_link(mirror):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    if os.path.lexists(mirror):
+        _contained(mirror, root)
+        try:
+            real = os.path.realpath(mirror)
+            root_real = os.path.realpath(root)
+            if os.path.normcase(os.path.commonpath([real, root_real])) != os.path.normcase(root_real):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        except ValueError:
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+    return mirror
+
+
+def _regular_single(info) -> bool:
+    return stat.S_ISREG(info.st_mode) and getattr(info, "st_nlink", 1) == 1
+
+
+def preflight_regular(path: str, *, root: str | None) -> None:
+    """Refuse a link, an escape, or an existing hard link. Does not open the file."""
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(path, root)
+    if not os.path.lexists(path):
+        return
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+    if not _regular_single(info) or _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(path, root)
+
+
+def read_checked(path: str, *, root: str | None) -> bytes:
+    """Read one regular single-link file. The opened handle must still be that file before any content read."""
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(path, root)
+    try:
+        before = os.lstat(path)
+    except OSError:
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+    if not _regular_single(before) or _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(path, root)
+    with open(path, "rb") as handle:
+        try:
+            info = os.fstat(handle.fileno())
+        except OSError:
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+        if (not _regular_single(info) or info.st_dev != before.st_dev or info.st_ino != before.st_ino):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        try:
+            after = os.lstat(path)
+        except OSError:
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+        if (after.st_dev != before.st_dev or after.st_ino != before.st_ino or _reparse_link(path)):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        _contained(path, root)
+        return handle.read()
+
+
+def append_checked(path: str, text: str, *, root: str | None) -> None:
+    """Append text. An existing file must still be the regular single-link file that was checked, before any write."""
+    preflight_regular(path, root=root)
+    if not os.path.lexists(path):
+        write_text(path, text, root=root)
+        return
+    try:
+        before = os.lstat(path)
+    except OSError:
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+    if not _regular_single(before) or _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    fd = os.open(path, os.O_APPEND | os.O_WRONLY)
+    try:
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+        if not _regular_single(info) or info.st_dev != before.st_dev or info.st_ino != before.st_ino:
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        try:
+            after = os.lstat(path)
+        except OSError:
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+        if (after.st_dev != before.st_dev or after.st_ino != before.st_ino
+                or not _regular_single(after) or _reparse_link(path)):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        _contained(path, root)
+        view = memoryview(text.encode("utf-8"))
+        while view:
+            wrote = os.write(fd, view)
+            if wrote <= 0:
+                raise OSError("write made no progress")
+            view = view[wrote:]
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _trust_root(path: str, root: str | None, roots: dict | None) -> str | None:
     if roots and path in roots:
         return roots[path]

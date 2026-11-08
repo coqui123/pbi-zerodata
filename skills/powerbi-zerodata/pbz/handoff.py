@@ -7,7 +7,8 @@ import os
 import re
 
 from . import tmdl
-from .common import PbzError, commit_bytes
+from .common import (PbzError, _workspace_root, anchor_mirror, commit_bytes, pbz_state_path,
+                     preflight_regular, read_checked)
 from .describe import field_usage
 
 
@@ -15,24 +16,34 @@ START = "<!-- pbz:generated:start -->"
 END = "<!-- pbz:generated:end -->"
 
 
+def _checked_text(path: str, root: str, *, sig: bool) -> str | None:
+    """Missing is None. A link or hard link is refused before any content read."""
+    preflight_regular(path, root=root)
+    if not os.path.lexists(path):
+        return None
+    try:
+        raw = read_checked(path, root=root)
+        return raw.decode("utf-8-sig" if sig else "utf-8")
+    except PbzError:
+        raise
+    except (OSError, UnicodeError):
+        raise PbzError("REFUSED", "handoff text is unreadable") from None
+
+
 def _packet_plan(ws, alias: str, text: str, folder: str) -> tuple[str, list]:
     """Plan the immutable packet, a legacy archive and the alias. Nothing is written."""
+    anchor_mirror(ws)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
     rel = f"{folder}/{digest}.md"
     packet = os.path.join(ws.mirror, folder, digest + ".md")
-    ops: list[tuple] = []
-    if os.path.exists(packet):
-        with open(packet, encoding="utf-8") as f:
-            if f.read() != text:
-                raise PbzError("PACKET_CONFLICT", "immutable packet contents differ")
-    else:
-        ops.append(("write", packet, text, b""))
     target = os.path.join(ws.mirror, alias)
-    try:
-        with open(target, encoding="utf-8-sig") as f:
-            old = f.read()
-    except FileNotFoundError:
-        old = ""
+    current = _checked_text(packet, ws.mirror, sig=False)
+    old = _checked_text(target, ws.mirror, sig=True) or ""
+    ops: list[tuple] = []
+    if current is not None and current != text:
+        raise PbzError("PACKET_CONFLICT", "immutable packet contents differ")
+    if current is None:
+        ops.append(("write", packet, text, b""))
     managed = START + "\n" + text.rstrip() + "\n" + END
     if START in old and END in old and old.index(START) < old.index(END):
         prefix, rest = old.split(START, 1)
@@ -42,7 +53,7 @@ def _packet_plan(ws, alias: str, text: str, folder: str) -> tuple[str, list]:
         # First migration cannot reliably separate handwritten notes from generated text.
         legacy = hashlib.sha256(old.encode("utf-8")).hexdigest()[:20]
         archive = os.path.join(ws.mirror, folder, "legacy-" + legacy + ".md")
-        if not os.path.exists(archive):
+        if _checked_text(archive, ws.mirror, sig=False) is None:
             ops.append(("write", archive, old, b""))
         new = managed + "\n\n## Preserved previous checklist and notes\n\n" + old
     else:
@@ -52,27 +63,42 @@ def _packet_plan(ws, alias: str, text: str, folder: str) -> tuple[str, list]:
     return "pbz-workspace/" + rel, ops
 
 
+def _commit(ws, ops: list) -> None:
+    """State lands under the workspace root; packets and the alias land under the mirror."""
+    if not ops:
+        return
+    anchor_mirror(ws)
+    state = pbz_state_path(ws, "handoff.json")
+    roots = {}
+    state_key = os.path.normcase(os.path.abspath(state))
+    for op in ops:
+        path = op[1]
+        roots[path] = _workspace_root(ws) if os.path.normcase(os.path.abspath(path)) == state_key else ws.mirror
+    commit_bytes(ops, roots=roots)
+
+
 def write_packet(ws, alias: str, text: str, folder: str) -> str:
     """Immutable generated packet plus an alias preserving all text outside its managed block."""
     rel, ops = _packet_plan(ws, alias, text, folder)
-    if ops:
-        commit_bytes(ops)
+    _commit(ws, ops)
     return rel
 
 
-def _load_state(path: str) -> dict:
+def _load_state(ws) -> dict:
     """Missing state is empty. A present file that cannot be read or parsed is refused."""
+    path = pbz_state_path(ws, "handoff.json")
     if not os.path.lexists(path):
         return {"version": 2, "projects": {}}
     try:
-        with open(path, encoding="utf-8") as f:
-            raw = f.read()
-    except OSError:
-        raise PbzError("REFUSED", "handoff state is unreadable")
+        raw = read_checked(path, root=_workspace_root(ws)).decode("utf-8")
+    except PbzError:
+        raise
+    except (OSError, UnicodeError):
+        raise PbzError("REFUSED", "handoff state is unreadable") from None
     try:
         state = json.loads(raw)
     except ValueError:
-        raise PbzError("REFUSED", "handoff state is malformed")
+        raise PbzError("REFUSED", "handoff state is malformed") from None
     projects = state.get("projects", {}) if isinstance(state, dict) else None
     if not isinstance(state, dict) or not isinstance(projects, dict):
         raise PbzError("REFUSED", "handoff state is malformed")
@@ -81,8 +107,9 @@ def _load_state(path: str) -> dict:
 
 def accept_generated(ws, project, mirror_revision: str, real_revision: str) -> bool:
     """Called only after the review command's human-only acceptance check."""
-    path = os.path.join(ws.pbz_dir, "handoff.json")
-    state = _load_state(path)
+    anchor_mirror(ws)
+    path = pbz_state_path(ws, "handoff.json")
+    state = _load_state(ws)
     current = state["projects"].get(project.name, {})
     if not isinstance(current, dict):
         return False
@@ -90,28 +117,32 @@ def accept_generated(ws, project, mirror_revision: str, real_revision: str) -> b
     match = re.fullmatch(r"pbz-workspace/handoffs/([a-f0-9]{20})\.md", packet) if isinstance(packet, str) else None
     if not match:
         return False
-    target = os.path.realpath(os.path.join(ws.mirror, "handoffs", match.group(1) + ".md"))
-    base = os.path.realpath(os.path.join(ws.mirror, "handoffs")) + os.sep
-    if not os.path.normcase(target).startswith(os.path.normcase(base)):
-        return False
+    target = os.path.join(ws.mirror, "handoffs", match.group(1) + ".md")
     try:
-        with open(target, encoding="utf-8") as f:
-            digest = hashlib.sha256(f.read().encode("utf-8")).hexdigest()[:20]
-    except (OSError, UnicodeError):
+        body = _checked_text(target, ws.mirror, sig=False)
+    except PbzError:
+        raise
+    if body is None:
         return False
+    real = os.path.realpath(target)
+    base = os.path.realpath(os.path.join(ws.mirror, "handoffs")) + os.sep
+    if not os.path.normcase(real).startswith(os.path.normcase(base)):
+        return False
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:20]
     if digest != match.group(1):
         return False
     if current.get("revision") != {"mirror": mirror_revision, "real": real_revision} or not current.get("generated"):
         return False
     current["accepted"] = current["generated"]
-    commit_bytes([("write", path, json.dumps(state), b"")])
+    commit_bytes([("write", path, json.dumps(state), b"")], roots={path: _workspace_root(ws)})
     return True
 
 
 def build(ws, project, include_all: bool = False) -> dict:
-    log = os.path.join(ws.pbz_dir, "push-log.jsonl")
-    state = os.path.join(ws.pbz_dir, "handoff.json")
-    cursor = _load_state(state)
+    anchor_mirror(ws)
+    log = pbz_state_path(ws, "push-log.jsonl")
+    state = pbz_state_path(ws, "handoff.json")
+    cursor = _load_state(ws)
     current = cursor["projects"].get(project.name, {})
     if not isinstance(current, dict):
         current = {}
@@ -119,10 +150,11 @@ def build(ws, project, include_all: bool = False) -> dict:
     entries = []
     if os.path.lexists(log):
         try:
-            with open(log, encoding="utf-8") as f:
-                lines = f.readlines()
-        except OSError:
-            raise PbzError("REFUSED", "push log is unreadable")
+            lines = read_checked(log, root=_workspace_root(ws)).decode("utf-8").splitlines(keepends=True)
+        except PbzError:
+            raise
+        except (OSError, UnicodeError):
+            raise PbzError("REFUSED", "push log is unreadable") from None
         for line in lines:
             if not line.strip():
                 continue
@@ -189,7 +221,7 @@ def build(ws, project, include_all: bool = False) -> dict:
     current.update(generated=max(e["stamp"] for e in entries), packet=packet, revision=revision)
     cursor["projects"][project.name] = current
     ops.append(("write", state, json.dumps(cursor), b""))
-    commit_bytes(ops)
+    _commit(ws, ops)
 
     return {"verb": "handoff", "project": project.name, "file": "pbz-workspace/HANDOFF.md",
             "packet": packet, "review_required": True, "checklist": text}

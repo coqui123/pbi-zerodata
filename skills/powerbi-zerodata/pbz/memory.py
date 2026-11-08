@@ -17,7 +17,7 @@ import json
 import os
 
 from . import checks, desktop, evidence, policy as policy_mod
-from .common import PbzError, engine_call, write_text
+from .common import PbzError, engine_call, pbz_state_path, preflight_regular, read_checked, write_text
 
 SIZE_BANDS = ("<1 MiB", "1-10 MiB", "10-100 MiB", "100-1000 MiB", ">=1000 MiB")
 SHARE_BANDS = ("<1%", "1-5%", "5-20%", ">=20%")
@@ -45,7 +45,7 @@ def _strip_bands(body: dict) -> dict:
 
 
 def _path(ws) -> str:
-    return os.path.join(ws.pbz_dir, "memory.json")
+    return pbz_state_path(ws, "memory.json")
 
 
 def _name(v) -> str | None:
@@ -136,6 +136,9 @@ def run(ws, project, predicates: bool = True) -> dict:
     """Storage bands of the model open in Desktop; saves .pbz/memory.json. Raises PbzError (ENGINE_UNAVAILABLE when
     Desktop does not hold the project, else the engine's error class); returns a BUDGET verdict when the daily probe
     budget is spent."""
+    # Destination is checked before Desktop, budget or the engine, so an aliased .pbz spends nothing.
+    path = _path(ws)
+    preflight_regular(path, root=ws.root)
     pol = policy_mod.load(ws)
     disclosure = _disclosure(ws)
     port = desktop.require_port(project)
@@ -152,18 +155,21 @@ def run(ws, project, predicates: bool = True) -> dict:
     doc = {"verb": "memory", "project": project.name,
            "saved_at": dt.datetime.now().replace(microsecond=0).isoformat(),
            "mirror_rev": _rev(ws, project), "disclosure": disclosure, **body}
-    os.makedirs(ws.pbz_dir, exist_ok=True)
-    write_text(_path(ws), json.dumps(doc, indent=1, ensure_ascii=False) + "\n")
+    write_text(path, json.dumps(doc, indent=1, ensure_ascii=False) + "\n", root=ws.root)
     return {"verb": "memory", "project": project.name, **body, "saved": SAVED}
 
 
 def load(ws, project) -> dict | None:
     """The saved result for this project (re-checked against the closed vocabulary) plus "stale": true when the mirror
     changed since it was saved; None when nothing usable is saved."""
+    path = _path(ws)
+    if not os.path.lexists(path):
+        return None
     try:
-        with open(_path(ws), encoding="utf-8") as f:
-            doc = json.load(f)
-    except (OSError, ValueError):
+        doc = json.loads(read_checked(path, root=ws.root).decode("utf-8"))
+    except PbzError:
+        raise
+    except (OSError, ValueError, UnicodeError):
         return None
     if not isinstance(doc, dict) or doc.get("verb") != "memory" or doc.get("project") != project.name:
         return None

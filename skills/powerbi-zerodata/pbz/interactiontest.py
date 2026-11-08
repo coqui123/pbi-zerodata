@@ -40,7 +40,7 @@ def _fields(node):
 
 
 def run(ws, project, spec, mode="static"):
-    data = control.load(spec)
+    data = control.load(spec, root=ws.root)
     control.keys(data, {"version", "cases"}, {"cases"})
     cases = data["cases"]
     if not isinstance(cases, list) or not cases or len(cases) > 200:

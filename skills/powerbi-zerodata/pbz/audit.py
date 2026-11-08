@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass, field
 
 from . import deps, lexers, mlineage, similar, tmdl, usage
-from .common import PbzError
+from .common import PbzError, pbz_state_path, read_checked, write_text
 
 SEVERITY = ("high", "medium", "low", "info")
 HIGH_COUNT = "10k+"                       # top distinct / row bucket of `pbz index`
@@ -996,40 +996,79 @@ def _ancestor_pairs(c: Call):
 # ---------------------------------------------------------------- baselines, waivers, gate
 
 def _audit_dir(ws) -> str:
-    return os.path.join(ws.pbz_dir, "audit")
+    return pbz_state_path(ws, "audit")
 
 
-def _load_json(path: str, default):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return default
-
-
-def _save_json(path: str, data) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
-
-
-def _baseline_path(ws, name: str) -> str:
+def _baseline_parts(name: str) -> tuple[str, str, str]:
     safe = "".join(ch for ch in name if ch.isalnum() or ch in "-_.") or "baseline"
-    return os.path.join(_audit_dir(ws), "baselines", safe + ".json")
+    return ("audit", "baselines", safe + ".json")
+
+
+_AUDIT_MALFORMED = "audit state is malformed"
+
+
+def _check_waivers(data: dict) -> None:
+    for key, value in data.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            raise PbzError("REFUSED", _AUDIT_MALFORMED)
+        expires = value.get("expires")
+        if expires is not None and not isinstance(expires, str):
+            raise PbzError("REFUSED", _AUDIT_MALFORMED)
+        reason = value.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise PbzError("REFUSED", _AUDIT_MALFORMED)
+
+
+def _check_baseline(data: dict) -> None:
+    if "findings" not in data or not isinstance(data["findings"], list):
+        raise PbzError("REFUSED", _AUDIT_MALFORMED)
+    findings = data["findings"]
+    for row in findings:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            raise PbzError("REFUSED", _AUDIT_MALFORMED)
+        for field in ("rule", "object", "severity"):
+            if field in row and row[field] is not None and not isinstance(row[field], str):
+                raise PbzError("REFUSED", _AUDIT_MALFORMED)
+
+
+def _load_json(ws, parts: tuple[str, ...], default):
+    """Missing state is `default`. A present file that is unsafe, unreadable or not an object is refused."""
+    path = pbz_state_path(ws, *parts)
+    if not os.path.lexists(path):
+        return default
+    try:
+        raw = read_checked(path, root=ws.root)
+    except PbzError:
+        raise
+    except OSError:
+        raise PbzError("REFUSED", "audit state is unreadable") from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError, RecursionError):
+        raise PbzError("REFUSED", _AUDIT_MALFORMED) from None
+    if not isinstance(data, dict):
+        raise PbzError("REFUSED", _AUDIT_MALFORMED)
+    if parts[-1] == "waivers.json":
+        _check_waivers(data)
+    elif len(parts) >= 2 and parts[-2] == "baselines":
+        _check_baseline(data)
+    return data
+
+
+def _save_json(ws, parts: tuple[str, ...], data) -> None:
+    path = pbz_state_path(ws, *parts)
+    write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", root=ws.root)
 
 
 def waive(ws, project, fid: str, reason: str | None, expires: str | None = None, remove: bool = False,
           by: str = "agent") -> dict:
-    path = os.path.join(_audit_dir(ws), "waivers.json")
-    data = _load_json(path, {})
+    path_parts = ("audit", "waivers.json")
+    data = _load_json(ws, path_parts, {})
     if remove:
         if fid not in data:
             raise PbzError("NOT_FOUND", f"no waiver {fid}")
         del data[fid]
-        _save_json(path, data)
+        _save_json(ws, path_parts, data)
         return {"verb": "audit", "action": "unwaive", "id": fid, "result": "REMOVED"}
     if not reason or not reason.strip():
         raise PbzError("BAD_REQUEST", "a waiver needs --reason")
@@ -1044,7 +1083,7 @@ def waive(ws, project, fid: str, reason: str | None, expires: str | None = None,
     f = current[fid]
     data[fid] = {"rule": f["rule"], "object": f["object"], "reason": reason.strip()[:300], "expires": expires,
                  "created": _dt.date.today().isoformat(), "by": by}
-    _save_json(path, data)
+    _save_json(ws, path_parts, data)
     return {"verb": "audit", "action": "waive", "id": fid, "rule": f["rule"], "object": f["object"],
             "expires": expires, "result": "WAIVED"}
 
@@ -1052,6 +1091,11 @@ def waive(ws, project, fid: str, reason: str | None, expires: str | None = None,
 def run(ws, project, rules: list[str] | None = None, category: str | None = None, min_severity: str | None = None,
         since: str | None = None, save_baseline: str | None = None, fail_on: str | None = None,
         coverage: bool = False, max_findings: int = MAX_FINDINGS, _gate_only: bool = False) -> dict:
+    if fail_on:
+        if fail_on not in ("new", "any", "high"):
+            raise PbzError("BAD_REQUEST", "--fail-on is new, any or high")
+        if fail_on == "new" and not since:
+            raise PbzError("BAD_REQUEST", "--fail-on new needs --since <baseline>")
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
@@ -1084,7 +1128,7 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
     if min_severity:
         out_f = [f for f in out_f if SEVERITY.index(f["severity"]) <= SEVERITY.index(min_severity)]
     out_f.sort(key=lambda f: (SEVERITY.index(f["severity"]), f["category"], f["rule"], f["object"].lower()))
-    waivers = _load_json(os.path.join(_audit_dir(ws), "waivers.json"), {})
+    waivers = _load_json(ws, ("audit", "waivers.json"), {})
     today = _dt.date.today().isoformat()
     waived, expired, active = [], [], []
     for f in out_f:
@@ -1108,7 +1152,7 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
     result["summary"] = {"findings": len(active), "by_category": by_cat, "by_severity": by_sev,
                          "waived": len(waived)}
     if since:
-        base = _load_json(_baseline_path(ws, since), None)
+        base = _load_json(ws, _baseline_parts(since), None)
         if base is None:
             raise PbzError("NOT_FOUND", f"no audit baseline {since} (pbz audit --save-baseline {since})")
         old = {r["id"]: r for r in base.get("findings", [])}
@@ -1146,16 +1190,12 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
     if skipped:
         result["coverage"] = skipped
     if save_baseline:
-        _save_json(_baseline_path(ws, save_baseline), {
+        _save_json(ws, _baseline_parts(save_baseline), {
             "saved": _dt.datetime.now().isoformat(timespec="seconds"), "project": project.name,
             "findings": [{"id": f["id"], "rule": f["rule"], "object": f["object"], "severity": f["severity"]}
                          for f in out_f]})
         result["baseline_saved"] = save_baseline
     if fail_on:
-        if fail_on not in ("new", "any", "high"):
-            raise PbzError("BAD_REQUEST", "--fail-on is new, any or high")
-        if fail_on == "new" and not since:
-            raise PbzError("BAD_REQUEST", "--fail-on new needs --since <baseline>")
         bad = [f for f in active if (fail_on == "any" and f["severity"] != "info")
                or (fail_on == "high" and f["severity"] == "high")
                or (fail_on == "new" and f.get("status") == "new")]

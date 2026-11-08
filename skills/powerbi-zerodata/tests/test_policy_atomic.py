@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
+sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 from pbz.common import PbzError, Workspace, write_text  # noqa: E402
 from pbz import policy  # noqa: E402
@@ -28,9 +29,8 @@ class PolicyAtomicTests(unittest.TestCase):
         open(os.path.join(self.tmp.name, "Canary.pbip"), "w", encoding="utf-8").close()
 
     def _junction(self, link: str, target: str) -> None:
-        made = subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True)
-        if made.returncode != 0:
-            self.skipTest("creating a junction is unavailable")
+        from _junction import make_junction
+        make_junction(self, link, target)
 
     def test_save_writes_policy_under_the_workspace(self):
         policy.save(self.ws, {"version": 1, "disclosure": "strict"})

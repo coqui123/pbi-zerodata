@@ -14,7 +14,7 @@ import os
 import re
 
 from . import deps, lexers, mirror, pbir, tmdl, usage
-from .common import PbzError, read_text, write_text
+from .common import PbzError, anchor_mirror, pbz_state_path, preflight_regular, read_checked, read_text, write_text
 
 SECTIONS = ["overview", "tables", "measures", "calculation_groups", "functions", "field_parameters",
             "relationships", "power_query", "security", "reports", "unused", "changelog"]
@@ -260,11 +260,14 @@ def collect(ws, project, dax: bool = False) -> dict:
 
 def _changelog(ws, project) -> tuple[list[dict], int]:
     """Keep well-formed lines for this project. A bad line is counted and never copied into the doc."""
-    path = os.path.join(ws.pbz_dir, "push-log.jsonl")
+    path = pbz_state_path(ws, "push-log.jsonl")
+    if not os.path.lexists(path):
+        return [], 0
     try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError:
+        lines = read_checked(path, root=ws.root).decode("utf-8").splitlines(keepends=True)
+    except PbzError:
+        raise
+    except (OSError, UnicodeError):
         return [], 0
     kept, skipped = [], 0
     for line in lines:
@@ -532,14 +535,18 @@ def render_html(d: dict) -> str:
 
 
 def run(ws, project, fmt: str = "md", dax: bool = False) -> dict:
+    anchor_mirror(ws)
+    chosen = fmt if fmt in ("json", "html") else "md"
+    rel = f"docs/{project.name}.{chosen}"
+    path = os.path.join(ws.mirror, *rel.split("/"))
+    preflight_regular(path, root=ws.mirror)
     d = collect(ws, project, dax)
-    if fmt == "json":
+    if chosen == "json":
         text = json.dumps(d, indent=1, ensure_ascii=False) + "\n"
-    elif fmt == "html":
+    elif chosen == "html":
         text = render_html(d)
     else:
-        fmt, text = "md", render_md(d)
-    rel = f"docs/{project.name}.{fmt}"
-    write_text(os.path.join(ws.mirror, *rel.split("/")), text)
-    return {"verb": "docs", "project": project.name, "file": f"pbz-workspace/{rel}", "format": fmt,
+        text = render_md(d)
+    write_text(path, text, root=ws.mirror)
+    return {"verb": "docs", "project": project.name, "file": f"pbz-workspace/{rel}", "format": chosen,
             "dax": dax, "sections": SECTIONS, "counts": d["overview"]}

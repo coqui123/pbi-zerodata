@@ -586,3 +586,16 @@ CLI and MCP share the same refusal path: `UNSAFE_PATH`, `REFUSED`, `HUMAN_ONLY`,
 the CLI, so a non-human `memscrub --show` is `HUMAN_ONLY` with no scrubbed text. Policy writes,
 push journals and synthetic publish still prepare before they replace. A failed replace leaves
 the previous bytes. This is not a claim that a crash mid-replace is atomic.
+
+## Round 16 parity
+
+`.pbz` state paths are anchored at the workspace root. Waiver, baseline, handoff state,
+memory and the push log use the same checked writers and single-link reads. A mirror
+junction is refused before pull, docs, handoff, control or guide writes treat that
+directory as a trust root. `--spec` and the sibling recipe, synth-test, freshness and
+interaction loaders refuse a link, a hard link, `.pbz`, a model or report path, or a
+protected file before the first content byte; malformed JSON stays `BAD_REQUEST`.
+Consent checks the opened handle before it reads. Requirement proofs store the mirror
+revision and the saved real revision together, and a check result is kept only when it
+matches the registered ids. A late push-log append after a committed push is still
+`POST_COMMIT_HISTORY`. None of this is crash-proof, and it is not OS isolation.

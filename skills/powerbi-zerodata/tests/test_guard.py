@@ -15,6 +15,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 GUARD = os.path.join(os.path.dirname(HERE), "pbz", "guard.py")
 
 
+
+def _mklink(link, target):
+    """Junction helper. A missing mklink prints SKIP and returns a failed result; it does not raise."""
+    import sys
+    sys.path.insert(0, HERE)
+    from _junction import make_junction
+    class _Result:
+        returncode = 0
+    if not make_junction(None, link, target):
+        _Result.returncode = 1
+        print("SKIP creating a junction is unavailable")
+    return _Result()
+
 def write(path: str, text: str = "") -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -242,7 +255,7 @@ def _private_root_memo() -> tuple[int, int]:
         parent = os.path.join(base, "parent")
         os.makedirs(parent)
         alias = os.path.join(parent, "alias")
-        made = subprocess.run(["cmd", "/c", "mklink", "/J", alias, real_dir], capture_output=True)
+        made = _mklink(alias, real_dir)
         if made.returncode != 0:
             print("SKIP ancestor junction")
         else:
@@ -257,7 +270,7 @@ def _private_root_memo() -> tuple[int, int]:
             os.rmdir(alias)
             real2 = os.path.join(base, "real2")
             os.rename(real_dir, real2)
-            again = subprocess.run(["cmd", "/c", "mklink", "/J", alias, real2], capture_output=True)
+            again = _mklink(alias, real2)
             if again.returncode != 0:
                 print("SKIP ancestor retarget")
             else:
@@ -301,8 +314,8 @@ def _private_root_memo() -> tuple[int, int]:
         os.makedirs(new_t)
         with open(os.path.join(old_t, "note.txt"), "w", encoding="utf-8") as f:
             f.write("old")
-        hop_made = subprocess.run(["cmd", "/c", "mklink", "/J", hop, old_t], capture_output=True)
-        cfg_made = subprocess.run(["cmd", "/c", "mklink", "/J", configured, hop], capture_output=True)
+        hop_made = _mklink(hop, old_t)
+        cfg_made = _mklink(configured, hop)
         if hop_made.returncode != 0 or cfg_made.returncode != 0:
             print("SKIP two-hop private-root junctions")
         else:
@@ -315,7 +328,7 @@ def _private_root_memo() -> tuple[int, int]:
             env_before = os.environ.get("PBZ_PRIVATE_ROOT")
             cfg_before = os.lstat(configured)
             os.rmdir(hop)
-            hop_again = subprocess.run(["cmd", "/c", "mklink", "/J", hop, new_t], capture_output=True)
+            hop_again = _mklink(hop, new_t)
             if hop_again.returncode != 0:
                 print("SKIP two-hop hop retarget")
             else:
@@ -360,8 +373,8 @@ def _private_root_memo() -> tuple[int, int]:
         os.makedirs(store_old)
         with open(os.path.join(store_old, "note.txt"), "w", encoding="utf-8") as f:
             f.write("old")
-        hop2_made = subprocess.run(["cmd", "/c", "mklink", "/J", hop2, old2], capture_output=True)
-        cfg2_made = subprocess.run(["cmd", "/c", "mklink", "/J", configured2, hop2], capture_output=True)
+        hop2_made = _mklink(hop2, old2)
+        cfg2_made = _mklink(configured2, hop2)
         if hop2_made.returncode != 0 or cfg2_made.returncode != 0:
             print("SKIP descendant two-hop private-root junctions")
         else:
@@ -377,7 +390,7 @@ def _private_root_memo() -> tuple[int, int]:
             leaf_before = os.lstat(leaf)
             os.rmdir(hop2)
             os.rename(old2, new2)
-            hop2_again = subprocess.run(["cmd", "/c", "mklink", "/J", hop2, new2], capture_output=True)
+            hop2_again = _mklink(hop2, new2)
             if hop2_again.returncode != 0:
                 print("SKIP descendant hop retarget")
             else:
@@ -426,11 +439,10 @@ def _private_root_memo() -> tuple[int, int]:
         os.makedirs(store3)
         with open(os.path.join(store3, "note.txt"), "w", encoding="utf-8") as f:
             f.write("old")
-        hop3_made = subprocess.run(["cmd", "/c", "mklink", "/J", hop3, old3], capture_output=True)
+        hop3_made = _mklink(hop3, old3)
         # configured points at hop/leaf (ordinary dir under the hop junction).
         cfg3_target = os.path.join(hop3, "leaf")
-        cfg3_made = subprocess.run(["cmd", "/c", "mklink", "/J", configured3, cfg3_target],
-                                   capture_output=True)
+        cfg3_made = _mklink(configured3, cfg3_target)
         if hop3_made.returncode != 0 or cfg3_made.returncode != 0:
             print("SKIP nested-target private-root junctions")
         else:
@@ -446,7 +458,7 @@ def _private_root_memo() -> tuple[int, int]:
             leaf3_before = os.lstat(leaf3)
             os.rmdir(hop3)
             os.rename(old3, new3)
-            hop3_again = subprocess.run(["cmd", "/c", "mklink", "/J", hop3, new3], capture_output=True)
+            hop3_again = _mklink(hop3, new3)
             if hop3_again.returncode != 0:
                 print("SKIP nested-target hop retarget")
             else:
@@ -496,8 +508,7 @@ def _private_root_memo() -> tuple[int, int]:
         os.makedirs(store_d)
         with open(os.path.join(store_d, "note.txt"), "w", encoding="utf-8") as f:
             f.write("old")
-        deep_made = subprocess.run(["cmd", "/c", "mklink", "/J", configured_d, old_d],
-                                   capture_output=True)
+        deep_made = _mklink(configured_d, old_d)
         if deep_made.returncode != 0:
             print("SKIP deep-nest private-root junction")
         else:
@@ -516,8 +527,7 @@ def _private_root_memo() -> tuple[int, int]:
             leaf_d_before = os.lstat(leaf_d)
             os.rmdir(configured_d)
             os.rename(old_d, new_d)
-            deep_again = subprocess.run(["cmd", "/c", "mklink", "/J", configured_d, new_d],
-                                        capture_output=True)
+            deep_again = _mklink(configured_d, new_d)
             if deep_again.returncode != 0:
                 print("SKIP deep-nest retarget")
             else:
@@ -580,9 +590,8 @@ def _private_root_memo() -> tuple[int, int]:
             f.write("old")
         with open(os.path.join(new_rl, "note.txt"), "w", encoding="utf-8") as f:
             f.write("new")
-        hop_rl_made = subprocess.run(["cmd", "/c", "mklink", "/J", hop_rl, old_rl], capture_output=True)
-        cfg_rl_made = subprocess.run(["cmd", "/c", "mklink", "/J", configured_rl, hop_rl],
-                                     capture_output=True)
+        hop_rl_made = _mklink(hop_rl, old_rl)
+        cfg_rl_made = _mklink(configured_rl, hop_rl)
         if hop_rl_made.returncode != 0 or cfg_rl_made.returncode != 0:
             print("SKIP readlink-fail private-root junctions")
         else:
@@ -608,8 +617,7 @@ def _private_root_memo() -> tuple[int, int]:
                     failures += 1
             failing["on"] = False
             os.rmdir(hop_rl)
-            hop_rl_again = subprocess.run(["cmd", "/c", "mklink", "/J", hop_rl, new_rl],
-                                          capture_output=True)
+            hop_rl_again = _mklink(hop_rl, new_rl)
             if hop_rl_again.returncode != 0:
                 print("SKIP readlink-fail hop retarget")
             else:
@@ -626,7 +634,7 @@ def _private_root_memo() -> tuple[int, int]:
         planted = os.path.join(target, "CANARY-NAME.txt")
         with open(planted, "w", encoding="utf-8") as f:
             f.write("y")
-        made = subprocess.run(["cmd", "/c", "mklink", "/J", missing, target], capture_output=True)
+        made = _mklink(missing, target)
         if made.returncode != 0:
             print("SKIP private-root junction")
             return failures, checks
@@ -640,7 +648,7 @@ def _private_root_memo() -> tuple[int, int]:
         with open(moved, "w", encoding="utf-8") as f:
             f.write("z")
         os.rmdir(missing)
-        again = subprocess.run(["cmd", "/c", "mklink", "/J", missing, other], capture_output=True)
+        again = _mklink(missing, other)
         if again.returncode != 0:
             print("SKIP private-root retarget")
             return failures, checks

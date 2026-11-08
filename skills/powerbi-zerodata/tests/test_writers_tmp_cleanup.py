@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
+sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 from pbz import images, mirror  # noqa: E402
 from pbz.common import PbzError, commit_bytes, write_bytes, write_text  # noqa: E402
@@ -62,9 +63,14 @@ class WriterTmpCleanupTests(unittest.TestCase):
         self._assert_clean()
 
     def _junction(self, link: str, target: str) -> None:
-        made = subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True)
-        if made.returncode != 0:
-            self.skipTest("creating a junction is unavailable")
+        from _junction import make_junction
+        make_junction(self, link, target)
+
+    def test_missing_mklink_skips_instead_of_erroring(self):
+        import _junction
+        with patch.object(_junction.subprocess, "run", side_effect=FileNotFoundError("cmd")):
+            with self.assertRaises(unittest.SkipTest):
+                _junction.make_junction(self, os.path.join(self.tmp.name, "missing-link"), self.tmp.name)
 
     def test_junction_destination_and_temp_are_not_followed(self):
         real = os.path.join(self.tmp.name, "real")

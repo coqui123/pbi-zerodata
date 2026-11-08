@@ -5,7 +5,7 @@ import copy
 import json
 import os
 
-from .common import PbzError, Workspace, _contained, _reparse_link, write_text
+from .common import PbzError, Workspace, pbz_state_path, write_text
 
 DEFAULT = {
     "version": 1,
@@ -30,13 +30,7 @@ def _guard_policy_paths(ws: Workspace) -> str:
     The trust root is the workspace root. Using `.pbz` itself would treat a junction
     there as a trusted boundary.
     """
-    pbz = os.path.join(ws.root, ".pbz")
-    path = os.path.join(pbz, "policy.json")
-    if _reparse_link(pbz) or _reparse_link(path):
-        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-    if os.path.lexists(pbz) or os.path.lexists(path):
-        _contained(path, ws.root)
-    return path
+    return pbz_state_path(ws, "policy.json")
 
 
 def load(ws: Workspace) -> dict:

@@ -209,10 +209,9 @@ class ConsentTests(unittest.TestCase):
         try:
             os.symlink(real, alias, target_is_directory=True)
         except OSError:
-            import subprocess
-            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(real)], capture_output=True)
-            if made.returncode != 0:
-                self.skipTest("directory alias unavailable")
+            sys.path.insert(0, str(SKILL / "tests"))
+            from _junction import make_junction
+            make_junction(self, str(alias), str(real))
         self.ws.private = str(alias)
         with self.assertRaises(PbzError) as raised:
             consent.request(self.ws, str(note))
@@ -251,6 +250,80 @@ class ConsentTests(unittest.TestCase):
         result=consent.status(self.ws)
         self.assertEqual(result['requests'][0]['id'],r['id'])
         self.assertNotIn('CANARY',json.dumps(result))
+
+    def test_swapped_handle_is_refused_before_content(self):
+        p = self.source(data=b'SYNTHETIC')
+        other = self.source('other.txt', b'CANARY_SWAPPED')
+        reads = []
+        closed = []
+        real_open = os.open
+        real_fdopen = os.fdopen
+
+        def swap(path, flags, mode=0o777):
+            if os.path.abspath(path) == os.path.abspath(str(p)):
+                return real_open(str(other), flags)
+            return real_open(path, flags, mode)
+
+        def wrap_fdopen(fd, mode='r', *args, **kwargs):
+            handle = real_fdopen(fd, mode, *args, **kwargs)
+            orig_read = handle.read
+            orig_close = handle.close
+
+            def tracked(*a, **k):
+                reads.append(b'read')
+                return orig_read(*a, **k)
+
+            def track_close(*a, **k):
+                closed.append(True)
+                return orig_close(*a, **k)
+
+            handle.read = tracked
+            handle.close = track_close
+            return handle
+
+        # Positive control: wrapping fdopen observes a real content read.
+        with patch('os.fdopen', wrap_fdopen):
+            consent.request(self.ws, str(p))
+        self.assertEqual(reads, [b'read'])
+        self.assertTrue(closed)
+        reads.clear()
+        closed.clear()
+        # Clear the receipt from the positive-control request.
+        import shutil
+        store = self.private / 'source-consents'
+        if store.exists():
+            shutil.rmtree(store)
+
+        with patch('os.open', swap), patch('os.fdopen', wrap_fdopen):
+            with self.assertRaises(PbzError) as raised:
+                consent.request(self.ws, str(p))
+        self.assertEqual(raised.exception.code, 'SOURCE_CHANGED')
+        self.assertNotIn('CANARY', str(raised.exception))
+        self.assertEqual(reads, [])
+        self.assertTrue(closed)
+        self.assertFalse(store.exists())
+        link = self.root / 'linked.txt'
+        try:
+            os.link(other, link)
+        except OSError:
+            self.skipTest('Hard links unavailable')
+        reads.clear()
+        closed.clear()
+        with patch('os.fdopen', wrap_fdopen):
+            with self.assertRaises(PbzError) as raised:
+                consent.request(self.ws, str(link))
+        self.assertEqual(raised.exception.code, 'UNSAFE_PATH')
+        self.assertEqual(reads, [])
+        approved = consent.request(self.ws, str(p))
+        self.approve(approved)
+        reads.clear()
+        closed.clear()
+        with patch('os.open', swap), patch('os.fdopen', wrap_fdopen):
+            with self.assertRaises(PbzError) as raised:
+                consent.read(self.ws, approved['id'])
+        self.assertNotIn('CANARY', str(raised.exception))
+        self.assertEqual(reads, [])
+        self.assertTrue(closed)
 
 
 if __name__=='__main__':unittest.main()

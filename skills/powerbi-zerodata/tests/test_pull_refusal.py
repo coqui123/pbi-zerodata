@@ -111,6 +111,37 @@ class PullRefusalTests(unittest.TestCase):
         blob = b"".join(file_map(self.ws.mirror).values())
         self.assertNotIn(b"CANARY-SECRET", blob)
 
+    def test_malformed_visual_cli_envelope_is_refused(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from pbz import cli
+        files = mirror.project_files(self.project)
+        rel, real = next((rel, real) for rel, real in files if rel.lower().endswith("/visual.json"))
+        with open(real, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"name": "CANARY-SECRET",}')
+        buf = io.StringIO()
+        private = os.path.join(self.tmp.name, "cli-private")
+        os.makedirs(private, exist_ok=True)
+        with redirect_stdout(buf):
+            old = os.environ.get("PBZ_PRIVATE_ROOT")
+            os.environ["PBZ_PRIVATE_ROOT"] = private
+            try:
+                rc = cli.main(["--workspace", self.ws.root, "pull", "--force"])
+            finally:
+                if old is None:
+                    os.environ.pop("PBZ_PRIVATE_ROOT", None)
+                else:
+                    os.environ["PBZ_PRIVATE_ROOT"] = old
+        text = buf.getvalue()
+        body = json.loads(text)
+        self.assertEqual(rc, 2)
+        self.assertEqual(body["error"], "REFUSED")
+        self.assertEqual(body["detail"], rel)
+        self.assertNotEqual(body["error"], "INTERNAL_ERROR")
+        self.assertNotEqual(body.get("result"), "PULLED")
+        self.assertNotIn("CANARY-SECRET", text)
+
     def test_deep_nesting_refuses_without_echo(self):
         files = mirror.project_files(self.project)
         rel, real = next((rel, real) for rel, real in files if rel.lower().endswith("/page.json"))
@@ -333,6 +364,40 @@ class PullRefusalTests(unittest.TestCase):
         finally:
             os.rmdir(report)
             os.rename(held, report)
+
+
+    def test_tokenize_pbir_callers_stay_in_mirror(self):
+        import pathlib
+        from unittest.mock import patch
+        from pbz import tokens
+        root = pathlib.Path(__file__).resolve().parents[1] / "pbz"
+        hits = []
+        for path in sorted(root.glob("*.py")):
+            if path.name == "tokens.py":
+                continue
+            text = path.read_text(encoding="utf-8")
+            if "tokenize_pbir(" in text:
+                hits.append(path.name)
+        self.assertEqual(hits, ["mirror.py"])
+        mirror_text = (root / "mirror.py").read_text(encoding="utf-8")
+        self.assertRegex(mirror_text, r"def _tokenize\(")
+        self.assertIn("tokens.tokenize_pbir(", mirror_text)
+        self.assertRegex(
+            mirror_text,
+            r"except PbzError as err:\s*\n\s*if err\.code == \"REFUSED\":\s*\n\s*raise PbzError\(\"REFUSED\", rel\)",
+        )
+        files = mirror.project_files(self.project)
+        rel, _real = next(pair for pair in files if not pair[0].lower().endswith(".tmdl"))
+
+        def boom(*_a, **_k):
+            raise common.PbzError("REFUSED", "CANARY-SECRET-DETAIL")
+
+        with patch.object(tokens, "tokenize_pbir", boom):
+            with self.assertRaises(common.PbzError) as caught:
+                mirror.pull(self.ws, self.project, force=True)
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(caught.exception.detail, rel)
+        self.assertNotIn("CANARY-SECRET-DETAIL", str(caught.exception))
 
 
 if __name__ == "__main__":
