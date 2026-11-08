@@ -120,6 +120,21 @@ class CliMcpParityTests(unittest.TestCase):
             exposed = {spec[0] for tool in tools for spec in tool.opts.values()}
             self.assertIn("--dry-run", exposed, name)
 
+    def test_touched_refusal_codes_share_the_envelope(self):
+        """CLI and MCP both emit through outcomes.envelope. Touched Round 17 codes stay closed."""
+        from pbz.outcomes import envelope
+        unavailable, rc = envelope({"ok": False, "error": "ENGINE_UNAVAILABLE"})
+        self.assertEqual(unavailable["outcome"]["status"], "UNAVAILABLE")
+        self.assertEqual(unavailable["outcome"]["code"], "ENGINE_UNAVAILABLE")
+        self.assertEqual(unavailable["error"], "ENGINE_UNAVAILABLE")
+        self.assertEqual(rc, 4)
+        for code in ("REFUSED", "UNSAFE_PATH", "HUMAN_ONLY", "NOT_RECORDED"):
+            wrapped, code_rc = envelope({"ok": False, "error": code})
+            self.assertEqual(wrapped["error"], code)
+            self.assertEqual(wrapped["outcome"]["code"], code)
+            self.assertNotEqual(wrapped["outcome"]["status"], "SUCCEEDED")
+            self.assertNotEqual(code_rc, 0)
+
     def test_preview_spec_is_an_object(self):
         flag, schema, mode = mcp.BY_NAME["preview"].opts["spec"]
         self.assertEqual(flag, "--spec")

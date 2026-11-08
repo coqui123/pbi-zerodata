@@ -22,8 +22,9 @@ import io
 import json
 import os
 import re
+import stat
 
-from .common import PbzError, commit_bytes
+from .common import PbzError, _reparse_link, anchor_mirror, commit_bytes, preflight_regular, read_checked
 
 ALLOWED = {"set", "rename", "move", "new", "relationship", "add", "style", "filter", "interaction", "link",
            "bookmark", "copy", "hierarchy", "format-expr", "function", "culture", "translate", "perspective", "role",
@@ -31,19 +32,59 @@ ALLOWED = {"set", "rename", "move", "new", "relationship", "add", "style", "filt
            "unused", "lineage", "describe", "image"}
 
 
+def _gather(base: str) -> list[str]:
+    """Regular files under `base`. A junction or hard link is refused before it is opened or entered."""
+    if not os.path.lexists(base):
+        return []
+    if _reparse_link(base):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    found: list[str] = []
+    stack = [base]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as scan:
+                entries = list(scan)
+        except OSError:
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+        for entry in entries:
+            path = entry.path
+            if _reparse_link(path):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            try:
+                info = os.lstat(path)
+            except OSError:
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+            if stat.S_ISDIR(info.st_mode):
+                stack.append(path)
+            elif stat.S_ISREG(info.st_mode):
+                if getattr(info, "st_nlink", 1) != 1:
+                    raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+                found.append(path)
+            else:
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    return found
+
+
 def _snapshot(ws, project) -> dict[str, bytes]:
-    snap = {}
+    """Anchor the mirror, refuse aliases, then read. Listing and preflight happen before any content read."""
+    root = anchor_mirror(ws)
+    paths: list[str] = []
     for base in (project.mirror_model, project.mirror_report):
-        for cur, _dirs, files in os.walk(base):
-            for f in files:
-                p = os.path.join(cur, f)
-                with open(p, "rb") as h:
-                    snap[os.path.relpath(p, ws.mirror)] = h.read()
+        paths.extend(_gather(base))
+    for path in paths:
+        preflight_regular(path, root=root)
+    snap = {}
+    for path in paths:
+        snap[os.path.relpath(path, root)] = read_checked(path, root=root)
     return snap
 
 
 def _restore(ws, project, snap: dict[str, bytes]) -> int:
-    now = _snapshot(ws, project)
+    try:
+        now = _snapshot(ws, project)
+    except PbzError:
+        raise PbzError("RECOVERY_REQUIRED", "the recipe could not be restored") from None
     ops = []
     for rel, data in snap.items():
         if now.get(rel) != data:
@@ -53,7 +94,7 @@ def _restore(ws, project, snap: dict[str, bytes]) -> int:
     if not ops:
         return 0
     try:
-        commit_bytes(ops)
+        commit_bytes(ops, root=ws.mirror)
     except PbzError:
         raise PbzError("RECOVERY_REQUIRED", "the recipe could not be restored") from None
     return len(ops)
@@ -189,7 +230,11 @@ def run(ws, project, spec: str, params: dict | None = None, dry_run: bool = Fals
             if failed:
                 break
         if not failed:
-            now = _snapshot(ws, project)
+            try:
+                now = _snapshot(ws, project)
+            except PbzError:
+                # A link planted while a step ran cannot be rolled back by walking it.
+                raise PbzError("RECOVERY_REQUIRED", "the recipe could not be restored") from None
             changed = sorted(rel.replace("\\", "/") for rel, data in now.items() if snap.get(rel) != data)
             removed = sorted(rel.replace("\\", "/") for rel in set(snap) - set(now))
             if limits.get("max_files") is not None and len(changed) + len(removed) > int(limits["max_files"]):

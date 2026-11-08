@@ -195,9 +195,9 @@ def build(ws, project, include_all: bool = False) -> dict:
                 pjson = os.path.join(project.mirror_report, "definition", "pages", pid, "page.json")
                 pname = pid
                 try:
-                    with open(pjson, encoding="utf-8-sig") as f:
-                        pname = json.load(f).get("displayName", pid)
-                except (OSError, ValueError):
+                    raw = read_checked(pjson, root=ws.mirror)
+                    pname = json.loads(raw.decode("utf-8-sig")).get("displayName", pid)
+                except (OSError, ValueError, UnicodeError, PbzError):
                     pass
                 pages.setdefault(pname, set()).add(f"{vid}: layout/format/binding changed" if vid else "page settings changed")
             elif obj.strip():

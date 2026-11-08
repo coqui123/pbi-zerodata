@@ -599,3 +599,21 @@ Consent checks the opened handle before it reads. Requirement proofs store the m
 revision and the saved real revision together, and a check result is kept only when it
 matches the registered ids. A late push-log append after a committed push is still
 `POST_COMMIT_HISTORY`. None of this is crash-proof, and it is not OS isolation.
+
+## Round 17 parity
+
+Evidence and synth-test state are anchored at the workspace root. The evidence log is capped
+at 1 MiB; nothing rotates it. Over-cap recovery is to archive or remove `.pbz/evidence.jsonl`
+by hand, which also discards `HUMAN_ACCEPTED` history with the file. A present policy that
+cannot be trusted fails closed (broker `REFUSED` / `UNSAFE_PATH`, guard lockdown) instead of
+falling back to shape disclosure. `diff --patch` and `push` refuse an aliased or hardlinked
+mirror file; other mirror readers still do not check link counts. Recipe snapshot and restore
+use the mirror as the trust root: an aliased directory or hardlinked leaf is refused before any
+step, and a link planted while a step runs is `RECOVERY_REQUIRED` without being followed. Freshness class `OTHER` is
+`ENGINE_UNAVAILABLE`. Interactions static honesty stays deferred to Round 18. Rollback is still
+exception-only. Documented residuals: shell content writes; script-built policy paths;
+script-level policy deletion; recursive directory copy/move that implicitly carries `.pbz`;
+recursive deletion of a workspace root or ancestor; script-scanning false positives; ancestor
+inspection failures that force lockdown; other mirror readers that do not check link counts;
+guard-log hardening (deferred). Unusable policy recovery: fix or remove `.pbz/policy.json` by
+hand in your own terminal. This is not OS isolation.

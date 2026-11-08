@@ -13,7 +13,7 @@ import uuid
 from . import desktop, policy as policy_mod, tmdl, tokens, validate
 from .classify import Classifier
 from .common import (PbzError, Project, Workspace, _contained, _reparse_link, anchor_mirror, append_checked,
-                    commit_bytes, file_sha, pbz_state_path, preflight_regular, read_text, remove_file,
+                    commit_bytes, file_sha, pbz_state_path, preflight_regular, read_checked, read_text, remove_file,
                     replace_bytes, sha, write_text)
 
 SKIP_DIRS = {".pbi", "daxqueries", "tmdlscripts", "customvisuals", "node_modules"}  # cultures: mirrored, see tokens
@@ -152,7 +152,37 @@ def _detokenize(rel: str, text: str, tm) -> tuple[str, list[str]]:
     return tokens.detokenize_pbir(text, tm)
 
 
-def mirror_changes(ws: Workspace, project: Project, man: dict) -> dict:
+def _checked_raw(path: str, root: str) -> bytes | None:
+    """Bytes of a present regular file. Missing is None. An alias or hard link is REFUSED, path only."""
+    if not os.path.lexists(path):
+        return None
+    rel = os.path.relpath(path, root).replace("\\", "/")
+    try:
+        preflight_regular(path, root=root)
+        return read_checked(path, root=root)
+    except PbzError as err:
+        if err.code == "UNSAFE_PATH":
+            raise PbzError("REFUSED", rel) from None
+        raise
+
+
+def _split_bom(raw: bytes) -> tuple[str, bytes]:
+    bom = raw[:3] if raw.startswith(b"\xef\xbb\xbf") else b""
+    return raw[len(bom):].decode("utf-8"), bom
+
+
+def _post_mirror_hash(ws, rel: str) -> str | None:
+    """Checked hash of a present mirror file. Missing stays None so the caller reports CONFLICT."""
+    path = os.path.join(ws.mirror, *rel.split("/"))
+    raw = _checked_raw(path, ws.mirror)
+    if raw is None:
+        return None
+    return hashlib.sha256(raw).hexdigest()
+
+
+def mirror_changes(ws: Workspace, project: Project, man: dict, *, checked: bool = False) -> dict:
+    if checked:
+        anchor_mirror(ws)
     files = man.get("files", {})
     changed, added, deleted = [], [], []
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
@@ -161,7 +191,15 @@ def mirror_changes(ws: Workspace, project: Project, man: dict) -> dict:
         if _path_outside_project(p, rel, ws, project):
             changed.append(rel)
             continue
-        h = file_sha(p)
+        if checked:
+            # Missing stays deleted. Do not fall through to bare file_sha (TOCTOU / hardlink).
+            if not os.path.lexists(p):
+                h = None
+            else:
+                raw = _checked_raw(p, ws.mirror)
+                h = hashlib.sha256(raw).hexdigest() if raw is not None else None
+        else:
+            h = file_sha(p)
         if h is None:
             deleted.append(rel)
         elif h != info.get("mirror"):
@@ -443,15 +481,19 @@ def diff(ws: Workspace, project: Project, patch: bool = False) -> dict:
     man = load_manifest(ws, project)
     if not man:
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    ch = mirror_changes(ws, project, man)
+    if patch:
+        anchor_mirror(ws)
+    ch = mirror_changes(ws, project, man, checked=patch)
     out = {"verb": "diff", "project": project.name, **ch}
     if patch:
         lines = []
         for rel in ch["changed"] + ch["added"]:
             a_path = os.path.join(base_dir(ws, project), *rel.split("/"))
             b_path = os.path.join(ws.mirror, *rel.split("/"))
-            a = read_text(a_path)[0].splitlines(keepends=True) if os.path.exists(a_path) else []
-            b = read_text(b_path)[0].splitlines(keepends=True)
+            a_raw = _checked_raw(a_path, ws.private) if os.path.lexists(a_path) else b""
+            b_raw = _checked_raw(b_path, ws.mirror)
+            a = _split_bom(a_raw or b"")[0].splitlines(keepends=True)
+            b = _split_bom(b_raw or b"")[0].splitlines(keepends=True)
             lines.extend(difflib.unified_diff(a, b, f"base/{rel}", f"mirror/{rel}"))
         out["patch"] = "".join(lines)
     return out
@@ -747,11 +789,12 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
     man = load_manifest(ws, project)
     if not man:
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    anchor_mirror(ws)
     blocked = excluded_mirror_additions(ws, project)
     if blocked:
         return {"verb": "push", "project": project.name, "result": "REFUSED",
                 "files": blocked, "hint": "files under excluded directories are not part of the model"}
-    ch, held = _select(mirror_changes(ws, project, man), only)
+    ch, held = _select(mirror_changes(ws, project, man, checked=True), only)
     if not any(ch.values()) and not preflight_only:
         return {"verb": "push", "project": project.name, "result": "NOTHING_TO_PUSH",
                 **({"held_back": held} if held else {})}
@@ -797,7 +840,11 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
     captured_mirror: dict[str, tuple[str, bytes]] = {}
     unknown_all: list[str] = []
     for rel in ch["changed"] + ch["added"]:
-        mtext, bom = read_text(os.path.join(ws.mirror, *rel.split("/")))
+        raw = _checked_raw(os.path.join(ws.mirror, *rel.split("/")), ws.mirror)
+        if raw is None:
+            return {"verb": "push", "project": project.name, "result": "CONFLICT",
+                    "hint": "project files changed during validation; pull and retry"}
+        mtext, bom = _split_bom(raw)
         captured_mirror[rel] = (mtext, bom)
         rtext, unknown = _detokenize(rel, mtext, tm)
         unknown_all += unknown
@@ -841,7 +888,7 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
         images.delete(imgs_drop, os.path.join(stage, project.name + ".Report"), root=ws.private)
         findings = validate.run_stage(ws, project, stage, tm)
         if any(file_sha(_real_path(ws, rel)) != pre_real[rel] for rel in pre_real) or \
-                any(file_sha(os.path.join(ws.mirror, *rel.split("/"))) != pre_mirror[rel] for rel in pre_mirror):
+                any(_post_mirror_hash(ws, rel) != pre_mirror[rel] for rel in pre_mirror):
             return {"verb": "push", "project": project.name, "result": "CONFLICT",
                     "hint": "project files changed during validation; pull and retry"}
         errors = [f for f in findings if f["severity"] == "error"]
@@ -851,8 +898,9 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
             bpath = os.path.join(base_dir(ws, project), *rel.split("/"))
             if os.path.exists(bpath):
                 old = read_text(bpath)[0]
-            mp = os.path.join(ws.mirror, *rel.split("/"))
-            new = read_text(mp)[0] if os.path.exists(mp) else None
+            # Changed/added text came from the checked capture. Deleted entries stay None —
+            # never reopen the mirror (a recreated alias must not be read for the summary).
+            new = captured_mirror[rel][0] if rel in captured_mirror else None
             summary += _object_summary(rel, old, new)
         if errors or dry_run or preflight_only:
             return {"verb": "push", "project": project.name, "result": "INVALID" if errors else "DRY_RUN_OK",

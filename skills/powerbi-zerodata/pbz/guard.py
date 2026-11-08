@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import base64
 import datetime as _dt
+import fnmatch
 import json
 import os
 import re
+import stat
 import sys
 
 POLICY_REL = os.path.join(".pbz", "policy.json")
@@ -153,15 +155,126 @@ def glob_to_regex(glob: str) -> re.Pattern:
     return re.compile("^" + out + "$")
 
 
-def read_policy_file(d: str) -> dict | None:
+def security_values_ok(data) -> bool:
+    """Same closed table as policy.security_values_ok. Unknown keys are kept. Absent keys are not checked."""
+    if not isinstance(data, dict):
+        return False
+    if "version" in data and (type(data["version"]) is not int or data["version"] != 1):
+        return False
+    if "synthetic" in data and type(data["synthetic"]) is not bool:
+        return False
+    if "disclosure" in data and data["disclosure"] not in ("shape", "strict"):
+        return False
+    if "literals" in data and data["literals"] != "strict":
+        return False
+    for key in ("deny", "allow", "deny_scripts", "sensitive_hosts", "category_columns",
+                "sensitive_columns", "reveal_columns", "memory_dirs"):
+        if key in data:
+            value = data[key]
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                return False
+    if "budgets" in data:
+        budgets = data["budgets"]
+        if (not isinstance(budgets, dict)
+                or any(type(value) is not int or value < 0 for value in budgets.values())):
+            return False
+    if "category_max" in data and (type(data["category_max"]) is not int or data["category_max"] < 0):
+        return False
+    return True
+
+
+def _lockdown() -> dict:
+    """Fail closed: strict disclosure and deny-all. Not an empty or synthetic policy."""
+    return {"_pbz_lockdown": True, "disclosure": "strict", "deny": ["**/*"], "allow": [], "synthetic": False}
+
+
+_LINK_TAGS = (0xA000000C, 0xA0000003)
+
+
+def _is_link(path: str) -> bool:
     try:
-        with open(os.path.join(d, POLICY_REL), encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if os.path.islink(path):
+        return True
+    return getattr(info, "st_reparse_tag", None) in _LINK_TAGS
+
+
+def _policy_absent(d: str) -> bool:
+    """True only when `.pbz` is missing, or a real `.pbz` directory has no policy file.
+
+    Links and inspection failures are present/unusable (not absent).
+    """
+    pbz = os.path.join(d, ".pbz")
+    try:
+        info = os.lstat(pbz)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if (os.path.islink(pbz) or getattr(info, "st_reparse_tag", None) in _LINK_TAGS
+            or not stat.S_ISDIR(info.st_mode)):
+        return False
+    try:
+        os.lstat(os.path.join(pbz, "policy.json"))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def read_policy_file(d: str) -> dict | None:
+    """None only when the policy file is absent. A present file that cannot be trusted is lockdown."""
+    pbz = os.path.join(d, ".pbz")
+    try:
+        pbz_info = os.lstat(pbz)
     except FileNotFoundError:
         return None
-    except (OSError, ValueError):
-        return {}
+    except OSError:
+        return _lockdown()
+    if (os.path.islink(pbz) or getattr(pbz_info, "st_reparse_tag", None) in _LINK_TAGS
+            or not stat.S_ISDIR(pbz_info.st_mode)):
+        return _lockdown()
+    path = os.path.join(d, POLICY_REL)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _lockdown()
+    try:
+        if _is_link(path):
+            return _lockdown()
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            return _lockdown()
+        with open(path, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_dev != before.st_dev or info.st_ino != before.st_ino):
+                return _lockdown()
+            after = os.lstat(path)
+            # Re-check the .pbz directory boundary after open — a mid-flight junction swap
+            # can make leaf identity agree on an external policy.json.
+            try:
+                again = os.lstat(pbz)
+            except OSError:
+                return _lockdown()
+            if (after.st_dev != before.st_dev or after.st_ino != before.st_ino or _is_link(path)
+                    or os.path.islink(pbz) or getattr(again, "st_reparse_tag", None) in _LINK_TAGS
+                    or not stat.S_ISDIR(again.st_mode)):
+                return _lockdown()
+            raw = handle.read()
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        data = json.loads(raw.decode("utf-8"))
+        if not security_values_ok(data):
+            return _lockdown()
+        return data
+    except Exception:
+        return _lockdown()
 
 
 def is_workspace_root(d: str) -> bool:
@@ -213,7 +326,11 @@ def find_root(path: str) -> str | None:
 def synthetic(path: str) -> bool:
     key = norm(path)
     if key not in _SYN:
-        _SYN[key] = any((read_policy_file(d) or {}).get("synthetic") is True for d in ancestors(key))
+        root = find_root(key)
+        if root and (read_policy_file(root) or {}).get("_pbz_lockdown"):
+            _SYN[key] = False
+        else:
+            _SYN[key] = any((read_policy_file(d) or {}).get("synthetic") is True for d in ancestors(key))
     return _SYN[key]
 
 
@@ -366,6 +483,33 @@ def global_denied(path: str) -> bool:
     return any(re.search(p, path) for p in GLOBAL_DENY_PATTERNS)
 
 
+def _mirror_blocked(path: str, root: str) -> bool:
+    """Reparse component from the mirror root through the leaf, or a hardlinked file leaf."""
+    mirror = root.rstrip("/") + "/" + MIRROR_DIR
+    if path != mirror and not path.startswith(mirror + "/"):
+        return False
+    if _is_link(mirror):
+        return True
+    if path == mirror:
+        return False
+    cur = mirror
+    parts = path[len(mirror) + 1:].split("/")
+    for index, part in enumerate(parts):
+        if not part:
+            continue
+        cur = cur + "/" + part
+        if _is_link(cur):
+            return True
+        if index == len(parts) - 1:
+            try:
+                info = os.lstat(cur)
+            except OSError:
+                return False
+            if stat.S_ISREG(info.st_mode) and getattr(info, "st_nlink", 1) != 1:
+                return True
+    return False
+
+
 def classify_path(path: str) -> str | None:
     """Reason key if content access to path is denied, else None."""
     if global_denied(path):
@@ -373,11 +517,15 @@ def classify_path(path: str) -> str | None:
     root = active_root(path)
     if not root:
         return None
+    pol = load_policy(root)
+    if pol.get("_pbz_lockdown"):
+        return "error"
     r = rel(path, root)
     parts = r.split("/")
     if parts[0] == MIRROR_DIR:
+        if _mirror_blocked(path, root):
+            return "definition"
         return None
-    pol = load_policy(root)
     if any(glob_to_regex(g).match(r) for g in pol.get("allow", [])):
         return None
     if any(p.endswith(".semanticmodel") or p.endswith(".report") for p in parts):
@@ -455,6 +603,18 @@ def looks_like_path(t: str) -> bool:
     if re.match(r"^[a-zA-Z]:[\\/]", t) or t.startswith(("/", "./", "../", ".\\", "..\\", "~")):
         return True
     return "/" in t or "\\" in t or bool(re.search(r"\.[A-Za-z0-9]{1,6}$", t))
+
+
+def _lexical_definition(token: str) -> bool:
+    """True when a token names a real model or report folder, including a `..` escape.
+
+    A `pbz-workspace` component is the mirror and stays allowed. Resolution can leave
+    the workspace, so this does not depend on `classify_path` finding an active root.
+    """
+    bits = [part.lower() for part in token.replace("\\", "/").split("/") if part not in ("", ".")]
+    if MIRROR_DIR.lower() in bits:
+        return False
+    return any(part.endswith(".semanticmodel") or part.endswith(".report") for part in bits)
 
 
 def interpreter_targets(toks: list[str]) -> tuple[list[str], list[str]]:
@@ -539,9 +699,221 @@ def split_heredocs(cmd: str) -> tuple[str, list[tuple[str, str]]]:
     return "\n".join(kept), bodies
 
 
-def check_shell(cmd: str, cwd: str) -> str | None:
+_POLICY_TEXT = re.compile(r"(?i)\.pbz[\\/]+policy\.json")
+_DELETE_VERBS = {"rm", "del", "erase", "rmdir", "rd", "remove-item", "ri"}
+_MOVE_VERBS = {"mv", "move", "mi", "move-item", "ren", "rename", "rni", "rename-item"}
+_COPY_VERBS = {"cp", "copy", "cpi", "copy-item", "xcopy", "robocopy"}
+_RENAME_VERBS = {"ren", "rename", "rni", "rename-item"}
+_NEW_VERBS = {"new-item", "ni"}
+_LINK_TYPES = {"hardlink", "symboliclink", "junction"}
+_ARG_PREFIX = re.compile(r"(?i)^-[A-Za-z][\w-]*:(.*)$")
+
+
+def strip_arg(token: str) -> str:
+    """Drop one leading `-<name>:` prefix and surrounding quotes.
+
+    Tokenization may leave an opening quote without the closer on colon-bound values
+    (`-ItemType:"HardLink"` → `-ItemType:"HardLink`); strip residual quote marks too.
+    """
+    text = token
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    matched = _ARG_PREFIX.match(text)
+    if matched:
+        text = matched.group(1)
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+            text = text[1:-1]
+        else:
+            text = text.strip("\"'")
+    return text
+
+
+def _path_bits(token: str) -> list[str]:
+    return [part for part in token.replace("\\", "/").split("/") if part not in ("", ".")]
+
+
+def _is_policy_file(token: str) -> bool:
+    bits = _path_bits(token)
+    return len(bits) >= 2 and bits[-2].lower() == ".pbz" and bits[-1].lower() == "policy.json"
+
+
+def _is_pbz_dir(token: str) -> bool:
+    bits = _path_bits(token)
+    return bool(bits) and bits[-1].lower() == ".pbz"
+
+
+def _ancestor_dir(path: str, session_root: str | None) -> bool:
+    if not session_root:
+        return False
+    path, root = norm(path), norm(session_root)
+    return path != root and root.startswith(path + "/")
+
+
+def _in_scope(path: str, session_root: str | None) -> bool:
+    """At or below an active root, or inside an ancestor of the session root."""
+    target = norm(path)
+    if active_root(target):
+        return True
+    if not session_root:
+        return False
+    root = norm(session_root)
+    if target == root or target.startswith(root + "/"):
+        return True
+    cursor = root
+    while True:
+        parent = norm(os.path.dirname(cursor))
+        if parent == cursor:
+            return False
+        if target == parent or target.startswith(parent + "/"):
+            return True
+        cursor = parent
+
+
+def _lexical_parent(base: str, token: str, index: int) -> str:
+    """Parent directory of bits[index] in token. Absolute tokens ignore cwd."""
+    parts = token.replace("\\", "/").split("/")
+    stripped = token.strip().strip("'\"")
+    absolute = (
+        bool(re.match(r"^[A-Za-z]:", stripped))
+        or stripped.startswith(("/", "\\"))
+        or bool(re.match(r"^/[a-zA-Z](/|$)", stripped))
+    )
+    if absolute:
+        prefix = "/".join(parts[:index])
+        if re.fullmatch(r"[A-Za-z]:", prefix or ""):
+            prefix = prefix + "/"
+        return norm(prefix) if prefix else norm(base)
+    cur = norm(base)
+    for part in parts[:index]:
+        if part in ("", "."):
+            continue
+        cur = norm(os.path.dirname(cur)) if part == ".." else norm(os.path.join(cur, part))
+    return cur
+
+
+def _wild_pbz(token: str, cur: str, session_root: str | None) -> bool:
+    """True when a wildcard can name `.pbz` or `.pbz/policy.json` in scope."""
+    if not any(ch in token for ch in "*?["):
+        return False
+    bits = token.replace("\\", "/").split("/")
+    visible = [(i, part) for i, part in enumerate(bits) if part not in ("", ".")]
+    for pos, (index, part) in enumerate(visible):
+        if not fnmatch.fnmatch(".pbz", part):
+            continue
+        parent = _lexical_parent(cur, token, index)
+        holds = os.path.lexists(os.path.join(parent, ".pbz"))
+        if not (active_root(parent) == norm(parent) or _ancestor_dir(parent, session_root) or holds):
+            continue
+        nxt = visible[pos + 1][1] if pos + 1 < len(visible) else None
+        if nxt is None or fnmatch.fnmatch("policy.json", nxt):
+            return True
+    return False
+
+
+def _rename_operands(raw_args: list[str]) -> tuple[str | None, str | None]:
+    """Source and new name for Rename-Item / ren.
+
+    Reads raw tokens (before strip_arg) so `-Path:` / `-NewName:` bindings survive in either order.
+    """
+    src = new = None
+    positional: list[str] = []
+    i = 0
+    while i < len(raw_args):
+        tok = raw_args[i]
+        bound = re.match(r"(?i)^-(path|literalpath|newname):(.*)$", tok)
+        if bound:
+            # strip_arg keeps the binding and clears residual tokenizer quotes
+            # (`-NewName:"policy.json` → policy.json).
+            name, val = bound.group(1).lower(), strip_arg(tok)
+            if name in ("path", "literalpath"):
+                src = val
+            else:
+                new = val
+            i += 1
+            continue
+        key = tok.lower()
+        if key in ("-path", "-literalpath") and i + 1 < len(raw_args):
+            src = strip_arg(raw_args[i + 1])
+            i += 2
+            continue
+        if key == "-newname" and i + 1 < len(raw_args):
+            new = strip_arg(raw_args[i + 1])
+            i += 2
+            continue
+        if key in ("-force", "-whatif", "-confirm", "-passthru", "-verbose", "-debug"):
+            i += 1
+            continue
+        if key in ("-erroraction", "-warningaction", "-informationaction", "-errorvariable",
+                   "-warningvariable", "-outvariable", "-outbuffer", "-pipelinevariable") and i + 1 < len(raw_args):
+            i += 2
+            continue
+        if tok.startswith("-") and len(tok) > 1 and tok[1].isalpha():
+            i += 1
+            continue
+        positional.append(strip_arg(tok))
+        i += 1
+    if src is None and positional:
+        src = positional.pop(0)
+    if new is None and positional:
+        new = positional[0]
+    return src, new
+
+
+def _policy_shell(part: str, toks: list[str], verb: str, cur: str, session_root: str | None) -> str | None:
+    """Policy-file shape rules. `pbz` invocations never reach here."""
+    if _POLICY_TEXT.search(part):
+        return "policy"
+    raw_args = toks[verb_index(toks) + 1:]
+    stripped = [strip_arg(token) for token in toks]
+    args = stripped[verb_index(toks) + 1:]
+    cur_bits = _path_bits(norm(cur))
+    cwd_pbz = bool(cur_bits) and fnmatch.fnmatch(cur_bits[-1], ".pbz")
+    for raw in args:
+        shaped = norm(raw, cur)
+        if _is_policy_file(raw) or _is_policy_file(shaped):
+            return "policy"
+        bits = _path_bits(raw)
+        wild = any(ch in raw for ch in "*?[")
+        if wild and len(bits) >= 2 and fnmatch.fnmatch(".pbz", bits[-2]) and fnmatch.fnmatch("policy.json", bits[-1]):
+            return "policy"
+        if cwd_pbz and bits and fnmatch.fnmatch("policy.json", bits[-1]):
+            return "policy"
+        if verb in _DELETE_VERBS | _MOVE_VERBS | _COPY_VERBS and _wild_pbz(raw, cur, session_root):
+            return "policy"
+    targets = list(args)
+    if verb in _RENAME_VERBS:
+        src, dest = _rename_operands(raw_args)
+        if src is not None and dest is not None and "/" not in dest and "\\" not in dest:
+            targets.append(os.path.join(os.path.dirname(src) or ".", dest))
+    if verb in _DELETE_VERBS:
+        for raw in targets:
+            shaped = norm(raw, cur)
+            if (_is_pbz_dir(raw) or _is_pbz_dir(shaped)) and _in_scope(shaped, session_root):
+                return "policy"
+    if verb in _MOVE_VERBS or verb in _COPY_VERBS:
+        for raw in targets:
+            shaped = norm(raw, cur)
+            if _is_pbz_dir(raw) or _is_pbz_dir(shaped) or _is_policy_file(raw) or _is_policy_file(shaped):
+                return "policy"
+    if verb in _NEW_VERBS and any(item.lower().strip("\"'") in _LINK_TYPES for item in stripped):
+        scoped = _in_scope(norm(cur), session_root) or bool(session_root and _in_scope(session_root, session_root))
+        scoped = scoped or any(_in_scope(norm(raw, cur), session_root) for raw in args)
+        if scoped:
+            return "policy"
+        for raw in args:
+            shaped = norm(raw, cur)
+            if _is_pbz_dir(raw) or _is_pbz_dir(shaped) or _is_policy_file(raw) or _is_policy_file(shaped):
+                return "policy"
+    return None
+
+
+def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int = 0) -> str | None:
+    if _depth == 0 and session_root is None:
+        session_root = active_root(norm(cwd))
     cmd, bodies = split_heredocs(cmd)
     for lead, body in bodies:  # a heredoc is code only when it feeds an interpreter; otherwise it is text
+        if _POLICY_TEXT.search(body):
+            return "policy"
         lead_root = active_root(cwd)
         for part in PIPE_SPLIT.split(SEG_SPLIT.split(lead)[-1]):
             if verb_of(tokens(part)) in INTERPRETERS:
@@ -561,8 +933,21 @@ def check_shell(cmd: str, cwd: str) -> str | None:
                     return "admin"
                 continue
             if v in CD_VERBS and len(toks) > verb_index(toks) + 1:
-                cur = norm(toks[-1], cur)
+                # Policy/redirection targets must be checked before tracking cwd.
+                if _policy_shell(part, toks, v, cur, session_root):
+                    return "policy"
+                dest = None
+                for token in toks[verb_index(toks) + 1:]:
+                    value = strip_arg(token)
+                    if value.startswith("-"):
+                        continue
+                    dest = value
+                    break
+                if dest is not None:
+                    cur = norm(dest, cur)
                 continue
+            if _policy_shell(part, toks, v, cur, session_root):
+                return "policy"
             root = active_root(cur)
             pol = load_policy(root)
             if not synthetic(cur) and hits(part, ENGINE_PATTERNS):
@@ -574,16 +959,25 @@ def check_shell(cmd: str, cwd: str) -> str | None:
                     return "script"
             denied, dir_targets, has_path = None, [], False
             for t in toks[verb_index(toks) + 1:]:
+                t = strip_arg(t)
                 if "*" in t and DATA_EXT.search(t):
                     base = norm(os.path.dirname(t) or ".", cur)
                     if active_root(base) or root:
                         denied = denied or "data_file"
+                    continue
+                # Inline -Command/-c payloads are multi-token strings; classify via recursion, not as paths.
+                if v in INTERPRETERS and (" " in t or "\t" in t):
                     continue
                 if not looks_like_path(t) and not (len(t) < 260 and os.path.exists(norm(t, cur))):
                     continue
                 has_path = True
                 p = norm(t, cur)
                 why = classify_path(p)
+                # Lexical definition fallback is for escapes that leave the root; never
+                # override an explicit valid-policy allow (lockdown still denies above).
+                if (not why and root and _lexical_definition(t)
+                        and not any(glob_to_regex(g).match(rel(p, root)) for g in pol.get("allow", []))):
+                    why = "definition"
                 if why:
                     denied = denied or why
                 elif os.path.isdir(p):
@@ -598,6 +992,10 @@ def check_shell(cmd: str, cwd: str) -> str | None:
             for code in inline:
                 if (root or not synthetic(cur)) and script_bad(code, pol) and (root or hits(code, ENGINE_PATTERNS)):
                     return "script"
+                if _depth == 0:
+                    why = check_shell(code, cur, session_root, 1)
+                    if why:
+                        return why
             for f in files:
                 p = norm(f, cur)
                 why = classify_path(p)
@@ -609,6 +1007,8 @@ def check_shell(cmd: str, cwd: str) -> str | None:
                         if os.path.getsize(p) <= MAX_SCRIPT_BYTES:
                             with open(p, encoding="utf-8", errors="replace") as fh:
                                 text = fh.read()
+                            if _POLICY_TEXT.search(text):
+                                return "policy"
                             if (sroot and script_bad(text, load_policy(sroot))) or hits(text, ENGINE_PATTERNS):
                                 return "script"
                     except OSError:
@@ -686,10 +1086,24 @@ def edited_text(path: str, ti: dict) -> str | None:
     return cur.replace(old, new) if ti.get("replace_all") else cur.replace(old, new, 1)
 
 
+def _policy_target(path: str) -> bool:
+    return path.replace("\\", "/").lower().endswith("/.pbz/policy.json")
+
+
 def check_write(p: str, tool: str, ti: dict, session_root: str | None) -> str | None:
     if session_root and self_protected(p):
         return "selfprotect"
-    if p.endswith("/.pbz/policy.json") and active_root(p):
+    if _policy_target(p):
+        root = find_root(p)
+        pol = load_policy(root) if root else {}
+        parent = norm(os.path.dirname(os.path.dirname(p)))
+        # Lockdown, an ancestor policy, or a path no active root covers: refuse before reading it.
+        if pol.get("_pbz_lockdown") or not active_root(p):
+            return "policy"
+        if session_root and _ancestor_dir(parent, session_root):
+            return "policy"
+        if root and _ancestor_dir(parent, root):
+            return "policy"
         if tool == "apply_patch":
             return "policy"
         text = edited_text(p, ti)
@@ -697,7 +1111,7 @@ def check_write(p: str, tool: str, ti: dict, session_root: str | None) -> str | 
             new = json.loads(text) if text is not None else None
         except ValueError:
             new = None
-        if not isinstance(new, dict) or policy_loosened(load_policy(find_root(p)), new):
+        if not security_values_ok(new) or policy_loosened(pol, new if isinstance(new, dict) else {}):
             return "policy"
     if p.endswith("/.pbz/consumers.json") and active_root(p):
         return "consumers"  # dropping a consumer would loosen protection; pbz writes this file itself
@@ -817,10 +1231,19 @@ def session_context(root: str) -> str:
     )
 
 
+def _stdin_text() -> str:
+    """Hook JSON from stdin. A text stream (tests) has no binary buffer."""
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is not None:
+        return buffer.read().decode("utf-8", errors="replace")
+    data = sys.stdin.read()
+    return data if isinstance(data, str) else bytes(data).decode("utf-8", errors="replace")
+
+
 def main() -> int:
     agent = sys.argv[sys.argv.index("--agent") + 1] if "--agent" in sys.argv[:-1] else "claude"
     try:
-        raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+        raw = _stdin_text()
         event = json.loads(raw) if raw.strip() else {}
     except ValueError:
         return 0

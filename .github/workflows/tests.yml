@@ -63,7 +63,9 @@ jobs:
                     "mirror_recovery_honesty", "push_boundary_honesty", "history_honesty",
                     "synthtest_atomic", "memory_disclosure", "docs_changelog", "ci_registration",
                     "policy_atomic", "pbz_state_atomic", "mirror_writers_root",
-                    "spec_input_gate", "requirements_honesty"
+                    "spec_input_gate", "requirements_honesty",
+                    "evidence_honesty", "synthtest_state_paths", "policy_failclosed",
+                    "mirror_alias_disclosure", "recipe_paths"
           $failed = @()
           foreach ($t in $suites) {
             Write-Host "::group::test_$t"

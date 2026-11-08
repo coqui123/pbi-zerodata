@@ -70,6 +70,8 @@ def capture(ws, project, max_age_hours=24, now=None):
         klass = result.get("class")
         if not isinstance(klass, str) or klass not in _ENGINE_CLASS:
             raise PbzError("PROTOCOL_ERROR", "engine provenance failure class is not in the closed vocabulary")
+        if klass == "OTHER":
+            raise PbzError("ENGINE_UNAVAILABLE")
         raise PbzError(klass)
     if "partitions" in result:
         labels = classify_partitions(result.get("partitions"), now=now or dt.datetime.now(dt.timezone.utc),

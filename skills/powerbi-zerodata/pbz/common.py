@@ -353,8 +353,16 @@ def preflight_regular(path: str, *, root: str | None) -> None:
     _contained(path, root)
 
 
-def read_checked(path: str, *, root: str | None) -> bytes:
-    """Read one regular single-link file. The opened handle must still be that file before any content read."""
+# Detail token when an optional max_bytes cap is exceeded. Callers map it; the token is not a path.
+SIZE_CAP = "SIZE_CAP"
+
+
+def read_checked(path: str, *, root: str | None, max_bytes: int | None = None) -> bytes:
+    """Read one regular single-link file. The opened handle must still be that file before any content read.
+
+    `max_bytes` is optional. When set, the cap is the opened handle's size, checked before read().
+    Callers that omit it stay unbounded.
+    """
     if _reparse_link(path):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     _contained(path, root)
@@ -364,6 +372,8 @@ def read_checked(path: str, *, root: str | None) -> bytes:
         raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
     if not _regular_single(before) or _reparse_link(path):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    if max_bytes is not None and before.st_size > max_bytes:
+        raise PbzError("REFUSED", SIZE_CAP)
     _contained(path, root)
     with open(path, "rb") as handle:
         try:
@@ -372,6 +382,8 @@ def read_checked(path: str, *, root: str | None) -> bytes:
             raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
         if (not _regular_single(info) or info.st_dev != before.st_dev or info.st_ino != before.st_ino):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        if max_bytes is not None and info.st_size > max_bytes:
+            raise PbzError("REFUSED", SIZE_CAP)
         try:
             after = os.lstat(path)
         except OSError:
@@ -379,22 +391,41 @@ def read_checked(path: str, *, root: str | None) -> bytes:
         if (after.st_dev != before.st_dev or after.st_ino != before.st_ino or _reparse_link(path)):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         _contained(path, root)
-        return handle.read()
+        if max_bytes is None:
+            return handle.read()
+        data = handle.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise PbzError("REFUSED", SIZE_CAP)
+        return data
 
 
-def append_checked(path: str, text: str, *, root: str | None) -> None:
-    """Append text. An existing file must still be the regular single-link file that was checked, before any write."""
-    preflight_regular(path, root=root)
-    if not os.path.lexists(path):
-        write_text(path, text, root=root)
-        return
+def _append_flags(max_bytes: int | None, *, create: bool = False) -> int:
+    flags = os.O_APPEND | os.O_WRONLY
+    if create:
+        flags |= os.O_CREAT | os.O_EXCL
+    if max_bytes is not None:
+        flags |= getattr(os, "O_BINARY", 0)
+    return flags
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        wrote = os.write(fd, view)
+        if wrote <= 0:
+            raise OSError("write made no progress")
+        view = view[wrote:]
+
+
+def _append_existing(path: str, payload: bytes, *, root: str | None, max_bytes: int | None) -> None:
+    """Identity-check an existing file and append. A cap failure writes nothing."""
     try:
         before = os.lstat(path)
     except OSError:
         raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
     if not _regular_single(before) or _reparse_link(path):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-    fd = os.open(path, os.O_APPEND | os.O_WRONLY)
+    fd = os.open(path, _append_flags(max_bytes))
     try:
         try:
             info = os.fstat(fd)
@@ -410,17 +441,57 @@ def append_checked(path: str, text: str, *, root: str | None) -> None:
                 or not _regular_single(after) or _reparse_link(path)):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         _contained(path, root)
-        view = memoryview(text.encode("utf-8"))
-        while view:
-            wrote = os.write(fd, view)
-            if wrote <= 0:
-                raise OSError("write made no progress")
-            view = view[wrote:]
+        if max_bytes is not None:
+            # Fresh size after identity/containment — do not reuse the earlier fstat.
+            try:
+                sized = os.fstat(fd)
+            except OSError:
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+            if sized.st_size + len(payload) > max_bytes:
+                raise PbzError("REFUSED", SIZE_CAP)
+        _write_all(fd, payload)
     finally:
         try:
             os.close(fd)
         except OSError:
             pass
+
+
+def append_checked(path: str, text: str, *, root: str | None, max_bytes: int | None = None) -> None:
+    """Append text. An existing file must still be the regular single-link file that was checked, before any write.
+
+    `max_bytes` is optional. When it is omitted, a new file still goes through write_text and an existing
+    file is opened with O_APPEND|O_WRONLY only. When it is set, the cap is checked before any byte is
+    written, new files are created with O_CREAT|O_EXCL|O_APPEND|O_WRONLY|O_BINARY, and a FileExistsError
+    re-enters the existing-file path.
+    """
+    preflight_regular(path, root=root)
+    payload = text.encode("utf-8")
+    if not os.path.lexists(path):
+        if max_bytes is None:
+            write_text(path, text, root=root)
+            return
+        if len(payload) > max_bytes:
+            raise PbzError("REFUSED", SIZE_CAP)
+        parent = os.path.dirname(os.path.abspath(path)) or "."
+        os.makedirs(parent, exist_ok=True)
+        if _reparse_link(parent) or _reparse_link(path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        _contained(path, root)
+        try:
+            fd = os.open(path, _append_flags(max_bytes, create=True))
+        except FileExistsError:
+            _append_existing(path, payload, root=root, max_bytes=max_bytes)
+            return
+        try:
+            _write_all(fd, payload)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return
+    _append_existing(path, payload, root=root, max_bytes=max_bytes)
 
 
 def _trust_root(path: str, root: str | None, roots: dict | None) -> str | None:

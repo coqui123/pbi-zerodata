@@ -23,9 +23,10 @@ import json
 import math
 import os
 import re
+import stat
 
 from . import lexers, synth, tmdl
-from .common import PbzError, commit_bytes, read_text, write_text
+from .common import PbzError, commit_bytes, pbz_state_path, preflight_regular, read_checked, read_text, write_text
 
 DIR = (".pbz", "synth-tests")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$")
@@ -39,25 +40,28 @@ _REF = re.compile(r"^\s*(?:'((?:[^']|'')+)'|([^\[\]']*?))?\s*\[(.+)\]\s*$")
 # ---------------------------------------------------------------- storage
 
 def _dir(ws) -> str:
-    return os.path.join(ws.root, *DIR)
+    return pbz_state_path(ws, "synth-tests")
 
 
 def _path(ws, name: str) -> str:
     if not NAME_RE.match(name or ""):
         raise PbzError("BAD_REQUEST", "a test name uses letters, digits, spaces, _ . - (up to 80)")
-    return os.path.join(_dir(ws), name + ".json")
+    return pbz_state_path(ws, "synth-tests", name + ".json")
 
 
 def _load(ws, name: str) -> dict:
     path = _path(ws, name)
+    if not os.path.lexists(path):
+        raise PbzError("NOT_FOUND", f"synth test {name} (`pbz synth test list`)")
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        raise PbzError("NOT_FOUND", f"synth test {name} (`pbz synth test list`)") from None
+        data = read_checked(path, root=ws.root)
+    except PbzError:
+        raise
     except OSError:
         raise PbzError("REFUSED", f"synth test {name}") from None
-    except ValueError:
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeError, ValueError):
         raise PbzError("BAD_REQUEST", f"synth test {name} is not valid JSON") from None
 
 
@@ -246,7 +250,8 @@ def compare(gold: dict, now: dict, tol: float = 1e-9) -> dict:
 def save(ws, project, name: str, spec=None, measures: list[str] | None = None, by: list[str] | None = None,
          replace: bool = False) -> dict:
     path = _path(ws, name)
-    if os.path.exists(path) and not replace:
+    preflight_regular(path, root=ws.root)
+    if os.path.lexists(path) and not replace:
         raise PbzError("NAME_TAKEN", f"synth test {name} exists: pass --replace or pick another name")
     queries = _spec_queries(spec, ws.root)
     if measures:
@@ -278,7 +283,7 @@ def save(ws, project, name: str, spec=None, measures: list[str] | None = None, b
            "synth": {**{k: info.get(k) for k in ("seed", "rows", "built", "tables")},
                      "profile": info.get("profile", "standard")},
            "model_hash": model_hash(project), "queries": results}
-    commit_bytes([("write", path, json.dumps(doc, indent=1, ensure_ascii=False) + "\n", b"")])
+    commit_bytes([("write", path, json.dumps(doc, indent=1, ensure_ascii=False) + "\n", b"")], root=ws.root)
     out = {"verb": "synth-test", "action": "save", "name": name, "data": "synthetic",
            "queries": [{"id": r["id"], **({"error": r["error"]} if r.get("error") else
                                           {"rows": len(r["rows"]), "columns": len(r["columns"])})} for r in results],
@@ -630,16 +635,33 @@ def check(ws, project, spec) -> dict:
     return out
 
 
+def _leaf_openable(path: str) -> bool:
+    """False for a link or hard link. Does not open the file."""
+    from .common import _reparse_link
+    if _reparse_link(path):
+        return False
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+
 def list_(ws) -> dict:
+    from .common import _reparse_link
     tests = []
     d = _dir(ws)
-    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+    names = sorted(os.listdir(d)) if os.path.isdir(d) and not _reparse_link(d) else []
+    for f in names:
         if not f.endswith(".json"):
             continue
+        full = os.path.join(d, f)
+        if not _leaf_openable(full):
+            tests.append({"name": f[:-5], "error": "unreadable"})
+            continue
         try:
-            with open(os.path.join(d, f), encoding="utf-8") as h:
-                doc = json.load(h)
-        except (OSError, ValueError):
+            doc = json.loads(read_checked(full, root=ws.root).decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, PbzError):
             tests.append({"name": f[:-5], "error": "unreadable"})
             continue
         s = doc.get("synth") or {}
@@ -650,7 +672,8 @@ def list_(ws) -> dict:
 
 def remove(ws, name: str) -> dict:
     path = _path(ws, name)
-    if not os.path.exists(path):
+    if not os.path.lexists(path):
         raise PbzError("NOT_FOUND", f"synth test {name}")
-    commit_bytes([("delete", path)])
+    preflight_regular(path, root=ws.root)
+    commit_bytes([("delete", path)], root=ws.root)
     return {"verb": "synth-test", "action": "remove", "name": name, "result": "REMOVED"}

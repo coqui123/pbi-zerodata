@@ -14,12 +14,33 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
+import stat
+import unicodedata
 
-from .common import PbzError, read_text, write_text
+from .common import (
+    PbzError, SIZE_CAP, append_checked, pbz_state_path, read_checked, _reparse_link,
+)
 
 STAGES = ("PARSED", "BOUND", "LOADED", "EXECUTED", "SYNTHETIC", "HANDOFF", "HUMAN_ACCEPTED")
 LOG = "evidence.jsonl"
+LOG_CAP = 1024 * 1024
+OVER_CAP = (
+    "evidence log is over 1 MiB; archive or remove .pbz/evidence.jsonl by hand in your own terminal"
+)
+UNUSABLE = "evidence log is unusable"
 CLASS_ORDER = ["SECURITY_REVIEW", "REFRESH_REQUIRED", "RECALC_REQUIRED", "LOGIC", "METADATA_ONLY", "REPORT_ONLY", "UNKNOWN"]
+_VERBS = {
+    "validate", "push", "desktop open", "desktop reload", "health", "check",
+    "snapshot compare", "snapshot save", "smoke", "synth-test run", "handoff", "review --accept",
+}
+_TOP = {"ts", "project", "verb", "mirror_rev", "real_rev", "stage", "summary", "scope"}
+_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+_MREV = re.compile(r"^m[0-9a-f]{12}$")
+_RREV = re.compile(r"^r[0-9a-f]{12}$")
+_SYNTH_RESULTS = {"SAME", "DIFF", "ERROR", "NOT_COMPARABLE"}
+_VALIDATION = {"PASS", "FAIL", "NOT_RUN"}
+_LOOSE = 256
 
 
 # ---------------------------------------------------------------- revisions
@@ -42,29 +63,305 @@ def real_rev(ws, project) -> str:
 
 
 def _log_path(ws) -> str:
-    return os.path.join(ws.pbz_dir, LOG)
+    return pbz_state_path(ws, LOG)
 
 
-def _entries(ws, project) -> list[dict]:
-    out = []
+def _io_error(err: PbzError) -> PbzError:
+    if err.code == "REFUSED" and err.detail == SIZE_CAP:
+        return PbzError("REFUSED", OVER_CAP)
+    return err
+
+
+def _read_log(ws) -> str | None:
+    """Checked log text. Missing is None. Present-unusable is REFUSED or UNSAFE_PATH, never a silent empty log."""
+    path = _log_path(ws)
+    if not os.path.lexists(path):
+        return None
     try:
-        with open(_log_path(ws), encoding="utf-8") as f:
-            for line in f:
-                try:
-                    e = json.loads(line)
-                except ValueError:
-                    continue
-                if e.get("project") == project.name:
-                    out.append(e)
+        data = read_checked(path, root=ws.root, max_bytes=LOG_CAP)
+    except PbzError as err:
+        raise _io_error(err) from None
     except OSError:
-        pass
-    return out
+        raise PbzError("REFUSED", UNUSABLE) from None
+    try:
+        return data.decode("utf-8")
+    except UnicodeError:
+        raise PbzError("REFUSED", UNUSABLE) from None
 
 
-def _append(ws, entry: dict) -> None:
-    os.makedirs(ws.pbz_dir, exist_ok=True)
-    with open(_log_path(ws), "a", encoding="utf-8", newline="\n") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+def _append_lines(ws, entries: list[dict]) -> None:
+    """One checked append for the whole batch. A refusal writes zero lines."""
+    if not entries:
+        return
+    text = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries)
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        append_checked(_log_path(ws), text, root=ws.root, max_bytes=LOG_CAP)
+    except PbzError as err:
+        raise _io_error(err) from None
+    except OSError:
+        raise PbzError("REFUSED", UNUSABLE) from None
+
+
+def _controls(value: str) -> bool:
+    return any(unicodedata.category(ch) == "Cc" for ch in value)
+
+
+def _loose(value) -> bool:
+    return isinstance(value, str) and len(value) <= _LOOSE and not _controls(value)
+
+
+def _nn(value) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _bool(value) -> bool:
+    return type(value) is bool
+
+
+def _canonical_ts(value) -> str | None:
+    if not isinstance(value, str) or not _TS.fullmatch(value):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None or parsed.microsecond:
+        return None
+    rendered = parsed.replace(microsecond=0).isoformat()
+    return rendered if rendered == value else None
+
+
+def _components(value, *, synth: bool = False) -> set[str] | None:
+    """Scope pieces a companion field may produce, including the null `?` / `None` fallbacks."""
+    if value is None:
+        return {"?", "None"}
+    if synth:
+        from .synthtest import NAME_RE
+        if not isinstance(value, str) or not NAME_RE.fullmatch(value):
+            return None
+        return {value}
+    if not _loose(value):
+        return None
+    return {value}
+
+
+def _count_map(value) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for key, count in value.items():
+        if not isinstance(key, str) or _verdict(key) != key or not _nn(count):
+            return False
+    return True
+
+
+def _scope_is(scope, expected: str) -> bool:
+    return isinstance(scope, str) and len(scope) <= _LOOSE and scope == expected
+
+
+def _joined(scope, prefix: str, parts: list[set[str]]) -> bool:
+    if not isinstance(scope, str) or len(scope) > _LOOSE:
+        return False
+    choices: list[tuple[str, ...]] = [()]
+    for part in parts:
+        choices = [acc + (piece,) for acc in choices for piece in part]
+    for pieces in choices:
+        if scope == prefix + ":".join(pieces):
+            return True
+    return False
+
+
+def _closed_str(value, allowed) -> bool:
+    """True when value is a str that belongs to allowed. Never hashes a non-str."""
+    return isinstance(value, str) and value in allowed
+
+
+def _tom_flag(value) -> bool:
+    """BOUND summary.tom is an actual bool or null — not 0/1/0.0."""
+    return value is True or value is False or value is None
+
+
+def _summary_scope(verb: str, stage: str, scope, summary: dict) -> str | None:
+    """Return the scope to keep when the whole summary matches one emitted shape, else None."""
+    if not isinstance(summary, dict):
+        return None
+    try:
+        keys = set(summary)
+    except TypeError:
+        return None
+    if stage == "PARSED" and verb == "validate" and keys == {"errors", "warnings", "outcome"}:
+        if (_nn(summary.get("errors")) and _nn(summary.get("warnings"))
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _verdict(summary["outcome"]) == summary["outcome"]):
+            return "validate" if _scope_is(scope, "validate") else None
+    if stage == "BOUND" and verb == "push" and keys == {"result", "errors", "tom", "validation", "outcome"}:
+        validation = summary.get("validation")
+        ok_val = (isinstance(validation, dict)
+                  and set(validation) == {"tom", "report_schema"}
+                  and _closed_str(validation.get("tom"), _VALIDATION)
+                  and _closed_str(validation.get("report_schema"), _VALIDATION))
+        if (ok_val and _closed_str(summary.get("result"), {_verdict(summary.get("result"))})
+                and _verdict(summary["result"]) == summary["result"] and _nn(summary.get("errors"))
+                and _tom_flag(summary.get("tom"))
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _scope_is(scope, "push")):
+            return "push"
+    if stage == "LOADED" and keys == {"action", "ready", "outcome"}:
+        action = summary.get("action")
+        if (_closed_str(action, {"open", "reload"}) and _bool(summary.get("ready"))
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})):
+            if action == "open" and verb == "desktop open" and _scope_is(scope, "desktop:open"):
+                return "desktop:open"
+            if action == "reload" and verb in ("desktop reload", "push") and _scope_is(scope, "desktop:reload"):
+                return "desktop:reload"
+    if (stage == "EXECUTED" and keys == {"outcome", "status", "executed"}
+            and summary.get("executed") is False
+            and _closed_str(summary.get("status"), {_verdict(summary.get("status"))})
+            and _verdict(summary["status"]) == summary["status"]
+            and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+            and _verdict(summary["outcome"]) == summary["outcome"]
+            and verb in ("health", "check", "snapshot compare", "snapshot save", "smoke")):
+        expected = verb.replace(" ", ":", 1)
+        return expected if _scope_is(scope, expected) else None
+    if stage == "EXECUTED" and verb == "health" and keys == {"health_errors", "unprocessed_tables", "outcome", "executed"}:
+        if (_nn(summary.get("health_errors")) and _nn(summary.get("unprocessed_tables"))
+                and _bool(summary.get("executed"))
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _scope_is(scope, "health")):
+            return "health"
+    if stage == "EXECUTED" and verb == "check" and keys == {"checks", "ids", "outcome", "executed"}:
+        ids = summary.get("ids")
+        ids_ok = isinstance(ids, list) and len(ids) <= 50 and all(item is None or _loose(item) for item in ids)
+        if (_count_map(summary.get("checks")) and ids_ok and _bool(summary.get("executed"))
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _scope_is(scope, "check")):
+            return "check"
+    if stage == "EXECUTED" and verb == "check" and keys == {"id", "status", "outcome", "executed"}:
+        pieces = _components(summary.get("id"))
+        if (pieces is not None and _closed_str(summary.get("status"), {_verdict(summary.get("status"))})
+                and _verdict(summary["status"]) == summary["status"] and _bool(summary.get("executed"))
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _joined(scope, "check:", [pieces])):
+            return scope
+    if stage == "EXECUTED" and verb == "snapshot compare" and keys == {"snapshot", "queries", "outcome", "executed"}:
+        if (_components(summary.get("snapshot")) is not None and _count_map(summary.get("queries"))
+                and _bool(summary.get("executed"))
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _scope_is(scope, "snapshot:compare")):
+            return "snapshot:compare"
+    if stage == "EXECUTED" and verb == "snapshot compare" and keys == {"snapshot", "id", "result", "outcome", "executed"}:
+        snaps = _components(summary.get("snapshot"))
+        ids = _components(summary.get("id"))
+        if (snaps is not None and ids is not None
+                and _closed_str(summary.get("result"), {_verdict(summary.get("result"))})
+                and _verdict(summary["result"]) == summary["result"]
+                and _bool(summary.get("executed"))
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _joined(scope, "snapshot:", [snaps, ids])):
+            return scope
+    if stage == "EXECUTED" and verb == "smoke" and keys == {"smoke", "partial_filters", "outcome", "executed"}:
+        if (_count_map(summary.get("smoke")) and _bool(summary.get("partial_filters"))
+                and _bool(summary.get("executed"))
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _scope_is(scope, "smoke")):
+            return "smoke"
+    if (stage == "EXECUTED" and verb == "smoke"
+            and keys == {"page", "smoke", "partial_filters", "coverage", "outcome", "executed"}):
+        pages = _components(summary.get("page"))
+        if (pages is not None and _count_map(summary.get("smoke")) and _bool(summary.get("partial_filters"))
+                and summary.get("coverage") == "QUERY_ONLY" and _bool(summary.get("executed"))
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _joined(scope, "smoke:", [pages])):
+            return scope
+    if stage == "SYNTHETIC" and verb == "synth-test run" and keys == {"test", "result", "outcome"}:
+        names = _components(summary.get("test"), synth=True)
+        if (names is not None and _closed_str(summary.get("result"), _SYNTH_RESULTS)
+                and _verdict(summary.get("outcome")) == summary.get("outcome")
+                and _closed_str(summary.get("outcome"), {_verdict(summary.get("outcome"))})
+                and _joined(scope, "synth-test:", [names])):
+            return scope
+    if stage == "HANDOFF" and verb == "handoff" and keys == {"file", "outcome"}:
+        if (summary.get("file") == "HANDOFF.md" and summary.get("outcome") == "GENERATED"
+                and _scope_is(scope, "handoff")):
+            return "handoff"
+    if (stage == "HUMAN_ACCEPTED" and verb == "review --accept" and keys == {"accepted"}
+            and summary.get("accepted") is True):
+        if scope is None or _scope_is(scope, "review:--accept"):
+            return "review:--accept"
+    return None
+
+
+def _validate_record(obj: dict, project_name: str) -> dict | None:
+    """Whole-record closed shape. Unknown fields are not copied. None means skip."""
+    if not isinstance(obj, dict):
+        return None
+    try:
+        extras = set(obj) - _TOP
+    except TypeError:
+        return None
+    if extras or any(key not in obj for key in _TOP - {"scope"}):
+        return None
+    verb, stage = obj.get("verb"), obj.get("stage")
+    if (obj.get("project") != project_name or not isinstance(verb, str) or verb not in _VERBS
+            or not isinstance(stage, str) or stage not in STAGES):
+        return None
+    ts = _canonical_ts(obj.get("ts"))
+    if ts is None or not _MREV.fullmatch(str(obj.get("mirror_rev", ""))) or not _RREV.fullmatch(str(obj.get("real_rev", ""))):
+        return None
+    summary = obj.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    scope = _summary_scope(verb, stage, obj.get("scope"), summary)
+    if scope is None:
+        return None
+    return {"ts": ts, "project": project_name, "verb": verb, "mirror_rev": obj["mirror_rev"],
+            "real_rev": obj["real_rev"], "stage": stage, "scope": scope, "summary": summary}
+
+
+def _load_entries(ws, project) -> tuple[list[dict], int]:
+    text = _read_log(ws)
+    if text is None:
+        return [], 0
+    entries: list[dict] = []
+    skipped = 0
+    # JSONL delimiter is LF only — do not use splitlines() (it splits on U+2028/U+2029).
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, RecursionError):
+            skipped += 1
+            continue
+        if not isinstance(obj, dict):
+            skipped += 1
+            continue
+        other = obj.get("project")
+        if not isinstance(other, str):
+            skipped += 1
+            continue
+        if other != project.name:
+            continue
+        try:
+            clean = _validate_record(obj, project.name)
+        except (TypeError, ValueError, RecursionError):
+            skipped += 1
+            continue
+        if clean is None:
+            skipped += 1
+            continue
+        entries.append(clean)
+    return entries, skipped
 
 
 # ---------------------------------------------------------------- recording
@@ -247,8 +544,10 @@ def record(ws, project, verb: str, action: str | None, out: dict) -> None:
                   "real_rev": real_rev(ws, project)}
     except (OSError, ValueError, PbzError):
         return
+    lines = []
     for stage, scope, summary in events:
-        _append(ws, {**shared, "stage": stage, "scope": scope, "summary": summary})
+        lines.append({**shared, "stage": stage, "scope": scope, "summary": summary})
+    _append_lines(ws, lines)
 
 
 # ---------------------------------------------------------------- release classes
@@ -305,25 +604,46 @@ def _status(e: dict | None, cur_m: str, cur_r: str, pending: bool, stage: str) -
     return "CURRENT"
 
 
+def _state_names(ws, dirname: str) -> tuple[str, list[str]]:
+    """Anchored directory listing. A link directory is UNSAFE_PATH. Link or hardlinked leaves are omitted, unopened."""
+    path = pbz_state_path(ws, dirname)
+    if not os.path.lexists(path):
+        return path, []
+    if _reparse_link(path) or not os.path.isdir(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    names = []
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        if _reparse_link(full):
+            continue
+        try:
+            info = os.lstat(full)
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            names.append(name)
+    return path, names
+
+
 def _suggested_tests(ws, project, logic: list[str]) -> list[str]:
     out = []
     if logic:
         out.append("pbz check with a compiles check per changed measure: " + ", ".join(logic[:10]))
-    snap = os.path.join(ws.pbz_dir, "snapshots")
-    for f in sorted(os.listdir(snap)) if os.path.isdir(snap) else []:
-        if f.endswith(".json"):
-            out.append(f"pbz snapshot compare {f[:-5]}")
-    tdir = os.path.join(ws.pbz_dir, "synth-tests")
+    _snap, snap_names = _state_names(ws, "snapshots")
+    for name in snap_names:
+        if name.endswith(".json"):
+            out.append(f"pbz snapshot compare {name[:-5]}")
+    tdir, test_names = _state_names(ws, "synth-tests")
     names = {n.lower().strip("[]") for n in logic}
-    for f in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
-        if not f.endswith(".json"):
+    for name in test_names:
+        if not name.endswith(".json"):
             continue
         try:
-            text = read_text(os.path.join(tdir, f))[0].lower()
-        except OSError:
+            text = read_checked(os.path.join(tdir, name), root=ws.root).decode("utf-8").lower()
+        except (OSError, UnicodeError, PbzError):
             continue
         if not names or any(f"[{n}]" in text for n in names):
-            out.append(f"pbz synth test run {f[:-5]}")
+            out.append(f"pbz synth test run {name[:-5]}")
     return out
 
 
@@ -334,11 +654,7 @@ def review(ws, project, accept: bool = False) -> dict:
         from .cli import _is_human
         if not _is_human():
             raise PbzError("HUMAN_ONLY", "acceptance is the reviewer's: run `pbz review --accept` yourself in a terminal")
-        _append(ws, {"ts": dt.datetime.now().replace(microsecond=0).isoformat(), "project": project.name,
-                     "stage": "HUMAN_ACCEPTED", "verb": "review --accept", "mirror_rev": cur_m, "real_rev": cur_r,
-                     "summary": {"accepted": True}})
-        from . import handoff
-        handoff.accept_generated(ws, project, cur_m, cur_r)
+    entries, skipped = _load_entries(ws, project)
     try:
         ch = changes.run(ws, project, "last", "mirror")
     except PbzError:
@@ -366,8 +682,21 @@ def review(ws, project, accept: bool = False) -> dict:
             by_class[cls] = by_class.get(cls, 0) + 1
     rows.sort(key=lambda r: (CLASS_ORDER.index(r["class"]), r["side"], str(r["object"]).lower()))
     logic = [r["object"] for r in rows if r["class"] == "LOGIC" and r["kind"] == "measure"]
+    # Path checks before acceptance, handoff, or the packet. Render stays on the entries already validated.
+    suggested = _suggested_tests(ws, project, logic)
+    if accept:
+        accepted = {"ts": dt.datetime.now().replace(microsecond=0).isoformat(), "project": project.name,
+                    "stage": "HUMAN_ACCEPTED", "verb": "review --accept", "mirror_rev": cur_m, "real_rev": cur_r,
+                    "summary": {"accepted": True}}
+        _append_lines(ws, [accepted])
+        from . import handoff
+        handoff.accept_generated(ws, project, cur_m, cur_r)
+        clean = _validate_record(accepted, project.name)
+        if clean is not None:
+            entries.append(clean)
     latest: dict = {}
-    for e in _entries(ws, project):
+    for e in entries:
+        # Latest validated record wins per stage+scope. Superseded outcomes are dropped.
         latest[(e["stage"], e.get("scope") or e.get("verb", e["stage"]))] = e
     evidence = []
     for stage in STAGES:
@@ -395,7 +724,10 @@ def review(ws, project, accept: bool = False) -> dict:
            "pending_edits": pending, "classes": {c: by_class[c] for c in CLASS_ORDER if c in by_class},
            "changes": rows[:300], "evidence": evidence, "coverage": coverage,
            "next": [f"{c}: {NEXT[c]}" for c in CLASS_ORDER if c in by_class],
-           "suggested_tests": _suggested_tests(ws, project, logic)}
+           "suggested_tests": suggested}
+    if skipped:
+        out["result"] = "INCOMPLETE"
+        out["skipped"] = skipped
     from . import handoff
     out["packet"] = handoff.write_packet(ws, "REVIEW.md", _markdown(out, ws, project, rows), "reviews")
     out["file"] = "pbz-workspace/REVIEW.md"

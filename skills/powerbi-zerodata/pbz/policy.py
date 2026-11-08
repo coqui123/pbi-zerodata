@@ -5,7 +5,7 @@ import copy
 import json
 import os
 
-from .common import PbzError, Workspace, pbz_state_path, write_text
+from .common import PbzError, Workspace, pbz_state_path, read_checked, write_text, _reparse_link
 
 DEFAULT = {
     "version": 1,
@@ -23,6 +23,39 @@ DEFAULT = {
     "budgets": {"session_checks": 300, "per_target": 60, "constants_per_target": 3},
 }
 
+MALFORMED = "policy is malformed; fix or remove .pbz/policy.json by hand in your own terminal"
+_LIST_KEYS = (
+    "deny", "allow", "deny_scripts", "sensitive_hosts", "category_columns",
+    "sensitive_columns", "reveal_columns", "memory_dirs",
+)
+
+
+def security_values_ok(data) -> bool:
+    """Closed security fields. Unknown keys are allowed. Absent keys are not checked."""
+    if not isinstance(data, dict):
+        return False
+    if "version" in data and (type(data["version"]) is not int or data["version"] != 1):
+        return False
+    if "synthetic" in data and type(data["synthetic"]) is not bool:
+        return False
+    if "disclosure" in data and data["disclosure"] not in ("shape", "strict"):
+        return False
+    if "literals" in data and data["literals"] != "strict":
+        return False
+    for key in _LIST_KEYS:
+        if key in data:
+            value = data[key]
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                return False
+    if "budgets" in data:
+        budgets = data["budgets"]
+        if (not isinstance(budgets, dict)
+                or any(type(value) is not int or value < 0 for value in budgets.values())):
+            return False
+    if "category_max" in data and (type(data["category_max"]) is not int or data["category_max"] < 0):
+        return False
+    return True
+
 
 def _guard_policy_paths(ws: Workspace) -> str:
     """Refuse a junction at `.pbz` or the policy leaf before any read or mkdir.
@@ -33,20 +66,50 @@ def _guard_policy_paths(ws: Workspace) -> str:
     return pbz_state_path(ws, "policy.json")
 
 
+def _policy_missing(ws: Workspace) -> bool:
+    """True only when `.pbz` or `policy.json` is absent. A link is present and unusable."""
+    pbz = os.path.join(ws.root, ".pbz")
+    try:
+        os.lstat(pbz)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if _reparse_link(pbz):
+        return False
+    try:
+        os.lstat(os.path.join(pbz, "policy.json"))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def load(ws: Workspace) -> dict:
-    pol = copy.deepcopy(DEFAULT)
+    if _policy_missing(ws):
+        return copy.deepcopy(DEFAULT)
     path = _guard_policy_paths(ws)
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if k == "budgets" and isinstance(v, dict):
-                    pol["budgets"].update(v)
-                else:
-                    pol[k] = v
-    except (OSError, ValueError):
-        pass
+        raw = read_checked(path, root=ws.root)
+    except PbzError:
+        raise
+    except OSError:
+        raise PbzError("REFUSED", MALFORMED) from None
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        raise PbzError("REFUSED", MALFORMED) from None
+    if not security_values_ok(data):
+        raise PbzError("REFUSED", MALFORMED)
+    pol = copy.deepcopy(DEFAULT)
+    for key, value in data.items():
+        if key == "budgets" and isinstance(value, dict):
+            pol["budgets"].update(value)
+        else:
+            pol[key] = value
     return pol
 
 

@@ -213,7 +213,8 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("--tables", nargs="*")
     sub.add_parser("health", help="objects in error in the open Desktop model (classes only)")
     p = sub.add_parser("check", help="data-blind assertions against the open Desktop model")
-    p.add_argument("spec", help="path to a checks JSON file, or inline JSON")
+    p.add_argument("spec", nargs="?", help="path to a checks JSON file, or inline JSON")
+    p.add_argument("--spec", dest="spec_opt", help="path to a checks JSON file, or inline JSON")
     p.add_argument("--validate-only", action="store_true", help="validate specification before spending disclosure budget")
     p.add_argument("--diagnostic", action="store_true", help="expected hypothesis differences are findings, not a failed gate")
     p = sub.add_parser("probe", help="shape facts of a table: booleans and coarse buckets")
@@ -634,7 +635,10 @@ def main(argv=None, *, parser_only: bool = False) -> int:
         elif a.cmd == "health":
             out = checks.health(ws, project)
         elif a.cmd == "check":
-            spec = _spec(a.spec, ws) or {}
+            spec_arg = a.spec or a.spec_opt
+            if not spec_arg:
+                raise PbzError("BAD_REQUEST", "spec required")
+            spec = _spec(spec_arg, ws) or {}
             if a.validate_only:
                 validation = checks.validate_spec(spec)
                 out = {"verb": "check validate", **validation, "spec_valid": validation["valid"]}
@@ -1026,6 +1030,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
 def admin(ws, a) -> dict:
     if not _is_human():
         raise PbzError("HUMAN_ONLY", "run `pbz admin` yourself in a terminal")
+    pol = policy.load(ws)
     if a.action == "budget-reset":
         p = os.path.join(ws.private, "state.json")
         if os.path.exists(p):
@@ -1036,7 +1041,6 @@ def admin(ws, a) -> dict:
             raise PbzError("BAD_REQUEST", "consumer id required")
         from pbz import consumers
         return consumers.remove(ws, a.value)
-    pol = policy.load(ws)
     if a.action == "allow" and a.value:
         pol["allow"] = sorted(set(pol.get("allow", [])) | {a.value})
     elif a.action == "category" and a.value:

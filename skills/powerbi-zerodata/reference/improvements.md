@@ -157,6 +157,19 @@ that handle before reading. A requirement proof is current only when its mirror 
 and saved-real revision still match, and only registered check ids are stored. Rollback
 remains best-effort after an exception. A killed process can still leave a temp, and this
 is not a claim of OS isolation.
+Round 17 anchors the evidence log and synth-test goldens at the workspace root and caps the
+evidence log at 1 MiB. Nothing rotates that log: archive or remove `.pbz/evidence.jsonl` by
+hand, which discards `HUMAN_ACCEPTED` history with the file. A present unreadable, aliased or
+malformed policy fails closed instead of loosening disclosure. `diff --patch` and `push` refuse
+an aliased or hardlinked mirror entry. Recipe snapshot and restore refuse an aliased or
+hardlinked mirror tree before any step; a link planted mid-run is `RECOVERY_REQUIRED` and is
+not followed. Interactions static honesty stays deferred to Round 18. Freshness `OTHER` is the closed
+`ENGINE_UNAVAILABLE` class. Rollback is still exception-only. Residuals: shell content writes; policy paths built at runtime inside scripts;
+script-level policy deletion; recursive directory copy/move that implicitly carries `.pbz`;
+recursive deletion of a workspace root or ancestor; script-scanning false positives; ancestor
+inspection failures that force lockdown; other mirror readers that do not check link counts;
+and deferred guard-log hardening. When policy is unusable, fix or remove `.pbz/policy.json` by
+hand in your own terminal, then re-run the refusing verb. This is not OS isolation.
 
 
 `--diagnostic` explicitly permits check-result collection without assertion failure exit codes.

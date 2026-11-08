@@ -66,6 +66,15 @@ class FreshnessOfflineTests(unittest.TestCase):
             self.capture({"ok": False, "class": secret})
         self.assertEqual(caught.exception.code, "PROTOCOL_ERROR")
         self.assertNotIn(secret, caught.exception.detail)
+        with self.assertRaises(PbzError) as caught:
+            self.capture({"ok": False, "class": "OTHER", "message": secret})
+        self.assertEqual(caught.exception.code, "ENGINE_UNAVAILABLE")
+        self.assertNotIn(secret, caught.exception.detail)
+        from pbz.outcomes import envelope
+        wrapped, rc = envelope({"ok": False, "error": "ENGINE_UNAVAILABLE"})
+        self.assertEqual(wrapped["outcome"]["status"], "UNAVAILABLE")
+        self.assertEqual(wrapped["outcome"]["code"], "ENGINE_UNAVAILABLE")
+        self.assertEqual(rc, 4)
 
     def test_publication_stays_unknown(self):
         secret = "1999-01-01T00:00:00Z"
