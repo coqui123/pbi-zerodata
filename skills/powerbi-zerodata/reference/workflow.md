@@ -31,12 +31,15 @@ how it ships, which checks ran on which revision, and what is still unverified. 
   | `BOUND` | `pbz push` (TOM, Microsoft's PBIR validator, built-in checks) |
   | `LOADED` | `pbz desktop open` / `reload` |
   | `EXECUTED` | `pbz health`, `check`, `snapshot compare`, `smoke` |
+  | `STATIC_CONTRACT` | `pbz interactions check` in static mode. It cannot satisfy a runtime requirement or `HUMAN_ACCEPTED` |
   | `SYNTHETIC` | `pbz synth test run` |
   | `HANDOFF` | `pbz handoff` |
   | `HUMAN_ACCEPTED` | `pbz review --accept`, typed by the reviewer in a terminal (agents get `HUMAN_ONLY`) |
 
   Each stage is `CURRENT` (ran on this revision), `STALE` (an older revision, or real-data evidence
   while edits are still pending) or `NOT_RUN`. Stale evidence is never reported as a pass.
+  `pbz review --interactions-spec <file>` binds a static interaction proof to that spec's digest.
+  A later mirror revision or a different digest invalidates it.
 - **Coverage**: whether external consumers are registered and whether the human accepted the
   revision. Changed pages are drawn as layout maps (boxes and labels, no data).
 

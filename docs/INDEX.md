@@ -10,6 +10,7 @@ Power BI PBIP projects without company data values entering the agent context.
 | [../README.md](../README.md) | Everyone | What it is, requirements, install, quick tour |
 | [overview.md](overview.md) | Everyone | Zero-data model, mirror, guard, engine, policy |
 | [getting-started.md](getting-started.md) | Practitioners | First session: init → edit → validate → push → handoff |
+| [install.md](install.md) | Practitioners | Junctions so Claude, Codex, ChatGPT, and Cursor follow `git pull` |
 | [cli-catalog.md](cli-catalog.md) | Practitioners | Every `pbz` verb and nested action |
 
 ## Legal and project process

@@ -40,7 +40,7 @@ and `project` (when the workspace holds several `.pbip` files), plus its own arg
 | `image` | `action` (add / list / remove, required), `target`, `name` |
 | `link` | `page`, `visual` (required), `to_page`, `back`, `bookmark`, `drillthrough`, `url`, `tooltip`, `clear` |
 | `filter` | `action` (add / remove / list, required), `target`, `report`, `page`, `visual`, `values_in`, `values_out`, `where`, `top`, `by`, `bottom` |
-| `interaction` | `page`, `source`, `target`, `mode` (all required) |
+| `interaction` | `page`, `source`, `target`, `mode` (all required). CLI `pbz interaction <page> --show` lists stored modes |
 | `bookmark` | `action` (add / remove / list, required), `name`, `page`, `hide`, `show`, `only` |
 | `evidence` (the `pbz review` packet) | none |
 | `set_props` / `get_props` | `items` (object and prop=value pairs), `kind`, `table`, `match`, `folder`, `unset`, `dry_run` |

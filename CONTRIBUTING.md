@@ -20,7 +20,8 @@ python install/install.py --what-if
 python install/install.py
 ```
 
-Trust hooks once in your agent host (for example Codex `/hooks`).
+That junctions the Claude, Codex / ChatGPT, and shared agent skill folders at this clone.
+See [docs/install.md](docs/install.md). Trust hooks once in your agent host (for example Codex `/hooks`).
 
 ## Tests
 

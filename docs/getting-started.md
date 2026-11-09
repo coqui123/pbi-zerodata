@@ -16,7 +16,12 @@ python install/install.py --what-if
 python install/install.py
 ```
 
-Then trust the PreToolUse / SessionStart hooks once in Claude Code or Codex. Uninstall with
+The installer junctions `%USERPROFILE%\.claude\skills\powerbi-zerodata`,
+`%USERPROFILE%\.codex\skills\powerbi-zerodata`, and
+`%USERPROFILE%\.agents\skills\powerbi-zerodata` at this clone. Codex and ChatGPT Codex use the
+`.codex` folder. Cursor reads the Claude and Codex folders. Hook commands run `pbz/guard.py`
+through the agents junction, so `git pull` updates the skill and the hook script together.
+Trust those hooks once. Details: [install.md](install.md). Uninstall with
 `python install/install.py --uninstall`.
 
 Requirements: Python 3.11+, .NET 10 for the engine, Power BI Desktop for live checks.

@@ -161,6 +161,9 @@ def main() -> int:
             "deny": ["secret-report.md", "more.md"], "deny_scripts": ["odata_pull.py"],
             "sensitive_hosts": ["acme.pvcloud.com"], "budgets": {"session_checks": 100}})}, ws), None),
         ("self protect", pre("Edit", {"file_path": GUARD, "old_string": "a", "new_string": "b"}, ws), "read-only"),
+        ("skill link agents", pre("Edit", {"file_path": j(home, ".agents", "skills", "powerbi-zerodata", "SKILL.md"), "old_string": "a", "new_string": "b"}, ws), "read-only"),
+        ("skill link claude", pre("Edit", {"file_path": j(home, ".claude", "skills", "powerbi-zerodata", "SKILL.md"), "old_string": "a", "new_string": "b"}, ws), "read-only"),
+        ("skill link codex", pre("Edit", {"file_path": j(home, ".codex", "skills", "powerbi-zerodata", "SKILL.md"), "old_string": "a", "new_string": "b"}, ws), "read-only"),
         ("self protect off-ws", pre("Edit", {"file_path": GUARD, "old_string": "zzzz-not-there", "new_string": "b"}, other), None),
         ("memory data", pre("Write", {"file_path": mem, "content": "cards showed $1,104 before"}, ws), "Memory notes"),
         ("memory clean", pre("Write", {"file_path": mem, "content": "Card measure repointed to Total Cost"}, ws), None),
@@ -185,6 +188,20 @@ def main() -> int:
             if not ok:
                 failures += 1
                 print(f"FAIL [{agent}] {name}: expected {expect!r}, got {got!r}")
+
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "install"))
+    import install as pbz_install
+    linked = {os.path.normcase(p) for p in pbz_install.LINKS}
+    expected_links = {os.path.normcase(j(home, rel, "powerbi-zerodata"))
+                      for rel in (os.path.join(".agents", "skills"),
+                                  os.path.join(".claude", "skills"),
+                                  os.path.join(".codex", "skills"))}
+    if linked != expected_links:
+        failures += 1
+        print(f"FAIL skill junctions: {sorted(linked)}")
+    if os.path.normcase(pbz_install.CANON) != os.path.normcase(j(home, ".agents", "skills", "powerbi-zerodata")):
+        failures += 1
+        print("FAIL hook canon is not the agents skill junction")
 
     ss = run({"hook_event_name": "SessionStart", "cwd": ws, "source": "startup"})
     if not (ss and "ZERO-DATA" in ss["hookSpecificOutput"]["additionalContext"]):

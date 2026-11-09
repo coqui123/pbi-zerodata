@@ -55,7 +55,7 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | `freshness` | Refresh provenance contracts | `capture` \| `compare` | improvements |
 | `requirements` | Revision-bound requirement checks | `import` \| `status` \| `verify` \| `accept` | improvements |
 | `consent` | Human file approval receipts | `request` \| `status` \| `approve` \| `read` | improvements |
-| `review` | Review packet + evidence | `--accept` (human-only) | [workflow.md](../skills/powerbi-zerodata/reference/workflow.md) |
+| `review` | Review packet + evidence | `--accept` (human-only), `--interactions-spec` | [workflow.md](../skills/powerbi-zerodata/reference/workflow.md) |
 | `handoff` | Human visual checklist | `--all` | workflow |
 | `recipe` | Transactional JSON edit batches | `run` \| `check` | workflow |
 

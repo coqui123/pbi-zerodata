@@ -39,7 +39,7 @@ pbz handoff / review         → human verifies visuals and acceptance
 - Tokenize sensitive literals in the mirror and restore them on push.
 - Block agent tool access to real definitions, data files, and denied paths.
 - Fail closed when policy is present but unusable or aliased.
-- Refuse aliased/hardlinked mirror paths on disclosure-sensitive verbs.
+- Refuse aliased/hardlinked mirror paths on disclosure-sensitive verbs, and read mirror definition files through the checked reader (single link, no reparse). Model TMDL loads through `tmdl.load_model` stay outside that gate.
 - Keep Desktop verification on a disclosure budget with closed outcomes.
 
 **pbz does not claim:**

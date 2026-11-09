@@ -52,10 +52,12 @@ python install/install.py --what-if
 python install/install.py
 ```
 
-Trust hooks once in your agent host (for example Codex `/hooks`). Uninstall:
-`python install/install.py --uninstall`.
+`install.py` creates directory junctions from the Claude, Codex / ChatGPT, and shared agent
+skill folders to `skills/powerbi-zerodata`. A later `git pull` updates those skills and the
+guard script the hooks run. Trust the hooks once (Codex: `/hooks`). Full steps:
+[docs/install.md](docs/install.md). Uninstall: `python install/install.py --uninstall`.
 
-CLI entry: `skills/powerbi-zerodata/bin/pbz.cmd` (after install, typically on your skill path as
+CLI entry: `skills/powerbi-zerodata/bin/pbz.cmd` (the same file the skill junctions expose as
 `pbz`).
 
 ## 60-second tour
@@ -115,7 +117,8 @@ From `skills/powerbi-zerodata`:
 ```powershell
 python tests/test_guard.py
 python tests/test_ci_registration.py
-# Full list: see the workflow file (84 python suites + test_engine.py --offline)
+# Suite names are the list in .github/workflows/tests.yml.
+# Then: python tests/test_engine.py --offline
 ```
 
 Desktop / e2e suites stay local and must use synthetic or fixture data only.

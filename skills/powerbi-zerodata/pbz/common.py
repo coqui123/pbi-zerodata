@@ -131,7 +131,10 @@ def read_text(path: str) -> tuple[str, bytes]:
 
 
 def open_mirror_file_readonly(path: str, *, mirror_root: str, max_bytes: int | None = None) -> bytes:
-    """Read one file under the mirror trust root: single-link, no reparse leaf/ancestors, handle recheck."""
+    """Read one file under the mirror trust root: single-link, no reparse leaf/ancestors, handle recheck.
+
+    The refusal detail is the shared link message, including on this read path.
+    """
     root = os.path.abspath(mirror_root)
     target = os.path.abspath(path)
     if _reparse_link(root):

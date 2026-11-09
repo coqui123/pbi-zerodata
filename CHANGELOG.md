@@ -6,6 +6,12 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- `install.py` junctions the Codex / ChatGPT skill folder as well as the Claude and shared
+  agent skill folders. A `git pull` updates the skill and the guard script the hooks run.
+  Setup steps: `docs/install.md`.
+
+## Round 18 — 2026-11-09
+
 - `pbz interaction <page> --show` lists stored cross-filter modes (`filter`, `highlight`, `none`,
   `default`, or `REFUSED`). Applying one pair keeps the other pairs. Page JSON is read through the
   mirror check, and the command result uses the page id. `pbz review --interactions-spec` binds a

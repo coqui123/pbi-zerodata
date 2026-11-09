@@ -1176,7 +1176,11 @@ def _covers_workspace(raw: str, cur: str, root: str, *, home_rebound: bool = Fal
 
 
 def _ancestor_or_self(shaped: str, root: str) -> bool:
-    """True when `shaped` is the workspace root or a directory that contains it. Inspection failure denies."""
+    """True when `shaped` is the workspace root or a directory that contains it.
+
+    `ValueError` from `commonpath` (a different drive, or a prefix it rejects) returns False.
+    `OSError` returns True. Bare drive roots are denied before this helper runs.
+    """
     try:
         left = os.path.normcase(os.path.abspath(shaped))
         right = os.path.normcase(os.path.abspath(root))
@@ -1189,7 +1193,13 @@ def _ancestor_or_self(shaped: str, root: str) -> bool:
 
 def _r18_shell(part: str, toks: list[str], verb: str, cur: str, session_root: str | None,
                *, home_rebound: bool = False) -> str | None:
-    """Round 18: content writes, recursive .pbz carry, and ancestor/root deletes."""
+    """Round 18 shell gate: protected writes, tree copy/move/delete, and fail-closed operands.
+
+    Sequence braces, unexpanded `$` / `%` / `!`, parentheses, `::`, a rebound `~`, a colon that
+    is not a drive prefix, and any bare drive root deny. A recursive delete whose wildcard sits
+    in the workspace or an ancestor and can match `policy.json` or `.pbz` denies. Moves are tree
+    operations even without a recurse flag.
+    """
     if not session_root or not verb:
         return None
     low = part.lower()
@@ -1424,7 +1434,8 @@ def self_protected(path: str) -> bool:
         norm(os.path.join(os.path.expanduser("~"), *p)) for p in (
             (".claude", "settings.json"), (".claude", "settings.local.json"), (".claude", "CLAUDE.md"),
             (".codex", "hooks.json"), (".codex", "config.toml"), (".codex", "AGENTS.md"),
-            (".agents", "skills", "powerbi-zerodata"), (".claude", "skills", "powerbi-zerodata"))]
+            (".agents", "skills", "powerbi-zerodata"), (".claude", "skills", "powerbi-zerodata"),
+            (".codex", "skills", "powerbi-zerodata"))]
     return any(path == g or path.startswith(g + "/") for g in guarded) or path.endswith("/.claude/settings.json") \
         or path.endswith("/.claude/settings.local.json") or path.endswith("/.codex/hooks.json")
 

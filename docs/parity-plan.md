@@ -617,26 +617,37 @@ falling back to shape disclosure. `diff --patch` and `push` refuse an aliased or
 mirror file; other mirror readers still do not check link counts. Recipe snapshot and restore
 use the mirror as the trust root: an aliased directory or hardlinked leaf is refused before any
 step, and a link planted while a step runs is `RECOVERY_REQUIRED` without being followed. Freshness class `OTHER` is
-`ENGINE_UNAVAILABLE`. Interactions static honesty stays deferred to Round 18. Rollback is still
-exception-only. Documented residuals: shell content writes; script-built policy paths;
-script-level policy deletion; recursive directory copy/move that implicitly carries `.pbz`;
-recursive deletion of a workspace root or ancestor; script-scanning false positives; ancestor
-inspection failures that force lockdown; other mirror readers that do not check link counts;
-guard-log hardening (deferred). Unusable policy recovery: fix or remove `.pbz/policy.json` by
-hand in your own terminal. This is not OS isolation.
+`ENGINE_UNAVAILABLE`. At the end of Round 17 these items were still open: interactions static
+honesty, shell content writes, script-built policy paths, script-level policy deletion, recursive
+directory copy/move that implicitly carries `.pbz`, recursive deletion of a workspace root or
+ancestor, script-scanning false positives, ancestor inspection failures that force lockdown,
+mirror readers that do not check link counts, and guard-log hardening. Round 18 closed the ones
+named in the next section. Rollback is still exception-only. Unusable policy recovery: fix or
+remove `.pbz/policy.json` by hand in your own terminal. This is not OS isolation.
 
 ## Round 18 parity
 
-`pbz interactions` is static-only. Results use a frozen token set (`MATCH`, `MISMATCH`,
-`DEFAULT_UNRESOLVED`, `MISSING_ID`, `RUNTIME_ONLY`, `LEGACY`, `UNKNOWN_TYPE`, `UNSUPPORTED`,
-`REFUSED`). Evidence stage is `STATIC_CONTRACT` and cannot stand in for `HUMAN_ACCEPTED` or native
-execution. Page and visual JSON under the mirror is read through `open_mirror_file_readonly`.
-The guard denies protected content writes, recursive copies that name `.pbz`, and recursive deletes
-of the workspace root. Model TMDL reads through `tmdl.load_model` stay outside that reader gate.
-Evidence rotation and `admin memory-dir` stay open. This is not OS isolation.
+`pbz interactions` is static-only (contract 2). Results use a frozen token set (`MATCH`,
+`MISMATCH`, `DEFAULT_UNRESOLVED`, `MISSING_ID`, `RUNTIME_ONLY`, `LEGACY`, `UNKNOWN_TYPE`,
+`UNSUPPORTED`, `REFUSED`). Evidence stage is `STATIC_CONTRACT`. That stage cannot stand in for
+`HUMAN_ACCEPTED` or native execution. A non-string literal or other malformed nested case is
+`REFUSED` and is not static proof. `pbz review --interactions-spec` binds the proof to that
+spec's digest and the current mirror revision.
 
-## Round 19 parity
+Page and visual JSON under the mirror is read through `open_mirror_file_readonly`. The same
+checked reader covers the other definition reads named in
+`skills/powerbi-zerodata/reference/improvements.md`. Model TMDL reads through `tmdl.load_model`
+stay outside that gate. Pull of the real project and history blobs stay outside it.
 
 `pbz interaction --show` reports stored cross-filter metadata for a page: one closed mode per
 source and target, with page and visual ids only. Setting one pair leaves the other stored pairs
-in place. `pbz review --interactions-spec` is how a static interaction digest becomes current.
+in place. A page folder id outside the folder pattern is refused before a file list is built.
+A malformed page is `UNUSABLE`, and the folder name is not echoed.
+
+The guard denies protected content writes (including 8.3 short names and `{a..b}` braces),
+recursive copies and moves that carry `.pbz` or the workspace, and recursive deletes of the
+workspace root, an ancestor, a bare drive root, or a wildcard in that directory that can match
+`policy.json` or `.pbz`. A move is a tree operation even without a recurse flag. Unexpanded
+`$`, `%`, and `!`, parentheses, and `::` fail closed. Pipeline-only delete names and a `\\?\`
+prefix stay residual #7. Evidence rotation and `admin memory-dir` stay open. This is not OS
+isolation.

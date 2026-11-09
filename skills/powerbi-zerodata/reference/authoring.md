@@ -227,7 +227,15 @@ point at it). Bookmarks that capture filters or slicer selections are made in De
 
 `pbz interaction <page> <source> <target|all> filter|highlight|none|default` writes the page's
 `visualInteractions` (DataFilter, HighlightFilter, NoFilter); `default` removes the entry so Desktop
-decides.
+decides. Setting one pair leaves the other stored pairs in place. The page folder id is checked
+before any result or file list is built. It must be 1–64 letters, digits, or hyphens. Anything else,
+including an underscore, is `REFUSED` with detail `identifier`. A malformed page is `REFUSED` with
+detail `UNUSABLE`, and the folder name is not echoed.
+
+`pbz interaction <page> [--source <visual>] --show` lists stored modes (`filter`, `highlight`,
+`none`, `default`). Output is page and visual ids only. A missing stored pair is `default`, which
+means Desktop's choice. Page and visual ids on `--show` must start with a letter and then use only
+letters and digits.
 
 ## Seeing a page: `pbz layout`
 

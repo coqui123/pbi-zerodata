@@ -22,8 +22,10 @@ and run `pbz doctor` for the host checklist.
 ## Supported versions
 
 Security fixes land on the default branch (`main`). There are no long-lived release trains yet;
-upgrade by pulling `main` and re-running `skills/powerbi-zerodata/install/install.py` when hooks
-or the engine change.
+upgrade by pulling `main`. Skill folders installed with `install.py` are junctions, so the
+pull updates the skill and `pbz/guard.py` the hooks run. Re-run
+`skills/powerbi-zerodata/install/install.py` when the hook registration or the engine build
+should change. See [docs/install.md](docs/install.md).
 
 ## Reporting a vulnerability
 

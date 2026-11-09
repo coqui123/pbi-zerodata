@@ -388,7 +388,10 @@ def _page_dir_id(value) -> str:
 
 
 def interaction_show(ws, project, page: str, source: str | None = None) -> dict:
-    """Stored cross-filter modes. A missing entry is Desktop's default. Ids only."""
+    """Stored cross-filter modes. A missing entry is Desktop's default. Ids only.
+
+    Page and visual ids must match the show pattern. A malformed page is UNUSABLE.
+    """
     from .style import targets
     try:
         _strict_docs(project)
@@ -420,7 +423,10 @@ def interaction_show(ws, project, page: str, source: str | None = None) -> dict:
 
 def interaction(ws, project, page: str, source: str, target: str, mode: str, dry_run: bool = False) -> dict:
     """How `source` affects `target` on a page: filter, highlight, none, or default (Desktop's choice).
-    target may be `all` (every other visual on the page)."""
+
+    `target` may be `all` (every other visual on the page). The page folder id is checked before
+    any result or file list. A malformed page is UNUSABLE, and the folder name is not echoed.
+    """
     from .style import targets
     if mode not in (*MODES, "default"):
         raise PbzError("BAD_REQUEST", "mode: filter, highlight, none or default")

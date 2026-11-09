@@ -1,14 +1,16 @@
-"""Install powerbi-zerodata for Claude Code and Codex (idempotent).
+"""Point Claude, Codex, and ChatGPT at this repo, then register their guard hooks.
 
   python install/install.py            apply
   python install/install.py --what-if  show what would change, change nothing
   python install/install.py --mcp      also register the pbz MCP server for Claude Code and Codex
   python install/install.py --uninstall  (also removes the MCP registrations)
 
-Steps: junctions into ~/.agents/skills and ~/.claude/skills; guard hooks in ~/.claude/settings.json
-and ~/.codex/hooks.json; Read deny rules for Power BI caches; a short rule block in
-~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; with --mcp, mcpServers.pbz in ~/.claude.json and
-[mcp_servers.pbz] in ~/.codex/config.toml. Every file it edits is backed up first.
+Skill folders become Windows directory junctions to this skill directory, so `git pull`
+updates the files those agents load. Cursor reads the Claude and Codex skill folders, so
+the same junctions cover it. Hook entries stay in each host's settings and run
+`pbz/guard.py` through the agents junction. Details: docs/install.md.
+
+Every settings file it edits is backed up first.
 """
 from __future__ import annotations
 
@@ -22,7 +24,15 @@ import sys
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOME = os.path.expanduser("~")
 NAME = "powerbi-zerodata"
-LINKS = [os.path.join(HOME, ".agents", "skills", NAME), os.path.join(HOME, ".claude", "skills", NAME)]
+# Junctions to this skill directory. CANON is the path the hook command runs.
+# Claude Code reads .claude; Codex and ChatGPT Codex read .codex; both also
+# accept the shared .agents folder. Cursor reads the Claude and Codex folders.
+SKILL_LINK_DIRS = (
+    os.path.join(".agents", "skills", NAME),
+    os.path.join(".claude", "skills", NAME),
+    os.path.join(".codex", "skills", NAME),
+)
+LINKS = [os.path.join(HOME, rel) for rel in SKILL_LINK_DIRS]
 CANON = LINKS[0]
 CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
 CODEX_HOOKS = os.path.join(HOME, ".codex", "hooks.json")
