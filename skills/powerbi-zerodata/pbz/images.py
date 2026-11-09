@@ -26,7 +26,7 @@ import shutil
 import stat
 import xml.etree.ElementTree as ET
 
-from .common import PbzError, _contained, _reparse_link, commit_bytes, read_text, remove_file, replace_bytes, write_text
+from .common import PbzError, _contained, _reparse_link, commit_bytes, read_definition_text, remove_file, replace_bytes, write_text
 
 PACKAGE = "RegisteredResources"
 PACKAGE_TYPE = 1
@@ -211,7 +211,7 @@ def _parse_report(project):
     if not os.path.isfile(path):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     try:
-        text, bom = read_text(path)
+        text, bom = read_definition_text(path)
         data = json.loads(text)
     except (OSError, UnicodeError, ValueError):
         raise PbzError("REFUSED", rel) from None
@@ -350,8 +350,9 @@ def _ref(rpi: dict, where: str, file: str, path) -> dict:
 
 def _load(path: str):
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            return json.load(f)
+        return json.loads(read_definition_text(path)[0])
+    except PbzError:
+        raise
     except (OSError, ValueError):
         return None
 
@@ -370,7 +371,7 @@ def _strict_definition(report_dir: str, mirror: str | None = None) -> None:
             path = os.path.join(cur, name)
             rel = os.path.relpath(path, root).replace("\\", "/")
             try:
-                json.loads(read_text(path)[0])
+                json.loads(read_definition_text(path)[0])
             except (OSError, UnicodeError, ValueError):
                 raise PbzError("REFUSED", rel) from None
 
@@ -390,7 +391,7 @@ def resolve(ws, project, raw: str) -> str:
     name = raw.strip()
     if name.lower().startswith("image:"):
         name = name[6:].strip()
-    text = read_text(_report_json(project.mirror_report))[0] if os.path.exists(_report_json(project.mirror_report)) else ""
+    text = read_definition_text(_report_json(project.mirror_report))[0] if os.path.exists(_report_json(project.mirror_report)) else ""
     reg = registered(text)
     if name in reg:
         return name
@@ -480,7 +481,7 @@ def list_(ws, project) -> dict:
     rjson = _report_json(project.mirror_report)
     if not os.path.exists(rjson):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    reg = registered(read_text(rjson)[0])
+    reg = registered(read_definition_text(rjson)[0])
     used = uses(project.mirror_report)
     rows = []
     for item in sorted(reg):
@@ -494,7 +495,7 @@ def list_(ws, project) -> dict:
         row["used_by"] = used.get(item, [])
         rows.append(row)
     real_rj = _report_json(project.report_dir)
-    real_reg = registered(read_text(real_rj)[0]) if os.path.exists(real_rj) else {}
+    real_reg = registered(read_definition_text(real_rj)[0]) if os.path.exists(real_rj) else {}
     rr = _rr_dir(project.report_dir)
     files = sorted(f for f in (os.listdir(rr) if os.path.isdir(rr) else []) if os.path.splitext(f)[1].lower() in KINDS)
     out = {"verb": "image", "action": "list", "project": project.name, "images": rows}

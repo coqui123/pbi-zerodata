@@ -8,7 +8,7 @@ import json
 import os
 import secrets
 
-from .common import PbzError, commit_bytes, read_text
+from .common import PbzError, commit_bytes, read_definition_text
 from .tokens import TOKEN_RE
 
 SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition"
@@ -23,7 +23,7 @@ def _meta(project) -> tuple[str, dict, bytes]:
     if os.path.exists(path):
         rel = os.path.relpath(path, project.ws.mirror).replace("\\", "/")
         try:
-            text, bom = read_text(path)
+            text, bom = read_definition_text(path)
             meta = json.loads(text)
         except (OSError, ValueError, UnicodeDecodeError):
             raise PbzError("REFUSED", rel)
@@ -39,7 +39,7 @@ def _all(project) -> dict[str, dict]:
     for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
         if f.endswith(".bookmark.json"):
             try:
-                out[f[:-len(".bookmark.json")]] = json.loads(read_text(os.path.join(d, f))[0])
+                out[f[:-len(".bookmark.json")]] = json.loads(read_definition_text(os.path.join(d, f))[0])
             except ValueError:
                 continue
     return out
@@ -84,7 +84,7 @@ def add(ws, project, name: str, page: str, hide: list[str] | None = None, show: 
     pid = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(vis[0]["path"]))))
     containers = {}
     for t in vis:
-        doc = json.loads(read_text(t["path"])[0])
+        doc = json.loads(read_definition_text(t["path"])[0])
         was_hidden = doc.get("isHidden") is True
         sv = {"visualType": t["type"]}
         if t["id"] in hidden or (was_hidden and t["id"] not in shown):

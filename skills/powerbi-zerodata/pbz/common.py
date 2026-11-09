@@ -118,13 +118,64 @@ def emit(obj, as_json: bool = False) -> None:
 
 
 def read_text(path: str) -> tuple[str, bytes]:
-    """Read text preserving BOM and newlines exactly. Returns (text, bom)."""
+    """Read text preserving BOM and newlines exactly. Returns (text, bom).
+
+    Unchecked. Prefer `read_text_checked` / `open_mirror_file_readonly` for mirror content.
+    """
     with open(path, "rb") as f:
         data = f.read()
     bom = b""
     if data.startswith(b"\xef\xbb\xbf"):
         bom, data = data[:3], data[3:]
     return data.decode("utf-8"), bom
+
+
+def open_mirror_file_readonly(path: str, *, mirror_root: str, max_bytes: int | None = None) -> bytes:
+    """Read one file under the mirror trust root: single-link, no reparse leaf/ancestors, handle recheck."""
+    root = os.path.abspath(mirror_root)
+    target = os.path.abspath(path)
+    if _reparse_link(root):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    return read_checked(target, root=root, max_bytes=max_bytes)
+
+
+def read_text_checked(path: str, *, root: str, max_bytes: int | None = None) -> tuple[str, bytes]:
+    """Like `read_text`, but through `open_mirror_file_readonly` / `read_checked`."""
+    data = open_mirror_file_readonly(path, mirror_root=root, max_bytes=max_bytes)
+    bom = b""
+    if data.startswith(b"\xef\xbb\xbf"):
+        bom, data = data[:3], data[3:]
+    return data.decode("utf-8"), bom
+
+
+def definition_root(path: str) -> str:
+    """Trust root for a definition file: the outermost pbz-workspace, else the project folder."""
+    cur = os.path.abspath(path)
+    mirror = None
+    report_parent = None
+    while True:
+        name = os.path.basename(cur)
+        if name.lower() == "pbz-workspace":
+            mirror = cur
+        lower = name.lower()
+        if lower.endswith(".report") or lower.endswith(".semanticmodel"):
+            report_parent = os.path.dirname(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    if mirror:
+        return mirror
+    if report_parent:
+        return report_parent
+    raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+
+def read_definition_text(path: str) -> tuple[str, bytes]:
+    """Read one mirror definition file. A missing file is FileNotFoundError. A link is UNSAFE_PATH."""
+    if not os.path.lexists(path):
+        raise FileNotFoundError(path)
+    return read_text_checked(path, root=definition_root(path))
 
 
 # IO_REPARSE_TAG_SYMLINK and IO_REPARSE_TAG_MOUNT_POINT. Junctions are mount points.
@@ -357,6 +408,10 @@ def preflight_regular(path: str, *, root: str | None) -> None:
 SIZE_CAP = "SIZE_CAP"
 
 
+# Tests set this to swap the path between the open and the identity re-check. Production leaves it None.
+_read_checked_hook = None
+
+
 def read_checked(path: str, *, root: str | None, max_bytes: int | None = None) -> bytes:
     """Read one regular single-link file. The opened handle must still be that file before any content read.
 
@@ -375,6 +430,8 @@ def read_checked(path: str, *, root: str | None, max_bytes: int | None = None) -
     if max_bytes is not None and before.st_size > max_bytes:
         raise PbzError("REFUSED", SIZE_CAP)
     _contained(path, root)
+    if _read_checked_hook is not None:
+        _read_checked_hook(path)
     with open(path, "rb") as handle:
         try:
             info = os.fstat(handle.fileno())

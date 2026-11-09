@@ -24,7 +24,7 @@ import stat
 import uuid
 
 from . import desktop, deps, dpapi, lexers, pbir, tmdl
-from .common import PbzError, Project, Workspace, _reparse_link, commit_bytes, engine_call, read_text, write_bytes, write_text
+from .common import PbzError, Project, Workspace, _reparse_link, commit_bytes, engine_call, read_text, read_text_checked, write_bytes, write_text
 from .tokens import TOKEN_RE, apply_edits
 
 MARKER = "PBZ_SYNTHETIC"
@@ -73,7 +73,7 @@ def _verified_owned(ws, root: str) -> bool:
     if not _is_synthetic_root(root):
         return False
     try:
-        with open(os.path.join(root, ".pbz", "synth.json"), encoding="utf-8") as f:
+        with open(os.path.join(root, ".pbz", "synth.json"), encoding="utf-8") as f:  # pbz-allow-open: private synth marker
             info = json.load(f)
         if not isinstance(info, dict) or not isinstance(info.get("built"), str) or not info["built"].strip():
             return False
@@ -87,13 +87,13 @@ def _verified_owned(ws, root: str) -> bool:
         texts = {}
         for path in tmdl.tmdl_files(mdef):
             rel = os.path.relpath(path, mdef).replace("\\", "/")
-            texts[rel] = read_text(path)[0]
+            texts[rel] = read_text_checked(path, root=root)[0]
         mt = texts.get("model.tmdl", "")
         mark = re.search(r"(?m)^annotation PBZ_SYNTHETIC = (\S+)", mt)
         if not mark:
             return False
         return mark.group(1) == marker_value(dpapi.load_key(ws.private), _table_tags(texts))
-    except (OSError, ValueError, KeyError, AttributeError):
+    except (OSError, ValueError, KeyError, AttributeError, PbzError):
         return False
 
 

@@ -163,12 +163,12 @@ hand, which discards `HUMAN_ACCEPTED` history with the file. A present unreadabl
 malformed policy fails closed instead of loosening disclosure. `diff --patch` and `push` refuse
 an aliased or hardlinked mirror entry. Recipe snapshot and restore refuse an aliased or
 hardlinked mirror tree before any step; a link planted mid-run is `RECOVERY_REQUIRED` and is
-not followed. Interactions static honesty stays deferred to Round 18. Freshness `OTHER` is the closed
-`ENGINE_UNAVAILABLE` class. Rollback is still exception-only. Residuals: shell content writes; policy paths built at runtime inside scripts;
-script-level policy deletion; recursive directory copy/move that implicitly carries `.pbz`;
-recursive deletion of a workspace root or ancestor; script-scanning false positives; ancestor
-inspection failures that force lockdown; other mirror readers that do not check link counts;
-and deferred guard-log hardening. When policy is unusable, fix or remove `.pbz/policy.json` by
+not followed. Round 18 closes interactions static honesty (`STATIC_CONTRACT`, contract 2, frozen result tokens) and guard residuals for protected content writes, recursive `.pbz` copy, and workspace-root or ancestor deletes. The mirror reader gate covers interactiontest, preview, validate.field_refs, describe, docs, filters, layout, style, a11y, author, smoke, images, repair, components, pbircheck, visuals, bookmarks, suggest, usage report files, consolidate visual reads, the synth ownership marker, and mirror rebase reads of the sanitized copy. Residual #8 is closed for those mirror definition reads. Model TMDL reads through `tmdl.load_model` stay under residual #8. Pull of the real project and history blobs stay outside that gate. Evidence rotation (#10) and `admin memory-dir` (#12) stay open. Runtime-built policy paths (#2), ancestor-inspection policy beyond deny (#7), guard-log hardening (#9), and crash-proof rollback (#11) stay open. Residual #7 still covers a delete whose target names arrive only through a pipeline, and a `\\?\` prefix that `os.path.commonpath` rejects. A path component containing `~` followed by a digit is denied as an 8.3 short name. A tree operand containing `$`, `%`, `!`, parentheses, or `::` is denied. `$true`, `$false`, and `$null` are not paths. A `~` operand is denied when the same command assigns `HOME` or `USERPROFILE`. A wildcard directory followed by `\*` is denied when that directory is the workspace. A drive root is denied, and a colon that is not a one-letter drive prefix is denied. A move is always a tree operation, so a bare star at the workspace is denied. A `{a..b}` brace is denied. A recursive delete whose wildcard sits in the workspace or an ancestor and can match `policy.json` or `.pbz` is denied. Malformed nested interaction metadata, including a non-string literal, is a REFUSED result and is not static proof. Freshness `OTHER` is the closed
+`ENGINE_UNAVAILABLE` class. Rollback is still exception-only. Residuals still open: policy paths built at runtime inside scripts;
+ancestor inspection failures that force lockdown; deferred guard-log hardening; evidence rotation;
+admin memory-dir. Round 18 closed shell content
+writes to protected paths, script-level policy deletion of named policy paths, recursive copy/move
+that names `.pbz` or copies the workspace root, and recursive deletion of the workspace root. When policy is unusable, fix or remove `.pbz/policy.json` by
 hand in your own terminal, then re-run the refusing verb. This is not OS isolation.
 
 

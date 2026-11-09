@@ -19,12 +19,27 @@ import secrets
 from datetime import datetime as _dt
 
 from . import author, tmdl
-from .common import PbzError, commit_bytes, read_text
+from .common import PbzError, commit_bytes, read_text_checked
 from .tokens import TOKEN_RE
 
 OPS = {"=": 0, "==": 0, ">": 1, ">=": 2, "<": 3, "<=": 4}
 OP_TEXT = {v: k for k, v in OPS.items() if k != "=="}
+
+
+def _mirror_root(project) -> str:
+    ws = getattr(project, "ws", None)
+    mirror = getattr(ws, "mirror", None) if ws is not None else None
+    if mirror:
+        return mirror
+    return os.path.dirname(project.mirror_report)
+
+
+_SHOW_ID = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,63}$")
+# Page folder names are echoed in the interaction result and in its file list.
+# Hex ids from authoring may start with a digit. An underscore or other mark is refused.
+_PAGE_DIR_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 MODES = {"filter": "DataFilter", "highlight": "HighlightFilter", "none": "NoFilter"}
+MODE_FROM = {value: key for key, value in MODES.items()}
 
 
 def _id() -> str:
@@ -168,7 +183,7 @@ def _strict_docs(project) -> None:
             path = os.path.join(cur, name)
             rel = os.path.relpath(path, project.ws.mirror).replace("\\", "/")
             try:
-                json.loads(read_text(path)[0])
+                json.loads(read_text_checked(path, root=_mirror_root(project))[0])
             except (OSError, UnicodeError, ValueError):
                 raise PbzError("REFUSED", rel) from None
 
@@ -205,7 +220,7 @@ def _scope_file(project, page: str | None, visual: str | None, report: bool) -> 
         pj = os.path.join(pdir, pid, "page.json")
         if not os.path.isfile(pj):
             continue
-        name = json.loads(read_text(pj)[0]).get("displayName") or pid
+        name = json.loads(read_text_checked(pj, root=_mirror_root(project))[0]).get("displayName") or pid
         if page.lower() in (pid.lower(), str(name).lower()):
             return pj, f"page {name}"
     raise PbzError("NOT_FOUND", f"page {page}")
@@ -218,7 +233,7 @@ def _all_filter_names(project) -> set:
         for f in fs:
             if f in ("report.json", "page.json", "visual.json"):
                 try:
-                    d = json.loads(read_text(os.path.join(cur, f))[0])
+                    d = json.loads(read_text_checked(os.path.join(cur, f), root=_mirror_root(project))[0])
                 except ValueError:
                     continue
                 names |= {x.get("name") for x in (d.get("filterConfig") or {}).get("filters") or [] if isinstance(x, dict)}
@@ -272,7 +287,7 @@ def add(ws, project, field: str, page: str | None = None, visual: str | None = N
     taken = _all_filter_names(project)
     while flt["name"] in taken:
         flt["name"] = _id()
-    text, bom = read_text(path)
+    text, bom = read_text_checked(path, root=ws.mirror)
     doc = json.loads(text)
     filters = doc.setdefault("filterConfig", {}).setdefault("filters", [])
     filters.append(flt)
@@ -286,7 +301,7 @@ def remove(ws, project, target: str, page: str | None = None, visual: str | None
            dry_run: bool = False) -> dict:
     _strict_docs(project)
     path, scope = _scope_file(project, page, visual, report)
-    text, bom = read_text(path)
+    text, bom = read_text_checked(path, root=ws.mirror)
     doc = json.loads(text)
     filters = (doc.get("filterConfig") or {}).get("filters") or []
     low = target.strip().lower()
@@ -313,7 +328,7 @@ def list_(ws, project, page: str | None = None, visual: str | None = None, repor
             for f in sorted(fs):
                 if f in ("report.json", "page.json", "visual.json"):
                     p = os.path.join(cur, f)
-                    d = json.loads(read_text(p)[0])
+                    d = json.loads(read_text_checked(p, root=ws.mirror)[0])
                     fl = (d.get("filterConfig") or {}).get("filters") or []
                     if fl:
                         scopes.append({"file": os.path.relpath(p, ws.mirror).replace("\\", "/"),
@@ -322,11 +337,85 @@ def list_(ws, project, page: str | None = None, visual: str | None = None, repor
                                                    for x in fl]})
         return {"verb": "filter", "action": "list", "scopes": scopes}
     path, scope = _scope_file(project, page, visual, report)
-    d = json.loads(read_text(path)[0])
+    d = json.loads(read_text_checked(path, root=ws.mirror)[0])
     fl = (d.get("filterConfig") or {}).get("filters") or []
     return {"verb": "filter", "action": "list", "scope": scope,
             "filters": [{"name": x.get("name"), "field": _label(x), "type": x.get("type"), "condition": _summary(x),
                          **({"how": x["howCreated"]} if x.get("howCreated") else {})} for x in fl]}
+
+
+def _page_json(visual_path: str) -> tuple[str, str]:
+    """(page.json path, page id) for a visual.json under definition/pages/<id>/visuals/<id>/."""
+    page_dir = os.path.dirname(os.path.dirname(os.path.dirname(visual_path)))
+    return os.path.join(page_dir, "page.json"), os.path.basename(page_dir)
+
+
+def _load_page(ws, visual_path: str) -> tuple[str, str, bytes, dict]:
+    path, page_id = _page_json(visual_path)
+    try:
+        text, bom = read_text_checked(path, root=ws.mirror)
+        doc = json.loads(text)
+    except PbzError:
+        raise
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        raise PbzError("REFUSED", "UNUSABLE") from None
+    if not isinstance(doc, dict):
+        raise PbzError("REFUSED", "UNUSABLE")
+    return path, page_id, bom, doc
+
+
+def _stored_modes(doc: dict) -> dict[tuple, str]:
+    out = {}
+    for item in doc.get("visualInteractions") or []:
+        if not isinstance(item, dict):
+            continue
+        out[(item.get("source"), item.get("target"))] = MODE_FROM.get(item.get("type"), "REFUSED")
+    return out
+
+
+def _show_id(value) -> str:
+    """A structural id. A display-like token is refused without being echoed."""
+    if isinstance(value, str) and _SHOW_ID.fullmatch(value):
+        return value
+    raise PbzError("REFUSED", "identifier")
+
+
+def _page_dir_id(value) -> str:
+    """Page folder id. Marks such as '_' are refused before a result or file list is built."""
+    if isinstance(value, str) and _PAGE_DIR_ID.fullmatch(value):
+        return value
+    raise PbzError("REFUSED", "identifier")
+
+
+def interaction_show(ws, project, page: str, source: str | None = None) -> dict:
+    """Stored cross-filter modes. A missing entry is Desktop's default. Ids only."""
+    from .style import targets
+    try:
+        _strict_docs(project)
+    except PbzError as err:
+        if err.code == "REFUSED":
+            raise PbzError("REFUSED", "UNUSABLE") from None
+        raise
+    visuals = targets(project, page, None, None, True)
+    if not visuals:
+        raise PbzError("NOT_FOUND", "page has no visuals")
+    if source:
+        src = targets(project, page, source, None, False)[0]
+        sources = [src]
+    else:
+        sources = visuals
+    _path, page_id, _bom, doc = _load_page(ws, visuals[0]["path"])
+    page_id = _show_id(page_id)
+    stored = _stored_modes(doc)
+    pairs = []
+    for src in sources:
+        for tgt in visuals:
+            if tgt["id"] == src["id"]:
+                continue
+            pairs.append({"source": _show_id(src["id"]), "target": _show_id(tgt["id"]),
+                          "mode": stored.get((src["id"], tgt["id"]), "default")})
+    return {"verb": "interaction show", "page": page_id, "pairs": pairs,
+            "note": "Stored cross-filter metadata. default is Desktop's choice. No data was read."}
 
 
 def interaction(ws, project, page: str, source: str, target: str, mode: str, dry_run: bool = False) -> dict:
@@ -335,18 +424,23 @@ def interaction(ws, project, page: str, source: str, target: str, mode: str, dry
     from .style import targets
     if mode not in (*MODES, "default"):
         raise PbzError("BAD_REQUEST", "mode: filter, highlight, none or default")
-    _strict_docs(project)
+    try:
+        _strict_docs(project)
+    except PbzError as err:
+        if err.code == "REFUSED":
+            raise PbzError("REFUSED", "UNUSABLE") from None
+        raise
     src = targets(project, page, source, None, False)[0]
-    page_dir = os.path.dirname(os.path.dirname(os.path.dirname(src["path"])))
     every = [t for t in targets(project, page, None, None, True) if t["id"] != src["id"]]
     tg = every if target.lower() == "all" else targets(project, page, target, None, False)
     if any(t["id"] == src["id"] for t in tg):
         raise PbzError("BAD_REQUEST", "a visual does not interact with itself")
-    pj = os.path.join(page_dir, "page.json")
-    text, bom = read_text(pj)
-    doc = json.loads(text)
+    pj, page_id, bom, doc = _load_page(ws, src["path"])
+    page_id = _page_dir_id(page_id)
+    target_ids = [t["id"] for t in tg]
+    chosen = {t["id"] for t in tg}
     inter = [i for i in doc.get("visualInteractions") or []
-             if not (isinstance(i, dict) and i.get("source") == src["id"] and i.get("target") in {t["id"] for t in tg})]
+             if not (isinstance(i, dict) and i.get("source") == src["id"] and i.get("target") in chosen)]
     if mode != "default":
         inter += [{"source": src["id"], "target": t["id"], "type": MODES[mode]} for t in tg]
     if inter:
@@ -354,5 +448,5 @@ def interaction(ws, project, page: str, source: str, target: str, mode: str, dry
     else:
         doc.pop("visualInteractions", None)
     return _commit_json(pj, bom, _dump(doc), dry_run, {
-        "verb": "interaction", "page": src["page"], "source": src["id"], "targets": [t["id"] for t in tg],
+        "verb": "interaction", "page": page_id, "source": src["id"], "targets": target_ids,
         "mode": mode, "next": "pbz validate, then pbz push --reload"}, ws.mirror)

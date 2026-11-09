@@ -19,7 +19,7 @@ import os
 import re
 
 from . import pbir, tmdl
-from .common import PbzError, commit_bytes, read_text, write_text
+from .common import PbzError, commit_bytes, read_definition_text, write_text
 from .tokens import TOKEN_RE
 
 _CAT: dict | None = None
@@ -72,7 +72,7 @@ def catalog() -> dict:
     global _CAT
     if _CAT is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules", "visual-objects.json")
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:  # pbz-allow-open: packaged rules file
             _CAT = json.load(f)
     return _CAT
 
@@ -234,7 +234,7 @@ def _pages(project) -> tuple[str, list[tuple[str, str]]]:
         pj = os.path.join(pdir, pid, "page.json")
         if os.path.isfile(pj):
             try:
-                name = json.loads(read_text(pj)[0]).get("displayName") or pid
+                name = json.loads(read_definition_text(pj)[0]).get("displayName") or pid
             except ValueError:
                 name = pid
             out.append((pid, name))
@@ -261,7 +261,7 @@ def _strict_documents(project, page: str | None, vtype: str | None, all_: bool, 
             continue
         rel = _mirror_rel(project, pj)
         try:
-            doc = json.loads(read_text(pj)[0])
+            doc = json.loads(read_definition_text(pj)[0])
             if not isinstance(doc, dict):
                 raise ValueError
             name = doc.get("displayName") or pid
@@ -284,7 +284,7 @@ def _strict_documents(project, page: str | None, vtype: str | None, all_: bool, 
                 continue
             rel = _mirror_rel(project, path)
             try:
-                doc = json.loads(read_text(path)[0])
+                doc = json.loads(read_definition_text(path)[0])
                 if not isinstance(doc, dict):
                     raise ValueError
             except (OSError, ValueError, UnicodeDecodeError):
@@ -411,7 +411,7 @@ def run(ws, project, page: str | None = None, visual: str | None = None, sets: l
     for t in tg:
         rel = os.path.relpath(t["path"], ws.mirror).replace("\\", "/")
         try:
-            text, bom = read_text(t["path"])
+            text, bom = read_definition_text(t["path"])
             doc = json.loads(text)
         except (OSError, ValueError, UnicodeDecodeError):
             if mutating:
@@ -544,7 +544,7 @@ def run_canvas(ws, project, page: str | None = None, sets: list[str] | None = No
         path = os.path.join(pdir, pid, "page.json")
         rel = os.path.relpath(path, ws.mirror).replace("\\", "/")
         try:
-            text, bom = read_text(path)
+            text, bom = read_definition_text(path)
             doc = json.loads(text)
         except (OSError, ValueError, UnicodeDecodeError):
             if mutating:

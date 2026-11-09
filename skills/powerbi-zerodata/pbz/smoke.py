@@ -7,7 +7,7 @@ import os
 import re
 
 from . import desktop, pbir, tmdl, tokens
-from .common import PbzError, engine_call, read_text
+from .common import PbzError, engine_call, read_definition_text
 from .lexers import dax_string, dax_table_name
 
 NON_DATA = {"textbox", "image", "shape", "basicShape", "actionButton", "pageNavigator", "bookmarkNavigator",
@@ -221,7 +221,9 @@ def _mirror_rel(root: str, path: str) -> str:
 
 def _read_pbir(path: str, rel: str):
     try:
-        text = read_text(path)[0]
+        text = read_definition_text(path)[0]
+    except PbzError:
+        raise
     except (OSError, UnicodeError) as e:
         raise PbzError("INVALID", rel) from e
     try:

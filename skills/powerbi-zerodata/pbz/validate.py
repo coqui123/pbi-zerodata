@@ -8,7 +8,7 @@ import subprocess
 
 from . import lint, pbir, pbircheck, tmdl
 from .classify import PII_IN_TEXT
-from .common import TOOLS_BIN, engine_call
+from .common import TOOLS_BIN, definition_root, engine_call, open_mirror_file_readonly
 from .tokens import ESC_TOKEN_RE, TOKEN_RE
 
 REPORT_AUTHOR = os.path.join(TOOLS_BIN, "powerbi-report-author.cmd")
@@ -107,23 +107,33 @@ def report_author(stage: str, project, scrub) -> list[dict]:
 
 
 def field_refs(stage: str, project, model, scrub) -> list[dict]:
+    from .common import open_mirror_file_readonly, PbzError as _Pbz
     out = []
     rdir = os.path.join(stage, project.name + ".Report")
+    trust = os.path.abspath(stage)
     ext_measures = set()
     ext = os.path.join(rdir, "definition", "reportExtensions.json")
     if os.path.exists(ext):
         try:
-            with open(ext, encoding="utf-8-sig") as f:
-                for e in json.load(f).get("entities", []):
-                    for m in e.get("measures", []):
-                        ext_measures.add(m.get("name", "").lower())
-        except (OSError, ValueError):
+            raw = open_mirror_file_readonly(ext, mirror_root=trust)
+            if raw.startswith(b"\xef\xbb\xbf"):
+                raw = raw[3:]
+            for e in json.loads(raw.decode("utf-8")).get("entities", []):
+                for m in e.get("measures", []):
+                    ext_measures.add(m.get("name", "").lower())
+        except _Pbz:
+            raise
+        except (OSError, ValueError, UnicodeError):
             pass
     for path in pbir.report_files(rdir):
         rel = os.path.relpath(path, rdir).replace("\\", "/")
         try:
-            with open(path, encoding="utf-8-sig") as f:
-                root = pbir.parse_json(f.read())
+            raw = open_mirror_file_readonly(path, mirror_root=trust)
+            if raw.startswith(b"\xef\xbb\xbf"):
+                raw = raw[3:]
+            root = pbir.parse_json(raw.decode("utf-8"))
+        except _Pbz:
+            raise
         except (OSError, pbir.JsonError, UnicodeDecodeError):
             out.append({"severity": "error", "code": "BAD_JSON", "where": rel, "message": "not valid JSON"})
             continue
@@ -183,11 +193,10 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
         for name in files:
             if name.lower().endswith((".tmdl", ".json", ".pbir", ".pbism")):
                 p = os.path.join(cur, name)
-                with open(p, encoding="utf-8", errors="replace") as f:
-                    body = f.read()
-                    if TOKEN_RE.search(body) or ESC_TOKEN_RE.search(body):
-                        findings.append({"severity": "error", "code": "UNRESOLVED_TOKEN",
-                                         "where": os.path.relpath(p, stage).replace("\\", "/"), "message": "token left"})
+                body = open_mirror_file_readonly(p, mirror_root=definition_root(p)).decode("utf-8", "replace")
+                if TOKEN_RE.search(body) or ESC_TOKEN_RE.search(body):
+                    findings.append({"severity": "error", "code": "UNRESOLVED_TOKEN",
+                                     "where": os.path.relpath(p, stage).replace("\\", "/"), "message": "token left"})
     return findings
 
 

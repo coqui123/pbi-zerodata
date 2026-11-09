@@ -24,7 +24,7 @@ import json
 import os
 
 from . import author, filters
-from .common import PbzError, commit_bytes, read_text
+from .common import PbzError, commit_bytes, read_definition_text
 from .layout import LABELS
 from .tokens import TOKEN_RE
 
@@ -32,7 +32,7 @@ from .tokens import TOKEN_RE
 def _load(ws, path: str) -> tuple[dict, bytes]:
     rel = _rel(ws, path)
     try:
-        text, bom = read_text(path)
+        text, bom = read_definition_text(path)
         doc = json.loads(text)
     except (OSError, ValueError, UnicodeDecodeError):
         raise PbzError("REFUSED", rel)
@@ -43,7 +43,7 @@ def _load(ws, path: str) -> tuple[dict, bytes]:
 
 def _read_blob(ws, path: str) -> tuple[str, bytes]:
     try:
-        return read_text(path)
+        return read_definition_text(path)
     except (OSError, UnicodeDecodeError):
         raise PbzError("REFUSED", _rel(ws, path))
 
@@ -137,7 +137,7 @@ def _bookmarks_on(rdir: str, pid: str) -> int:
     for f in os.listdir(bdir) if os.path.isdir(bdir) else []:
         if f.endswith(".bookmark.json"):
             try:
-                es = json.loads(read_text(os.path.join(bdir, f))[0]).get("explorationState") or {}
+                es = json.loads(read_definition_text(os.path.join(bdir, f))[0]).get("explorationState") or {}
             except ValueError:
                 continue
             if es.get("activeSection") == pid or pid in (es.get("sections") or {}):
@@ -247,7 +247,7 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
     pos = order.index(anchor) + 1 if anchor in order else len(order)
     order.insert(pos, new_pid)
     meta["pageOrder"] = order
-    _t, mbom = read_text(meta_p) if os.path.exists(meta_p) else ("", b"")
+    _t, mbom = read_definition_text(meta_p) if os.path.exists(meta_p) else ("", b"")
     plan(meta_p, _json_text(meta), mbom)
     commit_bytes(ops)
     out = {"verb": "copy", "kind": "page", "from": src_display, "page": new_name.strip(), "id": new_pid,

@@ -624,3 +624,19 @@ recursive deletion of a workspace root or ancestor; script-scanning false positi
 inspection failures that force lockdown; other mirror readers that do not check link counts;
 guard-log hardening (deferred). Unusable policy recovery: fix or remove `.pbz/policy.json` by
 hand in your own terminal. This is not OS isolation.
+
+## Round 18 parity
+
+`pbz interactions` is static-only. Results use a frozen token set (`MATCH`, `MISMATCH`,
+`DEFAULT_UNRESOLVED`, `MISSING_ID`, `RUNTIME_ONLY`, `LEGACY`, `UNKNOWN_TYPE`, `UNSUPPORTED`,
+`REFUSED`). Evidence stage is `STATIC_CONTRACT` and cannot stand in for `HUMAN_ACCEPTED` or native
+execution. Page and visual JSON under the mirror is read through `open_mirror_file_readonly`.
+The guard denies protected content writes, recursive copies that name `.pbz`, and recursive deletes
+of the workspace root. Model TMDL reads through `tmdl.load_model` stay outside that reader gate.
+Evidence rotation and `admin memory-dir` stay open. This is not OS isolation.
+
+## Round 19 parity
+
+`pbz interaction --show` reports stored cross-filter metadata for a page: one closed mode per
+source and target, with page and visual ids only. Setting one pair leaves the other stored pairs
+in place. `pbz review --interactions-spec` is how a static interaction digest becomes current.

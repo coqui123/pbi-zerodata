@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 from . import lexers, pbir, usage
-from .common import read_text
+from .common import read_definition_text
 
 TEXT_VISUALS = {"textbox", "image", "shape", "basicShape", "actionButton", "pageNavigator", "bookmarkNavigator",
                 "group", ""}
@@ -98,7 +98,7 @@ def _report_checks(rname: str, rdir: str, model, add) -> None:
     for path in pbir.report_files(rdir):
         rel = os.path.relpath(path, ddir).replace("\\", "/")
         try:
-            root = pbir.parse_json(read_text(path)[0])
+            root = pbir.parse_json(read_definition_text(path)[0])
         except (OSError, UnicodeDecodeError, pbir.JsonError):
             continue
         fc = root.get("filterConfig")

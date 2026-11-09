@@ -51,7 +51,7 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | Verb | Purpose | Nested | Docs |
 |---|---|---|---|
 | `preview` | Watermarked synthetic layout SVG | `--page`, `--spec` | [preview.md](../skills/powerbi-zerodata/reference/preview.md) |
-| `interactions` | Navigation / slicer contracts | `capabilities` \| `check`; `--mode static\|native` | improvements |
+| `interactions` | Navigation / slicer contracts (contract 2 tokens; native is `UNSUPPORTED`) | `capabilities` \| `check`; `--mode static\|native` | improvements |
 | `freshness` | Refresh provenance contracts | `capture` \| `compare` | improvements |
 | `requirements` | Revision-bound requirement checks | `import` \| `status` \| `verify` \| `accept` | improvements |
 | `consent` | Human file approval receipts | `request` \| `status` \| `approve` \| `read` | improvements |
@@ -85,7 +85,7 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | `link` | Button actions / tooltips | page + visual + action flags | authoring |
 | `filter` | Report/page/visual filters | `add` \| `remove` \| `list` | authoring |
 | `bookmark` | Show/hide bookmarks | `add` \| `remove` \| `list` | authoring |
-| `interaction` | Visual cross-filter mode | `filter` \| `highlight` \| `none` \| `default` | authoring |
+| `interaction` | Visual cross-filter mode | `page source target filter\|highlight\|none\|default`, or `page --show` | authoring |
 | `style` | Visual formatting | `--set`, `--unset`, `--canvas`, `--list` | [style.md](../skills/powerbi-zerodata/reference/style.md) |
 | `image` | Stage report images | `add` \| `list` \| `remove` | authoring |
 | `visual` | Built-in + custom catalog | `list` \| `roles` \| `import` \| `register` | visuals |

@@ -7,12 +7,14 @@ import json
 import os
 
 from . import pbir
-from .common import read_text
+from .common import PbzError, read_definition_text
 
 
 def _load(path: str):
     try:
-        return pbir.to_py(pbir.parse_json(read_text(path)[0]))
+        return pbir.to_py(pbir.parse_json(read_definition_text(path)[0]))
+    except PbzError:
+        raise
     except (OSError, UnicodeDecodeError, pbir.JsonError):
         return None  # unreadable JSON is reported by the field-reference check
 

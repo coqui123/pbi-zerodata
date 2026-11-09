@@ -6,6 +6,16 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- `pbz interaction <page> --show` lists stored cross-filter modes (`filter`, `highlight`, `none`,
+  `default`, or `REFUSED`). Applying one pair keeps the other pairs. Page JSON is read through the
+  mirror check, and the command result uses the page id. `pbz review --interactions-spec` binds a
+  static interaction contract to that spec's digest.
+- Round 18: interaction contracts move to contract version 2. Per-case `status` and `reason` are the
+  closed tokens `MATCH`, `MISMATCH`, `DEFAULT_UNRESOLVED`, `MISSING_ID`, `RUNTIME_ONLY`, `LEGACY`,
+  `UNKNOWN_TYPE`, `UNSUPPORTED`, and `REFUSED`. Evidence stage `STATIC_CONTRACT` cannot satisfy a
+  runtime requirement or `HUMAN_ACCEPTED`. `validate` field reads now raise `UNSAFE_PATH` on links
+  instead of recording `BAD_JSON`. Guard denies quoted protected writes, recursive ancestor
+  copy/move/delete, and `robocopy /MIR` of the workspace without flagging a `workspace-old` sibling.
 - Public documentation pack: overview, getting started, full CLI catalog, security and contributing
   guides, MIT license.
 - Repo hygiene: expanded `.gitignore`, removed internal Round-17 plan scratch from the tree.

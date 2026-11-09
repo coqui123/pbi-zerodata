@@ -47,25 +47,26 @@ class Fixture(unittest.TestCase):
         native=interactiontest.run(self.ws,self.project,spec,'native')
         self.assertEqual(native['status'],'UNSUPPORTED');self.assertFalse(native['executed'])
         static=interactiontest.run(self.ws,self.project,spec)
-        self.assertEqual(static['results'][0]['status'],'PASS');self.assertFalse(static['native_executed'])
+        self.assertEqual(static['results'][0]['status'],'MATCH');self.assertFalse(static['native_executed'])
+        self.assertEqual(static.get('stage'),'STATIC_CONTRACT')
 
     def test_drillthrough_field_mismatch(self):
         spec={'cases':[{'id':'drill','action':'drillthrough','page':'A','visual':'S','target':'B'}]}
-        self.assertEqual(interactiontest.run(self.ws,self.project,spec)['results'][0]['status'],'FAIL')
+        self.assertEqual(interactiontest.run(self.ws,self.project,spec)['results'][0]['status'],'MISMATCH')
 
     def test_context_loss_rejected(self):
         p=self.pages/'B/page.json';d=json.loads(p.read_text());d['pageBinding']['acceptsFilterContext']='None';p.write_text(json.dumps(d))
         spec={'cases':[{'id':'drill','action':'drillthrough','page':'A','visual':'D','target':'B'}]}
-        self.assertEqual(interactiontest.run(self.ws,self.project,spec)['results'][0]['status'],'FAIL')
+        self.assertEqual(interactiontest.run(self.ws,self.project,spec)['results'][0]['status'],'MISMATCH')
 
     def test_sync_group_field_contract(self):
         self.put('B','visuals/S2/visual.json',{'visual':{'visualType':'slicer','syncGroup':{'groupName':'G'},'query':{'field':self.field('Calendar','Month')}}})
         spec={'cases':[{'id':'sync','action':'slicer','page':'A','visual':'S'}]}
-        self.assertEqual(interactiontest.run(self.ws,self.project,spec)['results'][0]['reason'],'SYNC_FIELD_MISMATCH')
+        self.assertEqual(interactiontest.run(self.ws,self.project,spec)['results'][0]['reason'],'MISMATCH')
 
     def test_back_contract(self):
         spec={'cases':[{'id':'back','action':'back','page':'B','visual':'Back'}]}
-        self.assertEqual(interactiontest.run(self.ws,self.project,spec)['results'][0]['status'],'PASS')
+        self.assertEqual(interactiontest.run(self.ws,self.project,spec)['results'][0]['status'],'MATCH')
 
     def test_path_case_rejected(self):
         with self.assertRaises(common.PbzError):

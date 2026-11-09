@@ -7,7 +7,7 @@ import json
 import os
 
 from . import pbir, tmdl
-from .common import PbzError, commit_bytes, read_text
+from .common import PbzError, commit_bytes, read_definition_text
 
 
 def _rel(ws, path: str) -> str:
@@ -20,7 +20,7 @@ def _load(ws, path):
         return None, None, b""
     rel = _rel(ws, path)
     try:
-        text, bom = read_text(path)
+        text, bom = read_definition_text(path)
         data = json.loads(text)
     except (OSError, ValueError, UnicodeDecodeError):
         raise PbzError("REFUSED", rel)
@@ -63,7 +63,7 @@ def _lineage(project, fix, writes) -> None:
             new_text, changed = apply_edits(doc.text, sorted(edits)), True
         if changed:
             path = os.path.join(mdef, *rel.split("/"))
-            writes[path] = (new_text, read_text(path)[1])
+            writes[path] = (new_text, read_definition_text(path)[1])
 
 
 def _format_conflicts(project, fix, writes) -> None:
@@ -87,7 +87,7 @@ def _format_conflicts(project, fix, writes) -> None:
                     edits += ed
                     fix("FORMAT_STRING_CONFLICT", rel, f"dropped the static formatString of measure {node.name}")
         if edits:
-            writes[path] = (apply_edits(doc.text, sorted(edits)), read_text(path)[1])
+            writes[path] = (apply_edits(doc.text, sorted(edits)), read_definition_text(path)[1])
 
 
 def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool = False) -> dict:

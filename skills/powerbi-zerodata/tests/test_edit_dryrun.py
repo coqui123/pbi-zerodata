@@ -109,6 +109,93 @@ class EditDryRunTests(unittest.TestCase):
         self.assertEqual(applied["files"], dry["files"])
         self.assertIn("relationship", Path(os.path.join(project.mirror_model, "definition", "relationships.tmdl")).read_text(encoding="utf-8"))
 
+    def test_interaction_show_preserves_other_pairs(self):
+        ws, project = self._project()
+        page = os.path.join(project.mirror_report, "definition", "pages", "p1", "page.json")
+        doc = json.loads(Path(page).read_text(encoding="utf-8"))
+        doc["displayName"] = "PBZ_CANARY_PAGE"
+        doc["visualInteractions"] = [{"source": "v2", "target": "v1", "type": "DataFilter"},
+                                     {"source": "v1", "target": "v2", "type": "NotAMode"}]
+        Path(page).write_text(json.dumps(doc), encoding="utf-8")
+        shown = filters.interaction_show(ws, project, "p1")
+        blob = json.dumps(shown)
+        self.assertNotIn("PBZ_CANARY_PAGE", blob)
+        self.assertEqual(shown["page"], "p1")
+        pairs = {(item["source"], item["target"]): item["mode"] for item in shown["pairs"]}
+        self.assertEqual(pairs[("v2", "v1")], "filter")
+        self.assertEqual(pairs[("v1", "v2")], "REFUSED")
+        filters.interaction(ws, project, "p1", "v1", "v2", "highlight")
+        shown = filters.interaction_show(ws, project, "p1", "v1")
+        self.assertEqual(shown["pairs"], [{"source": "v1", "target": "v2", "mode": "highlight"}])
+        kept = json.loads(Path(page).read_text(encoding="utf-8"))["visualInteractions"]
+        self.assertIn({"source": "v2", "target": "v1", "type": "DataFilter"}, kept)
+        Path(page).write_text("{", encoding="utf-8")
+        with self.assertRaises(PbzError) as caught:
+            filters.interaction_show(ws, project, "p1")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(caught.exception.detail, "UNUSABLE")
+        self.assertNotIn("Expecting", caught.exception.detail)
+        canary = "PBZ_CANARY_PAGE"
+        src = os.path.join(project.mirror_report, "definition", "pages", "p1")
+        renamed = os.path.join(project.mirror_report, "definition", "pages", canary)
+        os.rename(src, renamed)
+        Path(os.path.join(renamed, "page.json")).write_text(json.dumps({"name": "p1", "displayName": "Page"}), encoding="utf-8")
+        with self.assertRaises(PbzError) as caught:
+            filters.interaction_show(ws, project, "Page")
+        self.assertEqual(caught.exception.detail, "identifier")
+        self.assertNotIn(canary, str(caught.exception))
+        Path(os.path.join(renamed, "page.json")).write_text("{", encoding="utf-8")
+        with self.assertRaises(PbzError) as caught:
+            filters.interaction_show(ws, project, "Page")
+        self.assertEqual(caught.exception.detail, "UNUSABLE")
+        self.assertNotIn(canary, str(caught.exception))
+
+    def test_interaction_refuses_canary_directory_name(self):
+        ws, project = self._project()
+        canary = "PBZ_CANARY_PAGE"
+        src = os.path.join(project.mirror_report, "definition", "pages", "p1")
+        renamed = os.path.join(project.mirror_report, "definition", "pages", canary)
+        os.rename(src, renamed)
+        Path(os.path.join(renamed, "page.json")).write_text(
+            json.dumps({"name": "p1", "displayName": "Page"}), encoding="utf-8")
+        before = _bytes(ws.mirror)
+        for dry in (True, False):
+            with self.assertRaises(PbzError) as caught:
+                filters.interaction(ws, project, "Page", "v1", "v2", "highlight", dry_run=dry)
+            self.assertEqual(caught.exception.detail, "identifier")
+            self.assertNotIn(canary, str(caught.exception))
+        self.assertEqual(_bytes(ws.mirror), before)
+        Path(os.path.join(renamed, "page.json")).write_text("{", encoding="utf-8")
+        broken = _bytes(ws.mirror)
+        for dry in (True, False):
+            with self.assertRaises(PbzError) as caught:
+                filters.interaction(ws, project, "Page", "v1", "v2", "highlight", dry_run=dry)
+            self.assertEqual(caught.exception.code, "REFUSED")
+            self.assertEqual(caught.exception.detail, "UNUSABLE")
+            self.assertNotIn(canary, str(caught.exception))
+            self.assertNotIn("Expecting", str(caught.exception))
+        self.assertEqual(_bytes(ws.mirror), broken)
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from pbz import cli
+        for args in (
+            ["--workspace", ws.root, "interaction", "Page", "v1", "v2", "highlight", "--dry-run"],
+            ["--workspace", ws.root, "interaction", "Page", "v1", "v2", "highlight"],
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = cli.main(args)
+            blob = out.getvalue() + err.getvalue()
+            self.assertNotEqual(rc, 0)
+            self.assertIn("UNUSABLE", blob)
+            self.assertNotIn(canary, blob)
+            self.assertNotIn("Expecting", blob)
+        self.assertEqual(_bytes(ws.mirror), broken)
+        for name in ("evidence.jsonl", os.path.join("logs", "guard.log")):
+            path = os.path.join(ws.root, ".pbz", name)
+            if os.path.isfile(path):
+                self.assertNotIn(canary, Path(path).read_text(encoding="utf-8"))
+
     def test_interaction_dry_run_unchanged(self):
         ws, project = self._project()
         before = _bytes(ws.mirror)

@@ -24,7 +24,7 @@ import re
 import uuid
 
 from . import deps, governance as gv, lexers, modeling as md, move, pbir, rename, scaffold, similar, tmdl, usage
-from .common import PbzError, commit_bytes, read_text
+from .common import PbzError, commit_bytes, read_definition_text, read_text
 from .tokens import TOKEN_RE, apply_edits
 
 MODEL_AREAS = ("measures", "calculated_columns", "calculation_items", "calculated_tables", "format_strings",
@@ -665,7 +665,7 @@ def _implicit_visuals(ws, project, model) -> list[str]:
                 continue
             mirror_rel = os.path.relpath(path, ws.mirror).replace("\\", "/")
             try:
-                root = pbir.parse_json(read_text(path)[0])
+                root = pbir.parse_json(read_definition_text(path)[0])
                 if any(f.kind == "aggregation" and "queryState" in p for f, p in pbir.walk_fields_with_path(root, model)):
                     parts = rel.split("/")
                     hits.append(f"{rname} | {parts[1]} | {parts[3]}")

@@ -23,7 +23,7 @@ from .common import (
     _workspace_root,
 )
 
-STAGES = ("PARSED", "BOUND", "LOADED", "EXECUTED", "SYNTHETIC", "HANDOFF", "HUMAN_ACCEPTED")
+STAGES = ("PARSED", "BOUND", "LOADED", "EXECUTED", "STATIC_CONTRACT", "SYNTHETIC", "HANDOFF", "HUMAN_ACCEPTED")
 LOG = "evidence.jsonl"
 LOG_CAP = 1024 * 1024
 OVER_CAP = (
@@ -33,7 +33,12 @@ UNUSABLE = "evidence log is unusable"
 CLASS_ORDER = ["SECURITY_REVIEW", "REFRESH_REQUIRED", "RECALC_REQUIRED", "LOGIC", "METADATA_ONLY", "REPORT_ONLY", "UNKNOWN"]
 _VERBS = {
     "validate", "push", "desktop open", "desktop reload", "health", "check",
-    "snapshot compare", "snapshot save", "smoke", "synth-test run", "handoff", "review --accept",
+    "snapshot compare", "snapshot save", "smoke", "interactions", "synth-test run",
+    "handoff", "review --accept",
+}
+_STATIC_RESULTS = {
+    "MATCH", "MISMATCH", "DEFAULT_UNRESOLVED", "MISSING_ID", "RUNTIME_ONLY",
+    "LEGACY", "UNKNOWN_TYPE", "UNSUPPORTED", "REFUSED",
 }
 _TOP = {"ts", "project", "verb", "mirror_rev", "real_rev", "stage", "summary", "scope"}
 _TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
@@ -299,6 +304,17 @@ def _summary_scope(verb: str, stage: str, scope, summary: dict) -> str | None:
             and summary.get("accepted") is True):
         if scope is None or _scope_is(scope, "review:--accept"):
             return "review:--accept"
+    if (stage == "STATIC_CONTRACT" and verb == "interactions"
+            and keys == {"ids", "counts", "spec_digest", "outcome", "executed", "native_executed"}):
+        ids = summary.get("ids")
+        digest = summary.get("spec_digest")
+        ids_ok = isinstance(ids, list) and len(ids) <= 50 and all(item is None or _loose(item) for item in ids)
+        if (ids_ok and _count_map(summary.get("counts"))
+                and isinstance(digest, str) and re.fullmatch(r"s[0-9a-f]{12}", digest)
+                and summary.get("outcome") == "INCOMPLETE"
+                and summary.get("executed") is False and summary.get("native_executed") is False
+                and _scope_is(scope, "interactions")):
+            return "interactions"
     return None
 
 
@@ -372,7 +388,9 @@ def _verdict(value) -> str:
     allowed = {"PASS", "FAIL", "ERROR", "EMPTY", "UNSUPPORTED", "BUDGET", "SAME", "DIFF", "NEW", "MISSING",
                "STALE_DATA", "OK", "N/A", "PUSHED", "DRY_RUN_OK", "INVALID", "RELOADED", "RELOAD_FAILED",
                "ENGINE_UNAVAILABLE", "DESKTOP_DIRTY", "DESKTOP_STATE_UNKNOWN", "NOT_READY", "TIMEOUT",
-               "INCOMPLETE", "BLOCKED", "GENERATED", "UNKNOWN", "PROTOCOL_ERROR"}
+               "INCOMPLETE", "BLOCKED", "GENERATED", "UNKNOWN", "PROTOCOL_ERROR",
+               "MATCH", "MISMATCH", "DEFAULT_UNRESOLVED", "MISSING_ID", "RUNTIME_ONLY", "LEGACY",
+               "UNKNOWN_TYPE", "REFUSED", "STATIC_ONLY"}
     if value in allowed:
         return value
     # Engine error classes are closed-vocabulary, never arbitrary diagnostic text.
@@ -494,6 +512,24 @@ def summarize(verb: str, action: str | None, out: dict) -> tuple[str, dict] | No
                              "outcome": _outcome([str(out.get("result", "UNKNOWN"))])}
     if verb == "handoff" and out.get("file") and out.get("result") != "NOTHING_NEW":
         return "HANDOFF", {"file": "HANDOFF.md", "outcome": "GENERATED"}
+    if verb == "interactions" and out.get("stage") == "STATIC_CONTRACT":
+        res = [r for r in (out.get("results") or []) if isinstance(r, dict)]
+        counts: dict = {}
+        for row in res:
+            status = row.get("status")
+            if status in _STATIC_RESULTS:
+                counts[status] = counts.get(status, 0) + 1
+        digest = out.get("spec_digest")
+        if not isinstance(digest, str) or not re.fullmatch(r"s[0-9a-f]{12}", digest):
+            return None
+        return "STATIC_CONTRACT", {
+            "ids": [r.get("id") for r in res][:50],
+            "counts": counts,
+            "spec_digest": digest,
+            "outcome": "INCOMPLETE",
+            "executed": False,
+            "native_executed": False,
+        }
     return None
 
 
@@ -648,7 +684,57 @@ def _suggested_tests(ws, project, logic: list[str]) -> list[str]:
     return out
 
 
-def review(ws, project, accept: bool = False) -> dict:
+def static_proof_ok(entries: list[dict], *, mirror_rev: str, spec_digest: str) -> bool:
+    """True only for a successful static interaction contract on this revision and digest.
+
+    A record of mismatches, unsupported native runs, or missing binding metadata is not proof.
+    The result never counts as runtime execution or HUMAN_ACCEPTED.
+    """
+    if not isinstance(spec_digest, str) or not re.fullmatch(r"s[0-9a-f]{12}", spec_digest):
+        return False
+    if not isinstance(mirror_rev, str) or not _MREV.fullmatch(mirror_rev):
+        return False
+    for entry in entries:
+        if entry.get("stage") != "STATIC_CONTRACT":
+            continue
+        if entry.get("stage") == "HUMAN_ACCEPTED":
+            return False
+        scope = entry.get("scope") or ""
+        if not str(scope).startswith("interactions"):
+            continue
+        if entry.get("mirror_rev") != mirror_rev:
+            continue
+        summary = entry.get("summary") if isinstance(entry.get("summary"), dict) else None
+        if not summary:
+            continue
+        if summary.get("spec_digest") != spec_digest:
+            continue
+        if summary.get("outcome") != "INCOMPLETE":
+            return False
+        if summary.get("executed") is not False or summary.get("native_executed") is not False:
+            return False
+        counts = summary.get("counts")
+        if not isinstance(counts, dict) or not counts:
+            return False
+        if any(key not in _STATIC_RESULTS for key in counts):
+            return False
+        failing = counts.keys() - {"MATCH"}
+        if failing or not counts.get("MATCH"):
+            return False
+        return True
+    return False
+
+
+def consume_static(entries: list[dict], *, mirror_rev: str, spec_digest: str | None) -> dict:
+    """Evidence-consumption view of a static interaction record.
+
+    Satisfaction is static-only. It cannot fill a runtime requirement or HUMAN_ACCEPTED.
+    """
+    ok = bool(spec_digest) and static_proof_ok(entries, mirror_rev=mirror_rev, spec_digest=spec_digest or "")
+    return {"static_contract": ok, "runtime_satisfied": False, "human_accepted": False}
+
+
+def review(ws, project, accept: bool = False, current_spec_digest: str | None = None) -> dict:
     from . import changes, consumers
     cur_m, cur_r = mirror_rev(ws, project), real_rev(ws, project)
     if accept:
@@ -719,8 +805,13 @@ def review(ws, project, accept: bool = False) -> dict:
         reg = consumers.load_registry(ws)["consumers"]
     except (OSError, ValueError):
         reg = []
+    # The stored digest is not the current spec. Callers pass the digest of the spec they just loaded.
+    static_view = consume_static(entries, mirror_rev=cur_m, spec_digest=current_spec_digest)
     coverage = {"external_consumers": "registered" if reg else "none registered",
-                "human_visual_review": next((x["status"] for x in evidence if x["stage"] == "HUMAN_ACCEPTED"), "NOT_RUN")}
+                "human_visual_review": next((x["status"] for x in evidence if x["stage"] == "HUMAN_ACCEPTED"), "NOT_RUN"),
+                "static_contract": static_view["static_contract"],
+                "runtime_from_static": static_view["runtime_satisfied"],
+                "human_from_static": static_view["human_accepted"]}
     out = {"verb": "review", "project": project.name, "revision": {"mirror": cur_m, "real": cur_r},
            "pending_edits": pending, "classes": {c: by_class[c] for c in CLASS_ORDER if c in by_class},
            "changes": rows[:300], "evidence": evidence, "coverage": coverage,

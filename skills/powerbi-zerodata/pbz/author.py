@@ -12,7 +12,7 @@ import re
 import secrets
 
 from . import images, pbir, tmdl, visuals
-from .common import PbzError, commit_bytes, read_text, write_text
+from .common import PbzError, commit_bytes, read_definition_text, write_text
 from .tokens import TOKEN_RE
 
 SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition"
@@ -33,7 +33,7 @@ def _versions(rdir: str) -> dict:
     seen: dict = collections.defaultdict(collections.Counter)
     for path in pbir.report_files(rdir):
         try:
-            sch = json.loads(read_text(path)[0]).get("$schema", "")
+            sch = json.loads(read_definition_text(path)[0]).get("$schema", "")
         except (OSError, ValueError, AttributeError):
             continue
         m = re.search(r"/definition/([A-Za-z]+)/(\d+\.\d+\.\d+)/schema\.json$", sch or "")
@@ -45,12 +45,12 @@ def _versions(rdir: str) -> dict:
 def _pages(rdir: str):
     pdir = os.path.join(rdir, "definition", "pages")
     meta_p = os.path.join(pdir, "pages.json")
-    meta = json.loads(read_text(meta_p)[0]) if os.path.exists(meta_p) else {"pageOrder": []}
+    meta = json.loads(read_definition_text(meta_p)[0]) if os.path.exists(meta_p) else {"pageOrder": []}
     out = {}
     for pid in sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []:
         pj = os.path.join(pdir, pid, "page.json")
         if os.path.isfile(pj):
-            out[pid] = json.loads(read_text(pj)[0])
+            out[pid] = json.loads(read_definition_text(pj)[0])
     return pdir, meta_p, meta, out
 
 
@@ -112,7 +112,7 @@ def add_page(ws, project, name: str, width: int | None = None, height: int | Non
     pos = order.index(anchor) + 1 if anchor is not None else len(order)
     order.insert(pos, pid)
     meta["pageOrder"] = order
-    _t, bom = read_text(meta_p) if os.path.exists(meta_p) else ("", b"")
+    _t, bom = read_definition_text(meta_p) if os.path.exists(meta_p) else ("", b"")
     ops: list[tuple] = [
         ("write", page_path, json.dumps(page, indent=2, ensure_ascii=False) + "\n", b""),
         ("write", meta_p, json.dumps(meta, indent=2) + "\n", bom),
@@ -153,7 +153,7 @@ def _bookmark_id(rdir: str, ref: str) -> str:
             continue
         bid = f[:-len(".bookmark.json")]
         try:
-            disp = json.loads(read_text(os.path.join(bdir, f))[0]).get("displayName", "")
+            disp = json.loads(read_definition_text(os.path.join(bdir, f))[0]).get("displayName", "")
         except ValueError:
             disp = ""
         if ref.lower() in (bid.lower(), str(disp).lower()):
@@ -179,7 +179,7 @@ def link(ws, project, page: str, visual: str, to_page: str | None = None, back: 
         raise PbzError("BAD_REQUEST", "pass an action, --tooltip <page> or --clear")
     lit = lambda v: {"expr": {"Literal": {"Value": v}}}  # noqa: E731
     quoted = lambda s: "'" + s.replace("'", "''") + "'"  # noqa: E731
-    text, bom = read_text(t["path"])
+    text, bom = read_definition_text(t["path"])
     doc = json.loads(text)
     body = doc["visual"]
     vco = body.setdefault("visualContainerObjects", {})
@@ -352,7 +352,7 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
     existing = []
     for vid in os.listdir(vdir) if os.path.isdir(vdir) else []:
         try:
-            existing.append(json.loads(read_text(os.path.join(vdir, vid, "visual.json"))[0]).get("position") or {})
+            existing.append(json.loads(read_definition_text(os.path.join(vdir, vid, "visual.json"))[0]).get("position") or {})
         except (OSError, ValueError):
             continue
     w, h = SIZES.get(vtype, (420, 300))

@@ -21,7 +21,7 @@ import os
 from dataclasses import dataclass, field
 
 from . import deps, pbir, tmdl
-from .common import PbzError, read_text
+from .common import PbzError, read_definition_text, read_text
 
 STATES = ("used", "used_external", "locked", "used_by_unused", "unused", "unknown")
 UNSEEN = ["service reports", "Excel / Analyze in Excel", "paginated reports", "composite models",
@@ -520,7 +520,7 @@ def _report(g: Graph, model, res, rname: str, rdir: str) -> None:
     for path in pbir.report_files(rdir):
         rel = os.path.relpath(path, ddir).replace("\\", "/")
         try:
-            files.append((rel, pbir.parse_json(read_text(path)[0])))
+            files.append((rel, pbir.parse_json(read_definition_text(path)[0])))
         except (OSError, UnicodeDecodeError, pbir.JsonError, IndexError):
             g.warnings.append({"code": "UNREADABLE_REPORT_FILE", "report": rname, "where": rel})
             g.incomplete = True

@@ -14,7 +14,7 @@ import os
 import re
 
 from . import deps, lexers, mirror, pbir, tmdl, usage
-from .common import PbzError, anchor_mirror, pbz_state_path, preflight_regular, read_checked, read_text, write_text
+from .common import PbzError, anchor_mirror, pbz_state_path, preflight_regular, read_checked, read_text, read_text_checked, write_text
 
 SECTIONS = ["overview", "tables", "measures", "calculation_groups", "functions", "field_parameters",
             "relationships", "power_query", "security", "reports", "unused", "changelog"]
@@ -78,8 +78,12 @@ def _report(name: str, rdir: str, model) -> dict:
 
     def load(*parts):
         p = os.path.join(ddir, *parts)
+        if not os.path.isfile(p):
+            return None
         try:
-            return pbir.parse_json(read_text(p)[0])
+            return pbir.parse_json(read_text_checked(p, root=os.path.dirname(rdir))[0])
+        except PbzError:
+            raise
         except (OSError, UnicodeDecodeError, pbir.JsonError):
             return None
 

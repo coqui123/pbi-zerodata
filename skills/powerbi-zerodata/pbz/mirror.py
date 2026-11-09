@@ -13,7 +13,7 @@ import uuid
 from . import desktop, policy as policy_mod, tmdl, tokens, validate
 from .classify import Classifier
 from .common import (PbzError, Project, Workspace, _contained, _reparse_link, anchor_mirror, append_checked,
-                    commit_bytes, file_sha, pbz_state_path, preflight_regular, read_checked, read_text, remove_file,
+                    commit_bytes, file_sha, pbz_state_path, preflight_regular, read_checked, read_text, read_text_checked, remove_file,
                     replace_bytes, sha, write_text)
 
 SKIP_DIRS = {".pbi", "daxqueries", "tmdlscripts", "customvisuals", "node_modules"}  # cultures: mirrored, see tokens
@@ -262,6 +262,11 @@ def excluded_mirror_additions(ws: Workspace, project: Project) -> list[str]:
     return sorted(set(found))
 
 
+def _read_mine(path: str, root: str) -> tuple[str, bytes]:
+    """Read one rebase input from the sanitized mirror."""
+    return read_text_checked(path, root=root)
+
+
 def _read_prepared(path: str, rel: str):
     """Read one pull input. A decode or IO failure names the mirror-relative path and nothing else."""
     try:
@@ -332,7 +337,7 @@ def pull(ws: Workspace, project: Project, force: bool = False, rebase: bool = Fa
             _must_stay(mine, ws.mirror)
             if os.path.lexists(base):
                 _must_stay(base, ws.private)
-            item["mine_text"], item["mine_bom"] = _read_prepared(mine, rel)
+            item["mine_text"], item["mine_bom"] = _read_mine(mine, ws.mirror)
             item["base_text"] = _read_prepared(base, rel)[0] if os.path.exists(base) else None
         prepared.append(item)
     # Preflight every planned mirror/base publish and stale-delete path before the first write,

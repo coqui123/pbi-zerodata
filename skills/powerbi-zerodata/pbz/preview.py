@@ -39,7 +39,13 @@ def _inside(path: Path, root: Path) -> Path:
 def _read(path: Path, mirror: Path) -> dict:
     _inside(path, mirror)
     try:
-        obj = json.loads(path.read_text(encoding="utf-8-sig"))
+        from .common import open_mirror_file_readonly
+        raw = open_mirror_file_readonly(str(path), mirror_root=str(mirror))
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        obj = json.loads(raw.decode("utf-8"))
+    except PbzError:
+        raise
     except (OSError, ValueError, UnicodeError):
         raise PbzError("BAD_JSON", "preview requires valid sanitized PBIR metadata")
     if not isinstance(obj, dict):

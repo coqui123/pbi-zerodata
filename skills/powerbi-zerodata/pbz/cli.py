@@ -229,6 +229,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p = sub.add_parser("review", help="review packet: pending changes by release class, impact, revision-bound evidence, "
                                       "coverage (writes pbz-workspace/REVIEW.md)")
     p.add_argument("--accept", action="store_true", help="the reviewer accepts the current revision (terminal only)")
+    p.add_argument("--interactions-spec", help="bind a static interaction contract to this spec's digest")
     p = sub.add_parser("handoff")
     p.add_argument("--all", action="store_true")
     p = sub.add_parser("memscrub")
@@ -421,9 +422,10 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("--only", nargs="+", default=[], help="add: apply to these visuals only")
     p = sub.add_parser("interaction", help="how one visual filters or highlights others on its page")
     p.add_argument("page")
-    p.add_argument("source", help="visual id or layout label")
-    p.add_argument("target", help="visual id, layout label, or all")
-    p.add_argument("mode", choices=["filter", "highlight", "none", "default"])
+    p.add_argument("source", nargs="?", help="visual id or layout label")
+    p.add_argument("target", nargs="?", help="visual id, layout label, or all")
+    p.add_argument("mode", nargs="?", choices=["filter", "highlight", "none", "default"])
+    p.add_argument("--show", action="store_true", help="list stored modes; default means Desktop's choice")
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("style", help="visual formatting (titles, labels, colors, fonts, axes, legends, ...) checked "
                                      "against Microsoft's formatting catalog")
@@ -657,7 +659,12 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             out = handoff.build(ws, project, a.all)
         elif a.cmd == "review":
             from pbz import evidence
-            out = evidence.review(ws, project, a.accept)
+            digest = None
+            if a.interactions_spec:
+                from pbz import interactiontest
+                loaded = _spec(a.interactions_spec, ws)
+                digest = interactiontest._spec_digest(loaded)
+            out = evidence.review(ws, project, a.accept, current_spec_digest=digest)
         elif a.cmd == "memscrub":
             out = memscrub.run(ws, project, a.dir, apply=a.apply, show=a.show, human=_is_human())
         elif a.cmd == "unused":
@@ -756,7 +763,12 @@ def main(argv=None, *, parser_only: bool = False) -> int:
                                   a.where or None, a.top, a.by, a.bottom, dry_run=a.dry_run)
         elif a.cmd == "interaction":
             from pbz import filters
-            out = filters.interaction(ws, project, a.page, a.source, a.target, a.mode, dry_run=a.dry_run)
+            if a.show:
+                out = filters.interaction_show(ws, project, a.page, a.source)
+            elif not (a.source and a.target and a.mode):
+                raise PbzError("BAD_REQUEST", "give source, target, and mode, or pass --show")
+            else:
+                out = filters.interaction(ws, project, a.page, a.source, a.target, a.mode, dry_run=a.dry_run)
         elif a.cmd == "copy":
             from pbz import components
             if a.kind == "page":

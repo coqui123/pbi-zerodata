@@ -7,12 +7,12 @@ import re
 
 from . import lexers, pbir, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
-from .common import PbzError, read_text
+from .common import PbzError, read_text_checked
 
 
 def _index_summary(ws) -> dict:
     try:
-        with open(os.path.join(ws.private, "index-summary.json"), encoding="utf-8") as f:
+        with open(os.path.join(ws.private, "index-summary.json"), encoding="utf-8") as f:  # pbz-allow-open: private index
             data = json.load(f)
     except (OSError, ValueError):
         return {}
@@ -32,7 +32,7 @@ def field_usage(project, model) -> dict:
         pjson = os.path.join(pages_dir, pid, "page.json")
         if not os.path.isfile(pjson):
             continue
-        proot = pbir.parse_json(read_text(pjson)[0])
+        proot = pbir.parse_json(read_text_checked(pjson, root=os.path.dirname(project.mirror_report))[0])
         pname = proot.get("displayName").value if isinstance(proot.get("displayName"), pbir.JStr) else pid
         for ref in pbir.walk_fields(proot, model):
             use.setdefault((ref.kind, ref.table, ref.name), set()).add(f"{pname} | (page filter)")
@@ -41,7 +41,7 @@ def field_usage(project, model) -> dict:
             vjson = os.path.join(vdir, vid, "visual.json")
             if not os.path.isfile(vjson):
                 continue
-            vroot = pbir.parse_json(read_text(vjson)[0])
+            vroot = pbir.parse_json(read_text_checked(vjson, root=os.path.dirname(project.mirror_report))[0])
             v = vroot.get("visual")
             vt = v.get("visualType").value if isinstance(v, pbir.JObj) and isinstance(v.get("visualType"), pbir.JStr) else "?"
             for ref in pbir.walk_fields(vroot, model):
@@ -88,7 +88,7 @@ def overview(ws, project) -> dict:
         for pid in sorted(os.listdir(pages_dir)):
             pj = os.path.join(pages_dir, pid, "page.json")
             if os.path.isfile(pj):
-                root = pbir.parse_json(read_text(pj)[0])
+                root = pbir.parse_json(read_text_checked(pj, root=os.path.dirname(project.mirror_report))[0])
                 name = root.get("displayName").value if isinstance(root.get("displayName"), pbir.JStr) else pid
                 vdir = os.path.join(pages_dir, pid, "visuals")
                 pages.append({"id": pid, "name": name, "visuals": len(os.listdir(vdir)) if os.path.isdir(vdir) else 0})

@@ -23,7 +23,7 @@ import math
 import os
 import re
 
-from .common import PbzError, commit_bytes, read_text, write_text
+from .common import PbzError, commit_bytes, read_definition_text, write_text
 from .tokens import TOKEN_RE
 
 MOBILE_SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainerMobileState"
@@ -45,7 +45,7 @@ def _pages(project) -> list[tuple[str, str, dict, str]]:
     meta = os.path.join(pdir, "pages.json")
     if os.path.exists(meta):
         try:
-            order = list(json.loads(read_text(meta)[0]).get("pageOrder") or [])
+            order = list(json.loads(read_definition_text(meta)[0]).get("pageOrder") or [])
         except ValueError:
             order = []
     ids = order + [p for p in sorted(os.listdir(pdir)) if os.path.isdir(os.path.join(pdir, p)) and p not in order]
@@ -55,7 +55,7 @@ def _pages(project) -> list[tuple[str, str, dict, str]]:
         if not os.path.isfile(pj):
             continue
         try:
-            page = json.loads(read_text(pj)[0])
+            page = json.loads(read_definition_text(pj)[0])
         except ValueError:
             continue
         out.append((pid, page.get("displayName") or pid, page, os.path.join(pdir, pid)))
@@ -79,7 +79,7 @@ def _require_json(project, path: str) -> tuple[dict, str, bytes]:
     """Parse a document a mutation will use. The detail is the mirror-relative path only."""
     rel = _rel(project, path)
     try:
-        text, bom = read_text(path)
+        text, bom = read_definition_text(path)
         doc = json.loads(text)
     except (OSError, ValueError, UnicodeDecodeError):
         raise PbzError("REFUSED", rel)
@@ -127,7 +127,7 @@ def _mutation_page(project, page: str):
             doc, _text, _bom = _require_json(project, pj)
         else:
             try:
-                doc = json.loads(read_text(pj)[0])
+                doc = json.loads(read_definition_text(pj)[0])
                 if not isinstance(doc, dict):
                     raise ValueError
             except (OSError, ValueError, UnicodeDecodeError):
@@ -158,7 +158,7 @@ def _visuals(page_dir: str) -> list[dict]:
     for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
         path = os.path.join(vdir, vid, "visual.json")
         try:
-            doc = json.loads(read_text(path)[0])
+            doc = json.loads(read_definition_text(path)[0])
         except (OSError, ValueError):
             continue
         body = doc.get("visual") if isinstance(doc.get("visual"), dict) else None
@@ -411,7 +411,7 @@ def _mobile_version(project) -> str:
         for v in _visuals(pdir):
             if os.path.exists(v["mobile"]):
                 try:
-                    sch = json.loads(read_text(v["mobile"])[0]).get("$schema", "")
+                    sch = json.loads(read_definition_text(v["mobile"])[0]).get("$schema", "")
                 except ValueError:
                     continue
                 m = re.search(r"/visualContainerMobileState/(\d+\.\d+\.\d+)/schema\.json$", sch or "")

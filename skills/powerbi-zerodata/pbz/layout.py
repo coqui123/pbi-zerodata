@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 
 from . import pbir
-from .common import PbzError, read_text
+from .common import PbzError, read_definition_text
 
 COLS, ROWS = 96, 30
 LABELS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -15,7 +15,9 @@ OVERLAY_TYPES = {"shape", "basicShape", "image", "actionButton", "textbox", "gro
 
 def _load(path):
     try:
-        return pbir.parse_json(read_text(path)[0])
+        return pbir.parse_json(read_definition_text(path)[0])
+    except PbzError:
+        raise
     except (OSError, UnicodeDecodeError, pbir.JsonError):
         return None
 

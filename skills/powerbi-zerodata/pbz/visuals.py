@@ -25,7 +25,7 @@ import shutil
 import zipfile
 
 from . import pbir
-from .common import PbzError, commit_bytes, read_text, write_text
+from .common import PbzError, commit_bytes, read_definition_text, write_text
 
 KINDS = {0: "grouping", 1: "measure", 2: "either", "grouping": "grouping", "measure": "measure",
          "groupingormeasure": "either", "either": "either"}
@@ -89,7 +89,7 @@ def core() -> dict:
     global _CORE
     if _CORE is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules", "visuals.json")
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:  # pbz-allow-open: packaged rules file
             _CORE = json.load(f)["visuals"]
     return _CORE
 
@@ -132,7 +132,7 @@ def _report_json(report_dir: str) -> tuple[str, bytes, object]:
     path = os.path.join(report_dir, "definition", "report.json")
     if not os.path.exists(path):
         raise PbzError("NO_MIRROR", "report.json missing: run `pbz pull` first")
-    text, bom = read_text(path)
+    text, bom = read_definition_text(path)
     return text, bom, pbir.parse_json(text)
 
 
@@ -140,7 +140,7 @@ def registrations(report_dir: str) -> dict:
     """{visualType: {"kind": public|private|organizational, "conflict"?: True}} plus the
     organizationCustomVisuals names under "_org_metadata" (metadata only, not a runtime registration)."""
     try:
-        data = json.loads(read_text(os.path.join(report_dir, "definition", "report.json"))[0])
+        data = json.loads(read_definition_text(os.path.join(report_dir, "definition", "report.json"))[0])
     except (OSError, ValueError):
         return {}
     out: dict = {}
@@ -168,7 +168,7 @@ def used_types(report_dir: str) -> dict[str, int]:
         if not path.replace("\\", "/").endswith("/visual.json"):
             continue
         try:
-            v = json.loads(read_text(path)[0]).get("visual") or {}
+            v = json.loads(read_definition_text(path)[0]).get("visual") or {}
         except (OSError, ValueError, AttributeError):
             continue
         vt = v.get("visualType") if isinstance(v, dict) else None
@@ -184,7 +184,7 @@ def observed_roles(report_dir: str, vtype: str) -> list[str]:
         if not path.replace("\\", "/").endswith("/visual.json"):
             continue
         try:
-            v = json.loads(read_text(path)[0]).get("visual") or {}
+            v = json.loads(read_definition_text(path)[0]).get("visual") or {}
         except (OSError, ValueError, AttributeError):
             continue
         if not isinstance(v, dict) or v.get("visualType") != vtype:
@@ -218,7 +218,7 @@ def contracts(ws) -> dict[str, dict]:
     for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
         if f.endswith(".json"):
             try:
-                with open(os.path.join(d, f), encoding="utf-8") as h:
+                with open(os.path.join(d, f), encoding="utf-8") as h:  # pbz-allow-open: custom-visual contract store
                     c = json.load(h)
             except (OSError, ValueError):
                 continue

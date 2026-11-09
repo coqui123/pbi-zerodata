@@ -705,6 +705,9 @@ _MOVE_VERBS = {"mv", "move", "mi", "move-item", "ren", "rename", "rni", "rename-
 _COPY_VERBS = {"cp", "copy", "cpi", "copy-item", "xcopy", "robocopy"}
 _RENAME_VERBS = {"ren", "rename", "rni", "rename-item"}
 _NEW_VERBS = {"new-item", "ni"}
+_CONTENT_VERBS = {
+    "set-content", "sc", "add-content", "ac", "out-file", "tee-object", "tee", "clear-content", "clc",
+}
 _LINK_TYPES = {"hardlink", "symboliclink", "junction"}
 _ARG_PREFIX = re.compile(r"(?i)^-[A-Za-z][\w-]*:(.*)$")
 
@@ -728,8 +731,29 @@ def strip_arg(token: str) -> str:
     return text
 
 
+def _plain_name(part: str) -> str:
+    """Windows file APIs ignore a trailing dot or space, and `name:stream` is `name`.
+
+    A drive-relative form such as `C:..` keeps its drive and its `.` or `..`.
+    """
+    if re.fullmatch(r"[A-Za-z]:", part) or part in {".", ".."}:
+        return part
+    drive = ""
+    body = part
+    matched = re.match(r"^([A-Za-z]:)(.*)$", part)
+    if matched:
+        drive, body = matched.group(1), matched.group(2)
+    if body in {".", ".."}:
+        return drive + body
+    if ":" in body:
+        body = body.split(":", 1)[0]
+    if body in {".", ".."}:
+        return drive + body
+    return drive + body.rstrip(". ")
+
+
 def _path_bits(token: str) -> list[str]:
-    return [part for part in token.replace("\\", "/").split("/") if part not in ("", ".")]
+    return [_plain_name(part) for part in token.replace("\\", "/").split("/") if part not in ("", ".")]
 
 
 def _is_policy_file(token: str) -> bool:
@@ -907,10 +931,362 @@ def _policy_shell(part: str, toks: list[str], verb: str, cur: str, session_root:
     return None
 
 
+def _protected_pieces(text: str) -> list[str]:
+    low = text.lower().replace("/", "\\")
+    low = low.replace('"', " ").replace("'", " ")
+    low = re.sub(r"[><|;,]", " ", low)
+    low = re.sub(r"(?<=[a-z0-9]):(?=[.\\])", " ", low)
+    return [name for part in re.split(r"[\s\\]+", low) if (name := _plain_name(part))]
+
+
+def _mentions_protected(text: str) -> bool:
+    """True for a `.pbz` path segment or `policy.json`, including quoted and redirected forms.
+
+    `.pbzignore` is a different segment and does not match.
+    A component containing `~` and a digit is an 8.3 short name (`PBZ~1`, `POLICY~1.JSO`).
+    """
+    parts = _protected_pieces(text)
+    if ".pbz" in parts or "policy.json" in parts:
+        return True
+    return any(re.search(r"~\d", part) for part in parts)
+
+
+def _wildcard_protected(text: str) -> bool:
+    """True when a wildcard segment can select `.pbz`, or `policy.json` inside that directory."""
+    parts = _protected_pieces(text)
+    for index, part in enumerate(parts):
+        if not any(ch in part for ch in "*?["):
+            continue
+        parent = parts[index - 1] if index else ""
+        parent_is_pbz = parent == ".pbz" or (any(ch in parent for ch in "*?[") and fnmatch.fnmatch(".pbz", parent))
+        # A bare `*` inside another directory is that directory's children, not `.pbz`.
+        if part != "*" and fnmatch.fnmatch(".pbz", part):
+            return True
+        if part == "*" and parent_is_pbz:
+            return True
+        if parent_is_pbz and fnmatch.fnmatch("policy.json", part):
+            return True
+    return False
+
+
+_CMD_LETTER_SWITCH_VERBS = {"rd", "rmdir", "del", "erase", "copy", "move"}
+_CMD_WORD_SWITCH_VERBS = {"robocopy", "xcopy"}
+
+
+_BRACE_LIMIT = 64
+
+
+def _brace_one(token: str) -> list[str] | None:
+    """Expand the innermost comma-brace, or None when this token has none.
+
+    A `}` whose body has no comma is literal. The opener under it stays open,
+    so `{../../ws,{x}}` still splits into `../../ws` and `{x}`.
+    """
+    stack: list[int] = []
+    for index, char in enumerate(token):
+        if char == "{":
+            stack.append(index)
+            continue
+        if char != "}" or not stack:
+            continue
+        opener = stack.pop()
+        body = token[opener + 1:index]
+        if "," not in body:
+            continue
+        pre, post = token[:opener], token[index + 1:]
+        return [pre + piece + post for piece in body.split(",")]
+    return None
+
+
+def _sequence_brace(token: str) -> bool:
+    """True for a bash sequence such as `{z..z}`. A comma list is not a sequence."""
+    stack = []
+    for index, char in enumerate(token):
+        if char == "{":
+            stack.append(index)
+            continue
+        if char != "}" or not stack:
+            continue
+        body = token[stack.pop() + 1:index]
+        if ".." in body and "," not in body:
+            return True
+    return False
+
+
+def _brace_expand(token: str) -> list[str] | None:
+    """Expand bash `{a,b}` lists, including several groups and nested groups.
+
+    None means the cap was hit, a brace list is still unresolved, or a `{a..b}`
+    sequence is present. A token without a comma-brace stays as it is, including
+    a literal `{name}`.
+    """
+    current = [token]
+    for _ in range(_BRACE_LIMIT):
+        nxt: list[str] = []
+        grew = False
+        for item in current:
+            expanded = _brace_one(item)
+            if expanded is None:
+                nxt.append(item)
+                continue
+            grew = True
+            nxt.extend(expanded)
+            if len(nxt) > _BRACE_LIMIT:
+                return None
+        current = nxt
+        if not grew:
+            break
+    for item in current:
+        if _brace_one(item) is not None or item.count("{") != item.count("}") or _sequence_brace(item):
+            return None
+    return current
+
+
+def _switch_name(token: str) -> str:
+    """Flag name before a colon value. `-Rec:$true` stays `-Rec`; paths still use strip_arg."""
+    text = token.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    if text.startswith("-"):
+        return text.split(":", 1)[0]
+    return strip_arg(text)
+
+
+def _cmd_letter_switches(token: str) -> list[str] | None:
+    """Split a cmd run of one-letter switches (`/s/q`) into `/s` and `/q`."""
+    if not token.startswith("/"):
+        return None
+    parts = [part for part in token[1:].split("/") if part]
+    if len(parts) >= 2 and all(len(part) == 1 and part.isalpha() for part in parts):
+        return ["/" + part for part in parts]
+    return None
+
+
+def _shell_operand(token: str, cur: str, *, cmd_switches: bool = False, letter_only: bool = False) -> str | None:
+    """A command operand, or None for a switch.
+
+    `/` and MSYS `/c` or `/c/` are the drive root. `/Users` is `<drive>\\Users`.
+    A single-letter or one-word `/MIR` switch is dropped only for cmd verbs.
+    """
+    if token.startswith("-"):
+        return None
+    if not token.startswith("/"):
+        return token
+    parts = [part for part in token[1:].split("/") if part != ""]
+    drive = os.path.splitdrive(os.path.abspath(cur))[0]
+    rooted = (drive + "\\") if drive else "\\"
+    if not parts:
+        return rooted
+    single_letter = len(parts) == 1 and len(parts[0]) == 1 and parts[0].isalpha()
+    if single_letter and cmd_switches and not token.endswith("/"):
+        return None
+    if single_letter:
+        return parts[0].upper() + ":\\"
+    if len(parts[0]) == 1 and parts[0].isalpha():
+        rest = "\\" + "\\".join(parts[1:]) if len(parts) > 1 else "\\"
+        return parts[0].upper() + ":" + rest
+    if cmd_switches and not letter_only and len(parts) == 1 and parts[0].isalpha():
+        return None
+    return rooted + "\\".join(parts)
+
+
+def _win_components(token: str) -> str:
+    """Drop trailing dots and spaces from each path component. `.` and `..` stay."""
+    cleaned = []
+    for part in token.replace("/", "\\").split("\\"):
+        if part in {"", ".", ".."} or re.fullmatch(r"[A-Za-z]:", part):
+            cleaned.append(part)
+        else:
+            cleaned.append(_plain_name(part))
+    return "\\".join(cleaned)
+
+
+_HOME_ASSIGN = re.compile(
+    r"(?i)(?:^|[\s;&|(])(?:export\s+|set\s+)?(?:\$env:)?(?:home|userprofile)\s*="
+)
+
+
+def _covers_workspace(raw: str, cur: str, root: str, *, home_rebound: bool = False) -> bool:
+    """True when a recursive operand is the workspace, an ancestor, or a wildcard over one of those.
+
+    `$` and `%` are not expanded. The guard process and the shell can disagree, and a
+    prefix assignment can change the shell's value. `$true`, `$false`, and `$null` are not paths.
+    """
+    if "`" in raw or "^" in raw or "(" in raw or ")" in raw or "::" in raw:
+        return True
+    text = raw.replace("/", "\\").strip()
+    if "%" in text or "!" in text:
+        return True
+    if "$" in text and text.lower() not in {"$true", "$false", "$null"}:
+        return True
+    if home_rebound and (text == "~" or text.startswith("~\\")):
+        return True
+    if text.startswith("~") and text != "~" and not text.startswith("~\\"):
+        return True
+    if text == "~" or text.startswith("~\\"):
+        text = os.path.expanduser(text)
+    drive_rel = re.match(r"^([A-Za-z]):([^\\].*)$", text)
+    if drive_rel:
+        cur_drive = os.path.splitdrive(os.path.abspath(cur))[0]
+        if not cur_drive or cur_drive[0].lower() != drive_rel.group(1).lower():
+            return True
+        text = drive_rel.group(2)
+    for part in text.split("\\"):
+        if ":" in part and not re.fullmatch(r"[A-Za-z]:", part):
+            return True
+    token = _win_components(text)
+    if re.fullmatch(r"[A-Za-z]:\\?\*?", token):
+        return True
+    if token in {".", ".."}:
+        return _ancestor_or_self(norm(token, cur), root)
+    if any(ch in token for ch in "*?["):
+        head = token
+        for mark in "*?[":
+            head = head.split(mark)[0]
+        head = head.rstrip("\\")
+        if _ancestor_or_self(norm(head or ".", cur), root):
+            return True
+        parts = token.split("\\")
+        for index, part in enumerate(parts):
+            if not any(ch in part for ch in "*?["):
+                continue
+            directory = "\\".join(parts[:index]) or "."
+            if not _ancestor_or_self(norm(directory, cur), root):
+                continue
+            if (fnmatch.fnmatch("policy.json", part) or fnmatch.fnmatch(".pbz", part)
+                    or re.search(r"~\d", part)):
+                return True
+        patterns = [token]
+        if token.endswith("\\*"):
+            parent_pat = token[:-2].rstrip("\\")
+            if parent_pat:
+                patterns.append(parent_pat)
+        for candidate in patterns:
+            pattern = os.path.normcase(norm(candidate, cur))
+            current = os.path.normcase(os.path.abspath(root))
+            while True:
+                if fnmatch.fnmatch(current, pattern):
+                    return True
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+        return False
+    return _ancestor_or_self(norm(token, cur), root)
+
+
+def _ancestor_or_self(shaped: str, root: str) -> bool:
+    """True when `shaped` is the workspace root or a directory that contains it. Inspection failure denies."""
+    try:
+        left = os.path.normcase(os.path.abspath(shaped))
+        right = os.path.normcase(os.path.abspath(root))
+        return os.path.commonpath([left, right]) == left
+    except ValueError:
+        return False
+    except OSError:
+        return True
+
+
+def _r18_shell(part: str, toks: list[str], verb: str, cur: str, session_root: str | None,
+               *, home_rebound: bool = False) -> str | None:
+    """Round 18: content writes, recursive .pbz carry, and ancestor/root deletes."""
+    if not session_root or not verb:
+        return None
+    low = part.lower()
+    redirects = re.findall(r">+\s*(\"[^\"]*\"|'[^']*'|\S+)", part)
+    redirect_names: list[str] = []
+    for target in redirects:
+        expanded = _brace_expand(strip_arg(target))
+        if expanded is None:
+            return "policy"
+        redirect_names.extend(expanded)
+    if verb in _CONTENT_VERBS and (_mentions_protected(part) or _wildcard_protected(part)):
+        return "policy"
+    if any(_mentions_protected(target) or _wildcard_protected(target) for target in redirect_names):
+        return "policy"
+    if verb in _NEW_VERBS and (_mentions_protected(part) or _wildcard_protected(part)) and any(
+            strip_arg(t).lower().startswith("-value") for t in toks):
+        return "policy"
+    if verb in _DELETE_VERBS and (_mentions_protected(part) or _wildcard_protected(part)):
+        return "policy"
+    has_dash = any(strip_arg(item).startswith("-") for item in toks)
+    letter_only = verb in _CMD_LETTER_SWITCH_VERBS
+    # A dash flag disables one-letter / switch dropping for every cmd verb class.
+    cmd_switches = False
+    if not has_dash:
+        if letter_only:
+            cmd_switches = True
+        elif verb in _CMD_WORD_SWITCH_VERBS:
+            cmd_switches = True
+    flag_tokens: list[str] = []
+    switch_verb = letter_only or verb in _CMD_WORD_SWITCH_VERBS
+    for token in toks:
+        text = _switch_name(token)
+        pieces = _cmd_letter_switches(text) if switch_verb else None
+        flag_tokens.extend(pieces or [text])
+    flags = {item.lower() for item in flag_tokens}
+    recurse = bool(flags & {"-recurse", "-r", "-rf", "-fr", "/e", "/s", "/mir", "/purge"}) or any(
+        flag in low for flag in ("/mir", "/purge", "-recurse"))
+    recurse = recurse or any(
+        flag.split("=", 1)[0] in {"--recursive", "--recurse", "--archive"} or flag.startswith("-rec")
+        for flag in flags)
+    recurse = recurse or any(
+        flag.startswith("-") and not flag.startswith("--") and flag[1:].isalpha() and any(ch in flag[1:] for ch in "ra")
+        for flag in flags)
+    here = os.path.normcase(norm(cur))
+    root = os.path.normcase(session_root)
+    args = []
+    brace_failed = False
+    for token in toks[verb_index(toks) + 1:]:
+        text = strip_arg(token)
+        if cmd_switches and _cmd_letter_switches(text):
+            continue
+        expanded = _brace_expand(text)
+        if expanded is None:
+            if verb in _DELETE_VERBS | _MOVE_VERBS | _COPY_VERBS | _CONTENT_VERBS | _NEW_VERBS:
+                return "policy"
+            brace_failed = True
+            continue
+        for item in expanded:
+            for piece in item.split(","):
+                if piece == "":
+                    continue
+                if piece.count("{") != piece.count("}"):
+                    brace_failed = True
+                    continue
+                if verb in _DELETE_VERBS | _MOVE_VERBS | _COPY_VERBS | _CONTENT_VERBS | _NEW_VERBS and (
+                        _mentions_protected(piece) or _wildcard_protected(piece)):
+                    return "policy"
+                operand = _shell_operand(piece, cur, cmd_switches=cmd_switches, letter_only=letter_only)
+                if operand is not None:
+                    args.append(operand)
+    tree_verbs = _MOVE_VERBS | (_COPY_VERBS if recurse else set()) | (_DELETE_VERBS if recurse else set())
+    if verb in tree_verbs and brace_failed:
+        return "policy"
+    if verb in tree_verbs:
+        if _mentions_protected(part):
+            return "policy"
+        for raw in args:
+            if _covers_workspace(raw, cur, session_root, home_rebound=home_rebound):
+                return "policy"
+        if not args and here == root:
+            return "policy"
+    if verb == "robocopy" and ("/mir" in low or "/purge" in low):
+        for raw in args:
+            if _mentions_protected(raw) or _ancestor_or_self(norm(raw, cur), session_root):
+                return "policy"
+    return None
+
+
 def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int = 0) -> str | None:
     if _depth == 0 and session_root is None:
         session_root = active_root(norm(cwd))
     cmd, bodies = split_heredocs(cmd)
+    if session_root and _mentions_protected(cmd):
+        write_verbs = _CONTENT_VERBS | _DELETE_VERBS | _NEW_VERBS
+        low = cmd.lower()
+        if ">" in cmd or any(re.search(rf"(^|[\s;|&]){re.escape(verb)}($|[\s;|&])", low) for verb in write_verbs):
+            return "policy"
     for lead, body in bodies:  # a heredoc is code only when it feeds an interpreter; otherwise it is text
         if _POLICY_TEXT.search(body):
             return "policy"
@@ -947,6 +1323,8 @@ def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int
                     cur = norm(dest, cur)
                 continue
             if _policy_shell(part, toks, v, cur, session_root):
+                return "policy"
+            if _r18_shell(part, toks, v, cur, session_root, home_rebound=bool(_HOME_ASSIGN.search(cmd))):
                 return "policy"
             root = active_root(cur)
             pol = load_policy(root)
