@@ -1,8 +1,11 @@
 # Reference projects
 
+> **Design history** (survey dated 2026-11-04). Related open-source work studied while designing
+> pbz. Licenses and activity change — re-check before vendoring. For current docs see
+> [INDEX.md](INDEX.md).
+
 No maintained project combines a byte-exact PBIP mirror, reversible typed tokens, a value-blind
-broker and agent hooks. These are the building blocks worth reusing or studying. Licenses and
-activity as reported by the research; re-check before vendoring.
+broker and agent hooks. These are building blocks worth studying.
 
 ## Parsing, validation, lint
 

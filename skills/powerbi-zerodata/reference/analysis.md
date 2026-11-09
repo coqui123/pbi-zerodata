@@ -1,4 +1,4 @@
-# Analysis verbs: unused, lineage, remove, suggest, m-lineage
+# Analysis verbs: unused, lineage, suggest, similar, changes, docs, m-lineage
 
 All of these read the sanitized mirror (`pbz-workspace\`) and print object names, states, counts
 and codes. They never read values. Mirror tokens `«...»` are treated as opaque literals, never as
@@ -65,6 +65,19 @@ every touched file). `pbz unused --restore <stamp>` puts it back if the files ha
 restore later points first. Push as usual; push validates the staged files with TOM, the report
 schema, field references and lint, so a removal that breaks a reference is refused.
 
+## Lineage (`pbz lineage`)
+
+```
+pbz lineage "[Total Sales]"
+pbz lineage "'Sales'[Amount]" --up
+pbz lineage Sales --depth 4
+pbz lineage "[M]" --report path\to\Thin.Report
+```
+
+Default direction is **dependents** (what breaks if you change this object). `--up` shows
+**dependencies**. Depth defaults to 6. Extra thin reports passed with `--report` join the usage
+graph the same way as `unused`.
+
 ## Suggestions (`pbz suggest`)
 
 `UNUSED_OBJECTS`, `AUTO_DATE_TIME`, `INACTIVE_RELATIONSHIP_UNUSED`, `VISIBLE_KEY_COLUMN` (many-side
@@ -72,6 +85,42 @@ relationship key never shown), `IS_AVAILABLE_IN_MDX` (hidden helper column with 
 hierarchy), `UNUSED_VARIABLE`, `SINGLE_FIELD_PARAMETER`, `EMPTY_FILTER`, `VISUAL_WITHOUT_FIELDS`,
 `HIDDEN_PAGE_UNREFERENCED` (not a tooltip or drillthrough page and nothing navigates to it),
 `HIDDEN_VISUAL` (no bookmark captures it), `UNUSED_CUSTOM_VISUAL`.
+
+## Similar measures (`pbz similar`)
+
+```
+pbz similar
+pbz similar --threshold 0.85 --max 50
+```
+
+Finds duplicate and near-duplicate measure expressions in the mirror (normalized DAX text). Useful
+before consolidating with `pbz consolidate` ([audit.md](audit.md)). Threshold is a similarity score
+in `[0, 1]`; `--max` caps reported pairs.
+
+## Changes (`pbz changes`)
+
+```
+pbz changes --list
+pbz changes --from <stamp> --to <stamp>
+```
+
+Semantic object-level diff across mirror history snapshots taken on pull/push. Lists what appeared,
+disappeared or changed by object identity — not a textual line diff of tokenized files. Prefer this
+when writing a review packet ([workflow.md](workflow.md)).
+
+## Docs (`pbz docs`)
+
+```
+pbz docs
+pbz docs --format md
+pbz docs --format html
+pbz docs --format json --dax
+```
+
+Builds model and report documentation from the mirror (names, descriptions, folders, relationships,
+pages). Optional `--dax` includes measure expressions. Change-log lines from `.pbz/push-log.jsonl`
+that are not valid JSON are skipped: the export reports `changelog_status: INCOMPLETE` and a skip
+count, and never echoes the bad line.
 
 ## Power Query lineage (`pbz m-lineage`)
 

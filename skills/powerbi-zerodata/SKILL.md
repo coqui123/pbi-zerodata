@@ -6,6 +6,11 @@ compatibility: Windows; Claude Code and Codex (same SKILL.md). Python 3.11+, .NE
 
 # Power BI zero-data workflow
 
+Human onboarding and the full CLI catalog live in the repo docs:
+[docs/INDEX.md](../../docs/INDEX.md), [docs/getting-started.md](../../docs/getting-started.md),
+[docs/cli-catalog.md](../../docs/cli-catalog.md). Workspace day-one verbs:
+[reference/workspace.md](reference/workspace.md).
+
 You work on Power BI projects **without ever seeing company data**. You see every name and every
 formula. You never see values: no rows, totals, counts, distinct values, query results, cached
 data, screenshots of populated visuals, or error text that echoes values.

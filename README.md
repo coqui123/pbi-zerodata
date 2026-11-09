@@ -1,104 +1,128 @@
 # pbi-zerodata
 
-Skill + CLI bundle that lets coding agents (Claude Code, Codex) develop Power BI PBIP projects
-without company data entering the agent's context.
+**Develop Power BI PBIP projects with coding agents — without company data values entering the
+agent context.**
 
-- `skills/powerbi-zerodata/SKILL.md`: the workflow agents follow.
-- `skills/powerbi-zerodata/pbz/`: the `pbz` CLI (Python, stdlib + jsonschema) and `guard.py`, the
-  PreToolUse / SessionStart hook shared by Claude Code and Codex.
-- `skills/powerbi-zerodata/engine/`: `pbz-engine`, the C# declassification broker (TOM + ADOMD.NET)
-  that runs checks against Power BI Desktop's local engine and prints verdicts only.
-- `skills/powerbi-zerodata/tools/`: Microsoft's `powerbi-report-author` and `powerbi-desktop`
-  CLIs (npm, local install; `screenshot` / `preview` are blocked by the guard).
-- Model hygiene verbs with Measure Killer parity, all metadata only: `unused` (with `--remove` /
-  `--restore`), `lineage`, `suggest`, `bpa` (scores, grades, `--fix`), `similar`, `changes`, `docs`,
-  `m-lineage`. Plan and status: `docs/parity-plan.md`; usage: `reference/analysis.md`,
-  `reference/bpa.md`; attributions: `THIRD_PARTY_NOTICES.md`.
-- Refactoring and authoring verbs (mirror edits, validated on push): `rename table`, `move measure`,
-  `new` (measure table, date table, calculation group, field parameter), `relationship`,
-  `add page|visual`, `layout`, `format`, `repair`. Usage: `reference/authoring.md`.
-- `add visual` covers every built-in visual type (roles from Microsoft's core visual capabilities) and
-  custom visuals: `visual import|register|roles|list` for AppSource, organizational and private
-  .pbiviz visuals (`reference/visuals.md`).
-- `style`: visual formatting (titles, data labels, colors, fonts, axes, legends, borders, one series,
-  button states) for one visual or every visual of a type, checked against Microsoft's formatting
-  catalog (`reference/style.md`).
-- `filter` (basic, not in, advanced, Top N, measure filters at report, page and visual level),
-  `interaction`, tooltip and drillthrough pages (`add page --tooltip | --drillthrough`), show/hide
-  `bookmark`s and button actions (`link`): `reference/authoring.md`.
-- `synth test`: golden results on the synthetic model and SAME / DIFF after a refactor
-  (`reference/synth.md`); `consumers discover` finds files connected to the model.
-- Model properties (`set` / `get`, bulk by table, kind, name pattern or folder), `hierarchy`,
-  `format-expr` (dynamic format strings), DAX user-defined `function`s, object-level security
-  (`role ols`); page and visual `copy`, `a11y` audit and tab-order fix, `mobile` phone layouts.
-- `review`: review packet by release class with revision-bound evidence (`reference/workflow.md`);
-  `recipe run`: JSON batches of mirror edits applied as one transaction with rollback.
-- `audit`: efficiency and consolidation findings (iterators, calculated columns, storage bands, relationships,
-  Power Query overlap, duplicate measures and tables, calculation-group, filtered and parameterized
-  families, repeated sub-expressions), each with evidence, fix and verification; baselines, waivers and a
-  CI gate. `audit memory` adds VertiPaq storage bands from Desktop (bands only); `consolidate merge` and
-  `consolidate calc-group` apply the consolidations with a check spec (`reference/audit.md`).
-- Themes, page backgrounds and images: custom theme JSON is edited in the mirror and checked on push;
-  `style --canvas` sets canvas and wallpaper color, transparency and image; `image add|list|remove`
-  stages image files without showing them and push installs them; `add visual image`. Images embedded
-  in themes, text or SVG measures become `«payload:image#n»` tokens (`reference/authoring.md`).
-- CI: `.github/workflows/tests.yml` runs the offline suites on every push (Desktop suites stay local).
-- `consumers`: register thin reports, PBIX, Excel workbooks, paginated reports, composite models, query
-  exports or a scanner result so `unused` keeps what they use (`used_external`) and refuses removals
-  while coverage is incomplete (`reference/consumers.md`).
-- Governance and refresh editors: `culture`, `translate`, `perspective`, `role`, `refresh-policy`;
-  `push --only` and `revert`. Usage: `reference/governance.md`.
-- `synth`: a synthetic copy of the model with fake data that agents may query freely
-  (`reference/synth.md`); `mcp`: the same verbs as typed MCP tools (`reference/mcp.md`, register with
-  `install.py --mcp`).
-- Safety: optional `"literals": "strict"` policy (hide every literal by default) and a 30-day
-  disclosure ledger for engine checks; OS-level hardening steps in `reference/leak-vectors.md`.
-- Self-contained at runtime: no third-party binaries (no Measure Killer, Tabular Editor, DAX Studio or
-  Bravo); built-in three-way merge and PBIR integrity checks; Microsoft's npm CLIs are optional.
+Agents see every **name** and every **formula**. They must never see rows, totals, distinct counts,
+query results, cached data, or screenshots of populated visuals. The `pbz` CLI and guard keep work
+inside a sanitized mirror (`pbz-workspace/`) and return closed-vocabulary verdicts from Desktop.
+
+| | |
+|---|---|
+| **License** | [MIT](LICENSE) |
+| **Docs** | [Documentation index](docs/INDEX.md) |
+| **Security** | [SECURITY.md](SECURITY.md) |
+| **Contributing** | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| **Changelog** | [CHANGELOG.md](CHANGELOG.md) |
+
+## Why it exists
+
+Normal agent setups can read `*.SemanticModel`, `*.Report`, workbooks, and Desktop outputs. That
+leaks business data into prompts. `pbz` separates:
+
+1. **Real PBIP files** — blocked from agent tools by the PreToolUse guard.
+2. **Sanitized mirror** — reversible tokens; safe to edit and search.
+3. **`pbz-engine`** — local Desktop broker that prints verdicts, never cell values.
+4. **Human gates** — consent, review acceptance, admin, and memory scrub apply.
+
+Honest limits (not OS isolation, not crash-proof atomicity) are documented in
+[docs/overview.md](docs/overview.md) and
+[skills/powerbi-zerodata/reference/leak-vectors.md](skills/powerbi-zerodata/reference/leak-vectors.md).
+
+## Requirements
+
+- Windows
+- Python 3.11+
+- .NET 10 SDK (to build `pbz-engine`)
+- Power BI Desktop (for live engine checks)
+- Node.js (optional; Microsoft PBIR / Desktop npm CLIs)
+- Claude Code or Codex (or any host that can run the skill + hooks)
 
 ## Install
 
-```
-cd skills/powerbi-zerodata/tools && npm install          # Microsoft PBIR + Desktop bridge CLIs
-cd ../engine && dotnet publish -c Release -r win-x64 --self-contained false -o bin
-python ../install/install.py --what-if                    # preview
-python ../install/install.py                              # junctions, hooks, rule blocks
+```powershell
+cd skills/powerbi-zerodata/tools
+npm install
+
+cd ../engine
+dotnet publish -c Release -r win-x64 --self-contained false -o bin
+
+cd ..
+python install/install.py --what-if
+python install/install.py
 ```
 
-Then trust the hooks once in Codex (`/hooks`). Uninstall: `python install/install.py --uninstall`.
+Trust hooks once in your agent host (for example Codex `/hooks`). Uninstall:
+`python install/install.py --uninstall`.
+
+CLI entry: `skills/powerbi-zerodata/bin/pbz.cmd` (after install, typically on your skill path as
+`pbz`).
+
+## 60-second tour
+
+From the folder that holds your `.pbip`:
+
+```powershell
+pbz init
+pbz status
+pbz describe
+pbz unused
+# edit only under pbz-workspace\
+pbz validate
+pbz preflight
+pbz push
+pbz handoff
+```
+
+Full walkthrough: [docs/getting-started.md](docs/getting-started.md).  
+Every verb: [docs/cli-catalog.md](docs/cli-catalog.md).
+
+## What you get
+
+| Area | Highlights | Docs |
+|---|---|---|
+| Zero-data workflow | Mirror, guard, policy fail-closed, disclosure contract | [overview](docs/overview.md), [SKILL.md](skills/powerbi-zerodata/SKILL.md) |
+| Analysis | `unused`, `lineage`, `suggest`, `bpa`, `similar`, `changes`, `docs`, `m-lineage` | [analysis](skills/powerbi-zerodata/reference/analysis.md), [bpa](skills/powerbi-zerodata/reference/bpa.md) |
+| Authoring | rename/move, scaffolds, pages/visuals, filters, bookmarks, style, images | [authoring](skills/powerbi-zerodata/reference/authoring.md), [visuals](skills/powerbi-zerodata/reference/visuals.md) |
+| Governance | cultures, roles/OLS, perspectives, refresh policy, selective push/revert | [governance](skills/powerbi-zerodata/reference/governance.md) |
+| Verification | `check`, snapshots, smoke, synth tests, preview, freshness, requirements | [checks](skills/powerbi-zerodata/reference/checks.md), [synth](skills/powerbi-zerodata/reference/synth.md), [improvements](skills/powerbi-zerodata/reference/improvements.md) |
+| Review | evidence stages, `review`, recipes | [workflow](skills/powerbi-zerodata/reference/workflow.md) |
+| Audit | efficiency + consolidation findings, waivers, memory bands | [audit](skills/powerbi-zerodata/reference/audit.md) |
+| Agents | same verbs as MCP tools | [mcp](skills/powerbi-zerodata/reference/mcp.md) |
+
+Attributions for upstream rules and ideas:
+[skills/powerbi-zerodata/THIRD_PARTY_NOTICES.md](skills/powerbi-zerodata/THIRD_PARTY_NOTICES.md).
+
+## Repository layout
+
+```
+docs/                         Human onboarding + CLI catalog
+skills/powerbi-zerodata/
+  SKILL.md                    Agent hard rules
+  pbz/                        Python CLI + guard hook
+  engine/                     C# declassification broker (TOM + ADOMD.NET)
+  reference/                  Deep topic documentation
+  install/                    Junctions, hooks, MCP registration
+  tests/                      Offline suites (CI) + canary fixture
+  tools/                      Optional Microsoft npm CLIs
+```
 
 ## Tests
 
-```
-python skills/powerbi-zerodata/tests/test_guard.py     # hook decision table (Claude + Codex shapes)
-python skills/powerbi-zerodata/tests/test_mirror.py    # tokenizer, round trip, push, rename, conflicts
-python skills/powerbi-zerodata/tests/test_parity.py    # resolver, usage states, unused/remove/restore, m-lineage
-python skills/powerbi-zerodata/tests/test_bpa.py       # best-practice rules, scores, grades
-python skills/powerbi-zerodata/tests/test_tools.py     # similar, changes, docs
-python skills/powerbi-zerodata/tests/test_refactor.py  # rename table, move measure, layout, bpa --fix
-python skills/powerbi-zerodata/tests/test_authoring.py # scaffolds, relationships, pages/visuals, repair
-python skills/powerbi-zerodata/tests/test_selfcontained.py # built-in merge and PBIR checks, no external binaries
-python skills/powerbi-zerodata/tests/test_governance.py # cultures, perspectives, roles, refresh policy, ledger, strict
-python skills/powerbi-zerodata/tests/test_mcp.py        # MCP server over stdio
-python skills/powerbi-zerodata/tests/test_synth.py      # synthetic model (add --live to open it in Desktop)
-python skills/powerbi-zerodata/tests/test_consumers.py  # external consumers: every kind, coverage gaps, canaries
-python skills/powerbi-zerodata/tests/test_visuals.py    # built-in catalog, custom visuals, private package push
-python skills/powerbi-zerodata/tests/test_style.py      # visual formatting: values, selectors, bulk, checks
-python skills/powerbi-zerodata/tests/test_reportedit.py # filters, interactions, tooltip / drillthrough pages, links
-python skills/powerbi-zerodata/tests/test_synthtest.py  # synthetic regression tests (add --live to run in Desktop)
-python skills/powerbi-zerodata/tests/test_props.py      # typed model properties, bulk selection
-python skills/powerbi-zerodata/tests/test_modeling.py   # hierarchies, dynamic formats, functions, OLS (TOM)
-python skills/powerbi-zerodata/tests/test_workflow.py   # review packet, evidence, recipes, Power Query guard
-python skills/powerbi-zerodata/tests/test_components.py # page and visual copies
-python skills/powerbi-zerodata/tests/test_a11y.py       # accessibility audit, tab order, phone layout
-python skills/powerbi-zerodata/tests/test_synthedge.py  # edge-case synthetic data and checks (add --live for Desktop)
-python skills/powerbi-zerodata/tests/test_audit.py      # audit rules, evidence, baselines, waivers, gate
-python skills/powerbi-zerodata/tests/test_consolidate.py # merge duplicates, calculation-group families (add --live for Desktop)
-python skills/powerbi-zerodata/tests/test_memory.py     # storage bands (add --live for Desktop)
-python skills/powerbi-zerodata/tests/test_images.py     # images, page canvas, embedded image tokens, push install
-python skills/powerbi-zerodata/tests/test_engine.py    # engine verbs + canary scan (needs Desktop)
-python skills/powerbi-zerodata/tests/test_e2e.py       # every verb on a fixture copy in Desktop, canary scan
+Offline suites run on every push via [.github/workflows/tests.yml](.github/workflows/tests.yml).
+From `skills/powerbi-zerodata`:
+
+```powershell
+python tests/test_guard.py
+python tests/test_ci_registration.py
+# Full list: see the workflow file (84 python suites + test_engine.py --offline)
 ```
 
-This repo is marked synthetic (`.pbz/policy.json`), so the guard treats its fixtures as fake data.
-Develop the skill from a session started here, not from a real Power BI workspace.
+Desktop / e2e suites stay local and must use synthetic or fixture data only.
+
+## Design history
+
+Earlier research and parity notes (optional reading):
+
+- [docs/parity-plan.md](docs/parity-plan.md)
+- [docs/reference-projects.md](docs/reference-projects.md)

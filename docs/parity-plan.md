@@ -1,5 +1,10 @@
 # pbz parity plan: Measure Killer features, metadata only
 
+> **Design history.** This file records how analysis and authoring features were planned and
+> shipped. For current user docs see [INDEX.md](INDEX.md), the [CLI catalog](cli-catalog.md), and
+> `skills/powerbi-zerodata/reference/`. No Measure Killer code or assets are vendored; see
+> [THIRD_PARTY_NOTICES.md](../skills/powerbi-zerodata/THIRD_PARTY_NOTICES.md).
+
 Research date 2026-11-04. Inputs: Measure Killer 2.9.4 public documentation and install layout (no
 proprietary code inspected), public docs, research passes over related open-source repositories
 (read through public APIs; nothing cloned for redistribution).
@@ -32,19 +37,21 @@ canary e2e. Deviations from the plan below:
   report rules (20 on, 1 opinion). Every rule citing `BPARules.json` uses the upstream rule id
   (checked against the file on 2026-11-04); other rules cite semantic-link-labs or are pbz's own.
 
-Verified on an internal development mirror (counts and object names only, no values retained in this document): `unused`, `lineage`, `suggest`, `bpa`,
-`similar`, `docs`, `m-lineage` and `unused --remove --dry-run` ran without errors and changed no
-file; the graph had no unresolved references or unknown fields; an independent text cross-check
-found zero objects called unused that a qualified DAX reference or an entity-matched report field
-still uses. A heuristic-mode canary scan (no engine index) found two tokenizer gaps, now fixed: RLS
-filters had no home table for bare `[Column]` references, and string cells of embedded tables under
-headers the model does not know were kept visible (they are now tokenized when they look specific).
+Verified on an internal development mirror (counts and object names only, no values retained in
+this document): `unused`, `lineage`, `suggest`, `bpa`, `similar`, `docs`, `m-lineage` and
+`unused --remove --dry-run` ran without errors and changed no file; the graph had no unresolved
+references or unknown fields; an independent text cross-check found zero objects called unused that
+a qualified DAX reference or an entity-matched report field still uses. A heuristic-mode canary scan
+(no engine index) found two tokenizer gaps, now fixed: RLS filters had no home table for bare
+`[Column]` references, and string cells of embedded tables under headers the model does not know
+were kept visible (they are now tokenized when they look specific).
 
 ## Round 2 (2026-11-04): gap research and authoring verbs
 
 Three research passes (a Perplexity deep research survey of Tabular Editor 2/3, Measure Killer, Bravo,
 DAX Studio, ALM Toolkit, fab-inspector, pbir-utils, semantic-link-labs, Microsoft's modeling MCP and
-report CLIs, Fabric Git tooling and community MCP projects; plus independent design reviews) agreed that the biggest gaps were write-side: safe
+report CLIs, Fabric Git tooling and community MCP projects; plus independent design reviews)
+agreed that the biggest gaps were write-side: safe
 refactoring, deterministic report construction, scaffolds, relationship edits, offline cross-file
 validation and local DAX formatting. Built:
 
