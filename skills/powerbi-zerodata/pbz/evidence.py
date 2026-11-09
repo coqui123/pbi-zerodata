@@ -20,6 +20,7 @@ import unicodedata
 
 from .common import (
     PbzError, SIZE_CAP, append_checked, pbz_state_path, read_checked, _reparse_link,
+    _workspace_root,
 )
 
 STAGES = ("PARSED", "BOUND", "LOADED", "EXECUTED", "SYNTHETIC", "HANDOFF", "HUMAN_ACCEPTED")
@@ -78,7 +79,7 @@ def _read_log(ws) -> str | None:
     if not os.path.lexists(path):
         return None
     try:
-        data = read_checked(path, root=ws.root, max_bytes=LOG_CAP)
+        data = read_checked(path, root=_workspace_root(ws), max_bytes=LOG_CAP)
     except PbzError as err:
         raise _io_error(err) from None
     except OSError:
@@ -97,7 +98,7 @@ def _append_lines(ws, entries: list[dict]) -> None:
     if "\r" in text:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
     try:
-        append_checked(_log_path(ws), text, root=ws.root, max_bytes=LOG_CAP)
+        append_checked(_log_path(ws), text, root=_workspace_root(ws), max_bytes=LOG_CAP)
     except PbzError as err:
         raise _io_error(err) from None
     except OSError:
@@ -639,7 +640,7 @@ def _suggested_tests(ws, project, logic: list[str]) -> list[str]:
         if not name.endswith(".json"):
             continue
         try:
-            text = read_checked(os.path.join(tdir, name), root=ws.root).decode("utf-8").lower()
+            text = read_checked(os.path.join(tdir, name), root=_workspace_root(ws)).decode("utf-8").lower()
         except (OSError, UnicodeError, PbzError):
             continue
         if not names or any(f"[{n}]" in text for n in names):

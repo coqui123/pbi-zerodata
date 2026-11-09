@@ -268,9 +268,15 @@ def test_offline(tmp: Path) -> None:
         write_policy(ws, {"disclosure": "strict"})
         memory.run(ws, project)
         expect("wrapper: strict policy -> strict request", calls[-1][1].get("disclosure") == "strict", calls[-1][1])
+        # Round 17: present unusable policy fails closed at load (REFUSED), not silent strict.
         write_policy(ws, {"disclosure": "loose"})
-        memory.run(ws, project)
-        expect("wrapper: malformed disclosure fails closed (strict)", calls[-1][1].get("disclosure") == "strict", calls[-1][1])
+        refused = False
+        try:
+            memory.run(ws, project)
+        except PbzError as err:
+            refused = err.code == "REFUSED"
+        expect("wrapper: malformed disclosure fails closed (REFUSED)", refused)
+        write_policy(ws, {"disclosure": "shape"})
         saved_path.write_text("{not json", "utf-8")
         expect("load: corrupt file -> None", memory.load(ws, project) is None)
 
