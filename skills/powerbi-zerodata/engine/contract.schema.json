@@ -8,6 +8,7 @@
     { "$ref": "#/$defs/ping" },
     { "$ref": "#/$defs/connect" },
     { "$ref": "#/$defs/health" },
+    { "$ref": "#/$defs/provenance" },
     { "$ref": "#/$defs/tmdlValidate" },
     { "$ref": "#/$defs/refresh" },
     { "$ref": "#/$defs/compiles" },
@@ -19,12 +20,13 @@
     { "$ref": "#/$defs/smoke" },
     { "$ref": "#/$defs/deps" },
     { "$ref": "#/$defs/synthQuery" },
-    { "$ref": "#/$defs/memory" }
+    { "$ref": "#/$defs/memory" },
+    { "$ref": "#/$defs/perf" }
   ],
   "$defs": {
     "verb": {
-      "enum": ["ping", "connect", "health", "tmdl-validate", "refresh", "compiles", "index", "check", "probe",
-               "snapshot-save", "snapshot-compare", "smoke", "deps", "synth-query", "memory"]
+      "enum": ["ping", "connect", "health", "provenance", "tmdl-validate", "refresh", "compiles", "index", "check", "probe",
+               "snapshot-save", "snapshot-compare", "smoke", "deps", "synth-query", "memory", "perf"]
     },
     "anyVerb": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_\\-]*$" },
     "errorClass": {
@@ -38,6 +40,9 @@
     "hmac": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "message": { "type": "string", "maxLength": 300, "pattern": "^[^\"\\u0000-\\u001f]*$" },
     "countBucket": { "enum": ["0", "1-9", "10-99", "100-999", "1k-9k", "10k+"] },
+    "durationBand": { "enum": ["LT_100MS", "100_500MS", "500MS_2S", "2_10S", "GT_10S"] },
+    "eventBand": { "enum": ["0", "1_5", "6_20", "21_100", "GT_100"] },
+    "planBand": { "enum": ["0", "1", "2_5", "6_20", "GT_20"] },
     "shareBucket": { "enum": ["none", "<1%", "1-10%", "10-50%", ">50%"] },
     "mismatch": { "enum": ["NONE", "ONE", "FEW", "MANY"] },
     "typeName": { "enum": ["string", "int64", "double", "dateTime", "decimal", "boolean", "binary", "variant", "unknown"] },
@@ -120,6 +125,19 @@
       }
     },
 
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "refresh", "source_publication", "coverage", "note"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "provenance" },
+        "refresh": { "enum": ["FRESH", "STALE", "UNKNOWN"] },
+        "source_publication": { "enum": ["UNKNOWN"] },
+        "coverage": { "enum": ["PARTIAL", "COMPLETE"] },
+        "note": { "$ref": "#/$defs/message" }
+      }
+    },
     "tmdlValidate": {
       "type": "object",
       "additionalProperties": false,
@@ -154,7 +172,19 @@
       "properties": {
         "ok": { "const": true },
         "verb": { "const": "refresh" },
-        "status": { "enum": ["PASS", "UNSUPPORTED"] }
+        "status": { "enum": ["PASS", "UNSUPPORTED"] },
+        "objects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "duration_band"],
+            "properties": {
+              "name": { "$ref": "#/$defs/name" },
+              "duration_band": { "$ref": "#/$defs/durationBand" }
+            }
+          }
+        }
       }
     },
 
@@ -445,7 +475,11 @@
                     "dictionary_heavy": { "type": "boolean" },
                     "time_part": { "type": "boolean" },
                     "fractional": { "type": "boolean" },
-                    "long_text": { "type": "boolean" }
+                    "long_text": { "type": "boolean" },
+                    "encoding": { "enum": ["Hash", "Value"] },
+                    "segment_band": { "$ref": "#/$defs/countBucket" },
+                    "ri": { "enum": ["RI_OK", "RI_VIOLATION"] },
+                    "ri_count": { "$ref": "#/$defs/countBucket" }
                   }
                 }
               },
@@ -474,7 +508,9 @@
               "name": { "$ref": "#/$defs/name" },
               "from": { "type": "string", "maxLength": 1100, "pattern": "^[^\\u0000-\\u001f]+\\[[^\\u0000-\\u001f]+\\]$" },
               "to": { "type": "string", "maxLength": 1100, "pattern": "^[^\\u0000-\\u001f]+\\[[^\\u0000-\\u001f]+\\]$" },
-              "size_band": { "$ref": "#/$defs/sizeBand" }
+              "size_band": { "$ref": "#/$defs/sizeBand" },
+              "ri": { "enum": ["RI_OK", "RI_VIOLATION"] },
+              "ri_count": { "$ref": "#/$defs/countBucket" }
             }
           }
         },
@@ -506,6 +542,42 @@
           }
         }
       }
+    },
+    "perf": {
+      "description": "Cold-run DAX timings as closed bands (v1.5). Milliseconds, plan text and storage-engine text never appear.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "timing", "trace"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "perf" },
+        "timing": { "enum": ["BANDED", "UNAVAILABLE"] },
+        "duration_band": { "$ref": "#/$defs/durationBand" },
+        "fe_share": { "enum": ["LOW", "MID", "HIGH"] },
+        "se_queries": { "$ref": "#/$defs/eventBand" },
+        "dq_events": { "$ref": "#/$defs/eventBand" },
+        "cache_hit": { "enum": ["NONE", "SOME", "MOST"] },
+        "callback": { "type": "boolean" },
+        "agg_rewrite": { "enum": ["HIT", "MISS", "NONE"] },
+        "trace": { "enum": ["CAPTURED", "UNAVAILABLE"] },
+        "verdict": { "enum": ["FASTER", "SAME", "SLOWER", "NOISY"] },
+        "baseline": { "enum": ["SAVED", "MISSING"] },
+        "plan": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "CallbackDataID": { "$ref": "#/$defs/planBand" },
+            "Spool_Iterator": { "$ref": "#/$defs/planBand" },
+            "CrossApply": { "$ref": "#/$defs/planBand" },
+            "LargeMaterialization": { "$ref": "#/$defs/planBand" }
+          }
+        }
+      },
+      "if": {
+        "properties": { "timing": { "const": "BANDED" } },
+        "required": ["timing"]
+      },
+      "then": { "required": ["ok", "verb", "timing", "trace", "duration_band"] }
     }
   }
 }

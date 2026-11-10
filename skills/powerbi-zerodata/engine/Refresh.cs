@@ -25,6 +25,7 @@ public static class Refresh
         var tables = req.StrList("tables");
         string dbName;
         var names = new List<string>();
+        var allowed = new HashSet<string>(StringComparer.Ordinal);
         using (var conn = Conn.Open(ctx, port))
         {
             dbName = conn.Meta.DatabaseName;
@@ -39,10 +40,30 @@ public static class Refresh
                     if (!names.Contains(tm.Name)) names.Add(tm.Name);
                 }
             }
+            Allow(allowed, dbName);
+            if (names.Count == 0)
+            {
+                foreach (var t in conn.Meta.UserTables)
+                {
+                    Allow(allowed, t.Name);
+                    foreach (var p in t.Partitions) Allow(allowed, p.Name);
+                }
+            }
+            else
+            {
+                foreach (var n in names)
+                {
+                    Allow(allowed, n);
+                    var tm = conn.Meta.FindTable(n);
+                    if (tm == null) continue;
+                    foreach (var p in tm.Partitions) Allow(allowed, p.Name);
+                }
+            }
         }
 
         string tmsl = BuildTmsl(dbName, names);
         var server = new TOM.Server();
+        EngineTrace? trace = null;
         try
         {
             ctx.Guard(() =>
@@ -50,7 +71,20 @@ public static class Refresh
                 server.Connect("Data Source=localhost:" + port.ToString(CultureInfo.InvariantCulture) + ";");
                 return 0;
             }, Math.Min(ctx.TimeoutSec, 60));
+            // A trace that cannot start must not fail the refresh. M partitions already returned UNSUPPORTED.
+            trace = EngineTrace.TryStart(server, new[] { "ProgressReportEnd" }, ctx);
+            trace?.Arm();
             var results = ctx.Guard(() => server.Execute(tmsl));
+            List<EngineTrace.Hit> hits = new();
+            if (trace != null && trace.Started)
+            {
+                try { hits = trace.Collect(200, null); }
+                catch (Exception ex)
+                {
+                    ctx.LogText("trace collect failed " + Errors.Classify(ex));
+                    hits = new();
+                }
+            }
             if (results != null && results.ContainsErrors)
             {
                 var sb = new StringBuilder("refresh returned errors:");
@@ -63,16 +97,70 @@ public static class Refresh
                 if (id != null) o["log_id"] = id;
                 return o;
             }
+            var fields = new JsonObject { ["status"] = "PASS" };
+            var objects = DurationObjects(hits, allowed);
+            if (objects != null) fields["objects"] = objects;
+            return Ctx.Ok("refresh", fields);
         }
         finally
         {
+            trace?.Dispose();
             Bounded.Run(() =>
             {
                 if (server.Connected) server.Disconnect();
                 server.Dispose();
             });
         }
-        return Ctx.Ok("refresh", new JsonObject { ["status"] = "PASS" });
+    }
+
+    static void Allow(HashSet<string> allowed, string name)
+    {
+        if (Printable(name)) allowed.Add(name);
+    }
+
+    static bool Printable(string name)
+    {
+        if (name.Length is < 1 or > 512) return false;
+        foreach (char c in name)
+            if (c < ' ') return false;
+        return true;
+    }
+
+    /// <summary>Known table, partition and database names only. Raw durations stay in this process. Null when nothing was captured.</summary>
+    static JsonArray? DurationObjects(List<EngineTrace.Hit> hits, HashSet<string> allowed)
+    {
+        var best = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var h in hits)
+        {
+            if (!string.Equals(h.Class, "ProgressReportEnd", StringComparison.Ordinal)) continue;
+            string? name = MatchName(h.ObjectName, allowed);
+            if (name == null) continue;
+            long d = h.Duration < 0 ? 0 : h.Duration;
+            if (!best.TryGetValue(name, out long cur) || d > cur) best[name] = d;
+        }
+        if (best.Count == 0) return null;
+        var arr = new JsonArray();
+        foreach (var name in best.Keys.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ThenBy(n => n, StringComparer.Ordinal))
+        {
+            arr.Add(new JsonObject
+            {
+                ["name"] = name,
+                ["duration_band"] = TraceBands.Duration(best[name]),
+            });
+        }
+        return arr;
+    }
+
+    static string? MatchName(string raw, HashSet<string> allowed)
+    {
+        if (allowed.Contains(raw)) return raw;
+        int dot = raw.LastIndexOf('.');
+        if (dot >= 0 && dot + 1 < raw.Length)
+        {
+            string tail = raw[(dot + 1)..];
+            if (allowed.Contains(tail)) return tail;
+        }
+        return null;
     }
 
     static string BuildTmsl(string db, List<string> tables)

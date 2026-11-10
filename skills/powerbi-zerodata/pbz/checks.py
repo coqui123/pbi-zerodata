@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import sys
 
 from . import desktop, dpapi, lexers, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
@@ -14,8 +15,11 @@ from .common import PbzError, engine_call
 
 ENGINE_KINDS = {"executes", "nonblank", "nonempty", "equal", "additive", "unique", "no_orphans",
                 "no_blank_keys", "sign", "subset"}
-ALL_KINDS = ENGINE_KINDS | {"differs", "filter_independent", "compiles"}
+ALL_KINDS = ENGINE_KINDS | {"differs", "filter_independent", "compiles", "rls", "perf"}
 EXPR_FIELDS = ("expr", "left", "right", "column", "from", "to", "of")
+RLS_EXPECT = ("EMPTY", "NON_EMPTY", "LESS", "EQUAL", "OLS_INACCESSIBLE")
+_RLS_TEXT = ("query", "role", "user", "column", "table")
+_CHECK_STATUS = {"PASS", "FAIL", "EMPTY", "UNSUPPORTED", "ERROR"}
 
 CHECK_REQUIRED = {
     **{k: ("expr",) for k in ("executes", "nonblank", "nonempty", "sign", "compiles")},
@@ -27,19 +31,122 @@ CHECK_REQUIRED = {
 
 
 def check_schema() -> dict:
-    """Public, dependency-free schema for check files. `subset.of` names a column."""
+    """Public, dependency-free schema for check files. `subset.of` names a column.
+
+    `rls` and `perf` are separate branches. role, query, user and baseline are not expression fields.
+    """
+    branches = [{"type": "object", "required": ["kind", *required], "properties": {
+        "kind": {"const": kind}, "id": {"type": "string", "minLength": 1},
+        **{k: {"type": "string", "minLength": 1} for k in EXPR_FIELDS},
+        "table": {"type": "string", "minLength": 1},
+        "by": {"type": "array", "items": {"type": "string", "minLength": 1},
+               **({"minItems": 1} if kind == "additive" else {})},
+        "where": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "tol": {"type": "number", "minimum": 0},
+        "expect": {"type": "array", "items": {"enum": ["NEG", "ZERO", "POS", "BLANK"]}},
+    }} for kind, required in CHECK_REQUIRED.items()]
+    branches.append({"type": "object", "required": ["kind", "expect"], "properties": {
+        "kind": {"const": "rls"}, "id": {"type": "string", "minLength": 1},
+        "expect": {"enum": list(RLS_EXPECT)},
+        **{k: {"type": "string", "minLength": 1} for k in _RLS_TEXT},
+    }})
+    branches.append({"type": "object", "required": ["kind", "query"], "properties": {
+        "kind": {"const": "perf"}, "id": {"type": "string", "minLength": 1},
+        "query": {"type": "string", "minLength": 1}, "expect": {"const": "NOT_SLOWER"},
+    }})
     return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
-            "required": ["checks"], "properties": {"checks": {"type": "array", "items": {
-                "oneOf": [{"type": "object", "required": ["kind", *required], "properties": {
-                    "kind": {"const": kind}, "id": {"type": "string", "minLength": 1},
-                    **{k: {"type": "string", "minLength": 1} for k in EXPR_FIELDS},
-                    "table": {"type": "string", "minLength": 1},
-                    "by": {"type": "array", "items": {"type": "string", "minLength": 1},
-                           **({"minItems": 1} if kind == "additive" else {})},
-                    "where": {"type": "array", "items": {"type": "string", "minLength": 1}},
-                    "tol": {"type": "number", "minimum": 0},
-                    "expect": {"type": "array", "items": {"enum": ["NEG", "ZERO", "POS", "BLANK"]}},
-                }} for kind, required in CHECK_REQUIRED.items()]}}}}
+            "required": ["checks"], "properties": {"checks": {"type": "array", "items": {"oneOf": branches}}}}
+
+
+def _human_terminal() -> bool:
+    """Local copy of the CLI human gate. Do not import pbz.cli (that imports this module)."""
+    return sys.stdin.isatty() and sys.stdout.isatty() and not any(
+        os.environ.get(name) for name in ("CLAUDECODE", "CODEX_SANDBOX", "CODEX_MANAGED_BY_NPM"))
+
+
+def _rls_synthetic(ws, project, pol: dict) -> bool:
+    """True only for a verified pbz-synth tree (policy, synth.json, and the lineage HMAC).
+
+    A policy flag or an annotation named PBZ_SYNTHETIC is not enough: either can be written
+    onto a real model. `project` and `pol` stay in the signature for callers.
+    """
+    del project, pol
+    if ws is None or not getattr(ws, "root", None):
+        return False
+    from . import synth
+    return synth._verified_owned(ws, ws.root)
+
+
+def _nonempty(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _perf_check(ws, project, raw: dict, cid: str) -> dict:
+    """perf.expect spends the probe budget. This does not also spend a check."""
+    from . import perf
+    query = raw.get("query") if isinstance(raw.get("query"), str) else ""
+    try:
+        got = perf.expect(ws, project, query)
+    except PbzError as err:
+        return {"id": cid, "status": "ERROR", "class": _class_of(err.code, _PY_CLASS) or "OTHER"}
+    status = got.get("status") if got.get("status") in _CHECK_STATUS else "ERROR"
+    verdict_ = got.get("verdict") if got.get("verdict") in ("FASTER", "SAME", "SLOWER", "NOISY", "UNAVAILABLE") else "UNAVAILABLE"
+    return {"id": cid, "status": status, "verdict": verdict_}
+
+
+_ERROR_CLASS = frozenset({
+    "SYNTAX", "UNKNOWN_OBJECT", "TYPE_MISMATCH", "CONVERSION", "CIRCULAR", "DUPLICATE_KEY",
+    "TIMEOUT", "ENGINE_UNAVAILABLE", "BAD_REQUEST", "OTHER",
+})
+_PY_CLASS = _ERROR_CLASS | frozenset({"HUMAN_ONLY", "ENGINE_MISMATCH", "REFUSED", "UNSAFE", "NO_MIRROR", "NOT_FOUND"})
+_LOG_ID = re.compile(r"^e-[0-9]{8}-[0-9]{4,}$")
+_COUNT_BAND = frozenset({"0", "1-9", "10-99", "100-999", "1k-9k", "10k+"})
+_MISMATCH = frozenset({"NONE", "ONE", "FEW", "MANY"})
+_SIGN = frozenset({"NEG", "ZERO", "POS", "BLANK"})
+
+
+def _class_of(value, allowed: frozenset) -> str | None:
+    return value if isinstance(value, str) and value in allowed else None
+
+
+def _rls_clean(row: dict) -> dict:
+    status = row.get("status") if row.get("status") in _CHECK_STATUS else "ERROR"
+    out = {"id": row.get("id"), "status": status}
+    klass = _class_of(row.get("class"), _ERROR_CLASS)
+    if klass is not None:
+        out["class"] = klass
+    elif status == "ERROR":
+        out["class"] = "OTHER"
+    return out
+
+
+def _closed_engine_row(row: dict, allowed_ids: set[str]) -> dict | None:
+    """Engine check rows: submitted ids and the contract fields only."""
+    ident = row.get("id")
+    if not isinstance(ident, str) or ident not in allowed_ids:
+        return None
+    status = row.get("status") if row.get("status") in _CHECK_STATUS else "ERROR"
+    out = {"id": ident, "status": status}
+    klass = _class_of(row.get("class"), _ERROR_CLASS)
+    if klass is not None:
+        out["class"] = klass
+    elif status == "ERROR":
+        out["class"] = "OTHER"
+    log_id = row.get("log_id")
+    if isinstance(log_id, str) and _LOG_ID.fullmatch(log_id):
+        out["log_id"] = log_id
+    if row.get("mismatch") in _MISMATCH:
+        out["mismatch"] = row["mismatch"]
+    if row.get("offenders_bucket") in _COUNT_BAND:
+        out["offenders_bucket"] = row["offenders_bucket"]
+    if row.get("sign") in _SIGN:
+        out["sign"] = row["sign"]
+    if row.get("note") == "differs":
+        out["note"] = "differs"
+    groups = row.get("groups")
+    if isinstance(groups, list) and groups:
+        out["groups"] = groups
+    return out
 
 
 def validate_spec(spec) -> dict:
@@ -70,6 +177,19 @@ def validate_spec(spec) -> dict:
         else:
             seen.add(ident)
         kind = check.get("kind")
+        if kind == "rls":
+            if check.get("expect") not in RLS_EXPECT:
+                issue(index, "expect", "rls expect is EMPTY, NON_EMPTY, LESS, EQUAL or OLS_INACCESSIBLE")
+            for field in _RLS_TEXT:
+                if field in check and not _nonempty(check.get(field)):
+                    issue(index, field, "field must be a nonempty string")
+            continue
+        if kind == "perf":
+            if "expect" in check and check.get("expect") != "NOT_SLOWER":
+                issue(index, "expect", "perf expect is NOT_SLOWER")
+            if not _nonempty(check.get("query")):
+                issue(index, "query", "required field must be a nonempty string")
+            continue
         if not isinstance(kind, str) or kind not in CHECK_REQUIRED:
             issue(index, "kind", "unknown check kind")
             continue
@@ -258,6 +378,12 @@ def run_checks(ws, project, spec: dict) -> dict:
                 "results": [{"id": f["id"], "status": "ERROR", "class": "BAD_REQUEST",
                              "field": f["path"], "note": f["message"]} for f in shape["findings"]]}
     pol = policy_mod.load(ws)
+    synthetic = _rls_synthetic(ws, project, pol)
+    perf_done = []
+    for index, raw in enumerate(spec.get("checks", [])):
+        if isinstance(raw, dict) and raw.get("kind") == "perf":
+            cid = str(raw.get("id") or f"c{index + 1}")
+            perf_done.append((index, _perf_check(ws, project, raw, cid)))
     budgets = pol.get("budgets", {})
     strict = pol.get("disclosure") == "strict"
     tm = tokens.TokenMap(ws.private)
@@ -271,9 +397,43 @@ def run_checks(ws, project, spec: dict) -> dict:
     mres = deps.Resolver(mmodel)
     authored = set(st["ledger"]["authored"])
     results, to_engine, compiles_items, negate = [], [], [], set()
-    for raw in spec.get("checks", []):
-        cid = str(raw.get("id") or f"c{len(results) + len(to_engine) + len(compiles_items) + 1}")
+    rls_ids = set()
+    for index, raw in enumerate(spec.get("checks", [])):
+        cid = str(raw.get("id") or f"c{index + 1}")
         kind = raw.get("kind")
+        if kind == "perf":
+            continue
+        if kind == "rls":
+            if not synthetic and not _human_terminal():
+                results.append({"id": cid, "status": "ERROR", "class": "HUMAN_ONLY"})
+                continue
+            query = raw.get("query") if isinstance(raw.get("query"), str) else None
+            if query is not None:
+                _q, unknown = tokens.detokenize_dax(query, tm)
+                if unknown:
+                    results.append({"id": cid, "status": "ERROR", "class": "BAD_REQUEST",
+                                    "note": "unknown or opaque token"})
+                    continue
+                query = _q
+            th = _h("rls")
+            if st["checks"] >= int(budgets.get("session_checks", 300)) or \
+                    st["per_target"].get(th, 0) >= int(budgets.get("per_target", 60)):
+                results.append({"id": cid, "status": "BUDGET",
+                                "note": "daily check budget reached; the user can reset it"})
+                continue
+            st["checks"] += 1
+            st["per_target"][th] = st["per_target"].get(th, 0) + 1
+            payload = {"id": cid, "kind": "rls", "expect": raw.get("expect")}
+            for field in _RLS_TEXT:
+                if field == "query":
+                    if query is not None:
+                        payload["query"] = query
+                    continue
+                if isinstance(raw.get(field), str):
+                    payload[field] = raw[field]
+            rls_ids.add(cid)
+            to_engine.append(payload)
+            continue
         if kind not in ALL_KINDS:
             results.append({"id": cid, "status": "ERROR", "class": "BAD_REQUEST", "note": "unknown kind"})
             continue
@@ -351,8 +511,9 @@ def run_checks(ws, project, spec: dict) -> dict:
         res = engine_call("check", {"private_dir": ws.private, "port": port, "disclosure": pol.get("disclosure", "shape"),
                                     "reveal": sorted(set(reveal)), "checks": to_engine}, timeout=600)
         if not res.get("ok"):
-            raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
+            raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
         key = dpapi.load_key(ws.private)
+        allowed_ids = {str(c.get("id")) for c in to_engine if c.get("id")}
         for r in res.get("checks", res.get("results", [])):
             r = dict(r)
             if r.get("id") in negate and r.get("status") in ("PASS", "FAIL"):
@@ -369,7 +530,8 @@ def run_checks(ws, project, spec: dict) -> dict:
                     elif isinstance(v, dict) and "hmac" in v:
                         lab = _canon_col(col)
                         ng[col] = tm.find_by_hmac(key, lab, v["hmac"]) or tm.opaque(lab, v["hmac"])
-                groups.append(ng)
+                if ng:
+                    groups.append(ng)
             if groups and not strict:
                 r["groups"] = groups
             else:
@@ -378,11 +540,16 @@ def run_checks(ws, project, spec: dict) -> dict:
                 for k in list(r):
                     if k.endswith("_bucket"):
                         r.pop(k)
-            results.append(r)
+            if str(r.get("id")) in rls_ids:
+                r = _rls_clean(r)
+            else:
+                r = _closed_engine_row(r, allowed_ids)
+            if r is not None:
+                results.append(r)
     if compiles_items:
         res = engine_call("compiles", {"private_dir": ws.private, "port": port, "items": compiles_items}, timeout=300)
         if not res.get("ok"):
-            raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
+            raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
         from .validate import retokenizer
         scrub = retokenizer(tm)
         for it in res.get("items", []):
@@ -391,7 +558,8 @@ def run_checks(ws, project, spec: dict) -> dict:
                 it["message"] = scrub(it["message"])
             results.append(it)
     tm.save()
-    order = {str(c.get("id")): i for i, c in enumerate(spec.get("checks", []))}
+    results.extend(row for _index, row in perf_done)
+    order = {str(c.get("id") or f"c{i + 1}"): i for i, c in enumerate(spec.get("checks", []))}
     results.sort(key=lambda r: order.get(str(r.get("id")), 1e9))
     return {"verb": "check", "project": project.name, "results": results,
             "budget": {"used_today": st["checks"], "limit": int(budgets.get("session_checks", 300))}}

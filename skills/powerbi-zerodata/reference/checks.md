@@ -37,6 +37,8 @@ Power BI Desktop. Results are verdicts, never values.
 | `no_blank_keys` | `column` | no blanks |
 | `sign` | `expr` | always PASS; adds `sign`: NEG, ZERO, POS or BLANK |
 | `subset` | `column`, `of` | values of `column` are all in `of` |
+| `rls` | `expect`, `role` or `user`, and `query` or `column` or `table` | role-scoped count matches `expect`. Real models need a human terminal. A verified `pbz-synth` tree does not. `OLS_INACCESSIBLE` passes only when the role query fails as an unknown object |
+| `perf` | `query`, `expect` = `NOT_SLOWER` | median is not slower than the saved baseline (`FASTER`, `SAME`, or `NOISY`). No milliseconds leave the engine |
 
 Statuses: `PASS`, `FAIL`, `EMPTY` (nothing to compare), `UNSUPPORTED`, `BUDGET`,
 `ERROR` + `class` (SYNTAX, UNKNOWN_OBJECT, TYPE_MISMATCH, CONVERSION, CIRCULAR, DUPLICATE_KEY,

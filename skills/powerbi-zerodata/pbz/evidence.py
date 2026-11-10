@@ -12,20 +12,24 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import re
 import stat
 import unicodedata
 
+from . import dpapi
 from .common import (
-    PbzError, SIZE_CAP, append_checked, pbz_state_path, read_checked, _reparse_link,
+    PbzError, SIZE_CAP, append_checked, pbz_state_path, read_checked, write_text, _reparse_link,
     _workspace_root,
 )
 
 STAGES = ("PARSED", "BOUND", "LOADED", "EXECUTED", "STATIC_CONTRACT", "SYNTHETIC", "HANDOFF", "HUMAN_ACCEPTED")
 LOG = "evidence.jsonl"
 LOG_CAP = 1024 * 1024
+GENESIS = "0" * 64
+_CHAIN_RE = re.compile(r"^[0-9a-f]{64}$")
 OVER_CAP = (
     "evidence log is over 1 MiB; archive or remove .pbz/evidence.jsonl by hand in your own terminal"
 )
@@ -78,9 +82,9 @@ def _io_error(err: PbzError) -> PbzError:
     return err
 
 
-def _read_log(ws) -> str | None:
+def _read_log(ws, path: str | None = None) -> str | None:
     """Checked log text. Missing is None. Present-unusable is REFUSED or UNSAFE_PATH, never a silent empty log."""
-    path = _log_path(ws)
+    path = path or _log_path(ws)
     if not os.path.lexists(path):
         return None
     try:
@@ -95,19 +99,254 @@ def _read_log(ws) -> str | None:
         raise PbzError("REFUSED", UNUSABLE) from None
 
 
-def _append_lines(ws, entries: list[dict]) -> None:
-    """One checked append for the whole batch. A refusal writes zero lines."""
-    if not entries:
-        return
-    text = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries)
-    if "\r" in text:
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
+def _segment_paths(ws) -> list[str]:
+    """Rotated segments, oldest first. A junction at the segment directory is refused."""
+    root = _workspace_root(ws)
+    directory = os.path.join(root, ".pbz", "evidence.d")
+    if not os.path.lexists(directory):
+        return []
+    directory = pbz_state_path(ws, "evidence.d")
+    out = []
     try:
-        append_checked(_log_path(ws), text, root=_workspace_root(ws), max_bytes=LOG_CAP)
-    except PbzError as err:
-        raise _io_error(err) from None
+        names = sorted(os.listdir(directory))
     except OSError:
         raise PbzError("REFUSED", UNUSABLE) from None
+    for name in names:
+        if re.fullmatch(r"\d{4}\.jsonl", name):
+            out.append(os.path.join(directory, name))
+    return out
+
+
+def _log_files(ws) -> list[str]:
+    files = list(_segment_paths(ws))
+    active = _log_path(ws)
+    if os.path.lexists(active):
+        files.append(active)
+    return files
+
+
+def _nocr(value):
+    if isinstance(value, str):
+        return value.replace("\r\n", "\n").replace("\r", "\n")
+    if isinstance(value, dict):
+        return {k: _nocr(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_nocr(v) for v in value]
+    return value
+
+
+def _canon(entry: dict) -> str:
+    body = {k: v for k, v in entry.items() if k != "chain_mac"}
+    return json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _mac(key: bytes, prev: str, entry: dict) -> str:
+    return hmac.new(key, (prev + "\n" + _canon(entry)).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _index_path(ws) -> str:
+    return pbz_state_path(ws, "evidence.chain.json")
+
+
+def _anchor(ws) -> str:
+    path = os.path.join(_workspace_root(ws), ".pbz", "evidence.chain.json")
+    if not os.path.lexists(path):
+        return GENESIS
+    try:
+        raw = read_checked(_index_path(ws), root=_workspace_root(ws), max_bytes=4096)
+        doc = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, PbzError):
+        return GENESIS
+    anchor = doc.get("anchor") if isinstance(doc, dict) else None
+    return anchor if isinstance(anchor, str) and _CHAIN_RE.fullmatch(anchor) else GENESIS
+
+
+def _last_mac(text: str | None) -> str | None:
+    last = None
+    for line in (text or "").split("\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        mac = obj.get("chain_mac") if isinstance(obj, dict) else None
+        if isinstance(mac, str) and _CHAIN_RE.fullmatch(mac):
+            last = mac
+    return last
+
+
+def _tip(ws) -> str:
+    """MAC the next record must cite. An already-over-cap active file is refused here."""
+    active = _log_path(ws)
+    if os.path.lexists(active):
+        return _last_mac(_read_log(ws, active)) or _anchor(ws)
+    segs = _segment_paths(ws)
+    if segs:
+        return _last_mac(_read_log(ws, segs[-1])) or _anchor(ws)
+    return _anchor(ws)
+
+
+def _stamp(ws, entries: list[dict]) -> None:
+    key = dpapi.load_key(ws.private)
+    prev = _tip(ws)
+    for i, entry in enumerate(entries):
+        clean = _nocr(entry)
+        clean.pop("chain_mac", None)
+        clean["chain_prev"] = prev
+        clean["chain_mac"] = _mac(key, prev, clean)
+        entries[i] = clean
+        prev = clean["chain_mac"]
+
+
+def _rotate(ws) -> str:
+    """Move the active log to the next numbered segment, after the highest existing number.
+
+    Reusing a hole left by prune would put a new segment before an older one and break the
+    HMAC chain order. The active path is free afterwards.
+    """
+    src = _log_path(ws)
+    directory = pbz_state_path(ws, "evidence.d")
+    os.makedirs(directory, exist_ok=True)
+    if _reparse_link(directory):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    nums = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        raise PbzError("REFUSED", UNUSABLE) from None
+    for name in names:
+        if len(name) == 10 and name.endswith(".jsonl") and name[:4].isdigit() and name[4] == ".":
+            nums.append(int(name[:4]))
+    n = max(nums, default=0) + 1
+    if n > 9999:
+        raise PbzError("REFUSED", UNUSABLE)
+    dest = os.path.join(directory, f"{n:04d}.jsonl")
+    if os.path.lexists(dest):
+        raise PbzError("REFUSED", UNUSABLE)
+    os.replace(src, dest)
+    return dest
+
+
+def _newest_day(text: str) -> str | None:
+    newest = None
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        ts = obj.get("ts") if isinstance(obj, dict) else None
+        if isinstance(ts, str) and _TS.fullmatch(ts):
+            day = ts[:10]
+            if newest is None or day > newest:
+                newest = day
+    return newest
+
+
+def prune(ws, today: dt.date | None = None) -> dict:
+    """Drop a prefix of rotated segments whose newest record is outside the ledger window.
+
+    The anchor is written before any segment is deleted. A crash after that write leaves an
+    anchor that the next prune can finish; a deleted segment without a new anchor cannot be
+    verified. Undated segments stay. The active log is never pruned.
+    """
+    from .checks import LEDGER_DAYS
+    cutoff = ((today or dt.date.today()) - dt.timedelta(days=LEDGER_DAYS)).isoformat()
+    anchor = _anchor(ws)
+    doomed = []
+    for path in _segment_paths(ws):
+        text = _read_log(ws, path)
+        if text is None:
+            continue
+        newest = _newest_day(text)
+        if newest is None or newest >= cutoff:
+            break
+        mac = _last_mac(text)
+        if mac:
+            anchor = mac
+        doomed.append(path)
+    if doomed:
+        write_text(_index_path(ws), json.dumps({"anchor": anchor}) + "\n", root=_workspace_root(ws))
+        for path in doomed:
+            try:
+                os.remove(path)
+            except OSError:
+                raise PbzError("REFUSED", UNUSABLE) from None
+    return {"verb": "evidence", "pruned_segments": len(doomed), "anchor_kept": bool(doomed)}
+
+
+def verify_chain(ws) -> dict:
+    """Recompute the HMAC chain across rotated segments and the active log."""
+    try:
+        key = dpapi.load_key(ws.private, create=False)
+    except FileNotFoundError:
+        key = None
+    prev = _anchor(ws)
+    chained = 0
+    files = _log_files(ws)
+    for path in files:
+        text = _read_log(ws, path)
+        for line in (text or "").split("\n"):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(obj, dict) or "chain_mac" not in obj:
+                continue
+            if key is None:
+                return {"verb": "evidence", "chain": "BROKEN", "reason": "NO_KEY", "records": chained}
+            got_prev = obj.get("chain_prev")
+            got_mac = obj.get("chain_mac")
+            if got_prev != prev or not isinstance(got_mac, str) or _mac(key, prev, obj) != got_mac:
+                return {"verb": "evidence", "chain": "BROKEN", "reason": "MISMATCH", "records": chained}
+            prev = got_mac
+            chained += 1
+    return {"verb": "evidence", "chain": "OK", "records": chained, "files": len(files)}
+
+
+def _append_lines(ws, entries: list[dict]) -> None:
+    """One checked append for the whole batch. A file already over 1 MiB is refused.
+
+    A batch that would cross the cap rotates the active log into a numbered segment first,
+    then writes the batch into a new active log. The HMAC chain continues across that split.
+    """
+    if not entries:
+        return
+    _stamp(ws, entries)
+    text = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries)
+    if len(text.encode("utf-8")) > LOG_CAP:
+        raise PbzError("REFUSED", OVER_CAP)
+    path = _log_path(ws)
+    root = _workspace_root(ws)
+    try:
+        append_checked(path, text, root=root, max_bytes=LOG_CAP)
+    except PbzError as err:
+        if not (err.code == "REFUSED" and err.detail == SIZE_CAP and os.path.lexists(path)):
+            raise _io_error(err) from None
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            raise PbzError("REFUSED", OVER_CAP) from None
+        if size > LOG_CAP:
+            raise PbzError("REFUSED", OVER_CAP) from None
+        _rotate(ws)
+        try:
+            append_checked(path, text, root=root, max_bytes=LOG_CAP)
+        except PbzError as err2:
+            raise _io_error(err2) from None
+        except OSError:
+            raise PbzError("REFUSED", UNUSABLE) from None
+    except OSError:
+        raise PbzError("REFUSED", UNUSABLE) from None
+    try:
+        prune(ws)
+    except PbzError:
+        # The batch is already durable. A prune problem must not look like a lost append.
+        pass
 
 
 def _controls(value: str) -> bool:
@@ -322,6 +561,12 @@ def _validate_record(obj: dict, project_name: str) -> dict | None:
     """Whole-record closed shape. Unknown fields are not copied. None means skip."""
     if not isinstance(obj, dict):
         return None
+    if "chain_mac" in obj or "chain_prev" in obj:
+        mac, prev = obj.get("chain_mac"), obj.get("chain_prev")
+        if not (isinstance(mac, str) and _CHAIN_RE.fullmatch(mac)
+                and isinstance(prev, str) and _CHAIN_RE.fullmatch(prev)):
+            return None
+        obj = {k: v for k, v in obj.items() if k not in ("chain_mac", "chain_prev")}
     try:
         extras = set(obj) - _TOP
     except TypeError:
@@ -346,38 +591,42 @@ def _validate_record(obj: dict, project_name: str) -> dict | None:
 
 
 def _load_entries(ws, project) -> tuple[list[dict], int]:
-    text = _read_log(ws)
-    if text is None:
+    files = _log_files(ws)
+    if not files:
         return [], 0
     entries: list[dict] = []
     skipped = 0
     # JSONL delimiter is LF only — do not use splitlines() (it splits on U+2028/U+2029).
-    for line in text.split("\n"):
-        if not line.strip():
+    for path in files:
+        text = _read_log(ws, path)
+        if text is None:
             continue
-        try:
-            obj = json.loads(line)
-        except (ValueError, RecursionError):
-            skipped += 1
-            continue
-        if not isinstance(obj, dict):
-            skipped += 1
-            continue
-        other = obj.get("project")
-        if not isinstance(other, str):
-            skipped += 1
-            continue
-        if other != project.name:
-            continue
-        try:
-            clean = _validate_record(obj, project.name)
-        except (TypeError, ValueError, RecursionError):
-            skipped += 1
-            continue
-        if clean is None:
-            skipped += 1
-            continue
-        entries.append(clean)
+        for line in text.split("\n"):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, RecursionError):
+                skipped += 1
+                continue
+            if not isinstance(obj, dict):
+                skipped += 1
+                continue
+            other = obj.get("project")
+            if not isinstance(other, str):
+                skipped += 1
+                continue
+            if other != project.name:
+                continue
+            try:
+                clean = _validate_record(obj, project.name)
+            except (TypeError, ValueError, RecursionError):
+                skipped += 1
+                continue
+            if clean is None:
+                skipped += 1
+                continue
+            entries.append(clean)
     return entries, skipped
 
 

@@ -610,7 +610,12 @@ matches the registered ids. A late push-log append after a committed push is sti
 ## Round 17 parity
 
 Evidence and synth-test state are anchored at the workspace root. The evidence log is capped
-at 1 MiB; nothing rotates it. Over-cap recovery is to archive or remove `.pbz/evidence.jsonl`
+at 1 MiB; a new record that would exceed the cap rotates it to `.pbz/evidence.d/NNNN.jsonl`
+when the file is not already over the cap, the HMAC chain (`chain_prev`, `chain_mac`)
+continues, a prefix of rotated segments whose newest parsed day is older than
+`checks.LEDGER_DAYS` (30) is pruned, undated segments stay and end that prefix, the anchor
+`.pbz/evidence.chain.json` moves to the last deleted MAC, and legacy lines without macs still
+verify. Over-cap recovery is to archive or remove `.pbz/evidence.jsonl`
 by hand, which also discards `HUMAN_ACCEPTED` history with the file. A present policy that
 cannot be trusted fails closed (broker `REFUSED` / `UNSAFE_PATH`, guard lockdown) instead of
 falling back to shape disclosure. `diff --patch` and `push` refuse an aliased or hardlinked

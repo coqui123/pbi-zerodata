@@ -3,6 +3,7 @@ the mirror by object name (then diff / validate / push). Role members and transl
 like personal names are tokenized again on the next pull. Output: names and counts only."""
 from __future__ import annotations
 
+import json
 import os
 import re
 
@@ -384,6 +385,187 @@ def translate(ws, project, code: str, target: str, caption: str | None = None, d
     return {"verb": "translate", "culture": code, "object": label, "kind": kind,
             "set": [p for p, v in (("caption", caption), ("description", description), ("displayFolder", folder)) if v is not None],
             "files": [_rel(project, rel)], "next": "pbz diff, pbz validate, pbz push"}
+
+
+_TRANSLATION_PROPS = ("caption", "description", "displayFolder")
+
+
+def _local_json(path: str) -> str:
+    if not isinstance(path, str) or not path.strip():
+        raise PbzError("BAD_REQUEST", "a local translations file is required")
+    if re.match(r"(?i)^[a-z][a-z0-9+.-]*://", path.strip()):
+        raise PbzError("REFUSED", "translations are a local file")
+    if os.path.lexists(path) and not os.path.isfile(path):
+        raise PbzError("REFUSED", "translations file must be a regular file")
+    return path
+
+
+def _translation_rows(mdef: str) -> list[dict]:
+    rows = []
+    for rel, doc in culture_docs(mdef).items():
+        code = rel.split("/")[-1][:-5]
+        for node in doc.nodes:
+            if node.kind == "linguisticMetadata":
+                continue
+            if node.kind == "table" and node.parent is not None and node.parent.kind == "model":
+                kind, table, obj = "table", node.name, node.name
+            elif node.kind in ("column", "measure", "hierarchy") and node.parent is not None and node.parent.kind == "table":
+                kind, table, obj = node.kind, node.parent.name, node.name
+            else:
+                continue
+            for prop in _TRANSLATION_PROPS:
+                if prop not in node.props:
+                    continue
+                value = node.props[prop].strip()
+                if value:
+                    rows.append({"culture": code, "objectType": kind, "table": table, "object": obj,
+                                 "property": prop, "value": value})
+    rows.sort(key=lambda r: (r["culture"].lower(), r["objectType"], r["table"].lower(), r["object"].lower(), r["property"]))
+    return rows
+
+
+def translation_export(ws, project, path: str) -> dict:
+    """Flat JSON of culture captions. Counts only come back; the file holds the strings."""
+    path = _local_json(path)
+    mdef, _model_ = _model(project)
+    rows = _translation_rows(mdef)
+    write_text(path, json.dumps({"version": 1, "translations": rows}, indent=1, ensure_ascii=False) + "\n")
+    return {"verb": "translate", "action": "export", "cultures": len({r["culture"] for r in rows}),
+            "translations": len(rows)}
+
+
+def _resolve_translation(model, kind: str, table: str, obj: str):
+    if kind == "table":
+        hit = model.table(obj or table)
+        if hit is None:
+            raise PbzError("NOT_FOUND", "table")
+        return "table", "", hit.name
+    host = model.table(table)
+    if host is None:
+        raise PbzError("NOT_FOUND", "table")
+    if kind == "column":
+        col = model.column(host.name, obj)
+        if col is None:
+            raise PbzError("NOT_FOUND", "column")
+        return "column", host.name, col.name
+    if kind == "measure":
+        measure = next((item for item_name, item in host.measures.items() if item_name.lower() == obj.lower()), None)
+        if measure is None:
+            raise PbzError("NOT_FOUND", "measure")
+        return "measure", host.name, measure.name
+    if kind == "hierarchy":
+        hier = next((item for item in host.hierarchies if item.lower() == obj.lower()), None)
+        if hier is None:
+            raise PbzError("NOT_FOUND", "hierarchy")
+        return "hierarchy", host.name, hier
+    raise PbzError("BAD_REQUEST", "objectType is table, column, measure or hierarchy")
+
+
+def _apply_one(text: str, rel: str, model, code: str, kind: str, table: str, name: str, prop: str, value: str) -> str:
+    """Same culture-tree edits as translate(), on one in-memory document."""
+    mname = model.model_node.name if model.model_node is not None else "Model"
+
+    def parse():
+        return tmdl.parse(rel, text)
+
+    doc = parse()
+    root = next((n for n in doc.nodes if n.kind == "cultureInfo"), None)
+    if root is None:
+        raise PbzError("BAD_REQUEST", f"culture {code} has no cultureInfo declaration")
+    tr = _child(root, "translations", "")
+    if tr is None:
+        text = _append_child(text, doc, root, "\ttranslations")
+        doc = parse()
+        root = next(n for n in doc.nodes if n.kind == "cultureInfo")
+        tr = _child(root, "translations", "")
+    mnode = _child(tr, "model", mname)
+    if mnode is None:
+        text = _append_child(text, doc, tr, f"\t\tmodel {_q(mname)}")
+        doc = parse()
+        tr = _child(next(n for n in doc.nodes if n.kind == "cultureInfo"), "translations", "")
+        mnode = _child(tr, "model", mname)
+    tname = name if kind == "table" else table
+    tnode = _child(mnode, "table", tname)
+    if tnode is None:
+        text = _append_child(text, doc, mnode, f"\t\t\ttable {_q(tname)}")
+        doc = parse()
+        mnode = _child(_child(next(n for n in doc.nodes if n.kind == "cultureInfo"), "translations", ""), "model", mname)
+        tnode = _child(mnode, "table", tname)
+    obj = tnode
+    if kind != "table":
+        obj = _child(tnode, kind, name)
+        if obj is None:
+            text = _append_child(text, doc, tnode, f"\t\t\t\t{kind} {_q(name)}")
+            doc = parse()
+            mnode = _child(_child(next(n for n in doc.nodes if n.kind == "cultureInfo"), "translations", ""), "model", mname)
+            obj = _child(_child(mnode, "table", tname), kind, name)
+    edits = tmdl.prop_edit(doc, obj, prop, value)
+    return apply_edits(text, sorted(edits)) if edits else text
+
+
+def _add_ref_text(text: str, kind: str, name: str) -> str:
+    eol = _eol(text)
+    pat = re.compile(rf"(?m)^ref {kind} ('(?:[^']|'')*'|\S+)[ \t]*(?:\r?\n|$)")
+    if any(tmdl.unquote(m.group(1)).lower() == name.lower() for m in pat.finditer(text)):
+        return text
+    refs = list(re.finditer(r"(?m)^ref \w+ .*$", text))
+    line = f"ref {kind} {_q(name)}"
+    if refs:
+        return text[:refs[-1].end()] + eol + line + text[refs[-1].end():]
+    return text.rstrip("\r\n") + eol + eol + line + eol
+
+
+def translation_import(ws, project, path: str) -> dict:
+    """Write cultures/{code}.tmdl from flat JSON. Token-like values are refused. Counts only."""
+    path = _local_json(path)
+    try:
+        data = json.loads(open(path, encoding="utf-8-sig").read())
+    except (OSError, UnicodeError, ValueError) as err:
+        raise PbzError("BAD_REQUEST", "translations file could not be read") from err
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("translations"), list):
+        raise PbzError("BAD_REQUEST", "translations file needs version 1 and a translations array")
+    mdef, model = _model(project)
+    planned = []
+    for row in data["translations"]:
+        if not isinstance(row, dict):
+            raise PbzError("BAD_REQUEST", "each translation is an object")
+        code, kind, table, obj = row.get("culture"), row.get("objectType"), row.get("table"), row.get("object")
+        prop, value = row.get("property"), row.get("value")
+        if not isinstance(code, str) or not CODE_RE.match(code):
+            raise PbzError("BAD_REQUEST", "culture code like de-DE or fr-FR")
+        if kind not in ("table", "column", "measure", "hierarchy"):
+            raise PbzError("BAD_REQUEST", "objectType is table, column, measure or hierarchy")
+        if prop not in _TRANSLATION_PROPS:
+            raise PbzError("BAD_REQUEST", "property is caption, description or displayFolder")
+        if not isinstance(table, str) or not isinstance(obj, str) or not isinstance(value, str):
+            raise PbzError("BAD_REQUEST", "translation fields must be strings")
+        if TOKEN_RE.search(value) or "\n" in value or "\r" in value:
+            raise PbzError("BAD_REQUEST", "translations are single-line plain text")
+        planned.append((code, *_resolve_translation(model, kind, table, obj), prop, value))
+    texts: dict[str, str] = {}
+    cultures = {code for code, *_rest in planned}
+    mname = model.model_node.name if model.model_node is not None else "Model"
+    for code in sorted(cultures):
+        rel = f"cultures/{code}.tmdl"
+        full = os.path.join(mdef, *rel.split("/"))
+        if os.path.exists(full):
+            texts[rel] = read_text(full)[0]
+        else:
+            texts[rel] = f"cultureInfo {code}\n\n\ttranslations\n\n\t\tmodel {_q(mname)}\n"
+    for code, kind, table, name, prop, value in planned:
+        rel = f"cultures/{code}.tmdl"
+        texts[rel] = _apply_one(texts[rel], rel, model, code, kind, table, name, prop, value)
+    model_path = os.path.join(mdef, "model.tmdl")
+    model_text, model_bom = read_text(model_path)
+    new_model = model_text
+    for code in sorted(cultures):
+        new_model = _add_ref_text(new_model, "cultureInfo", code)
+    ops = [_write_op(mdef, rel, text) for rel, text in texts.items()]
+    if new_model != model_text:
+        ops.append(("write", model_path, new_model, model_bom))
+    _commit(ops)
+    return {"verb": "translate", "action": "import", "cultures": len(cultures),
+            "translations": len(planned), "files": len(ops)}
 
 
 def _translated(doc) -> set[tuple]:

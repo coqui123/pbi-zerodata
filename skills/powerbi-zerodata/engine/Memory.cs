@@ -48,12 +48,13 @@ public static class Memory
     sealed class ColumnSize
     {
         public long Dictionary, Data, Hierarchy;
+        public int Segments;
         public long Total => Dictionary + Data + Hierarchy;
     }
 
     sealed record HierInfo(ulong Id, TableMeta Table, string Name);
 
-    sealed record RelInfo(ulong Id, string Name, ColumnMeta? From, ColumnMeta? To)
+    sealed record RelInfo(ulong Id, string Name, ColumnMeta? From, ColumnMeta? To, bool Active)
     {
         public bool Private => (From?.Table.IsPrivate ?? false) || (To?.Table.IsPrivate ?? false);
     }
@@ -82,6 +83,7 @@ public static class Memory
         public readonly Dictionary<ulong, long> Relationships = new();
         public readonly Dictionary<ulong, TableMeta> RelationshipHome = new();
         public readonly List<string> UnattributedIds = new();            // DPAPI log only
+        public readonly Dictionary<ColumnMeta, string> Encoding = new();
 
         public ColumnSize Of(ColumnMeta c)
         {
@@ -99,6 +101,13 @@ public static class Memory
         using var conn = Conn.Open(ctx, port);
         var ids = LoadIds(conn);
         var st = ReadStorage(conn, ids);
+        try { ApplyEncodings(conn, ids, st); }
+        catch (Exception ex)
+        {
+            ctx.LogText("memory encoding omitted");
+            if (Errors.Classify(ex) == ErrorClass.TIMEOUT)
+                try { conn.Reset(); } catch { }
+        }
         if (st.Unattributed > 0 || st.Truncated)
             ctx.LogText("memory: storage not attributed (storage ids only)" + (st.Truncated ? ", rows truncated" : "") + "\n" +
                         string.Join("\n", st.UnattributedIds));
@@ -116,7 +125,8 @@ public static class Memory
             results = RunPredicates(conn, ctx, chosen);
             predicateState = results.Count == wanted.Count ? "DONE" : "PARTIAL";
         }
-        return Ctx.Ok("memory", Build(ids, st, results, predicateState, ctx.Strict));
+        var ri = RunIntegrity(conn, ctx, ids);
+        return Ctx.Ok("memory", Build(ids, st, results, predicateState, ctx.Strict, ri));
     }
 
     // ------------------------------------------------------------------ metadata
@@ -133,8 +143,8 @@ public static class Memory
             if (I(r[1]) == RowNumberColumnType) ids.RowNumbers.Add(U(r[0]));
         foreach (var r in conn.Dmv("TMSCHEMA_HIERARCHIES", new[] { "ID", "TableID", "Name" }))
             if (ids.Tables.TryGetValue(U(r[1]), out var t)) ids.Hierarchies[U(r[0])] = new HierInfo(U(r[0]), t, S(r[2]));
-        foreach (var r in conn.Dmv("TMSCHEMA_RELATIONSHIPS", new[] { "ID", "Name", "FromColumnID", "ToColumnID" }))
-            ids.Relationships[U(r[0])] = new RelInfo(U(r[0]), S(r[1]), ids.Columns.GetValueOrDefault(U(r[2])), ids.Columns.GetValueOrDefault(U(r[3])));
+        foreach (var r in conn.Dmv("TMSCHEMA_RELATIONSHIPS", new[] { "ID", "Name", "FromColumnID", "ToColumnID", "IsActive" }))
+            ids.Relationships[U(r[0])] = new RelInfo(U(r[0]), S(r[1]), ids.Columns.GetValueOrDefault(U(r[2])), ids.Columns.GetValueOrDefault(U(r[3])), r[4] is bool active && active);
 
         // imported = every partition is held in memory (Import, or Default with an Import model); predicates never touch
         // DirectQuery, Dual or DirectLake tables, so they cannot send queries to a source
@@ -265,7 +275,12 @@ public static class Memory
                 {
                     var s = st.Of(col);
                     if (dictionary) s.Dictionary += bytes;
-                    else s.Data += bytes;
+                    else
+                    {
+                        s.Data += bytes;
+                        // Segment rows already read here (dictionary:false, default kind). Not a new DMV.
+                        s.Segments++;
+                    }
                     return;
                 }
                 if (objName.StartsWith("RowNumber", StringComparison.Ordinal))
@@ -328,6 +343,99 @@ public static class Memory
         st.Unattributed++;
         if (table != null) AddRest(st, table, bytes);
         if (st.UnattributedIds.Count < MaxLoggedIds) st.UnattributedIds.Add(tableId + " / " + columnId);
+    }
+
+    /// <summary>Encoding is not on the StorageDmv allowlist. Failure leaves the field absent. Only Hash or Value is kept.</summary>
+    static void ApplyEncodings(Conn conn, Ids ids, Storage st)
+    {
+        var rows = conn.TryColumnEncoding(MaxStorageRows);
+        if (rows == null) return;
+        foreach (var r in rows)
+        {
+            string? enc = EncodingLabel(r.Length > 3 ? r[3] : null);
+            if (enc == null) continue;
+            var col = DataColumn(ids, S(r[0]), S(r[1]), S(r[2]));
+            if (col != null) st.Encoding[col] = enc;
+        }
+    }
+
+    static string? EncodingLabel(object? v)
+    {
+        if (v == null || v is DBNull) return null;
+        string s = (Convert.ToString(v, CultureInfo.InvariantCulture) ?? "").Trim();
+        if (s.Equals("HASH", StringComparison.OrdinalIgnoreCase)) return "Hash";
+        if (s.Equals("VALUE", StringComparison.OrdinalIgnoreCase)) return "Value";
+        return null;
+    }
+
+    static ColumnMeta? DataColumn(Ids ids, string dimension, string tableId, string columnId)
+    {
+        if (tableId.Contains('$') || columnId.Contains('$')) return null;
+        TableMeta? table = null;
+        ulong objId = 0;
+        string objName = columnId;
+        var p = PlainId.Match(tableId);
+        if (p.Success) ids.Tables.TryGetValue(Id(p.Groups["id"].Value), out table);
+        var c = PlainId.Match(columnId);
+        if (c.Success)
+        {
+            objId = Id(c.Groups["id"].Value);
+            objName = c.Groups["n"].Value;
+        }
+        table ??= ids.Meta.Tables.FirstOrDefault(t => string.Equals(t.Name, dimension, StringComparison.Ordinal));
+        if (table == null || table.IsPrivate || ids.RowNumbers.Contains(objId)) return null;
+        return FindColumn(ids, table, objId, objName);
+    }
+
+    sealed class RiMaps
+    {
+        public readonly Dictionary<ulong, long> Rel = new();
+        public readonly Dictionary<ColumnMeta, long> Col = new();
+    }
+
+    /// <summary>
+    /// Referential integrity for relationship ends that can be tested with COUNTROWS/FILTER/RELATED.
+    /// Counts stay in this process and leave only as Buckets.Count. No key samples and no min/max.
+    /// A query that errors is omitted; it does not fail the verb.
+    /// </summary>
+    static RiMaps RunIntegrity(Conn conn, Ctx ctx, Ids ids)
+    {
+        var maps = new RiMaps();
+        var clock = Stopwatch.StartNew();
+        double budget = Math.Clamp(ctx.TimeoutSec * 2.0, 15.0, 300.0);
+        foreach (var rel in ids.Relationships.Values)
+        {
+            if (clock.Elapsed.TotalSeconds >= budget) break;
+            if (!rel.Active || rel.Private || rel.From == null || rel.To == null) continue;
+            if (!ids.Imported.Contains(rel.From.Table) || !ids.Imported.Contains(rel.To.Table)) continue;
+            try
+            {
+                string table = Dax.QTable(rel.From.Table.Name);
+                string keyed = "NOT (" + rel.From.BlankPredicate + ")";
+                string q = "EVALUATE ROW(\"n\", COUNTROWS(FILTER(" + table + ", " + keyed + " && ISBLANK(RELATED(" + rel.To.Ref + ")))))";
+                long n = ColumnStats.L(conn.Row1(q)[0]);
+                if (n < 0) n = 0;
+                maps.Rel[rel.Id] = n;
+                maps.Col[rel.From] = AddCap(maps.Col.GetValueOrDefault(rel.From), n);
+            }
+            catch (Exception ex)
+            {
+                ctx.LogText("memory ri omitted");
+                if (Errors.Classify(ex) == ErrorClass.TIMEOUT)
+                {
+                    try { conn.Reset(); } catch { }
+                    break;
+                }
+            }
+        }
+        return maps;
+    }
+
+    static long AddCap(long a, long b)
+    {
+        if (b < 0) b = 0;
+        if (a > long.MaxValue - b) return long.MaxValue;
+        return a + b;
     }
 
     // ------------------------------------------------------------------ predicates
@@ -409,7 +517,7 @@ public static class Memory
 
     // ------------------------------------------------------------------ response
 
-    static JsonObject Build(Ids ids, Storage st, Dictionary<ColumnMeta, bool> predicates, string predicateState, bool strict)
+    static JsonObject Build(Ids ids, Storage st, Dictionary<ColumnMeta, bool> predicates, string predicateState, bool strict, RiMaps ri)
     {
         long total = st.Total;
         var outTables = new JsonArray();
@@ -429,6 +537,13 @@ public static class Memory
                     o["share_band"] = Buckets.StorageShare(bytes, total);
                 }
                 o["dictionary_heavy"] = s != null && bytes > 0 && s.Dictionary * 2 >= bytes;
+                if (st.Encoding.TryGetValue(c, out var enc)) o["encoding"] = enc;
+                if (!strict) o["segment_band"] = Buckets.Count(s?.Segments ?? 0);
+                if (ri.Col.TryGetValue(c, out long orphans))
+                {
+                    o["ri"] = orphans == 0 ? "RI_OK" : "RI_VIOLATION";
+                    if (!strict) o["ri_count"] = Buckets.Count(orphans);
+                }
                 if (predicates.TryGetValue(c, out var flag)) o[PredicateKey(c)!] = flag;
                 cols.Add(o);
             }
@@ -461,6 +576,11 @@ public static class Memory
             if (r.From != null) o["from"] = r.From.Key;
             if (r.To != null) o["to"] = r.To.Key;
             if (!strict) o["size_band"] = Buckets.Size(st.Relationships.GetValueOrDefault(r.Id));
+            if (ri.Rel.TryGetValue(r.Id, out long orphans))
+            {
+                o["ri"] = orphans == 0 ? "RI_OK" : "RI_VIOLATION";
+                if (!strict) o["ri_count"] = Buckets.Count(orphans);
+            }
             rels.Add(o);
         }
 

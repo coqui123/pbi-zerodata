@@ -189,3 +189,61 @@ def set_(ws, project, from_ref: str, to_ref: str, active: bool | None = None, bo
            "cross_filter": ("both" if both else "single") if both is not None else ("both" if r.both else "single"),
            "next": "pbz diff, pbz push"}
     return _apply(path, bom, doc.text[:s] + edits_block + doc.text[e:], dry_run, out, _mirror_rel(ws, path))
+
+
+def _table_arg(model, ref: str) -> str:
+    text = (ref or "").strip()
+    for rx in REF:
+        m = rx.match(text)
+        if m:
+            col = model.column(m.group(1).replace("''", "'"), m.group(2))
+            if col is None:
+                raise PbzError("NOT_FOUND", ref)
+            return col.table
+    table = model.table(text.strip("'"))
+    if table is None:
+        raise PbzError("NOT_FOUND", ref)
+    return table.name
+
+
+def _active_paths(model, left: str, right: str) -> list[list[str]]:
+    """Up to two simple paths of active relationship names. Inactive relationships are ignored."""
+    adj: dict[str, list[tuple[str, str]]] = {}
+    for rel in model.relationships:
+        if not rel.active:
+            continue
+        adj.setdefault(rel.from_table.lower(), []).append((rel.to_table.lower(), rel.name))
+        adj.setdefault(rel.to_table.lower(), []).append((rel.from_table.lower(), rel.name))
+    start, goal = left.lower(), right.lower()
+    if start == goal:
+        return []
+    found: list[list[str]] = []
+    stack = [(start, {start}, [])]
+    while stack and len(found) < 2:
+        cur, seen, rels = stack.pop()
+        for nxt, name in adj.get(cur, ()):
+            if nxt in seen:
+                continue
+            path = rels + [name]
+            if nxt == goal:
+                found.append(path)
+                if len(found) >= 2:
+                    break
+            else:
+                stack.append((nxt, seen | {nxt}, path))
+    return found
+
+
+def paths(ws, project, left: str, right: str) -> dict:
+    """Active filter paths between two tables. ONE lists relationship names; AMBIGUOUS and NONE do not."""
+    _mdef, model = _model(project)
+    a, b = _table_arg(model, left), _table_arg(model, right)
+    found = _active_paths(model, a, b)
+    if not found:
+        status, names = "NONE", []
+    elif len(found) == 1:
+        status, names = "ONE", found[0]
+    else:
+        status, names = "AMBIGUOUS", []
+    return {"verb": "relationship", "action": "paths", "from": a, "to": b,
+            "status": status, "relationships": names}

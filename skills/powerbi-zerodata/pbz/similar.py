@@ -296,3 +296,79 @@ def run(ws, project, threshold: float = 0.80, max_pairs: int = 100) -> dict:
                           for grp in identical],
             "aliases": aliases, "same_shape": same_shape, "pairs": pairs[:max_pairs],
             "pairs_total": len(pairs)}
+
+
+_STRUCT = ("tables", "columns", "measures", "relationships")
+
+
+def _structure(project) -> dict[str, set[str]]:
+    mdef = os.path.join(project.mirror_model, "definition")
+    if not os.path.isdir(mdef):
+        raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    model = tmdl.load_model(mdef)
+    tables, columns, measures, rels = set(), set(), set(), set()
+    for table in model.tables.values():
+        if table.private:
+            continue
+        tables.add(table.name.lower())
+        columns.update(f"{table.name.lower()}[{name.lower()}]" for name in table.columns)
+        measures.update(name.lower() for name in table.measures)
+    for rel in model.relationships:
+        rels.add(f"{rel.from_table.lower()}[{rel.from_column.lower()}]->"
+                 f"{rel.to_table.lower()}[{rel.to_column.lower()}]")
+    return {"tables": tables, "columns": columns, "measures": measures, "relationships": rels}
+
+
+def _overlap_band(shared: int, left: int, right: int) -> str:
+    if shared <= 0:
+        return "NONE"
+    base = max(1, min(left, right))
+    ratio = shared / base
+    if ratio < 0.34:
+        return "LOW"
+    if ratio < 0.67:
+        return "MID"
+    return "HIGH"
+
+
+def models(ws, names, against=None) -> dict:
+    """Structural overlap of projects in one workspace. Counts are shared names, never a similarity float."""
+    if isinstance(names, str):
+        names = [names]
+    if not isinstance(names, (list, tuple)) or not names:
+        raise PbzError("BAD_REQUEST", "name the projects to compare")
+    wanted = list(names)
+    if against:
+        if not isinstance(against, str):
+            raise PbzError("BAD_REQUEST", "against is a project name")
+        wanted.append(against)
+    by_name = {p.name.lower(): p for p in ws.projects}
+    chosen = []
+    for name in wanted:
+        if not isinstance(name, str) or not name.strip():
+            raise PbzError("BAD_REQUEST", "project names are strings")
+        hit = by_name.get(name.strip().lower())
+        if hit is None:
+            raise PbzError("NO_PROJECT", name)
+        chosen.append(hit)
+    structs = {}
+    for project in chosen:
+        if project.name not in structs:
+            structs[project.name] = _structure(project)
+    if against:
+        target = by_name[against.strip().lower()].name
+        resolved = list(dict.fromkeys(by_name[a.strip().lower()].name for a in names))
+        pairs = [(a, target) for a in resolved if a.lower() != target.lower()]
+    else:
+        resolved = list(dict.fromkeys(by_name[a.strip().lower()].name for a in names))
+        pairs = [(resolved[i], resolved[j]) for i in range(len(resolved)) for j in range(i + 1, len(resolved))
+                 if resolved[i] != resolved[j]]
+    rows = []
+    for left_name, right_name in pairs:
+        left, right = structs[left_name], structs[right_name]
+        shared = {kind: len(left[kind] & right[kind]) for kind in _STRUCT}
+        total = sum(shared.values())
+        rows.append({"a": left_name, "b": right_name, "overlap_band": _overlap_band(
+            total, sum(len(left[k]) for k in _STRUCT), sum(len(right[k]) for k in _STRUCT)),
+            "shared": shared})
+    return {"verb": "similar", "action": "models", "pairs": rows}

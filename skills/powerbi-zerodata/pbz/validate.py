@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 
-from . import lint, pbir, pbircheck, tmdl
+from . import daxcatalog, deps, lint, pbir, pbircheck, tmdl
 from .classify import PII_IN_TEXT
 from .common import TOOLS_BIN, definition_root, engine_call, open_mirror_file_readonly
 from .tokens import ESC_TOKEN_RE, TOKEN_RE
@@ -208,12 +208,59 @@ def synthetic_marker(model) -> list[dict]:
             if node.kind == "annotation" and node.name.strip("'").upper() == "PBZ_SYNTHETIC"]
 
 
+def circular_dependencies(model) -> list[dict]:
+    """Measures whose DAX references form a cycle, including a measure that references itself.
+
+    Expressions that fail to parse are skipped. The finding names the measure and does not quote DAX.
+    """
+    res = deps.Resolver(model)
+    graph: dict[str, set[str]] = {}
+    labels: dict[str, tuple[str, str]] = {}
+    for table in model.tables.values():
+        for measure in table.measures.values():
+            key = measure.name.lower()
+            labels[key] = (measure.table, measure.name)
+            try:
+                parsed = deps.dax(measure.expression or "", measure.table, res)
+            except Exception:
+                continue
+            graph[key] = {ref.name.lower() for ref in parsed.refs if ref.kind == "measure"}
+    color = {key: 0 for key in graph}
+    cycled: set[str] = set()
+
+    def walk(node: str, stack: list[str]) -> None:
+        color[node] = 1
+        stack.append(node)
+        for nxt in graph.get(node, ()):
+            if nxt not in graph:
+                continue
+            if color[nxt] == 1:
+                if nxt in stack:
+                    cycled.update(stack[stack.index(nxt):])
+            elif color[nxt] == 0:
+                walk(nxt, stack)
+        stack.pop()
+        color[node] = 2
+
+    for key in list(graph):
+        if color[key] == 0:
+            walk(key, [])
+    out = []
+    for key in sorted(cycled, key=lambda item: (labels[item][0].lower(), labels[item][1].lower())):
+        table, name = labels[key]
+        out.append({"severity": "error", "code": "CIRCULAR_DEPENDENCY", "where": f"{table}[{name}]",
+                    "message": f"[{name}] is in a circular measure dependency"})
+    return out
+
+
 def run_mirror(ws, project) -> list[dict]:
     """Metadata-only checks on the mirror itself (no engine): lint + field references."""
     mdef = os.path.join(project.mirror_model, "definition")
     model = tmdl.load_model(mdef) if os.path.isdir(mdef) else tmdl.Model()
     ident = lambda s: s  # mirror text is already sanitized
     out = lint.run(model) + synthetic_marker(model)
+    out += circular_dependencies(model)
+    out += daxcatalog.findings(model)
     out += field_refs(ws.mirror, project, model, ident)
     if os.path.isdir(project.mirror_report):
         from . import images, visuals

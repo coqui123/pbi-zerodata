@@ -250,16 +250,27 @@ These read the mirror and print names, states, counts, scores and rule ids. Deta
 
 | Verb | Use it for |
 |---|---|
-| `pbz unused [--all] [--report <dir>]` | state of every object: used / used_external / locked / used_by_unused / unused / unknown |
+| `pbz unused [--all] [--what-if] [--report <dir>]` | state of every object; `--what-if` uses saved memory bands only |
+| `pbz bpa [model\|report] [--labels measure-killer] [--import-rules file] [--fail-on new\|any\|high] [--ci github\|azdo] [--format sarif\|trx\|junit]` | best-practice findings; data rules run only when memory bands exist |
+| `pbz similar [--models name name] [--against project]` | duplicate measures, or structural overlap of projects |
+| `pbz changes [--from previous --to last] [--against <workspace>]` | semantic diff of mirrors; `--against` refuses a raw SemanticModel folder |
+| `pbz relationship paths <left> <right>` | one, none, or ambiguous active path |
+| `pbz calendar add <table> <name> --column <col> [--unit Day]` / `pbz kpi set <measure> [--target --status --trend]` | calendar column group or KPI expressions |
+| `pbz function import <file>` / `pbz script export\|apply <file>` | local UDF or measure script; no network |
+| `pbz translate --export <file>` / `--import <file>` | culture caption file; counts only on stdout |
 | `pbz consumers add <path> \| --object <ref> --label <l>`, `discover <folder> [--register]`, `list`, `scan`, `show <id>` | find and register external consumers (thin reports, PBIX, Excel, RDL, composite models, query exports, a scanner result) so `unused` keeps what they use ([reference/consumers.md](reference/consumers.md)) |
-| `pbz lineage <obj> [--up]` | where-used tree (default) or what it depends on |
+| `pbz lineage <obj> [--up] [--from-source T C] [--native-sql] [--format json\|openlineage --out file]` | where-used tree, source-column walk, or a local lineage file |
+| `pbz impact --drop-source-column <name>` / `--rename-source-column <old> --to <new>` | what a source-column change reaches |
+| `pbz find <pattern>` / `pbz replace <pattern> <repl> [--apply]` | search the mirror; replace is a dry run until `--apply` |
+| `pbz rewrite unused-var\|qualify\|divide\|format\|description <measure>` | checked measure rewrite; `divide` needs `--accept-semantic` |
+| `pbz expand <measure>` | tokenized DEFINE block and dependency names; not executed |
+| `pbz watch [--once]` | re-run validate and bpa; `--once` is a single pass |
+| `pbz perf --dax <query> [--runs N] [--baseline name --action save\|compare]` | duration and plan bands, never milliseconds |
+| `pbz perf-import <file> [--replay]` | Performance Analyzer bands; replay is human-only |
 | `pbz unused --remove [--dry-run] [--cascade] [--only kinds] [--m-step remove\|keep\|none]` | delete unused objects from the mirror, with a restore point |
 | `pbz unused --restore <stamp>` | undo a removal (before or after push) |
 | `pbz suggest` | cleanup suggestions (auto date/time, unused variables, hidden pages, key columns...) |
-| `pbz bpa [model\|report] [--labels measure-killer]` | best-practice findings, score and grade |
-| `pbz similar` | identical, alias, same-shape and near-duplicate measures |
 | `pbz audit [--category efficiency\|consolidation] [--since <baseline>] [--fail-on new]`, `pbz audit memory`, `pbz audit waive <id> --reason ...` | efficiency and consolidation findings with evidence, fix and verify; storage bands from Desktop; baselines and waivers ([reference/audit.md](reference/audit.md)) |
-| `pbz changes [--from previous --to last]` | semantic diff of mirror snapshots (pending edits, or what changed between pulls) |
 | `pbz docs [--format md\|html\|json] [--dax]` | documentation into `pbz-workspace\docs\` |
 | `pbz m-lineage [table]` | Power Query steps, column origins, columns the query drops or the model lacks |
 | `pbz unused --verify-engine` | cross-check the dependency parser against the open Desktop engine |

@@ -1,0 +1,18 @@
+# This example is not the CI for the pbi-zerodata repo.
+# Sample for a PBIP repository that consumes pbz. pbz is expected on PATH.
+name: pbz bpa
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bpa:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Best practice analysis
+        run: pbz bpa --fail-on new --since bpa --ci github --format sarif --out bpa.sarif

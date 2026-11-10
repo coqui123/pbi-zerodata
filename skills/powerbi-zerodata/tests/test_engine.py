@@ -407,6 +407,60 @@ def test_offline(env: Env, tmp: Path) -> None:
     r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(tmp / "nope")}, "tmdl-no-folder")
     expect("tmdl missing folder -> BAD_REQUEST", r and r["class"] == "BAD_REQUEST", r)
 
+    # perf / refresh / memory contract shapes (no Desktop)
+    perf_ok = {
+        "ok": True, "verb": "perf", "timing": "BANDED", "duration_band": "100_500MS",
+        "fe_share": "LOW", "se_queries": "1_5", "dq_events": "0", "cache_hit": "NONE",
+        "callback": False, "agg_rewrite": "NONE", "trace": "CAPTURED", "verdict": "SAME",
+        "baseline": "SAVED",
+        "plan": {"CallbackDataID": "0", "Spool_Iterator": "1", "CrossApply": "2_5", "LargeMaterialization": "0"},
+    }
+    perf_down = {"ok": True, "verb": "perf", "timing": "UNAVAILABLE", "trace": "UNAVAILABLE"}
+    perf_raw = dict(perf_ok)
+    perf_raw["milliseconds"] = 12
+    perf_unbanded = {"ok": True, "verb": "perf", "timing": "BANDED", "trace": "CAPTURED"}
+    expect("perf banded example validates", not list(VALIDATOR.iter_errors(perf_ok)))
+    expect("perf unavailable example validates without a duration", not list(VALIDATOR.iter_errors(perf_down)))
+    expect("perf rejects a raw timing field", list(VALIDATOR.iter_errors(perf_raw)))
+    expect("perf BANDED requires duration_band", list(VALIDATOR.iter_errors(perf_unbanded)))
+    refresh_old = {"ok": True, "verb": "refresh", "status": "PASS"}
+    refresh_new = {"ok": True, "verb": "refresh", "status": "PASS",
+                   "objects": [{"name": "Sales", "duration_band": "LT_100MS"}]}
+    expect("refresh without objects still validates", not list(VALIDATOR.iter_errors(refresh_old)))
+    expect("refresh duration objects validate", not list(VALIDATOR.iter_errors(refresh_new)))
+    mem_old = {
+        "ok": True, "verb": "memory", "tables": [{
+            "name": "Sales", "columns": [{"name": "Id", "dictionary_heavy": False}], "hierarchies": [],
+        }], "relationships": [], "coverage": "FULL", "predicates": "OFF",
+    }
+    mem_new = {
+        "ok": True, "verb": "memory", "tables": [{
+            "name": "Sales", "columns": [{
+                "name": "Id", "dictionary_heavy": False, "encoding": "Hash", "segment_band": "1-9",
+                "ri": "RI_OK", "ri_count": "0",
+            }], "hierarchies": [],
+        }], "relationships": [{"name": "SalesDate", "from": "Sales[Id]", "to": "Date[Id]",
+                               "ri": "RI_VIOLATION", "ri_count": "1-9"}],
+        "coverage": "FULL", "predicates": "OFF",
+    }
+    expect("memory column without the new fields still validates", not list(VALIDATOR.iter_errors(mem_old)))
+    expect("memory column with encoding, segment_band and ri validates", not list(VALIDATOR.iter_errors(mem_new)))
+
+    r = engine("perf", {"private_dir": str(env.pd), "port": 1, "dax": "SELECT 1", "runs": 1}, "perf-not-dax")
+    expect("perf refuses a query that is not DEFINE or EVALUATE", r and r.get("ok") is False and r.get("class") == "BAD_REQUEST", r)
+    r = engine("perf", {"private_dir": str(env.pd), "port": 1, "dax": "EVALUATE INFO.TABLES()", "runs": 1}, "perf-info")
+    expect("perf refuses INFO", r and r.get("ok") is False and r.get("class") == "BAD_REQUEST", r)
+    r = engine("perf", {"private_dir": str(env.pd), "port": 1, "dax": "EVALUATE EVALUATEANDLOG(1)", "runs": 1}, "perf-eal")
+    expect("perf refuses EVALUATEANDLOG", r and r.get("ok") is False and r.get("class") == "BAD_REQUEST", r)
+    r = engine("perf", {"private_dir": str(env.pd), "port": 1, "dax": "EVALUATE ROW(\"v\", 1)", "runs": 0}, "perf-runs")
+    expect("perf runs must be from 1 to 20", r and r.get("class") == "BAD_REQUEST", r)
+    r = engine("perf", {"private_dir": str(env.pd), "port": 1, "dax": "EVALUATE ROW(\"v\", 1)", "runs": 1, "action": "drop"}, "perf-action")
+    expect("perf action must be save or compare", r and r.get("class") == "BAD_REQUEST", r)
+    r = engine("perf", {"private_dir": str(env.pd), "port": 1, "dax": "EVALUATE ROW(\"v\", 1)", "runs": 1, "action": "save"}, "perf-baseline")
+    expect("perf save requires a baseline name", r and r.get("class") == "BAD_REQUEST", r)
+    r = engine("perf", {"private_dir": str(env.pd), "port": 1, "dax": "EVALUATE ROW(\"v\", 1)", "runs": 1}, "perf-closed")
+    expect("perf on a closed port is ENGINE_UNAVAILABLE after the guard", r and r.get("ok") is False and r.get("class") == "ENGINE_UNAVAILABLE", r)
+
     # pbz/engine.py wrapper
     spec = importlib.util.spec_from_file_location("pbz_engine_wrapper", S / "pbz" / "engine.py")
     mod = importlib.util.module_from_spec(spec)

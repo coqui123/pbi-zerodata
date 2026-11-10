@@ -89,6 +89,13 @@ Source: `$SYSTEM.TMSCHEMA_TABLES`, `TMSCHEMA_COLUMNS`, `TMSCHEMA_MEASURES`,
 `DBSCHEMA_CATALOGS` DMVs may ever be queried by any verb, except the fixed-column reads of `deps` (v1.2) and
 `memory` (v1.4).
 
+### `provenance`
+Request `{"private_dir", "port", "max_age_hours": 24}`. `max_age_hours` is 1 to 8760.
+Response `{"ok": true, "verb": "provenance", "refresh": "FRESH|STALE|UNKNOWN",
+"source_publication": "UNKNOWN", "coverage": "PARTIAL|COMPLETE",
+"note": "Refresh does not certify source publication. Raw timestamps remain in protected storage."}`.
+Partition refresh times stay in `private_dir\refresh-provenance.bin`. They are never printed.
+
 ### `tmdl-validate`
 Request `{"private_dir", "folder": "<...>\\X.SemanticModel\\definition"}` (no port).
 Uses `TmdlSerializer.DeserializeDatabaseFromFolder`. Also inventory: every `ref` in
@@ -99,8 +106,14 @@ Response `{"ok": true, "verb": "tmdl-validate", "valid": false,
 "missing_refs": ["tables/Y.tmdl"], "orphan_files": ["tables/Z.tmdl"]}`. Never echo line text.
 
 ### `refresh`
-Request `{"private_dir", "port", "tables": ["T"]?}` (all tables when omitted). TMSL/TOM full
-refresh. Response `{"ok": true, "verb": "refresh", "status": "PASS"}` or class on failure.
+Request `{"private_dir", "port", "tables": ["T"]?}` (all tables when omitted). TMSL/TOM refresh
+as in v1.1 (calculate, or full on calculated partitions only). Response
+`{"ok": true, "verb": "refresh", "status": "PASS"}` or `UNSUPPORTED`. When a ProgressReportEnd
+trace is actually captured, PASS may also include
+`objects`: `[{"name": "Sales", "duration_band": "LT_100MS"}]`. `duration_band` is
+`LT_100MS`, `100_500MS`, `500MS_2S`, `2_10S` or `GT_10S`. Names are known table, partition or
+database names. Raw durations stay in the process. If the trace cannot start, `objects` is
+omitted and the response stays the old shape. A trace failure does not fail the refresh.
 
 ### `compiles`
 Request `{"private_dir", "port", "items": [{"id": "m1", "table": "T", "expression": "<DAX scalar>"}]}`
@@ -141,7 +154,7 @@ Request:
 Kinds the engine implements: `executes`, `nonblank`, `nonempty` (table expr), `equal`
 (`left`, `right`, optional `by`, `where`, `tol` relative, BLANK equals BLANK only), `additive`
 (`expr`, `by`: total equals sum over `by` groups), `unique` (`column`), `no_orphans` (`from`, `to`),
-`no_blank_keys` (`column`), `sign` (`expr`), `subset` (`column`, `of`).
+`no_blank_keys` (`column`), `sign` (`expr`), `subset` (`column`, `of`), `rls`.
 Python rewrites `differs`, `filter_independent` and `compiles` into these before calling.
 `where` items are boolean single-column filter predicates applied with CALCULATE/CALCULATETABLE.
 Response per check:
@@ -154,6 +167,15 @@ Response per check:
   otherwise `hmac` (Python turns it into a token). Strict tier: no `groups`, still `mismatch`.
 - `sign` adds `"sign": "NEG|ZERO|POS|BLANK"`. `unique`/`no_orphans`/`no_blank_keys` add
   `"offenders_bucket"` in shape tier.
+- `rls` request fields: `expect` (`EMPTY`, `NON_EMPTY`, `LESS`, `EQUAL` or `OLS_INACCESSIBLE`),
+  at least one of `role` and `user` (neither may contain `;`, `'` or `"`), and one of `query`
+  (a DAX query, or a table expression), `column` or `table`. The engine compares row counts
+  internally. `EMPTY` / `NON_EMPTY` look at the role-scoped count; `LESS` / `EQUAL` compare it
+  with the unrestricted count. `OLS_INACCESSIBLE`: unrestricted query succeeds and the role
+  query fails as an unknown object → `PASS`; the role query succeeds → `FAIL`; a connection
+  failure, timeout, bad request, or any other role-side error → `ERROR`. Status stays `PASS`,
+  `FAIL`, `EMPTY`, `UNSUPPORTED` or `ERROR`. The response does not add `role`, `query`, `user`,
+  the count or the error text.
 
 ### `probe`
 Request `{"private_dir", "port", "table": "T", "columns": ["C"]?, "disclosure": "shape"}`
@@ -180,7 +202,9 @@ Response `{"visuals": [{"id": "page/visual", "status": "OK|EMPTY|ERROR", "class"
 
 - Never print engine strings except scrubbed `message` fields above.
 - Never run DMVs other than `TMSCHEMA_*` / `DBSCHEMA_CATALOGS` (storage DMVs leak counts). The only exceptions are
-  the fixed-column reads of `deps` (v1.2) and `memory` (v1.4); `memory` keeps every size and count inside the process
+  the fixed-column reads of `deps` (v1.2) and `memory` (v1.4). `memory` may also try one separate
+  `COLUMN_ENCODING` read of `DISCOVER_STORAGE_TABLE_COLUMNS` that is not on the `StorageDmv` allowlist;
+  if that query fails, `encoding` is omitted. `memory` keeps every size and count inside the process
   and prints fixed bands only.
 - Default per-command timeout 60 s -> `TIMEOUT`.
 - Before any data query on `port`, `connect` logic must succeed; callers pass the same port.
@@ -214,8 +238,13 @@ Agreed after v1 (coordinator addendum and the Desktop refresh finding). Implemen
      data-source) partition the response is `{"ok": true, "verb": "refresh", "status": "UNSUPPORTED"}`
      and nothing is attempted.
    - Response `status` is `PASS` or `UNSUPPORTED`; engine failures use the error envelope.
+   - On `PASS` only, and only when a ProgressReportEnd trace was captured, optional `objects`:
+     `[{"name", "duration_band"}]` for known tables, partitions and the database. Trace setup
+     failure omits `objects` and does not fail the refresh. M partitions stay `UNSUPPORTED`.
 
 ## v1.2 addition: `deps`
+
+### `deps`
 
 Request `{"private_dir", "port"}`. Response `{"ok": true, "verb": "deps", "edges": [[type, table, object,
 ref_type, ref_table, ref_object], ...]}` from `$SYSTEM.DISCOVER_CALC_DEPENDENCY`, the one DMV besides
@@ -227,6 +256,8 @@ becomes `"?"`; each type must match `^[A-Z_]{1,40}$` or it becomes `"?"`. Duplic
 Used by `pbz unused --verify-engine` to cross-check the metadata parser; never the primary source.
 
 ## v1.3 addition: `synth-query`
+
+### `synth-query`
 
 Request `{"private_dir", "port", "dax": "EVALUATE ...", "max_rows": 500}`. Response `{"ok": true,
 "verb": "synth-query", "columns": ["..."], "rows": [[...]], "truncated": false}`: the only verb that
@@ -242,6 +273,8 @@ the same guard as snapshot / smoke (DEFINE or EVALUATE first, no INFO.* or EVALU
 500; DateTime values are `yyyy-MM-ddTHH:mm:ss` strings.
 
 ## v1.4 addition: `memory`
+
+### `memory`
 
 Request `{"private_dir", "port", "disclosure"?, "predicates"?: true}` (`predicates` must be a boolean). VertiPaq
 storage attributed to model objects the way VertiPaq Analyzer does, released only as fixed bands.
@@ -277,21 +310,77 @@ query per table; after an error, one query per column. A predicate that errors o
 to the DPAPI log, never to stdout). Response `predicates`: `OFF` (request `"predicates": false`), `DONE`, or `PARTIAL`
 (some eligible column has no answer).
 
+Optional column fields, all closed strings, omitted when unknown. Existing responses without them stay valid.
+`encoding` is `Hash` or `Value` from a separate `COLUMN_ENCODING` query (not added to `StorageColumns`); the field is
+omitted when that query fails or the value is neither. `segment_band` counts segment rows already read for that column
+(`dictionary: false`, default storage kind) and is only `Buckets.Count`: `"0"`, `"1-9"`, `"10-99"`, `"100-999"`,
+`"1k-9k"`, `"10k+"`. Referential integrity runs `COUNTROWS` / `FILTER` / `RELATED` on active imported relationship ends
+that can be tested without printing keys. `ri` is `RI_OK` or `RI_VIOLATION` and `ri_count` is `Buckets.Count` of the
+mismatch count. The same pair may appear on the relationship. A failing test omits that end. No min/max, no raw counts,
+no key samples.
+
 ```json
 {"ok": true, "verb": "memory", "model": {"size_band": "10-100 MiB"},
  "tables": [{"name": "Sales", "size_band": "10-100 MiB", "share_band": ">=20%",
-   "columns": [{"name": "OrderDate", "size_band": "1-10 MiB", "share_band": "1-5%", "dictionary_heavy": false, "time_part": true}],
+   "columns": [{"name": "OrderDate", "size_band": "1-10 MiB", "share_band": "1-5%", "dictionary_heavy": false,
+     "encoding": "Value", "segment_band": "1-9", "ri": "RI_OK", "ri_count": "0", "time_part": true}],
    "hierarchies": [{"name": "Calendar", "size_band": "<1 MiB"}]}],
- "relationships": [{"name": "<TOM relationship name>", "from": "Sales[DateKey]", "to": "Date[DateKey]", "size_band": "<1 MiB"}],
+ "relationships": [{"name": "SalesDate", "from": "Sales[DateKey]", "to": "Date[DateKey]", "size_band": "<1 MiB",
+   "ri": "RI_OK", "ri_count": "0"}],
  "other": {"size_band": "<1 MiB", "share_band": "<1%"},
  "auto_datetime": {"size_band": "1-10 MiB", "share_band": "5-20%"},
  "coverage": "FULL", "predicates": "DONE"}
 ```
 
 `other` appears only when something was not attributed; `auto_datetime` only when the model has private tables.
-Strict tier: not refused; every band (`model`, `size_band`, `share_band`, `other`, `auto_datetime`) is omitted, while
-names, `dictionary_heavy`, the predicate booleans, `coverage` and `predicates` stay (booleans are allowed in both tiers,
-as in `probe`). Engine failures use the error envelope.
+Strict tier: not refused; every band (`model`, `size_band`, `share_band`, `segment_band`, `ri_count`, `other`,
+`auto_datetime`) is omitted, while names, `dictionary_heavy`, `encoding`, `ri`, the predicate booleans, `coverage`
+and `predicates` stay (booleans are allowed in both tiers, as in `probe`). Engine failures use the error envelope.
+
+## v1.5 addition: `perf`
+
+### `perf`
+
+Request `{"private_dir", "port", "dax", "runs", "baseline"?, "action"?}`. `dax` must pass the snapshot/smoke
+guard (`DEFINE` or `EVALUATE` first; no `INFO.*`, no `EVALUATEANDLOG`). `runs` is 1 to 20. `action` is `save`,
+`compare`, or absent. `baseline` is a file name (`^[A-Za-z0-9._-]{1,64}$`) required when `action` is set.
+Each run is a cold XMLA `ClearCache` (`DatabaseID` is the catalog name) followed by the query. Result rows are
+discarded. The median and the run-to-run spread stay in the process. The baseline file is DPAPI in
+`private_dir\perf\<name>.bin` and holds only those two numbers.
+
+Trace events, subscribed only when `Enum.TryParse` finds the name: `QueryEnd`, `VertiPaqSEQueryEnd`,
+`VertiPaqSEQueryCacheMatch`, `DirectQueryEnd`, `AggregateTableRewriteQuery`, `DAXQueryPlan`. Unknown names are
+skipped. `ExecutionMetrics` is not required. If trace setup throws, the verb still returns
+`trace: UNAVAILABLE`. A guard refusal is still an error. If no `QueryEnd` is captured, `timing` is `UNAVAILABLE`.
+
+`fe_share` is `LOW` when formula-engine time is under 25% of `QueryEnd`, `HIGH` when over 75%, otherwise `MID`.
+Formula-engine time is `QueryEnd` duration minus the sum of storage-engine durations, computed in-process and
+clamped at zero. `se_queries` and `dq_events` are `0`, `1_5`, `6_20`, `21_100`, `GT_100`. `cache_hit` is `NONE`
+when there is no cache-match event, `MOST` when cache matches outnumber storage-engine queries, otherwise `SOME`.
+`callback` is true when private storage-engine text contains `CallbackDataID` or `EncodeCallback`; that text is
+never emitted. `agg_rewrite` is `HIT` when rewrite text contains `matchFound`, `MISS` when a rewrite event fired
+without it, and `NONE` when the event did not fire. `duration_band` is `LT_100MS`, `100_500MS`, `500MS_2S`,
+`2_10S`, `GT_10S`.
+
+`plan`, when a plan event was captured, counts operator classes as `0`, `1`, `2_5`, `6_20`, `GT_20` only:
+`CallbackDataID`, `Spool_Iterator`, `CrossApply`, and `LargeMaterialization` (a spool whose record count bands
+through `Buckets.Count` to `1k-9k` or `10k+`). Spool record counts are not emitted. No plan text.
+
+Compare uses the same rule as `pbz/perf.py` (`RATIO = 1.25`): if `old <= 0`, `NOISY`. Otherwise if
+`new/old > 1.25` or `new/old < 1/1.25`, then `NOISY` when `abs(new-old) <= spread`, else `SLOWER` when the ratio
+is over 1.25 and `FASTER` when it is under `1/1.25`. Otherwise `SAME`. `spread` is the wider of the saved and
+the new run-to-run ranges. Stdout carries the verdict only.
+
+```json
+{"ok": true, "verb": "perf", "timing": "BANDED", "duration_band": "100_500MS",
+ "fe_share": "LOW", "se_queries": "1_5", "dq_events": "0", "cache_hit": "NONE",
+ "callback": false, "agg_rewrite": "NONE", "trace": "CAPTURED", "verdict": "SAME",
+ "plan": {"CallbackDataID": "0", "Spool_Iterator": "1", "CrossApply": "0", "LargeMaterialization": "0"}}
+```
+
+`verdict` is present only on a compare that had both medians. `baseline` is present only as `SAVED`
+after `action: save`, or `MISSING` when a compare has no saved baseline. A trace that did not start is
+`{"ok": true, "verb": "perf", "timing": "UNAVAILABLE", "trace": "UNAVAILABLE"}`.
 
 Implementation clarifications that callers must know (response container names, the blank group
 key, optional `timeout_s`, stricter message scrubbing, query guards) are listed in

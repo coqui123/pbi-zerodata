@@ -84,6 +84,9 @@ CONTRACT.md v1.4).
 - `pbz/engine.py`: `call(verb, request, timeout=120) -> dict`. Pass `private_dir` (absolute) in every
   request and `port` for live verbs. Wrapper envelopes: missing exe or unparseable stdout ->
   `ENGINE_UNAVAILABLE`; wall-clock timeout -> `TIMEOUT`; request not JSON-serializable -> `BAD_REQUEST`.
+  `perf` returns duration and plan bands only. `check` kind `rls` compares counts inside the process.
+  `memory` may add `encoding`, `segment_band`, `ri`, and `ri_count` as closed strings. `refresh` may
+  add `objects[].duration_band` when a trace is captured.
 - Before any data verb: find the port as in spike 5 for the instance whose file is the workspace's
   `.pbip`, cross-check with bridge status, then call `connect` and compare `tables` with the expected
   model before sending data queries. Never pass a port that belongs to another instance.

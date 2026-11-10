@@ -17,7 +17,24 @@ real files and validates them again with TOM before writing. None of them reads 
   annotations) into the target table, rewrites `'Old'[Measure]` references and the PBIR entity of every
   visual, filter, sort and bookmark reference. A filter whose single `From` alias also serves other
   fields of the old table is listed under `manual` instead of being edited.
-- `pbz rename measure|column` is unchanged.
+- `pbz rename measure|column` is unchanged. `pbz rename --match <pattern> --to <repl>` renames every
+  matching object name of the given kind (`any` searches columns, then measures, then tables). It is
+  one transaction: a failure restores the mirror. `--dry-run` lists the renames.
+- `pbz find <pattern>` and `pbz replace <pattern> <repl>` search the mirror. Replace writes only with
+  `--apply`. Token syntax in the pattern or replacement is refused.
+
+## Checked rewrites
+
+- `pbz rewrite unused-var|qualify|divide|format|description [Measure]`. `divide` changes a slash into
+  `DIVIDE` only for an expression that is exactly two operands, and only with `--accept-semantic`.
+- `pbz expand [Measure]` returns a tokenized `DEFINE` block for the measure and the measures it
+  depends on. It does not run the query.
+- `pbz calendar add <table> <name> --column 'T'[Date] [--unit Day|Month|Quarter|Year|Week]` inserts a
+  calendar column group. `pbz kpi set [Measure] --target <expr> [--status --trend]` inserts one KPI
+  block. A second KPI on the same measure is refused.
+- `pbz script export <file>` / `apply <file>` round-trips measure expressions as JSON under the
+  workspace. Apply refuses a new token that is not already in that measure, and refuses a duplicate
+  measure in the same file.
 
 ## Scaffolds (`pbz new`)
 
@@ -36,7 +53,8 @@ Each new object gets a fresh `lineageTag`; the table is added to `model.tmdl`.
 relationship on the same columns (`DUPLICATE`), mismatched data types (`TYPE_MISMATCH`, override with
 `--force`) and a second active filter path between the two tables (`AMBIGUOUS_PATH`; add it
 `--inactive` and use `USERELATIONSHIP`). `set ... --active|--inactive|--both|--single` changes an
-existing one with the same path guard; `remove` deletes it. Key uniqueness and orphans are data
+existing one with the same path guard; `remove` deletes it. `pbz relationship paths <left> <right>`
+reports `ONE`, `NONE`, or `AMBIGUOUS` for active relationships. Key uniqueness and orphans are data
 questions: check them with `pbz check` (`unique`, `no_orphans`) while Desktop is open.
 
 ## Pages and visuals (`pbz add`)
@@ -135,7 +153,9 @@ screenshot, a pasted chart). pbz handles the bytes without showing them:
 `Table.Hierarchy`), or of a selection: `pbz set --table Sales --kind measure --match "%$"
 formatString=0.0%`, `--folder <display folder>`. Properties: `description` (written as `///` lines),
 `displayFolder`, `formatString`, `isHidden`, `isKey`, `dataCategory`, `summarizeBy`, `sortByColumn`
-(same table, no loops), `isAvailableInMdx`. `--unset prop` removes one, `--dry-run` previews, and
+(same table, no loops), `isAvailableInMdx`, `encodingHint` (`Hash` or `Value`), and `isNullable`.
+`lineageTag=regenerate` writes a new tag. `detailRowsExpression` and `alternateOf` are inserted as
+blocks, not `prop:` lines. `--unset prop` removes one, `--dry-run` previews, and
 `pbz get <object or selection>` shows the current values. Data types, lineage tags and expressions are
 not edited here. To confirm a new sort-by on real data, check that each label maps to one sort value:
 `equal` with `COUNTROWS(SUMMARIZE('T', 'T'[Label], 'T'[Sort]))` against `DISTINCTCOUNT('T'[Label])`.
@@ -145,6 +165,9 @@ not edited here. To confirm a new sort-by on real data, check that each label ma
 - `pbz hierarchy add <table> <name> --level Year --level Month [--names Year Month]`,
   `pbz hierarchy levels ...` (replace the levels; a level whose name survives keeps its lineage tag),
   `pbz hierarchy remove <table> <name> [--force]` (refused while visuals use it).
+- `pbz function import <file>` reads a local JSON document or a `FUNCTION Name = (params) => body`
+  file. It does not fetch from the network. If Desktop is closed, the function is still written and
+  `compile` is `NOT_RUN`.
 - `pbz format-expr "[Measure]" "<DAX returning a format string>"` sets the measure's
   formatStringDefinition, `--remove` drops it. Needs compatibility level 1601 (`--upgrade-compat`).
   It replaces the measure's static `formatString`: Desktop refuses to open a measure that has both

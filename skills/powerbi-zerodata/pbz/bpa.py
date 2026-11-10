@@ -5,7 +5,8 @@ the logic is one predicate per rule id below. Rules are adapted from microsoft/A
 BestPracticeRules (MIT), NatVanG/fab-inspector Base-rules (MIT), akhilannan/pbir-utils (MIT) and
 microsoft/semantic-link-labs (MIT); each catalog entry names its source. Everything runs on the
 sanitized mirror. Findings name objects and count things; they never quote literal values from DAX, M
-or PBIR. Data-derived rules (evidence "data") are listed in the catalog but not run.
+or PBIR. Data-derived rules run only when a saved memory document is present; otherwise they stay
+listed and skipped. Bands only: no distinct counts and no raw bytes.
 
 Scores: model = sum(severity x violations) x log10(tables + columns + measures + relationships), graded
 at 75 / 300 / 600 / 900 / 1200; report = sum(severity x (1 + excess)), graded at 50 / 100 / 150 / 250 / 300.
@@ -1122,6 +1123,142 @@ def grade(score: float, scope: str, labels: str = "letters") -> str:
     return names[-1]
 
 
+DATA_RULES = {
+    "SPLIT_DATE_AND_TIME",
+    "LARGE_TABLES_SHOULD_BE_PARTITIONED",
+    "AVOID_BI-DIRECTIONAL_RELATIONSHIPS_AGAINST_HIGH-CARDINALITY_COLUMNS",
+    "REDUCE_USAGE_OF_LONG-LENGTH_COLUMNS_WITH_HIGH_CARDINALITY",
+    "FIX_REFERENTIAL_INTEGRITY_VIOLATIONS",
+}
+_BIG_TABLE = {"100-1000 MiB", ">=1000 MiB"}
+
+
+def _memory_doc(cx):
+    cached = getattr(cx, "_memory_doc", None)
+    if cached is not None:
+        return cached or None
+    doc = None
+    if cx.ws is not None and cx.project is not None:
+        from . import memory
+        doc = memory.load(cx.ws, cx.project)
+    cx._memory_doc = doc or {}
+    return doc
+
+
+def _mem_column(doc, table: str, column: str) -> dict:
+    if not doc:
+        return {}
+    for item in doc.get("tables") or []:
+        if str(item.get("name", "")).lower() != table.lower():
+            continue
+        for col in item.get("columns") or []:
+            if str(col.get("name", "")).lower() == column.lower():
+                return col
+    return {}
+
+
+def _mem_table(doc, table: str) -> dict:
+    if not doc:
+        return {}
+    for item in doc.get("tables") or []:
+        if str(item.get("name", "")).lower() == table.lower():
+            return item
+    return {}
+
+
+def _mem_rel(doc, rel) -> dict:
+    if not doc:
+        return {}
+    want_from = f"{rel.from_table}[{rel.from_column}]".lower()
+    want_to = f"{rel.to_table}[{rel.to_column}]".lower()
+    for item in doc.get("relationships") or []:
+        name = (rel.name or "").strip()
+        item_name = str(item.get("name") or "").strip()
+        if name and item_name and item_name.lower() == name.lower():
+            return item
+        if str(item.get("from", "")).lower() == want_from and str(item.get("to", "")).lower() == want_to:
+            return item
+    return {}
+
+
+@check("SPLIT_DATE_AND_TIME")
+def _split_date(cx, rule):
+    doc = _memory_doc(cx)
+    hits = []
+    examined = 0
+    for col in cx.columns:
+        band = _mem_column(doc, col.table, col.name)
+        if "time_part" not in band:
+            continue
+        examined += 1
+        if band.get("time_part") is True:
+            hits.append(Hit(f"{col.table}[{col.name}]", "column", col.table, node=col.node))
+    return examined, hits
+
+
+@check("LARGE_TABLES_SHOULD_BE_PARTITIONED")
+def _large_tables(cx, rule):
+    doc = _memory_doc(cx)
+    hits = []
+    examined = 0
+    for table in cx.tables:
+        size = _mem_table(doc, table.name).get("size_band")
+        if size not in ("<1 MiB", "1-10 MiB", "10-100 MiB", "100-1000 MiB", ">=1000 MiB"):
+            continue
+        examined += 1
+        if size in _BIG_TABLE and len(table.partitions) <= 1:
+            hits.append(Hit(table.name, "table", node=table.node))
+    return examined, hits
+
+
+@check("AVOID_BI-DIRECTIONAL_RELATIONSHIPS_AGAINST_HIGH-CARDINALITY_COLUMNS")
+def _bi_high_card(cx, rule):
+    doc = _memory_doc(cx)
+    hits = []
+    for rel in cx.rels:
+        if not rel.both:
+            continue
+        for table, column in ((rel.from_table, rel.from_column), (rel.to_table, rel.to_column)):
+            size = _mem_column(doc, table, column).get("size_band")
+            if size and size != "<1 MiB":
+                hits.append(Hit(_rel_label(rel), "relationship", node=rel.node))
+                break
+    return len(cx.rels), hits
+
+
+@check("REDUCE_USAGE_OF_LONG-LENGTH_COLUMNS_WITH_HIGH_CARDINALITY")
+def _long_high(cx, rule):
+    doc = _memory_doc(cx)
+    hits = []
+    examined = 0
+    for col in cx.columns:
+        band = _mem_column(doc, col.table, col.name)
+        if band.get("long_text") is not True:
+            continue
+        examined += 1
+        size = band.get("size_band")
+        if band.get("dictionary_heavy") is True or (isinstance(size, str) and size != "<1 MiB"):
+            hits.append(Hit(f"{col.table}[{col.name}]", "column", col.table, node=col.node))
+    return examined, hits
+
+
+@check("FIX_REFERENTIAL_INTEGRITY_VIOLATIONS")
+def _ri_violations(cx, rule):
+    doc = _memory_doc(cx)
+    hits = []
+    for rel in cx.rels:
+        info = _mem_rel(doc, rel)
+        bad = info.get("ri") == "RI_VIOLATION"
+        if not bad:
+            for table, column in ((rel.from_table, rel.from_column), (rel.to_table, rel.to_column)):
+                if _mem_column(doc, table, column).get("ri") == "RI_VIOLATION":
+                    bad = True
+                    break
+        if bad:
+            hits.append(Hit(_rel_label(rel), "relationship", node=rel.node))
+    return len(cx.rels), hits
+
+
 def catalog(scope: str = "all") -> list[dict]:
     rules = []
     for name in ("model", "report"):
@@ -1185,7 +1322,7 @@ def ignored_model(model) -> set[str]:
 
 
 def run(ws, project, scope: str = "all", rules_path: str | None = None, opinion: bool = False,
-        labels: str = "letters", extra_reports=()) -> dict:
+        labels: str = "letters", extra_reports=(), import_rules: str | None = None) -> dict:
     if scope not in ("model", "report", "all"):
         raise PbzError("BAD_REQUEST", "scope must be model, report or all")
     if labels not in LABELS:
@@ -1205,7 +1342,7 @@ def run(ws, project, scope: str = "all", rules_path: str | None = None, opinion:
         on = (rule.get("enabled", True) and (opinion or not rule.get("opinion")) or rid in enable) and rid not in disable
         thr = cx.threshold(rule)
         effective.append([rid, sev, bool(on), thr])
-        if rule.get("evidence") == "data":
+        if rule.get("evidence") == "data" and not (_memory_doc(cx) and rid in DATA_RULES and rid in CHECKS):
             coverage["skipped_data_rules"].append(rid)
             continue
         if not on or rid not in CHECKS:
@@ -1245,6 +1382,29 @@ def run(ws, project, scope: str = "all", rules_path: str | None = None, opinion:
         st["findings"] += len(kept)
         if kept:
             st["by_rule"][rid] = len(kept)
+    imported = None
+    if import_rules:
+        from . import ruleset
+        document = ruleset.load_path(import_rules)
+        extra = ruleset.evaluate(cx.model, document)
+        for hit in extra.get("findings") or []:
+            if not isinstance(hit, dict) or not isinstance(hit.get("object"), str) or not hit["object"]:
+                continue
+            sev = hit.get("severity")
+            if type(sev) is not int:
+                sev = 2
+            sev = min(3, max(1, int(sev)))
+            rec = {"rule": str(hit.get("rule") or "RULE")[:80], "severity": sev, "category": "custom",
+                   "scope": "model", "kind": str(hit.get("kind") or "model")[:40], "object": hit["object"][:500],
+                   "message": str(hit.get("message") or hit.get("rule") or "custom rule")[:200], "fix": ""}
+            findings.append(rec)
+            st = stats["model"]
+            st["raw"] += sev
+            st["bad"] += sev
+            st["possible"] += sev
+            st["findings"] += 1
+            st["by_rule"][rec["rule"]] = st["by_rule"].get(rec["rule"], 0) + 1
+        imported = {"supported": document.get("supported", 0), "refused": document.get("refused", 0)}
     findings.sort(key=lambda f: (-f["severity"], f["scope"], f["rule"], f["object"].lower()))
     out = {"verb": "bpa", "project": project.name, "scope": scope, "labels": labels,
            "ruleset": hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()[:12]}
@@ -1265,6 +1425,8 @@ def run(ws, project, scope: str = "all", rules_path: str | None = None, opinion:
         out["truncated"] = len(findings) - MAX_FINDINGS
     if suppressed:
         out["suppressed"] = suppressed[:200]
+    if imported is not None:
+        out["import_rules"] = imported
     return out
 
 

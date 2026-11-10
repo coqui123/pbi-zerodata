@@ -19,7 +19,7 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | `diff` | Pending mirror vs real | `--patch` | tokens |
 | `push` | Validate and write real files | `--reload`, `--dry-run`, `--only` | tokens |
 | `revert` | Discard mirror edits | paths, `--object` | workspace |
-| `validate` | Mirror metadata lint / PBIR | — | workspace |
+| `validate` | Mirror metadata lint / PBIR | `--fail-on`, `--since`, `--ci`, `--format`, `--out` | workspace |
 | `preflight` | Full staged validation, no apply | `--only` | [improvements.md](../skills/powerbi-zerodata/reference/improvements.md) |
 | `recover` | Interrupted push recovery | `--transaction` | improvements |
 
@@ -29,7 +29,7 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 |---|---|---|---|
 | `describe` | Data dictionary (model / table / measure / column) | Metadata only | workspace |
 | `values` | Column shape from the mirror | Not a live grid | workspace |
-| `rename` | Rename measure/column/table + fix refs | `kind` required | [authoring.md](../skills/powerbi-zerodata/reference/authoring.md) |
+| `rename` | Rename measure/column/table + fix refs, or a pattern | `--match`, `--to`, `--dry-run`, kind `any` | [authoring.md](../skills/powerbi-zerodata/reference/authoring.md) |
 | `move` | Move measure to another table | `--to` | authoring |
 
 ## Desktop and engine verification
@@ -40,7 +40,9 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | `index` | Column classification index in Desktop | — | checks |
 | `refresh` | Refresh open model | `--tables` | checks |
 | `health` | Objects in error (classes only) | — | checks |
-| `check` | Data-blind assertions | `--validate-only`, `--diagnostic` | checks |
+| `check` | Data-blind assertions, including `rls` and `perf` | `--validate-only`, `--diagnostic` | checks |
+| `perf` | DAX query bands and baseline verdict | `--dax`, `--runs`, `--baseline`, `--action save\|compare` | checks |
+| `perf-import` | Performance Analyzer file as bands | `--replay` (human terminal only) | checks |
 | `check-schema` | JSON schema for check specs | — | checks |
 | `probe` | Table shape: booleans / coarse buckets | `--columns` | checks |
 | `snapshot` | Save/compare query shapes | `save` \| `compare` | checks |
@@ -63,12 +65,16 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 
 | Verb | Purpose | Nested / key flags | Docs |
 |---|---|---|---|
-| `unused` | Usage states; optional remove/restore | `--remove`, `--restore`, `--cascade`, `--verify-engine` | [analysis.md](../skills/powerbi-zerodata/reference/analysis.md) |
-| `lineage` | Dependency tree | `--up`, `--depth` | analysis |
+| `unused` | Usage states; optional remove/restore or memory what-if | `--remove`, `--restore`, `--what-if`, `--cascade` | [analysis.md](../skills/powerbi-zerodata/reference/analysis.md) |
+| `lineage` | Dependency tree, source column, or native SQL | `--up`, `--from-source`, `--native-sql`, `--format`, `--out` | analysis |
+| `impact` | Source-column drop or rename | `--drop-source-column`, `--rename-source-column`, `--to` | analysis |
+| `find` | Names and mirror lines matching a pattern | `--kind` | analysis |
+| `replace` | Rename matches or replace text outside tokens | `--apply` (default is dry run), `--kind` | analysis |
 | `suggest` | Cleanup suggestions | `--report` | analysis |
-| `bpa` | Best-practice analysis | scope `model\|report\|all`; `--fix`, `--opinion` | [bpa.md](../skills/powerbi-zerodata/reference/bpa.md) |
-| `similar` | Near-duplicate measures | `--threshold`, `--max` | analysis |
-| `changes` | Semantic diff of mirror snapshots | `--from`, `--to`, `--list` | analysis |
+| `bpa` | Best-practice analysis | `--import-rules`, `--fail-on`, `--since`, `--ci`, `--format`, `--out` | [bpa.md](../skills/powerbi-zerodata/reference/bpa.md) |
+| `similar` | Near-duplicate measures, or project overlap | `--models`, `--against` | analysis |
+| `changes` | Semantic diff of mirror snapshots | `--from`, `--to`, `--against` | analysis |
+| `watch` | Re-run validate and bpa | `--once` | analysis |
 | `docs` | Model/report documentation export | `--format md\|html\|json` | analysis |
 | `m-lineage` | Power Query step/column lineage | optional table | analysis |
 | `audit` | Efficiency / consolidation findings | `run` \| `waive` \| `memory` | [audit.md](../skills/powerbi-zerodata/reference/audit.md) |
@@ -94,18 +100,23 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | `mobile` | Phone layout positions | `--pos`, `--remove` | authoring |
 | `format` | Token-safe DAX formatter | `--apply` | authoring |
 | `repair` | Structural PBIR fixes | `--dry-run`, `--fields`, `--lineage` | authoring |
-| `relationship` | Model relationships | `add` \| `remove` \| `set` | authoring |
+| `relationship` | Model relationships | `add` \| `remove` \| `set` \| `paths` | authoring |
+| `calendar` | Calendar column group | `add`, `--column`, `--unit` | authoring |
+| `kpi` | Measure KPI expressions | `set`, `--target`, `--status`, `--trend` | authoring |
+| `rewrite` | Checked measure rewrite | `unused-var` \| `qualify` \| `divide` \| `format` \| `description`; `--accept-semantic` | authoring |
+| `expand` | Tokenized DEFINE block | measure target | authoring |
+| `script` | Measure script JSON under the workspace | `export` \| `apply` | authoring |
 | `set` / `get` | Typed model properties | `--kind`, `--table`, `--match`, `--folder` | authoring |
 | `hierarchy` | User hierarchies | `add` \| `levels` \| `remove` | authoring |
 | `format-expr` | Dynamic format string | `--remove` | authoring |
-| `function` | DAX UDFs | `add` \| `update` \| `rename` \| `remove` \| `list` | authoring |
+| `function` | DAX UDFs | `add` \| `update` \| `rename` \| `remove` \| `list` \| `import` | authoring |
 
 ## Model governance
 
 | Verb | Purpose | Nested | Docs |
 |---|---|---|---|
 | `culture` | Cultures | `add` \| `remove` \| `list` \| `missing` | [governance.md](../skills/powerbi-zerodata/reference/governance.md) |
-| `translate` | Captions / descriptions / folders | — | governance |
+| `translate` | Captions / descriptions / folders, or a culture file | `--export`, `--import` | governance |
 | `perspective` | Perspectives | `add` \| `remove` \| `include` \| `exclude` | governance |
 | `role` | RLS roles + OLS | `add` \| `remove` \| `filter` \| `unfilter` \| `member-add` \| `member-remove` \| `ols` | governance |
 | `refresh-policy` | Incremental refresh | `set` \| `remove` \| `show` | governance |

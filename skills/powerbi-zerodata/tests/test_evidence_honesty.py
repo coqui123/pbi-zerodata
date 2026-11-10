@@ -4,6 +4,7 @@ Run: python tests/test_evidence_honesty.py
 """
 from __future__ import annotations
 
+import datetime as dt
 import io
 import json
 import os
@@ -393,16 +394,19 @@ class EvidenceHonestyTests(unittest.TestCase):
         self.assertEqual(self.accepts, [])
         self.assertEqual(self.packets, [])
 
-    def test_accept_near_cap_refuses_with_bytes_unchanged(self):
+    def test_accept_near_cap_rotates_and_keeps_segment_bytes(self):
         path = self._write_log("z" * (evidence.LOG_CAP - 10))
         before = open(path, "rb").read()
-        with self.assertRaises(PbzError) as caught:
-            self._review(accept=True)
-        self.assertEqual(caught.exception.code, "REFUSED")
-        self.assertEqual(caught.exception.detail, evidence.OVER_CAP)
-        self.assertEqual(open(path, "rb").read(), before)
-        self.assertEqual(self.accepts, [])
-        self.assertEqual(self.packets, [])
+        out = self._review(accept=True)
+        segment = os.path.join(self.ws.pbz_dir, "evidence.d", "0001.jsonl")
+        self.assertEqual(open(segment, "rb").read(), before)
+        active = open(path, "rb").read()
+        self.assertIn(b"HUMAN_ACCEPTED", active)
+        self.assertLess(len(active), evidence.LOG_CAP)
+        self.assertTrue(self.accepts)
+        self.assertTrue(self.packets)
+        self.assertEqual(out["coverage"]["human_visual_review"], "CURRENT")
+        self.assertEqual(evidence.verify_chain(self.ws)["chain"], "OK")
 
     def test_growth_past_cap_between_read_and_accept_appends_nothing(self):
         path = self._write_log(_line("validate", "PARSED", "validate",
@@ -523,8 +527,9 @@ class EvidenceHonestyTests(unittest.TestCase):
         self.assertEqual(emitted.get("evidence_status"), "NOT_RECORDED")
         self.assertEqual(open(outside, "rb").read(), b"EXTERNAL\n")
 
-    def test_near_cap_check_batch_records_nothing(self):
-        filler = {"ts": TS, "project": "Canary", "verb": "validate", "mirror_rev": M, "real_rev": R,
+    def test_near_cap_check_batch_rotates_and_records(self):
+        recent = (dt.date.today() - dt.timedelta(days=1)).isoformat() + "T03:04:05"
+        filler = {"ts": recent, "project": "Canary", "verb": "validate", "mirror_rev": M, "real_rev": R,
                   "stage": "PARSED", "scope": "validate", "summary": {"errors": 0, "warnings": 0, "outcome": "PASS"}}
         blob = (json.dumps(filler) + "\n").encode()
         os.makedirs(self.ws.pbz_dir, exist_ok=True)
@@ -550,8 +555,13 @@ class EvidenceHonestyTests(unittest.TestCase):
                     os.chdir(old)
         emitted = json.loads(buf.getvalue())
         self.assertEqual(emitted["results"], primary["results"])
-        self.assertEqual(emitted.get("evidence_status"), "NOT_RECORDED")
-        self.assertEqual(open(path, "rb").read(), before)
+        self.assertNotEqual(emitted.get("evidence_status"), "NOT_RECORDED")
+        segment = os.path.join(self.ws.pbz_dir, "evidence.d", "0001.jsonl")
+        self.assertEqual(open(segment, "rb").read(), before)
+        active = open(path, encoding="utf-8").read()
+        self.assertIn('"verb": "check"', active)
+        self.assertLess(len(active.encode("utf-8")), evidence.LOG_CAP)
+        self.assertEqual(evidence.verify_chain(self.ws)["chain"], "OK")
 
     def test_skipped_lines_still_accept(self):
         self._write_log("[]\n" + _line("validate", "PARSED", "validate",

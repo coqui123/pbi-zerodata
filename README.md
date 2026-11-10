@@ -84,10 +84,10 @@ Every verb: [docs/cli-catalog.md](docs/cli-catalog.md).
 | Area | Highlights | Docs |
 |---|---|---|
 | Zero-data workflow | Mirror, guard, policy fail-closed, disclosure contract | [overview](docs/overview.md), [SKILL.md](skills/powerbi-zerodata/SKILL.md) |
-| Analysis | `unused`, `lineage`, `suggest`, `bpa`, `similar`, `changes`, `docs`, `m-lineage` | [analysis](skills/powerbi-zerodata/reference/analysis.md), [bpa](skills/powerbi-zerodata/reference/bpa.md) |
-| Authoring | rename/move, scaffolds, pages/visuals, filters, bookmarks, style, images | [authoring](skills/powerbi-zerodata/reference/authoring.md), [visuals](skills/powerbi-zerodata/reference/visuals.md) |
-| Governance | cultures, roles/OLS, perspectives, refresh policy, selective push/revert | [governance](skills/powerbi-zerodata/reference/governance.md) |
-| Verification | `check`, snapshots, smoke, synth tests, preview, freshness, requirements | [checks](skills/powerbi-zerodata/reference/checks.md), [synth](skills/powerbi-zerodata/reference/synth.md), [improvements](skills/powerbi-zerodata/reference/improvements.md) |
+| Analysis | `unused`, `lineage`, `find`, `suggest`, `bpa`, `similar`, `changes`, `watch` | [analysis](skills/powerbi-zerodata/reference/analysis.md), [bpa](skills/powerbi-zerodata/reference/bpa.md) |
+| Authoring | rename/replace/rewrite, calendars, KPIs, scripts, scaffolds, pages/visuals | [authoring](skills/powerbi-zerodata/reference/authoring.md), [visuals](skills/powerbi-zerodata/reference/visuals.md) |
+| Governance | cultures and translation files, roles/OLS, perspectives, refresh policy | [governance](skills/powerbi-zerodata/reference/governance.md) |
+| Verification | `check` including RLS and perf bands, snapshots, smoke, synth, Performance Analyzer import | [checks](skills/powerbi-zerodata/reference/checks.md), [external parity](skills/powerbi-zerodata/reference/external-parity.md) |
 | Review | evidence stages, `review`, recipes | [workflow](skills/powerbi-zerodata/reference/workflow.md) |
 | Audit | efficiency + consolidation findings, waivers, memory bands | [audit](skills/powerbi-zerodata/reference/audit.md) |
 | Agents | same verbs as MCP tools | [mcp](skills/powerbi-zerodata/reference/mcp.md) |

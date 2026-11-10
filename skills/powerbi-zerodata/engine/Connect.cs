@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.AnalysisServices.AdomdClient;
 
@@ -130,15 +131,41 @@ public sealed class Conn : IDisposable
 {
     readonly Ctx _ctx;
     readonly int _port;
+    readonly string? _roles;
+    readonly string? _user;
     AdomdConnection? _c;
     public Meta Meta { get; private set; } = new();
+    public int Port => _port;
 
-    Conn(Ctx ctx, int port) { _ctx = ctx; _port = port; }
+    Conn(Ctx ctx, int port, string? roles, string? user)
+    {
+        _ctx = ctx;
+        _port = port;
+        _roles = roles;
+        _user = user;
+    }
+
+    /// <summary>Rejects connection-string breakers. Existing callers pass neither value.</summary>
+    public static void RejectIdentity(string? roles, string? effectiveUserName)
+    {
+        RejectToken(roles, "roles");
+        RejectToken(effectiveUserName, "effective_user");
+    }
+
+    static void RejectToken(string? value, string field)
+    {
+        if (string.IsNullOrEmpty(value)) return;
+        if (value.IndexOfAny(new[] { ';', '"', '\'' }) >= 0)
+            throw new BadRequestException(field + " contains a character that is not allowed");
+    }
 
     /// <summary>The "connect logic": open, require exactly one catalog, load TMSCHEMA metadata.</summary>
-    public static Conn Open(Ctx ctx, int port)
+    public static Conn Open(Ctx ctx, int port, string? roles = null, string? effectiveUserName = null)
     {
-        var conn = new Conn(ctx, port);
+        RejectIdentity(roles, effectiveUserName);
+        if (string.IsNullOrWhiteSpace(roles)) roles = null;
+        if (string.IsNullOrWhiteSpace(effectiveUserName)) effectiveUserName = null;
+        var conn = new Conn(ctx, port, roles, effectiveUserName);
         try
         {
             conn.Reopen();
@@ -153,14 +180,32 @@ public sealed class Conn : IDisposable
         }
     }
 
+    string ConnectionString()
+    {
+        var sb = new StringBuilder();
+        sb.Append("Data Source=localhost:");
+        sb.Append(_port.ToString(CultureInfo.InvariantCulture));
+        sb.Append(";Connect Timeout=");
+        sb.Append(Math.Min(_ctx.TimeoutSec, 60).ToString(CultureInfo.InvariantCulture));
+        if (!string.IsNullOrEmpty(_roles))
+        {
+            sb.Append(";Roles=");
+            sb.Append(_roles);
+        }
+        if (!string.IsNullOrEmpty(_user))
+        {
+            sb.Append(";EffectiveUserName=");
+            sb.Append(_user);
+        }
+        return sb.ToString();
+    }
+
     void Reopen()
     {
         var old = _c;
         _c = null;
         if (old != null) Bounded.Run(() => old.Dispose());
-        var c = new AdomdConnection(
-            "Data Source=localhost:" + _port.ToString(CultureInfo.InvariantCulture) +
-            ";Connect Timeout=" + Math.Min(_ctx.TimeoutSec, 60).ToString(CultureInfo.InvariantCulture) + ";");
+        var c = new AdomdConnection(ConnectionString());
         _ctx.Guard(() => { c.Open(); return 0; }, Math.Min(_ctx.TimeoutSec, 60));
         _c = c;
         var cats = Dmv("DBSCHEMA_CATALOGS", new[] { "CATALOG_NAME", "COMPATIBILITY_LEVEL" });
@@ -196,8 +241,9 @@ public sealed class Conn : IDisposable
 
     /// <summary>
     /// The memory verb's narrow exception to the rule above: exactly two storage DMVs, each read with a fixed column
-    /// list (storage identity plus one size). Callers cannot choose DMVs or columns. Sizes stay inside the process; the
-    /// memory verb releases fixed bands only (CONTRACT.md v1.4).
+    /// list (storage identity plus one size). Callers cannot choose DMVs or columns. COLUMN_ENCODING is deliberately
+    /// not in this allowlist; <see cref="TryColumnEncoding"/> is a separate query that may fail. Sizes stay inside the
+    /// process; the memory verb releases fixed bands only (CONTRACT.md v1.4).
     /// </summary>
     static readonly Dictionary<string, string[]> StorageColumns = new(StringComparer.Ordinal)
     {
@@ -209,6 +255,55 @@ public sealed class Conn : IDisposable
     {
         if (!StorageColumns.TryGetValue(dmv, out var columns)) throw new InvalidOperationException("storage DMV not allowed");
         return Rows("SELECT " + string.Join(", ", columns.Select(c => "[" + c + "]")) + " FROM $SYSTEM." + dmv, maxRows);
+    }
+
+    /// <summary>
+    /// Separate from <see cref="StorageColumns"/>. Reads COLUMN_ENCODING only. A missing column or an engine that
+    /// rejects the query returns null so the caller can omit the field. Timeout still propagates.
+    /// </summary>
+    public List<object?[]>? TryColumnEncoding(int maxRows)
+    {
+        try
+        {
+            return Rows(
+                "SELECT [DIMENSION_NAME], [TABLE_ID], [COLUMN_ID], [COLUMN_ENCODING] FROM $SYSTEM.DISCOVER_STORAGE_TABLE_COLUMNS",
+                maxRows);
+        }
+        catch (Exception ex) when (Errors.Classify(ex) != ErrorClass.TIMEOUT)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Runs a statement and discards every cell. The row count is not returned.</summary>
+    public void Drain(string text)
+    {
+        var c = Raw;
+        _ctx.Guard(() =>
+        {
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = text;
+            cmd.CommandTimeout = _ctx.TimeoutSec;
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) { }
+            return 0;
+        });
+    }
+
+    /// <summary>Counts result rows without keeping cell values.</summary>
+    public long CountRows(string text)
+    {
+        var c = Raw;
+        return _ctx.Guard(() =>
+        {
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = text;
+            cmd.CommandTimeout = _ctx.TimeoutSec;
+            using var r = cmd.ExecuteReader();
+            long n = 0;
+            while (r.Read()) n++;
+            return n;
+        });
     }
 
     /// <summary>Runs a statement and returns rows (values stay inside the process).</summary>

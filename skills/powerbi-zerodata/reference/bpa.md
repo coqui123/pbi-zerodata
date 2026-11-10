@@ -45,6 +45,14 @@ They never quote a literal value from DAX, M or PBIR.
 - Overlay file (`--rules`): `{"disable": [ids], "enable": [ids], "severity": {"ID": 3},
   "thresholds": {"REDUCE_PAGES": 10}}`. Rule ids match microsoft/Analysis-Services BPARules.json
   where one exists, so existing ignore lists carry over.
+- `--import-rules <file>` loads a Tabular Editor-shaped rule document. Only the safe expression subset
+  runs. Identifiers such as `RowCount`, `Vertipaq`, `Cardinality`, and `Min` are refused before
+  evaluation, and a refused rule emits no finding. `--rules` remains the overlay file and is not an
+  import.
+- `--fail-on new|any|high`, `--since <baseline>`, `--ci github|azdo`, and `--format sarif|trx|junit`
+  are the same gate `validate` accepts. `--fail-on new` requires `--since`. Workflow commands go to
+  stderr. A sample for another repo is `docs/examples/bpa-annotations.yml`. Data-derived rules run
+  only when `pbz audit memory` has saved bands; otherwise they stay skipped.
 
 ## Model rules
 

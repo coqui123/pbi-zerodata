@@ -11,6 +11,7 @@ Names and DAX only; literals typed here are written as typed.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
@@ -400,6 +401,130 @@ def function_list(ws, project) -> dict:
         rows.append({"function": name, "params": m.group(1) if m else "?",
                      "calls": sum(len(v) for v in _call_edits(model, name, name).values()), "file": node.file})
     return {"verb": "function", "action": "list", "functions": rows}
+
+
+def _local_path(path: str, what: str) -> str:
+    if not isinstance(path, str) or not path.strip():
+        raise PbzError("BAD_REQUEST", f"a local {what} file is required")
+    if re.match(r"(?i)^[a-z][a-z0-9+.-]*://", path.strip()):
+        raise PbzError("REFUSED", f"{what} is read from a local file")
+    return path
+
+
+def _parse_function_text(text: str) -> list[tuple[str, str, str]]:
+    chunks = [part.strip() for part in re.split(r"(?im)^(?=FUNCTION\s+)", text.strip()) if part.strip()]
+    if not chunks:
+        raise PbzError("BAD_REQUEST", "function file needs FUNCTION Name = (params) => body")
+    out = []
+    rx = re.compile(r"(?is)^FUNCTION\s+(?P<name>[A-Za-z_][A-Za-z0-9_.]*)\s*=\s*(?P<params>\([^)]*\))\s*=>\s*(?P<body>.*)$")
+    for chunk in chunks:
+        m = rx.match(chunk)
+        if not m or not m.group("body").strip():
+            raise PbzError("BAD_REQUEST", "function file needs FUNCTION Name = (params) => body")
+        out.append((m.group("name"), m.group("params"), m.group("body").strip()))
+    return out
+
+
+def _parse_function_json(data) -> list[tuple[str, str, str]]:
+    rows = data if isinstance(data, list) else data.get("functions") if isinstance(data, dict) and isinstance(data.get("functions"), list) else [data]
+    if not isinstance(rows, list) or not rows:
+        raise PbzError("BAD_REQUEST", "function file needs name, parameters and expression")
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise PbzError("BAD_REQUEST", "function file needs name, parameters and expression")
+        name, params, body = row.get("name"), row.get("parameters", row.get("params")), row.get("expression", row.get("body"))
+        if not isinstance(name, str) or not isinstance(params, str) or not isinstance(body, str):
+            raise PbzError("BAD_REQUEST", "function file needs name, parameters and expression")
+        out.append((name, params, body))
+    return out
+
+
+def _load_functions(path: str) -> list[tuple[str, str, str]]:
+    path = _local_path(path, "function")
+    try:
+        text = open(path, encoding="utf-8-sig").read()
+    except OSError as err:
+        raise PbzError("BAD_REQUEST", "function file could not be read") from err
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            data = json.loads(text)
+        except ValueError as err:
+            raise PbzError("BAD_REQUEST", "function file is not JSON") from err
+        return _parse_function_json(data)
+    return _parse_function_text(text)
+
+
+def _blank_params(params: str, body: str) -> str:
+    inner = params.strip()
+    if inner.startswith("(") and inner.endswith(")"):
+        inner = inner[1:-1]
+    names = []
+    for part in inner.split(","):
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", part)
+        if m:
+            names.append(m.group(1))
+    expr = body
+    for name in sorted(names, key=len, reverse=True):
+        expr = re.sub(rf"\b{re.escape(name)}\b", "BLANK()", expr)
+    return expr
+
+
+def _compile_functions(ws, project, model, items: list[tuple[str, str, str]]) -> str:
+    """PASS when Desktop compiles every body. NOT_RUN when the engine is unavailable. A failed compile raises."""
+    from . import desktop
+    from .common import engine_call
+    try:
+        port = desktop.require_port(project)
+    except PbzError:
+        return "NOT_RUN"
+    home = next((t.name for t in model.tables.values() if not t.private), None) or next(iter(model.tables), None)
+    if not home:
+        return "NOT_RUN"
+    payload = [{"id": f"f{i}", "table": home, "expression": _blank_params(params, body)}
+               for i, (_name, params, body) in enumerate(items)]
+    res = engine_call("compiles", {"private_dir": ws.private, "port": port, "items": payload}, timeout=120)
+    if not isinstance(res, dict) or res.get("ok") is not True:
+        klass = res.get("class") if isinstance(res, dict) else None
+        if klass in (None, "ENGINE_UNAVAILABLE", "NOT_READY", "TIMEOUT"):
+            return "NOT_RUN"
+        raise PbzError(klass or "ENGINE_UNAVAILABLE", "function did not compile")
+    for item in res.get("items") or []:
+        if not isinstance(item, dict) or item.get("status") != "PASS":
+            klass = item.get("class") if isinstance(item, dict) else None
+            raise PbzError(str(klass or "ERROR"), "function did not compile")
+    return "PASS"
+
+
+def function_import(ws, project, path: str) -> dict:
+    """Import one local function file. No network. One commit. Engine down still writes, with compile NOT_RUN."""
+    items = _load_functions(path)
+    mdef, model = _model(project)
+    seen = set()
+    for name, _params, _body in items:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", name or ""):
+            raise PbzError("BAD_REQUEST", "a function name has letters, digits, _ and dots")
+        if name.lower() in seen or _fn(model, name) is not None or model.measure(name) or model.table(name):
+            raise PbzError("NAME_TAKEN", name)
+        seen.add(name.lower())
+        model.functions[name] = tmdl.Node("function", name, 0, 0)
+    for name, params, body in items:
+        _check_body(model, params, body)
+    cur, _db = compat_level(mdef)
+    need = COMPAT["function"]
+    if cur is not None and cur < need:
+        raise PbzError("COMPAT_LEVEL", f"function needs compatibility level {need}; the model is at {cur}")
+    compile_status = _compile_functions(ws, project, model, items)
+    fn_path = os.path.join(mdef, FN_FILE)
+    text, bom = read_text(fn_path) if os.path.exists(fn_path) else ("", b"")
+    eol = _eol(text) if text else ("\r\n" if any("\r\n" in d.text for d in model.docs.values()) else "\n")
+    for name, params, body in items:
+        text = (text.rstrip("\r\n") + eol + eol if text.strip() else "") + _fn_text(name, params, body, eol, _tag())
+    commit_bytes([("write", fn_path, text, bom)], root=ws.root)
+    return {"verb": "function", "action": "import", "functions": [name for name, _p, _b in items],
+            "compile": compile_status, "files": [_rel(project, FN_FILE)],
+            "next": "pbz diff, pbz push (TOM validates the function)"}
 
 
 # ---------------------------------------------------------------- object-level security

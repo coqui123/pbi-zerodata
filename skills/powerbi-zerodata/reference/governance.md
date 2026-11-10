@@ -17,6 +17,7 @@ free text like any description.
 | `pbz culture list` | cultures, caption counts, whether a linguistic schema exists |
 | `pbz culture missing <code>` | visible tables, columns, measures and hierarchies with no caption |
 | `pbz translate <code> <object> [--caption] [--description] [--folder]` | sets one object's translation (creates the path in the file) |
+| `pbz translate --export <file>` / `--import <file>` | round-trips a flat `{version, translations[]}` file. Stdout is counts. A value that matches a mirror token is refused. The destination must be a regular file |
 
 `rename`, `move measure` and `unused --remove` keep translations in step: renamed objects are renamed
 in every culture, a moved measure's translation moves to its new table, removed objects lose their

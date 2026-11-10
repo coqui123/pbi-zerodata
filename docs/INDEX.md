@@ -45,6 +45,7 @@ These live with the skill so agents and humans share one source of truth:
 | [../skills/powerbi-zerodata/reference/improvements.md](../skills/powerbi-zerodata/reference/improvements.md) | Consent, preview, freshness, requirements, recover, honesty notes |
 | [../skills/powerbi-zerodata/reference/preview.md](../skills/powerbi-zerodata/reference/preview.md) | Synthetic layout preview |
 | [../skills/powerbi-zerodata/reference/mcp.md](../skills/powerbi-zerodata/reference/mcp.md) | MCP stdio server |
+| [../skills/powerbi-zerodata/reference/external-parity.md](../skills/powerbi-zerodata/reference/external-parity.md) | What stays out of scope versus DAX Studio, Tabular Editor, and Measure Killer |
 | [../skills/powerbi-zerodata/reference/disclosure-contract.md](../skills/powerbi-zerodata/reference/disclosure-contract.md) | What may leave the broker |
 | [../skills/powerbi-zerodata/reference/leak-vectors.md](../skills/powerbi-zerodata/reference/leak-vectors.md) | Leak surface and OS isolation checklist |
 | [../skills/powerbi-zerodata/reference/gotchas.md](../skills/powerbi-zerodata/reference/gotchas.md) | TMDL / PBIR / Desktop pitfalls |

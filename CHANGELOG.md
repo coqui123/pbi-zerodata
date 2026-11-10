@@ -6,6 +6,18 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- Banded performance (`pbz perf`), refresh duration bands, memory encoding / segment / referential-integrity
+  bands, and an RLS check kind. Durations, counts, plan text, and role identity stay inside the engine.
+  Real-model RLS and Performance Analyzer replay (`pbz perf-import --replay`) are human-terminal only.
+  Synthetic RLS runs only in a verified `pbz-synth` tree.
+- Evidence log rotates at 1 MiB into `.pbz/evidence.d/`, keeps an HMAC chain, and prunes segments older
+  than 30 days. A file already over the cap is still removed by hand.
+- Mirror authoring: `find` / `replace`, pattern `rename`, `rewrite`, `expand`, calendars, KPIs, measure
+  scripts, function import, and translation export/import. `DIVIDE` rewrites need `--accept-semantic`.
+- Analysis: source-column lineage and impact, native SQL column lists (tokenized SQL stays opaque),
+  relationship paths, model overlap, unused what-if from memory bands, custom BPA rules, and CI output
+  (`--fail-on`, `--ci`, SARIF/TRX/JUnit). Sample workflow: `docs/examples/bpa-annotations.yml` (not this
+  repo's CI). Contract for what stays out of scope: `skills/powerbi-zerodata/reference/external-parity.md`.
 - `install.py` junctions the Codex / ChatGPT skill folder as well as the Claude and shared
   agent skill folders. A `git pull` updates the skill and the guard script the hooks run.
   Setup steps: `docs/install.md`.

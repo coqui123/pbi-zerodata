@@ -162,8 +162,13 @@ and saved-real revision still match, and only registered check ids are stored. R
 remains best-effort after an exception. A killed process can still leave a temp, and this
 is not a claim of OS isolation.
 Round 17 anchors the evidence log and synth-test goldens at the workspace root and caps the
-evidence log at 1 MiB. Nothing rotates that log: archive or remove `.pbz/evidence.jsonl` by
-hand, which discards `HUMAN_ACCEPTED` history with the file. A present unreadable, aliased or
+evidence log at 1 MiB. A new record that would exceed the cap rotates the active log to
+`.pbz/evidence.d/NNNN.jsonl` when the file is not already over the cap and continues the HMAC
+chain (`chain_prev`, `chain_mac`); a prefix of rotated segments whose newest parsed day is
+older than `checks.LEDGER_DAYS` (30) is pruned, undated segments stay and end that prefix,
+the anchor `.pbz/evidence.chain.json` moves to the last deleted MAC, legacy lines without
+macs still verify, and a file already over the cap is still archived or removed by hand,
+which discards that file's `HUMAN_ACCEPTED` history. A present unreadable, aliased or
 malformed policy fails closed instead of loosening disclosure. `diff --patch` and `push` refuse
 an aliased or hardlinked mirror entry. Recipe snapshot and restore refuse an aliased or
 hardlinked mirror tree before any step; a link planted mid-run is `RECOVERY_REQUIRED` and is

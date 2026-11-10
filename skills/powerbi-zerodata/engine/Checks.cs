@@ -15,7 +15,7 @@ public static class Checks
 
     static readonly HashSet<string> Kinds = new(StringComparer.Ordinal)
     {
-        "executes", "nonblank", "nonempty", "equal", "additive", "unique", "no_orphans", "no_blank_keys", "sign", "subset",
+        "executes", "nonblank", "nonempty", "equal", "additive", "unique", "no_orphans", "no_blank_keys", "sign", "subset", "rls",
     };
 
     public static JsonObject Run(Req req, Ctx ctx)
@@ -102,6 +102,9 @@ public static class Checks
                     Offenders(res, ColumnStats.L(row[0]), ColumnStats.L(row[1]), ctx);
                     break;
                 }
+                case "rls":
+                    Rls(chk, res, conn, ctx);
+                    break;
                 case "sign":
                 {
                     var v = conn.Row1("EVALUATE ROW(\"v\", " + Dax.Calc(Expr(chk, "expr"), where) + ")")[0];
@@ -138,6 +141,120 @@ public static class Checks
             }
         }
         return res;
+    }
+
+    readonly record struct RlsTarget(string Text, bool FullQuery);
+
+    /// <summary>
+    /// Row counts are compared here and never returned. The role, the query and the user are not returned.
+    /// An expected access error for OLS_INACCESSIBLE is handled in this method so the outer catch does not
+    /// turn it into a generic ERROR.
+    /// </summary>
+    static void Rls(JsonObject chk, JsonObject res, Conn conn, Ctx ctx)
+    {
+        string expect = J.ReqStr(chk, "expect");
+        if (expect is not ("EMPTY" or "NON_EMPTY" or "LESS" or "EQUAL" or "OLS_INACCESSIBLE"))
+            throw new BadRequestException("expect is not an rls verdict");
+        string? role = BlankToNull(J.Str(chk, "role"));
+        string? user = BlankToNull(J.Str(chk, "user"));
+        if (role == null && user == null) throw new BadRequestException("rls needs a role or a user");
+        Conn.RejectIdentity(role, user);
+        var target = RlsTargetOf(chk, conn);
+
+        if (expect == "OLS_INACCESSIBLE")
+        {
+            RunCount(conn, target);
+            Conn restricted;
+            try
+            {
+                restricted = Conn.Open(ctx, conn.Port, role, user);
+            }
+            catch (Exception ex)
+            {
+                var openClass = Errors.Classify(ex);
+                throw new EngineException(
+                    openClass is ErrorClass.TIMEOUT or ErrorClass.BAD_REQUEST ? openClass : ErrorClass.ENGINE_UNAVAILABLE,
+                    "rls role connection failed");
+            }
+            try
+            {
+                using (restricted)
+                {
+                    RunCount(restricted, target);
+                    res["status"] = "FAIL";
+                }
+            }
+            catch (Exception ex) when (ex is not EngineException)
+            {
+                var cls = Errors.Classify(ex);
+                if (cls != ErrorClass.UNKNOWN_OBJECT)
+                    throw new EngineException(
+                        cls is ErrorClass.TIMEOUT or ErrorClass.BAD_REQUEST or ErrorClass.ENGINE_UNAVAILABLE
+                            ? cls : ErrorClass.OTHER,
+                        "rls role query failed");
+                ctx.LogText("rls role query failed");
+                res["status"] = "PASS";
+            }
+            return;
+        }
+
+        long openRows = RunCount(conn, target);
+        long roleRows;
+        try
+        {
+            using var restricted = Conn.Open(ctx, conn.Port, role, user);
+            roleRows = RunCount(restricted, target);
+        }
+        catch (Exception ex)
+        {
+            var cls = Errors.Classify(ex);
+            if (cls is ErrorClass.TIMEOUT or ErrorClass.BAD_REQUEST) throw;
+            throw new EngineException(cls, "rls role query failed");
+        }
+        bool pass = expect switch
+        {
+            "EMPTY" => roleRows == 0,
+            "NON_EMPTY" => roleRows > 0,
+            "LESS" => roleRows < openRows,
+            "EQUAL" => roleRows == openRows,
+            _ => false,
+        };
+        res["status"] = pass ? "PASS" : "FAIL";
+    }
+
+    static string? BlankToNull(string? s) => string.IsNullOrWhiteSpace(s) ? null : s;
+
+    static RlsTarget RlsTargetOf(JsonObject chk, Conn conn)
+    {
+        string? query = J.Str(chk, "query");
+        if (!string.IsNullOrWhiteSpace(query))
+        {
+            string? first = Dax.BareWords(query).FirstOrDefault();
+            bool full = first != null && (first.Equals("EVALUATE", StringComparison.OrdinalIgnoreCase)
+                || first.Equals("DEFINE", StringComparison.OrdinalIgnoreCase));
+            if (full) Dax.GuardQuery(query, "query");
+            else Dax.Guard(query, "query");
+            return new RlsTarget(query, full);
+        }
+        string? column = J.Str(chk, "column");
+        if (!string.IsNullOrWhiteSpace(column))
+        {
+            var c = conn.Meta.ResolveColumn(column);
+            return new RlsTarget("VALUES(" + c.Ref + ")", false);
+        }
+        string? table = J.Str(chk, "table");
+        if (!string.IsNullOrWhiteSpace(table))
+        {
+            var t = conn.Meta.FindTable(table) ?? throw new EngineException(ErrorClass.UNKNOWN_OBJECT, "rls table not found");
+            return new RlsTarget(Dax.QTable(t.Name), false);
+        }
+        throw new BadRequestException("rls needs a query, column or table");
+    }
+
+    static long RunCount(Conn conn, RlsTarget target)
+    {
+        if (target.FullQuery) return conn.CountRows(target.Text);
+        return ColumnStats.L(conn.Row1("EVALUATE ROW(\"n\", COUNTROWS(" + target.Text + "))")[0]);
     }
 
     static void Offenders(JsonObject res, long rows, long offenders, Ctx ctx)

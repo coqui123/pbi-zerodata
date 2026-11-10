@@ -49,6 +49,60 @@ def _is_human() -> bool:
         and not os.environ.get("CODEX_SANDBOX") and not os.environ.get("CODEX_MANAGED_BY_NPM")
 
 
+def _workspace_path(ws, path: str) -> str:
+    """Resolve a filesystem path under the workspace. Relative paths start at the workspace root."""
+    if not isinstance(path, str) or not path.strip():
+        raise PbzError("BAD_REQUEST", "path required")
+    root = os.path.abspath(ws.root)
+    raw = path.strip()
+    candidate = raw if os.path.isabs(raw) else os.path.join(root, raw)
+    resolved = os.path.abspath(os.path.normpath(candidate))
+    try:
+        inside = os.path.commonpath([os.path.normcase(resolved), os.path.normcase(root)]) == os.path.normcase(root)
+    except ValueError:
+        inside = False
+    if not inside:
+        raise PbzError("UNSAFE_PATH", "path must stay inside the workspace")
+    return resolved
+
+
+_URL_PATH = re.compile(r"(?i)^[a-z][a-z0-9+.-]*://")
+
+
+def _local_workspace_file(ws, path: str, what: str = "path") -> str:
+    """A local file inside the workspace. A URL is refused before any read or write."""
+    if not isinstance(path, str) or not path.strip():
+        raise PbzError("BAD_REQUEST", f"{what} required")
+    if _URL_PATH.match(path.strip()):
+        raise PbzError("REFUSED", f"{what} is a local file")
+    return _workspace_path(ws, path)
+
+
+def _ci_arguments(p):
+    """Gate and report flags for validate and bpa. ciout writes workflow commands to stderr."""
+    p.add_argument("--fail-on", choices=["new", "any", "high"], help="gate: exit 1 when findings match")
+    p.add_argument("--since", help="baseline name; required with --fail-on new")
+    p.add_argument("--ci", choices=["github", "azdo"], help="workflow commands on stderr")
+    p.add_argument("--format", choices=["sarif", "trx", "junit"], help="report file; requires --out")
+    p.add_argument("--out", help="report file inside the workspace")
+    p.add_argument("--save-baseline", help="save finding fingerprints under this name")
+
+
+def _attach_ci(ws, out: dict, findings, a) -> dict:
+    from pbz import ciout
+    report = _local_workspace_file(ws, a.out, "report") if a.out else None
+    return ciout.attach(ws, out, findings, fail_on=a.fail_on, since=a.since,
+                         save=a.save_baseline, ci=a.ci, fmt=a.format, report=report)
+
+
+def _write_lineage_json(ws, out: dict, path: str) -> dict:
+    """Write the lineage result. The file is the result itself; nothing is detokenized."""
+    from pbz.common import _workspace_root, write_text
+    dest = _local_workspace_file(ws, path, "lineage output")
+    write_text(dest, json.dumps(out) + "\n", root=_workspace_root(ws))
+    return {**out, "format": "json", "file": os.path.basename(dest)}
+
+
 # The five steps in reference/leak-vectors.md (Hardening tier). Read-only; never applied here.
 ISOLATION = (
     ("account", "Separate standard account for agent sessions"),
@@ -172,15 +226,19 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("paths", nargs="*", help="mirror files (globs, folder prefixes); default all")
     p.add_argument("--object", help="one TMDL object: measure 'Table'[Name] (also column, hierarchy, partition, calculationItem)")
     p = sub.add_parser("rename", help="rename a measure, column or table and fix references")
-    p.add_argument("kind", choices=["measure", "column", "table"])
-    p.add_argument("old")
-    p.add_argument("new")
+    p.add_argument("kind", nargs="?", choices=["measure", "column", "table", "any"])
+    p.add_argument("old", nargs="?")
+    p.add_argument("new", nargs="?")
     p.add_argument("--table")
+    p.add_argument("--match", help="with --to: rename every object name the pattern matches")
+    p.add_argument("--to", help="with --match: replacement")
+    p.add_argument("--dry-run", action="store_true", help="with --match: list renames and write nothing")
     p = sub.add_parser("describe", help="data dictionary: the model, a table, a measure or a column")
     p.add_argument("target", nargs="?", help="table name, [Measure] or 'Table'[Column]; omit for a model overview")
     p = sub.add_parser("values")
     p.add_argument("column", help="'Table'[Column]")
-    sub.add_parser("validate", help="metadata checks on the mirror: lint, references, PBIR")
+    p = sub.add_parser("validate", help="metadata checks on the mirror: lint, references, PBIR")
+    _ci_arguments(p)
     p = sub.add_parser("preflight", help="full private staged validation without applying edits")
     p.add_argument("--only", nargs="+")
     p = sub.add_parser("recover", help="recover an interrupted push without overwriting later edits")
@@ -249,11 +307,21 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("--dry-run", action="store_true", help="with --remove: list what would go, change nothing")
     p.add_argument("--restore", metavar="STAMP", help="undo a removal (restore point printed by --remove)")
     p.add_argument("--verify-engine", action="store_true", help="cross-check dependencies with the open Desktop engine")
-    p = sub.add_parser("lineage", help="dependency tree of one object")
-    p.add_argument("target", help="'Table'[Column], [Measure], Table or a bare name")
+    p.add_argument("--what-if", action="store_true", help="share bands of unused columns; does not also print the usage report")
+    p = sub.add_parser("lineage", help="dependency tree of one object, or source-column and native-SQL lineage")
+    p.add_argument("target", nargs="?", help="'Table'[Column], [Measure], Table or a bare name")
     p.add_argument("--up", action="store_true", help="what it depends on (default: what depends on it)")
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--report", action="append", default=[])
+    p.add_argument("--from-source", nargs=2, metavar=("TABLE", "COLUMN"),
+                   help="model columns and dependents of a source column")
+    p.add_argument("--native-sql", action="store_true", help="native SQL in partitions; tokenized text stays opaque")
+    p.add_argument("--format", choices=["json", "openlineage"], help="write the lineage result; requires --out")
+    p.add_argument("--out", help="local output file inside the workspace; a URL is refused")
+    p = sub.add_parser("impact", help="what a source-column drop or rename reaches in the model")
+    p.add_argument("--drop-source-column", help="source column that would be dropped")
+    p.add_argument("--rename-source-column", help="source column that would be renamed")
+    p.add_argument("--to", help="new source column name, with --rename-source-column")
     p = sub.add_parser("suggest", help="cleanup and optimisation suggestions")
     p.add_argument("--report", action="append", default=[])
     p = sub.add_parser("bpa", help="best practice analysis with scores and grades")
@@ -265,9 +333,14 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("--fix", action="append", default=[], metavar="RULE",
                    help="apply a rule's property-only fix to the mirror (repeatable)")
     p.add_argument("--dry-run", action="store_true", help="with --fix: list what would change")
-    p = sub.add_parser("similar", help="duplicate and near-duplicate measures")
+    p.add_argument("--import-rules", help="custom rules file; separate from the --rules overlay")
+    _ci_arguments(p)
+    p = sub.add_parser("similar", help="duplicate and near-duplicate measures, or structural overlap of projects")
     p.add_argument("--threshold", type=float, default=0.80)
     p.add_argument("--max", type=int, default=100)
+    p.add_argument("--models", action="append", default=[], metavar="PROJECT",
+                   help="compare these projects in the workspace (repeatable)")
+    p.add_argument("--against", help="with --models: compare each project with this one")
     p = sub.add_parser("audit", help="efficiency and consolidation audit (static + bucketed evidence), baselines, waivers")
     p.add_argument("action", nargs="?", choices=["run", "waive", "memory"], default="run")
     p.add_argument("id", nargs="?", help="waive: finding id")
@@ -299,6 +372,7 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("--from", dest="from_", default="last", help="last (latest snapshot), previous, or a stamp")
     p.add_argument("--to", default="mirror", help="mirror (current files), last, or a stamp")
     p.add_argument("--list", action="store_true", help="list snapshots")
+    p.add_argument("--against", help="compare this project's mirror with another workspace; a raw semantic model is refused")
     p = sub.add_parser("docs", help="documentation of the model and reports from the mirror")
     p.add_argument("--format", default="md", choices=["md", "html", "json"])
     p.add_argument("--dax", action="store_true", help="include DAX and M expressions")
@@ -387,9 +461,9 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("dax", nargs="?", help="DAX returning a format string")
     p.add_argument("--remove", action="store_true")
     p.add_argument("--upgrade-compat", action="store_true", help="raise the compatibility level if needed (one way)")
-    p = sub.add_parser("function", help="DAX user-defined functions: add, update, rename, remove, list")
-    p.add_argument("action", choices=["add", "update", "rename", "remove", "list"])
-    p.add_argument("name", nargs="?")
+    p = sub.add_parser("function", help="DAX user-defined functions: add, update, rename, remove, list, import")
+    p.add_argument("action", choices=["add", "update", "rename", "remove", "list", "import"])
+    p.add_argument("name", nargs="?", help="add/update/rename/remove: function name; import: a file inside the workspace")
     p.add_argument("--params", help="add / update: (name : TYPE, ...)")
     p.add_argument("--body", help="add / update: the DAX body")
     p.add_argument("--to", help="rename: new name")
@@ -402,7 +476,8 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("--dry-run", action="store_true", help="apply then restore; write nothing")
     for verb in ("set", "get"):
         p = sub.add_parser(verb, help="typed model properties (description, displayFolder, formatString, isHidden, isKey, "
-                                      "dataCategory, summarizeBy, sortByColumn, isAvailableInMdx)"
+                                      "dataCategory, summarizeBy, sortByColumn, isAvailableInMdx, encodingHint, "
+                                      "isNullable, lineageTag, detailRowsExpression, alternateOf)"
                                       + (": prop=value ..." if verb == "set" else ": show them"))
         p.add_argument("items", nargs="*", help="an object ('T'[C], [M], Table, Table.Hierarchy)"
                                                 + (" and prop=value pairs" if verb == "set" else ""))
@@ -467,10 +542,10 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("--object", action="append", default=[], help="add: declare a used object by hand (repeatable)")
     p.add_argument("--model-name", action="append", default=[],
                    help="add: the model's name in the service, if it differs from the project name")
-    p = sub.add_parser("relationship", help="add, remove or change a relationship (metadata-guarded)")
-    p.add_argument("action", choices=["add", "remove", "set"])
-    p.add_argument("from_col", help="many side, 'Table'[Column]")
-    p.add_argument("to_col", help="one side, 'Table'[Column]")
+    p = sub.add_parser("relationship", help="add, remove or change a relationship, or list active filter paths")
+    p.add_argument("action", choices=["add", "remove", "set", "paths"])
+    p.add_argument("from_col", nargs="?", help="add/remove/set: many side, 'Table'[Column]; paths: left table or column")
+    p.add_argument("to_col", nargs="?", help="add/remove/set: one side, 'Table'[Column]; paths: right table or column")
     active = p.add_mutually_exclusive_group()
     active.add_argument("--inactive", action="store_true")
     active.add_argument("--active", action="store_true", help="set: make it active")
@@ -487,12 +562,14 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p = sub.add_parser("culture", help="add, remove, list cultures; list objects missing a caption")
     p.add_argument("action", choices=["add", "remove", "list", "missing"])
     p.add_argument("code", nargs="?", help="culture code, e.g. de-DE")
-    p = sub.add_parser("translate", help="set a translated caption, description or display folder")
-    p.add_argument("code", help="culture code")
-    p.add_argument("target", help="Table, 'Table'[Column], [Measure] or 'Table'[Hierarchy]")
+    p = sub.add_parser("translate", help="set a translated caption, or export or import culture captions")
+    p.add_argument("code", nargs="?", help="culture code")
+    p.add_argument("target", nargs="?", help="Table, 'Table'[Column], [Measure] or 'Table'[Hierarchy]")
     p.add_argument("--caption")
     p.add_argument("--description")
     p.add_argument("--folder")
+    p.add_argument("--export", help="write culture captions to a JSON file inside the workspace")
+    p.add_argument("--import", dest="import_path", help="read culture captions from a JSON file inside the workspace")
     p = sub.add_parser("perspective", help="add, remove, include or exclude objects in a perspective")
     p.add_argument("action", choices=["add", "remove", "include", "exclude"])
     p.add_argument("name")
@@ -541,6 +618,48 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p = sub.add_parser("layout", help="text canvas map of report pages plus layout lint")
     p.add_argument("--page", help="page display name or id (draws its map)")
     p.add_argument("--no-map", action="store_true")
+    p = sub.add_parser("find", help="find object names and mirror lines matching a regular expression")
+    p.add_argument("pattern")
+    p.add_argument("--kind", choices=["any", "measure", "column", "table"], default="any")
+    p = sub.add_parser("replace", help="rename matching objects, or replace text outside tokens (dry-run unless --apply)")
+    p.add_argument("pattern")
+    p.add_argument("repl")
+    p.add_argument("--kind", choices=["any", "measure", "column", "table"], default="any")
+    p.add_argument("--apply", action="store_true", help="write the replacement (default is a dry run)")
+    p = sub.add_parser("rewrite", help="checked rewrite of one measure")
+    p.add_argument("action", choices=["unused-var", "qualify", "divide", "format", "description"])
+    p.add_argument("target", help="[Measure]")
+    p.add_argument("--accept-semantic", action="store_true",
+                   help="required for divide, which changes blank-divide semantics")
+    p.add_argument("--format", help="format: a format string")
+    p.add_argument("--description", help="description: text; {name} and {table} are filled in")
+    p = sub.add_parser("expand", help="DEFINE block for a measure, its dependencies and the functions it calls")
+    p.add_argument("target", help="[Measure]")
+    p = sub.add_parser("calendar", help="add a calendar column group")
+    p.add_argument("action", choices=["add"])
+    p.add_argument("table")
+    p.add_argument("name")
+    p.add_argument("--column", required=True, help="date column")
+    p.add_argument("--unit", choices=["Day", "Month", "Quarter", "Year", "Week"], default="Day")
+    p = sub.add_parser("kpi", help="set a measure KPI target, status or trend expression")
+    p.add_argument("action", choices=["set"])
+    p.add_argument("measure", help="[Measure]")
+    p.add_argument("--target")
+    p.add_argument("--status")
+    p.add_argument("--trend")
+    p = sub.add_parser("script", help="export or apply a measure script JSON file under the workspace")
+    p.add_argument("action", choices=["export", "apply"])
+    p.add_argument("path")
+    p = sub.add_parser("watch", help="validation and best-practice passes; polls unless --once")
+    p.add_argument("--once", action="store_true", help="a single pass")
+    p = sub.add_parser("perf", help="performance bands for a DAX query (no durations)")
+    p.add_argument("--dax", required=True, help="DAX query")
+    p.add_argument("--runs", type=int, default=1, help="1 to 20")
+    p.add_argument("--baseline")
+    p.add_argument("--action", choices=["save", "compare"])
+    p = sub.add_parser("perf-import", help="Performance Analyzer file as duration bands")
+    p.add_argument("file")
+    p.add_argument("--replay", action="store_true", help="replay the first query (human terminal only)")
     p = sub.add_parser("admin", help="human-only: reset the budget, allow a path, set a category, read the log")
     p.add_argument("action", choices=["budget-reset", "allow", "category", "synthetic", "log", "consumer-remove"])
     p.add_argument("value", nargs="?")
@@ -583,14 +702,28 @@ def main(argv=None, *, parser_only: bool = False) -> int:
         elif a.cmd == "revert":
             out = mirror.revert(ws, project, a.paths or None, a.object)
         elif a.cmd == "rename":
-            out = rename.rename(ws, project, a.kind, a.old, a.new, a.table)
+            if a.match is not None or a.to is not None:
+                if a.match is None or a.to is None:
+                    raise PbzError("BAD_REQUEST", "rename --match and --to are used together")
+                from pbz import findreplace
+                out = findreplace.rename_match(ws, project, a.kind or "any", a.match, a.to, dry_run=a.dry_run)
+            elif a.dry_run:
+                raise PbzError("BAD_REQUEST", "--dry-run needs --match and --to")
+            elif not a.kind or a.old is None or a.new is None:
+                raise PbzError("BAD_REQUEST", "rename <kind> <old> <new>")
+            elif a.kind == "any":
+                raise PbzError("BAD_REQUEST", "kind any needs --match and --to")
+            else:
+                out = rename.rename(ws, project, a.kind, a.old, a.new, a.table)
         elif a.cmd == "describe":
             out = describe.describe(ws, project, a.target)
         elif a.cmd == "values":
             out = describe.values(ws, project, a.column)
         elif a.cmd == "validate":
+            findings = validate.run_mirror(ws, project)
             out = {"verb": "validate", "mode": "mirror (metadata only; push runs the full staged validation)",
-                   "findings": validate.run_mirror(ws, project)}
+                   "findings": findings}
+            out = _attach_ci(ws, out, findings, a)
         elif a.cmd == "preflight":
             out = mirror.preflight(ws, project, only=a.only)
         elif a.cmd == "recover":
@@ -669,7 +802,11 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             out = memscrub.run(ws, project, a.dir, apply=a.apply, show=a.show, human=_is_human())
         elif a.cmd == "unused":
             from pbz import unused
-            if a.restore:
+            if a.what_if:
+                if a.remove or a.restore or a.verify_engine:
+                    raise PbzError("BAD_REQUEST", "--what-if does not run with remove, restore or verify-engine")
+                out = unused.what_if(ws, project)
+            elif a.restore:
                 out = unused.restore(ws, project, a.restore)
             elif a.remove:
                 out = unused.remove(ws, project, a.report, m_step=a.m_step, cascade=a.cascade, only=a.only,
@@ -680,21 +817,68 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             else:
                 out = unused.report(ws, project, a.report, include_all=a.all, impact=a.impact, kinds=a.kinds)
         elif a.cmd == "lineage":
-            from pbz import unused
-            out = unused.lineage(ws, project, a.target, "up" if a.up else "down", a.depth, a.report)
+            from pbz import sourceline, unused
+            selected = [name for name, on in (
+                ("--from-source", bool(a.from_source)),
+                ("--native-sql", bool(a.native_sql)),
+                ("--format openlineage", a.format == "openlineage"),
+            ) if on]
+            if len(selected) > 1:
+                raise PbzError("BAD_REQUEST", "use only one of --from-source, --native-sql, --format openlineage")
+            if a.format == "openlineage":
+                if not a.out:
+                    raise PbzError("BAD_REQUEST", "--format requires --out")
+                out = sourceline.openlineage(ws, project, _local_workspace_file(ws, a.out, "lineage output"))
+            elif a.from_source:
+                if a.target:
+                    raise PbzError("BAD_REQUEST", "--from-source does not take a target")
+                table, column = a.from_source
+                out = sourceline.from_source(ws, project, table, column)
+            elif a.native_sql:
+                if a.target:
+                    raise PbzError("BAD_REQUEST", "--native-sql does not take a target")
+                out = sourceline.native_sql(ws, project)
+            else:
+                if not a.target:
+                    raise PbzError("BAD_REQUEST", "lineage needs a target, --from-source, or --native-sql")
+                out = unused.lineage(ws, project, a.target, "up" if a.up else "down", a.depth, a.report)
+            if a.format == "json":
+                if not a.out:
+                    raise PbzError("BAD_REQUEST", "--format requires --out")
+                out = _write_lineage_json(ws, out, a.out)
+        elif a.cmd == "impact":
+            from pbz import sourceline
+            if bool(a.drop_source_column) == bool(a.rename_source_column):
+                raise PbzError("BAD_REQUEST", "pass --drop-source-column or --rename-source-column")
+            if a.drop_source_column:
+                if a.to:
+                    raise PbzError("BAD_REQUEST", "--to is for --rename-source-column")
+                out = sourceline.impact(ws, project, a.drop_source_column, "drop")
+            else:
+                if not a.to:
+                    raise PbzError("BAD_REQUEST", "--rename-source-column needs --to")
+                out = sourceline.impact(ws, project, a.rename_source_column, "rename", a.to)
         elif a.cmd == "suggest":
             from pbz import suggest
             out = suggest.run(ws, project, a.report)
         elif a.cmd == "bpa" and a.fix:
+            if a.import_rules or a.fail_on or a.since or a.ci or a.format or a.out or a.save_baseline:
+                raise PbzError("BAD_REQUEST", "--fix does not take report gates or --import-rules")
             from pbz import fix
             out = fix.run(ws, project, a.fix, dry_run=a.dry_run)
         elif a.cmd == "bpa":
             from pbz import bpa
             out = bpa.run(ws, project, a.scope, rules_path=a.rules, opinion=a.opinion, labels=a.labels,
-                          extra_reports=a.report)
+                          extra_reports=a.report, import_rules=a.import_rules)
+            out = _attach_ci(ws, out, out.get("findings") or [], a)
         elif a.cmd == "similar":
             from pbz import similar
-            out = similar.run(ws, project, a.threshold, a.max)
+            if a.models:
+                out = similar.models(ws, a.models, against=a.against or None)
+            elif a.against:
+                raise PbzError("BAD_REQUEST", "--against is used with --models")
+            else:
+                out = similar.run(ws, project, a.threshold, a.max)
         elif a.cmd == "audit":
             from pbz import audit
             if a.action == "waive":
@@ -726,7 +910,12 @@ def main(argv=None, *, parser_only: bool = False) -> int:
                                              column=a.column, precedence=a.precedence, dry_run=a.dry_run)
         elif a.cmd == "changes":
             from pbz import changes
-            out = changes.list_snapshots(ws, project) if a.list else changes.run(ws, project, a.from_, a.to)
+            if a.against:
+                if a.list or a.from_ != "last" or a.to != "mirror":
+                    raise PbzError("BAD_REQUEST", "--against is not combined with --from, --to or --list")
+                out = changes.compare_against(ws, project, a.against)
+            else:
+                out = changes.list_snapshots(ws, project) if a.list else changes.run(ws, project, a.from_, a.to)
         elif a.cmd == "docs":
             from pbz import docs
             out = docs.run(ws, project, a.format, a.dax)
@@ -807,6 +996,10 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             from pbz import modeling
             if a.action == "list":
                 out = modeling.function_list(ws, project)
+            elif a.action == "import":
+                if not a.name:
+                    raise PbzError("BAD_REQUEST", "function import <path>")
+                out = modeling.function_import(ws, project, _local_workspace_file(ws, a.name, "function file"))
             elif not a.name:
                 raise PbzError("BAD_REQUEST", f"function {a.action} needs a name")
             elif a.action == "add":
@@ -907,7 +1100,13 @@ def main(argv=None, *, parser_only: bool = False) -> int:
                 out = consumers.add(ws, project, a.target, a.kind, a.label, a.object, a.model_name)
         elif a.cmd == "relationship":
             from pbz import relate
-            if a.action == "add":
+            if a.action == "paths":
+                if not a.from_col or not a.to_col:
+                    raise PbzError("BAD_REQUEST", "relationship paths <left> <right>")
+                out = relate.paths(ws, project, a.from_col, a.to_col)
+            elif not a.from_col or not a.to_col:
+                raise PbzError("BAD_REQUEST", "relationship add, remove and set need both columns")
+            elif a.action == "add":
                 out = relate.add(ws, project, a.from_col, a.to_col, inactive=a.inactive, both=a.both,
                                  many_to_many=a.many_to_many, force=a.force, dry_run=a.dry_run)
             elif a.action == "remove":
@@ -927,7 +1126,18 @@ def main(argv=None, *, parser_only: bool = False) -> int:
                 out = {"add": gv.culture_add, "remove": gv.culture_remove, "missing": gv.culture_missing}[a.action](
                     ws, project, a.code) if a.action != "list" else gv.culture_list(ws, project, a.code)
             elif a.cmd == "translate":
-                out = gv.translate(ws, project, a.code, a.target, a.caption, a.description, a.folder)
+                if a.export or a.import_path:
+                    if a.export and a.import_path:
+                        raise PbzError("BAD_REQUEST", "use --export or --import")
+                    if a.code or a.target or a.caption or a.description or a.folder:
+                        raise PbzError("BAD_REQUEST", "--export and --import take only a file")
+                    path = _local_workspace_file(ws, a.export or a.import_path, "translations file")
+                    out = gv.translation_export(ws, project, path) if a.export else gv.translation_import(
+                        ws, project, path)
+                else:
+                    if not a.code or not a.target:
+                        raise PbzError("BAD_REQUEST", "translate <culture> <target>")
+                    out = gv.translate(ws, project, a.code, a.target, a.caption, a.description, a.folder)
             elif a.cmd == "perspective":
                 if a.action == "add":
                     out = gv.perspective_add(ws, project, a.name)
@@ -994,6 +1204,38 @@ def main(argv=None, *, parser_only: bool = False) -> int:
         elif a.cmd == "layout":
             from pbz import layout
             out = layout.run(ws, project, a.page, show_map=not a.no_map)
+        elif a.cmd == "find":
+            from pbz import findreplace
+            out = findreplace.find(ws, project, a.pattern, a.kind)
+        elif a.cmd == "replace":
+            from pbz import findreplace
+            out = findreplace.replace(ws, project, a.pattern, a.repl, a.kind, apply=a.apply)
+        elif a.cmd == "rewrite":
+            from pbz import rewrite
+            out = rewrite.run(ws, project, a.action, a.target, accept_semantic=a.accept_semantic,
+                              format_string=a.format, description=a.description)
+        elif a.cmd == "expand":
+            from pbz import expand
+            out = expand.run(ws, project, a.target)
+        elif a.cmd == "calendar":
+            from pbz import calendars
+            out = calendars.add_calendar(ws, project, a.table, a.name, a.column, a.unit)
+        elif a.cmd == "kpi":
+            from pbz import calendars
+            out = calendars.set_kpi(ws, project, a.measure, a.target, a.status, a.trend)
+        elif a.cmd == "script":
+            from pbz import scripts
+            path = _workspace_path(ws, a.path)
+            out = scripts.export(ws, project, path) if a.action == "export" else scripts.apply(ws, project, path)
+        elif a.cmd == "watch":
+            from pbz import watch
+            out = watch.run(ws, project, once=a.once)
+        elif a.cmd == "perf":
+            from pbz import perf
+            out = perf.run(ws, project, a.dax, runs=a.runs, baseline=a.baseline, action=a.action)
+        elif a.cmd == "perf-import":
+            from pbz import pa
+            out = pa.load(ws, project, a.file, replay=a.replay, human=_is_human())
         elif a.cmd == "admin":
             out = admin(ws, a)
         else:

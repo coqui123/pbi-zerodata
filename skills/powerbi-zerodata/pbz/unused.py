@@ -168,6 +168,43 @@ def lineage(ws, project, target: str, direction: str = "down", depth: int = 6, e
             "state": {g.label(k): g.state[k] for k in hits[:3]}, "trees": trees}
 
 
+def what_if(ws, project) -> dict:
+    """Share bands of unused columns from the saved memory document. No byte totals."""
+    from . import memory
+    doc = memory.load(ws, project)
+    if not doc:
+        return {"verb": "unused", "action": "what-if", "project": project.name,
+                "status": "UNKNOWN", "reason": "NO_BANDS"}
+    bands = {}
+    for table in doc.get("tables") or []:
+        tname = table.get("name")
+        if not isinstance(tname, str):
+            continue
+        for col in table.get("columns") or []:
+            cname = col.get("name")
+            share = col.get("share_band")
+            if isinstance(cname, str) and share in memory.SHARE_BANDS:
+                bands[(tname.lower(), cname.lower())] = share
+    g = usage.build(ws, project)
+    columns = []
+    for key, obj in g.objects.items():
+        if obj.kind != "column" or g.state.get(key) != "unused":
+            continue
+        table = g.model.table(obj.table) if g.model is not None else None
+        if table is not None and table.private:
+            continue
+        rec = {"object": obj.label(), "table": obj.table}
+        share = bands.get((obj.table.lower(), obj.name.lower()))
+        if share:
+            rec["share_band"] = share
+            if share == ">=20%":
+                rec["impact"] = "MOST"
+        columns.append(rec)
+    columns.sort(key=lambda row: (row["object"].lower(), row["object"]))
+    return {"verb": "unused", "action": "what-if", "project": project.name, "status": "OK",
+            "columns": columns[:500]}
+
+
 def _tree(g, k, direction, depth, path) -> dict:
     o = g.objects[k]
     node = {"object": o.label(), "kind": o.kind}

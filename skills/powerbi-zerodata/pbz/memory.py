@@ -21,6 +21,9 @@ from .common import PbzError, engine_call, pbz_state_path, preflight_regular, re
 
 SIZE_BANDS = ("<1 MiB", "1-10 MiB", "10-100 MiB", "100-1000 MiB", ">=1000 MiB")
 SHARE_BANDS = ("<1%", "1-5%", "5-20%", ">=20%")
+COUNT_BANDS = ("0", "1-9", "10-99", "100-999", "1k-9k", "10k+")
+ENCODING = ("Hash", "Value")
+RI = ("RI_OK", "RI_VIOLATION")
 COVERAGE = ("FULL", "PARTIAL")
 PREDICATE_RUNS = ("OFF", "DONE", "PARTIAL")
 PREDICATES = ("time_part", "fractional", "long_text")
@@ -69,6 +72,13 @@ def _bands(src, share: bool = True) -> dict:
     return out
 
 
+def _exact(src: dict, key: str, allowed) -> str | None:
+    value = src.get(key)
+    if isinstance(value, str) and value in allowed:
+        return value
+    return None
+
+
 def _by_name(items: list[dict]) -> list[dict]:
     return sorted(items, key=lambda x: (x["name"].lower(), x["name"]))
 
@@ -98,6 +108,11 @@ def closed(res: dict) -> dict:
             for p in PREDICATES:
                 if isinstance(c.get(p), bool):
                     oc[p] = c[p]
+            for key, allowed in (("segment_band", COUNT_BANDS), ("ri_count", COUNT_BANDS),
+                                 ("encoding", ENCODING), ("ri", RI)):
+                exact = _exact(c, key, allowed)
+                if exact is not None:
+                    oc[key] = exact
             cols.append(oc)
         hiers = [{"name": hn, **_bands(h, share=False)} for h in _list(t.get("hierarchies"))
                  if (hn := _name(h.get("name"))) is not None]
@@ -113,6 +128,10 @@ def closed(res: dict) -> dict:
             v = _name(r.get(k))
             if v is not None:
                 o[k] = v
+        for key, allowed in (("ri", RI), ("ri_count", COUNT_BANDS)):
+            exact = _exact(r, key, allowed)
+            if exact is not None:
+                o[key] = exact
         rels.append({**o, **_bands(r, share=False)})
     out["relationships"] = _by_name(rels)
     for k in ("other", "auto_datetime"):

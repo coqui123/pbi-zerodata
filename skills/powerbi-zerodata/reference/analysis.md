@@ -140,3 +140,26 @@ With the project open in Desktop, pbz-engine reads `DISCOVER_CALC_DEPENDENCY` (o
 columns only, names checked against the model) and pbz compares measure and column edges.
 `engine_only` edges are parser misses; `pbz_only` edges are usually unpushed mirror edits. The
 engine knows nothing about reports, so it never decides what is unused.
+
+## Source lineage and impact
+
+`pbz lineage --from-source <table> <column>` joins a Power Query source column to the model column and
+then to dependents. `pbz lineage --native-sql` lists select-list identifiers only when the SQL text is
+visible; a tokenized query is `OPAQUE` and is not detokenized. Server and database names are HMAC'd, or
+`REDACTED` when this workspace has no key. `pbz lineage --format openlineage --out <file>` writes a local
+file and refuses a URL.
+
+`pbz impact --drop-source-column <name>` and `--rename-source-column <old> --to <new>` list the steps,
+columns, measures, and visuals that name would reach.
+
+## Find, replace, and watch
+
+`pbz find <pattern>` searches object names and mirror text. `pbz replace` is a dry run until `--apply`.
+A pattern that is itself a mirror token is refused, and a rename of an object name does not also rewrite
+that name inside other text. `pbz watch` runs validate and best-practice analysis again; `--once` is a
+single pass for tests.
+
+`pbz unused --what-if` reports share bands from a saved `pbz audit memory` result. With no saved bands
+the status is `UNKNOWN` / `NO_BANDS`. `pbz similar --models` reports an overlap band (`NONE`, `LOW`,
+`MID`, `HIGH`) and shared name counts. `pbz changes --against <workspace>` compares another pbz mirror
+and refuses a raw `*.SemanticModel` path.

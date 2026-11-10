@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 from dataclasses import dataclass, field
 
 from . import deps, lexers, mirror, pbir, tmdl, usage
-from .common import PbzError, sha
+from .common import PbzError, find_workspace, sha
 
 OBJECT_KINDS = {"model", "database", "table", "column", "measure", "hierarchy", "partition", "relationship", "role",
                 "tablePermission", "expression", "function", "calculationItem", "perspective", "dataSource",
@@ -525,3 +526,41 @@ def run(ws, project, from_: str = "last", to: str = "mirror") -> dict:
     for rec in model + report:
         summary[rec["status"]] = summary.get(rec["status"], 0) + 1
     return {**out, "result": "CHANGED", "summary": summary, "model": model, "report": report, "files": files}
+
+
+def _raw_semantic_model(path: str) -> bool:
+    cur = os.path.abspath(path)
+    for _ in range(12):
+        if os.path.basename(cur).lower().endswith(".semanticmodel"):
+            return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+    return False
+
+
+def compare_against(ws, project, other: str) -> dict:
+    """Semantic diff of this project's mirror against another workspace's mirror.
+
+    `other` is a workspace root (or any path inside it). A raw *.SemanticModel path is refused.
+    """
+    if not isinstance(other, str) or not other.strip():
+        raise PbzError("BAD_REQUEST", "name another workspace")
+    if _raw_semantic_model(other):
+        raise PbzError("REFUSED", "compare a workspace, not a raw semantic model")
+    other_ws = find_workspace(other)
+    other_project = other_ws.project()
+    if not os.path.isdir(os.path.join(project.mirror_model, "definition")) or not os.path.isdir(
+            os.path.join(other_project.mirror_model, "definition")):
+        raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    left, left_model = _model_side(mirror.mirror_texts(ws, project), project)
+    right, right_model = _model_side(mirror.mirror_texts(other_ws, other_project), other_project)
+    model = _compare_model(left, right, deps.Resolver(left_model), deps.Resolver(right_model))
+    out = {"verb": "changes", "action": "against", "project": project.name, "against": other_project.name}
+    if not model:
+        return {**out, "result": "NO_CHANGES", "model": []}
+    summary: dict = {}
+    for rec in model:
+        summary[rec["status"]] = summary.get(rec["status"], 0) + 1
+    return {**out, "result": "CHANGED", "summary": summary, "model": model}

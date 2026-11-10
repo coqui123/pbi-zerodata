@@ -3,13 +3,15 @@ once (Tabular Editor's property grid and its bulk scripts, without scripting): d
 folders, format strings, hidden, key, data category, sort-by column, summarize-by, MDX availability.
 
 Names and metadata only. Values are what you type; mirror tokens are refused in new text (an old
-description that held tokens is replaced as a whole). Data types, lineage tags and expressions are
-not edited here (Desktop, `pbz rename`, or the TMDL text itself).
+description that held tokens is replaced as a whole). Data types stay with Desktop or the TMDL
+text. `lineageTag=regenerate` writes a new id. Detail rows and alternateOf are blocks, not
+`prop: value` lines.
 """
 from __future__ import annotations
 
 import os
 import re
+import uuid
 
 from . import tmdl
 from .common import PbzError, commit_bytes, read_text
@@ -20,6 +22,8 @@ CATEGORIES = ["Uncategorized", "Address", "City", "Continent", "Country", "Count
               "Place", "PostalCode", "StateOrProvince", "WebUrl", "ImageUrl", "Barcode", "Organization",
               "Product", "Years", "Months", "Quarters", "Days", "Time"]
 SUMMARIZE = ["none", "sum", "count", "min", "max", "average", "distinctCount"]
+ENCODING = ["Hash", "Value"]
+SUMMARIZATION = ["sum", "count", "min", "max", "average", "distinctCount", "groupBy"]
 PROPS = {  # property -> (object kinds, value type, allowed values)
     "description": (("table", "column", "measure", "hierarchy"), "description", None),
     "displayFolder": (("column", "measure", "hierarchy"), "text", None),
@@ -30,7 +34,13 @@ PROPS = {  # property -> (object kinds, value type, allowed values)
     "summarizeBy": (("column",), "enum", SUMMARIZE),
     "sortByColumn": (("column",), "column", None),
     "isAvailableInMdx": (("column",), "bool", None),
+    "encodingHint": (("column",), "enum", ENCODING),
+    "isNullable": (("column",), "bool", None),
+    "lineageTag": (("table", "column", "measure", "hierarchy"), "lineage", None),
+    "detailRowsExpression": (("measure",), "daxblock", None),
+    "alternateOf": (("measure",), "altblock", None),
 }
+_BLOCK_TYPES = {"lineage", "daxblock", "altblock"}
 
 
 def _objects(model, target: str | None, kind: str | None, table: str | None, match: str | None,
@@ -150,6 +160,110 @@ def _desc_edits(doc, node, text: str | None) -> list[tuple[int, int, str]]:
     return [] if old == new else [(starts[first], starts[i], new)]
 
 
+def _eol(text: str) -> str:
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _insert_at_end(doc, node, block: str) -> list[tuple[int, int, str]]:
+    """Insert `block` at the end of a node's own block, ahead of the trailing blank lines."""
+    eol = _eol(doc.text)
+    end = tmdl.block_span(doc, node)[1]
+    prefix = doc.text[:end]
+    trail = len(prefix) - len(prefix.rstrip("\r\n"))
+    at = end - trail + (len(eol) if trail else 0)
+    return [(at, at, block if trail else eol + block)]
+
+
+def _swap_child(doc, node, kind: str, block: str | None) -> list[tuple[int, int, str]]:
+    """Insert, replace, or (block None) remove one child declaration. Uses block_span, not prop_edit."""
+    child = next((c for c in node.children if c.kind == kind), None)
+    if block is None:
+        if child is None:
+            return []
+        s, e = tmdl.block_span(doc, child)
+        return [(s, e, "")]
+    if child is not None:
+        s, e = tmdl.block_span(doc, child)
+        return [] if doc.text[s:e] == block else [(s, e, block)]
+    return _insert_at_end(doc, node, block)
+
+
+def _lineage_edit(doc, node) -> list[tuple[int, int, str]]:
+    """Write a fresh lineageTag. Not the generic `prop: value` writer."""
+    new = str(uuid.uuid4())
+    lines = tmdl._lines(doc.text)
+    s, e = tmdl.block_span(doc, node)
+    for off, ln in lines:
+        if off < s or off >= e or tmdl._indent(ln) != node.indent + 1:
+            continue
+        m = tmdl.PROP_RE.match(ln)
+        if m and m.group("prop") == "lineageTag":
+            return [(off + m.start("val"), off + len(ln), new)]
+    eol = _eol(doc.text)
+    line = "\t" * (node.indent + 1) + "lineageTag: " + new + eol
+    regs = [r for r in doc.regions if r.node is node and r.prop == "expression"]
+    after = max([r.end for r in regs] + [lines[node.line][0] + len(lines[node.line][1])])
+    nl = doc.text.find("\n", after)
+    if nl < 0:
+        return [(len(doc.text), len(doc.text), eol + line)]
+    return [(nl + 1, nl + 1, line)]
+
+
+def _detail_block(node, raw: str, eol: str) -> str:
+    if TOKEN_RE.search(raw):
+        raise PbzError("BAD_REQUEST", "mirror tokens cannot be written into new text")
+    body = raw.strip()
+    if not body or "\x00" in body:
+        raise PbzError("BAD_REQUEST", "detailRowsExpression needs a DAX expression")
+    ind = "\t" * (node.indent + 1)
+    if "\n" in body or "\r" in body:
+        inner = eol.join(ind + "\t" + ln.strip() for ln in body.splitlines() if ln.strip())
+        return f"{ind}detailRowsDefinition ={eol}{inner}{eol}"
+    return f"{ind}detailRowsDefinition = {body}{eol}"
+
+
+def _alternate_block(model, node, raw: str, eol: str) -> str:
+    if TOKEN_RE.search(raw):
+        raise PbzError("BAD_REQUEST", "mirror tokens cannot be written into new text")
+    m = re.match(r"(?i)^(sum|count|min|max|average|distinctcount|groupby)\s*:\s*(.+)$", raw.strip())
+    if not m:
+        raise PbzError("BAD_REQUEST", "alternateOf: sum: 'Table'[Column] or sum: [Measure]")
+    summ = next(s for s in SUMMARIZATION if s.lower() == m.group(1).lower())
+    ref = m.group(2).strip()
+    ind = "\t" * (node.indent + 1)
+    lines = [f"{ind}alternateOf", f"{ind}\tsummarization: {summ}"]
+    meas = re.match(r"^\[(.+)\]$", ref)
+    col = re.match(r"^'((?:[^']|'')+)'\s*\[(.+)\]$", ref) or re.match(r"^([^\[\]']+?)\s*\[(.+)\]$", ref)
+    if meas:
+        mm = model.measure(meas.group(1))
+        if mm is None:
+            raise PbzError("NOT_FOUND", ref)
+        lines.append(f"{ind}\tbaseMeasure: {tmdl_name(mm.table)}.{tmdl_name(mm.name)}")
+    elif col:
+        hit = model.column(col.group(1).replace("''", "'"), col.group(2))
+        if hit is None:
+            raise PbzError("NOT_FOUND", ref)
+        lines.append(f"{ind}\tbaseColumn: {tmdl_name(hit.table)}.{tmdl_name(hit.name)}")
+    else:
+        raise PbzError("BAD_REQUEST", "alternateOf: sum: 'Table'[Column] or sum: [Measure]")
+    return eol.join(lines) + eol
+
+
+def _block_edits(model, doc, node, prop: str, op: str, raw: str | None) -> list[tuple[int, int, str]]:
+    if prop == "lineageTag":
+        if op == "unset":
+            return _remove_prop(doc, node, "lineageTag")
+        if raw is None or raw.strip().lower() != "regenerate" or TOKEN_RE.search(raw):
+            raise PbzError("BAD_REQUEST", "lineageTag: regenerate")
+        return _lineage_edit(doc, node)
+    kind = "detailRowsDefinition" if prop == "detailRowsExpression" else "alternateOf"
+    if op == "unset":
+        return _swap_child(doc, node, kind, None)
+    eol = _eol(doc.text)
+    block = _detail_block(node, raw or "", eol) if prop == "detailRowsExpression" else _alternate_block(model, node, raw or "", eol)
+    return _swap_child(doc, node, kind, block)
+
+
 def _remove_prop(doc, node, prop: str) -> list[tuple[int, int, str]]:
     s, e = tmdl.block_span(doc, node)
     pos = 0
@@ -203,7 +317,9 @@ def run(ws, project, target: str | None = None, sets: list[str] | None = None, u
                     raise PbzError("FORMAT_STRING_CONFLICT", f"{label} has a dynamic format string: "
                                    "pbz format-expr --remove it first, or change that expression")
                 continue
-            if PROPS[prop][1] == "description":
+            if PROPS[prop][1] in _BLOCK_TYPES:
+                ed = _block_edits(model, doc, node, prop, op, raw)
+            elif PROPS[prop][1] == "description":
                 ed = _desc_edits(doc, node, None if op == "unset" else _value(prop, raw, model, k, node))
             elif op == "unset":
                 ed = _remove_prop(doc, node, prop)
@@ -252,7 +368,7 @@ def get(ws, project, target: str | None = None, kind: str | None = None, table: 
         if desc:
             rec["description"] = "\n".join(desc)
         for prop, (kinds, typ, _a) in PROPS.items():
-            if k not in kinds or typ == "description":
+            if k not in kinds or typ == "description" or typ in _BLOCK_TYPES:
                 continue
             if typ == "flag":
                 if any(ln.strip() == prop for ln in doc.text[slice(*tmdl.block_span(doc, node))].splitlines()
