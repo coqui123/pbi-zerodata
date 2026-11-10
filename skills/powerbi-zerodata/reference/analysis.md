@@ -156,8 +156,8 @@ columns, measures, and visuals that name would reach.
 
 `pbz find <pattern>` searches object names and mirror text. `pbz replace` is a dry run until `--apply`.
 A pattern that is itself a mirror token is refused, and a rename of an object name does not also rewrite
-that name inside other text. `pbz watch` runs validate and best-practice analysis again; `--once` is a
-single pass for tests.
+that name inside other text. `pbz watch` runs validate and best-practice analysis again. Without
+`--once` the human CLI polls until interrupted. MCP always runs one pass.
 
 `pbz unused --what-if` reports share bands from a saved `pbz audit memory` result. With no saved bands
 the status is `UNKNOWN` / `NO_BANDS`. `pbz similar --models` reports an overlap band (`NONE`, `LOW`,

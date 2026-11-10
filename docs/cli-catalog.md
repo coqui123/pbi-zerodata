@@ -74,7 +74,7 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | `bpa` | Best-practice analysis | `--import-rules`, `--fail-on`, `--since`, `--ci`, `--format`, `--out` | [bpa.md](../skills/powerbi-zerodata/reference/bpa.md) |
 | `similar` | Near-duplicate measures, or project overlap | `--models`, `--against` | analysis |
 | `changes` | Semantic diff of mirror snapshots | `--from`, `--to`, `--against` | analysis |
-| `watch` | Re-run validate and bpa | `--once` | analysis |
+| `watch` | Re-run validate and bpa. The CLI polls until interrupted; MCP runs one pass | `--once` | analysis |
 | `docs` | Model/report documentation export | `--format md\|html\|json` | analysis |
 | `m-lineage` | Power Query step/column lineage | optional table | analysis |
 | `audit` | Efficiency / consolidation findings | `run` \| `waive` \| `memory` | [audit.md](../skills/powerbi-zerodata/reference/audit.md) |

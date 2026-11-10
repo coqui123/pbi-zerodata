@@ -6,6 +6,13 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+## 2026-11-10
+
+- Fail closed on a few edges that could reset a good file or publish the wrong name. An unreadable
+  checks ledger is refused. Native SQL is parsed only when the argument is one select string.
+  `pbz probe` rejects a column reference for a different table. Vendor-host matching is the domain
+  or a subdomain, not a name that merely ends with `microsoft.com`. A human `pbz watch` polls until
+  interrupted; MCP runs one pass.
 - Banded performance (`pbz perf`), refresh duration bands, memory encoding / segment / referential-integrity
   bands, and an RLS check kind. Durations, counts, plan text, and role identity stay inside the engine.
   Real-model RLS and Performance Analyzer replay (`pbz perf-import --replay`) are human-terminal only.

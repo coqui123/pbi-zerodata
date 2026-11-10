@@ -264,7 +264,7 @@ These read the mirror and print names, states, counts, scores and rule ids. Deta
 | `pbz find <pattern>` / `pbz replace <pattern> <repl> [--apply]` | search the mirror; replace is a dry run until `--apply` |
 | `pbz rewrite unused-var\|qualify\|divide\|format\|description <measure>` | checked measure rewrite; `divide` needs `--accept-semantic` |
 | `pbz expand <measure>` | tokenized DEFINE block and dependency names; not executed |
-| `pbz watch [--once]` | re-run validate and bpa; `--once` is a single pass |
+| `pbz watch [--once]` | re-run validate and bpa; the CLI polls until interrupted, `--once` is a single pass, and MCP always passes `--once` |
 | `pbz perf --dax <query> [--runs N] [--baseline name --action save\|compare]` | duration and plan bands, never milliseconds |
 | `pbz perf-import <file> [--replay]` | Performance Analyzer bands; replay is human-only |
 | `pbz unused --remove [--dry-run] [--cascade] [--only kinds] [--m-step remove\|keep\|none]` | delete unused objects from the mirror, with a restore point |

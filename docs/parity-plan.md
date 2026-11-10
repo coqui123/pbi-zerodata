@@ -1,7 +1,8 @@
 # pbz parity plan: Measure Killer features, metadata only
 
-> **Design history.** This file records how analysis and authoring features were planned and
-> shipped. For current user docs see [INDEX.md](INDEX.md), the [CLI catalog](cli-catalog.md), and
+> **Design history, frozen 2026-11-04.** This file records how analysis and authoring features were
+> planned. Later releases shipped that work. It is not a current backlog. For current user docs see
+> [INDEX.md](INDEX.md), the [CLI catalog](cli-catalog.md), and
 > `skills/powerbi-zerodata/reference/`. No Measure Killer code or assets are vendored; see
 > [THIRD_PARTY_NOTICES.md](../skills/powerbi-zerodata/THIRD_PARTY_NOTICES.md).
 
@@ -380,14 +381,14 @@ extra terms), pbi-tools (AGPL), TabularEditor/BestPracticeRules text (no license
 
 ## 2. Phase 0: foundation (prerequisite for everything above)
 
-Fixed during this research (already in the working tree, not yet committed):
+Fixed in that research and shipped since:
 - Mirror leak: TMDL `kpi` expressions, calc-group selection expressions and any unknown
   `name = value` property were not treated as expression regions, so their literals were not
   tokenized. Now every such line is lexed and tokenized (fail closed). Test added.
 - Mirror tokens `«...»` were lexed as `«` + identifier + `[...]`, producing fake references in
   `describe`, `lint` and possibly `rename`. Both lexers now emit an opaque `pbztok` token.
 
-Remaining foundation work (new module `pbz/deps.py`, shared by describe, lint, rename, unused):
+Foundation gaps recorded on 2026-11-04 (`pbz/deps.py` has since shipped):
 
 | Gap (verified against our code) | Fix | Reference |
 |---|---|---|
