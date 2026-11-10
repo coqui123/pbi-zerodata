@@ -252,6 +252,27 @@ class GuardTreeOperations(unittest.TestCase):
         self.assertIsNone(self._shell("del /s /q sub\\*.txt", child))
         self.assertIsNone(self._shell("Remove-Item -Recurse sub\\node_modules", child))
 
+    def test_existing_short_prefix_is_not_a_policy_name(self):
+        """An 8.3 profile directory (`RUNNER~1`) is not `.pbz`. A missing `pkg~1` still is refused."""
+        import ctypes
+        parent = tempfile.mkdtemp(prefix="longname_workspace_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(parent, ignore_errors=True))
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(parent, buf, len(buf))
+        if n <= 0 or os.path.normcase(buf.value) == os.path.normcase(parent):
+            self.skipTest("8.3 short names are unavailable")
+        root = os.path.join(buf.value, "ws")
+        os.makedirs(os.path.join(root, ".pbz"))
+        with open(os.path.join(root, ".pbz", "policy.json"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"version": 1}))
+        with open(os.path.join(root, "Demo.pbip"), "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        sibling = os.path.join(os.path.dirname(root), "workspace-old")
+        self.assertIsNone(guard.check_shell(f"robocopy {sibling} C:\\empty /MIR", root))
+        self.assertIsNone(guard.check_shell(
+            "Remove-Item -Recurse " + os.path.join(os.path.dirname(root), "workspace-old."), root))
+        self.assertEqual(guard.check_shell("Remove-Item -Recurse sub\\pkg~1", root), "policy")
+
 
 if __name__ == "__main__":
     unittest.main()

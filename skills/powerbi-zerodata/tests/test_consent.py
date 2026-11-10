@@ -259,8 +259,16 @@ class ConsentTests(unittest.TestCase):
         real_open = os.open
         real_fdopen = os.fdopen
 
+        def _same_file(path) -> bool:
+            try:
+                return os.path.samefile(path, p)
+            except OSError:
+                return os.path.normcase(os.path.abspath(str(path))) == os.path.normcase(os.path.abspath(str(p)))
+
         def swap(path, flags, mode=0o777):
-            if os.path.abspath(path) == os.path.abspath(str(p)):
+            # Consent opens the resolved long path. `C:\\Users\\RUNNER~1\\...` and
+            # `C:\\Users\\runneradmin\\...` are the same file.
+            if _same_file(path):
                 return real_open(str(other), flags)
             return real_open(path, flags, mode)
 

@@ -29,6 +29,14 @@ def _reset():
     guard._POL.clear()
 
 
+def _same_path(left, right) -> bool:
+    """True when both strings name one existing file, including 8.3 vs long spellings."""
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
+
+
 class PolicyFailClosedTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -179,7 +187,7 @@ class PolicyFailClosedTests(unittest.TestCase):
 
         def watch(target, *args, **kwargs):
             handle = real_open(target, *args, **kwargs)
-            if os.path.normcase(str(target)) == os.path.normcase(self.ws.policy_path):
+            if _same_path(target, self.ws.policy_path):
                 raw = handle.read
 
                 def counted(*a, **k):
@@ -190,7 +198,7 @@ class PolicyFailClosedTests(unittest.TestCase):
             return handle
 
         def lstat(path, *args, **kwargs):
-            if os.path.normcase(str(path)) == os.path.normcase(pbz):
+            if _same_path(path, pbz):
                 raise PermissionError("denied")
             return real_lstat(path, *args, **kwargs)
 
@@ -244,14 +252,14 @@ class PolicyFailClosedTests(unittest.TestCase):
             handle = real_open(target, *args, **kwargs)
             # Production opens the lexical workspace policy path; after the swap that
             # resolves to the external file. Count any read through that lexical path.
-            if os.path.normcase(str(target)) == os.path.normcase(self.ws.policy_path):
+            if _same_path(target, self.ws.policy_path):
                 return Guard(handle)
-            if os.path.normcase(str(target)) == os.path.normcase(secret):
+            if _same_path(target, secret):
                 return Guard(handle)
             return handle
 
         def lstat(path, *args, **kwargs):
-            if os.path.normcase(str(path)) == os.path.normcase(self.ws.pbz_dir) and not swapped["done"]:
+            if _same_path(path, self.ws.pbz_dir) and not swapped["done"]:
                 info = real_lstat(path, *args, **kwargs)
                 swapped["done"] = True
                 shutil.rmtree(self.ws.pbz_dir)
@@ -307,7 +315,7 @@ class PolicyFailClosedTests(unittest.TestCase):
                 self.raw.close()
 
         def swapped(target, *args, **kwargs):
-            if os.path.normcase(str(target)) != os.path.normcase(path):
+            if not _same_path(target, path):
                 return real_open(target, *args, **kwargs)
             return Guard(real_open(secret, *args, **kwargs))
 

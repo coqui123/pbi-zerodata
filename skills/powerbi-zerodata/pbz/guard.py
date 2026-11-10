@@ -25,7 +25,68 @@ MIRROR_DIR = "pbz-workspace"
 MAX_WALK_ENTRIES = 6000
 MAX_SCRIPT_BYTES = 2_000_000
 
-HOME = os.path.normcase(os.path.normpath(os.path.expanduser("~"))).replace("\\", "/")
+
+def _long_existing(path: str) -> str:
+    """Expand 8.3 names on the longest existing prefix. A missing tail stays literal.
+
+    `RUNNER~1` is a profile directory, not `.pbz`. `PBZ~1` that does not exist stays
+    `PBZ~1`, so a short name that cannot be checked is still refused. Junctions are
+    not resolved; only the 8.3 spelling of this path changes.
+    """
+    if os.name != "nt" or not re.search(r"~\d", path):
+        return path
+    raw = os.path.normpath(path)
+    probe = raw
+    tail: list[str] = []
+    while True:
+        try:
+            exists = os.path.exists(probe)
+        except OSError:
+            return path
+        if exists:
+            break
+        parent, name = os.path.split(probe)
+        if not name or parent == probe:
+            return path
+        tail.append(name)
+        probe = parent
+    if not re.search(r"~\d", probe):
+        return path
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetLongPathNameW(probe, buf, len(buf))
+    except (OSError, AttributeError):
+        return path
+    if n <= 0 or n >= len(buf):
+        return path
+    out = buf.value
+    if out.startswith("\\\\?\\"):
+        out = out[4:]
+    for name in reversed(tail):
+        out = os.path.join(out, name)
+    return out
+
+
+def _expand_cmd_shorts(text: str) -> str:
+    """Rewrite absolute paths in a command so an existing `RUNNER~1` is its long name."""
+    if "~" not in text:
+        return text
+
+    def repl(match: re.Match) -> str:
+        token = match.group(0)
+        if not re.search(r"~\d", token):
+            return token
+        return _long_existing(token)
+
+    return re.sub(
+        r'(?i)(?<![A-Za-z0-9])[a-z]:[\\/](?:[^\\/:*?"<>|\r\n]+[\\/])*(?:[^\\/:*?"<>|\r\n]*)',
+        repl,
+        text,
+    )
+
+
+HOME = os.path.normcase(_long_existing(os.path.normpath(os.path.expanduser("~")))).replace("\\", "/")
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
 APPDATA = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -135,7 +196,10 @@ def norm(p: str, base: str | None = None) -> str:
     p = os.path.expandvars(os.path.expanduser(p))
     if base and not os.path.isabs(p):
         p = os.path.join(base, p)
-    return os.path.normcase(os.path.normpath(p)).replace("\\", "/")
+    p = os.path.normpath(p)
+    if "~" in p:
+        p = _long_existing(p)
+    return os.path.normcase(p).replace("\\", "/")
 
 
 def glob_to_regex(glob: str) -> re.Pattern:
@@ -944,8 +1008,10 @@ def _mentions_protected(text: str) -> bool:
 
     `.pbzignore` is a different segment and does not match.
     A component containing `~` and a digit is an 8.3 short name (`PBZ~1`, `POLICY~1.JSO`).
+    An existing short name is judged by its long name, so `RUNNER~1` (the profile
+    directory) is not `.pbz`. A short name that does not exist stays fail-closed.
     """
-    parts = _protected_pieces(text)
+    parts = _protected_pieces(_expand_cmd_shorts(text))
     if ".pbz" in parts or "policy.json" in parts:
         return True
     return any(re.search(r"~\d", part) for part in parts)

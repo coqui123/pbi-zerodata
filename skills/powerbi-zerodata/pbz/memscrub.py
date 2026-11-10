@@ -96,7 +96,13 @@ def _links_within(path: str, boundary: str) -> None:
         raise PbzError("UNSAFE_PATH", "memory folder is outside approved roots") from None
     current = os.path.abspath(path)
     for _ in range(64):
-        below = os.path.normcase(current) != os.path.normcase(root_abs)
+        # 8.3 and long spellings of the boundary are the same directory. A string
+        # compare would treat the short path as a child and then reject its parent.
+        try:
+            here = os.path.realpath(current)
+        except OSError:
+            here = current
+        below = os.path.normcase(here) != os.path.normcase(root_real)
         if below and _reparse_link(current):
             raise PbzError("UNSAFE_PATH", "memory folder is outside approved roots")
         try:

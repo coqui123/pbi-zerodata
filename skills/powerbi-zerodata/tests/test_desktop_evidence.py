@@ -155,7 +155,9 @@ class EvidenceTests(unittest.TestCase):
 
     def test_review_retains_independent_scopes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ws=SimpleNamespace(root=tmp,pbz_dir=os.path.join(tmp,'.pbz'),mirror=os.path.join(tmp,'pbz-workspace'))
+            private=os.path.join(tmp,'private')
+            os.makedirs(private,exist_ok=True)
+            ws=SimpleNamespace(root=tmp,private=private,pbz_dir=os.path.join(tmp,'.pbz'),mirror=os.path.join(tmp,'pbz-workspace'))
             project=SimpleNamespace(name='Synthetic')
             mrev,rrev='m0123456789ab','r0123456789ab'
             with patch.object(evidence,'mirror_rev',return_value=mrev),patch.object(evidence,'real_rev',return_value=rrev),patch('pbz.changes.run',return_value={'result':'SAME'}),patch('pbz.consumers.load_registry',return_value={'consumers':[]}),patch.object(evidence,'_suggested_tests',return_value=[]):

@@ -60,6 +60,25 @@ class MemscrubAtomicTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "FAILED")
         self.assertEqual({p: open(p, "rb").read() for p in before}, before)
 
+    def test_short_temp_path_is_inside_approved_roots(self):
+        import ctypes
+        parent = tempfile.mkdtemp(prefix="longname_memory_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(parent, ignore_errors=True))
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(parent, buf, len(buf))
+        if n <= 0 or os.path.normcase(buf.value) == os.path.normcase(parent):
+            self.skipTest("8.3 short names are unavailable")
+        notes = os.path.join(buf.value, "notes")
+        os.makedirs(notes)
+        note = os.path.join(notes, "a.md")
+        with open(note, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("spent 1000 hours\n")
+        policy.save(self.ws, {**policy.DEFAULT, "memory_dirs": [notes]})
+        with self.assertRaises(PbzError) as caught:
+            memscrub.run(self.ws, None, notes, apply=True, human=False)
+        self.assertEqual(caught.exception.code, "HUMAN_ONLY")
+        self.assertEqual(open(note, encoding="utf-8").read(), "spent 1000 hours\n")
+
     def test_username_alone_does_not_configure_isolation(self):
         with patch.dict(os.environ, {"USERNAME": "WDAGUtilityAccount"}):
             out = cli.cmd_doctor()
