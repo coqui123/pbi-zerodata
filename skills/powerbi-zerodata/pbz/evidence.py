@@ -177,10 +177,16 @@ def _last_mac(text: str | None) -> str | None:
 
 
 def _tip(ws) -> str:
-    """MAC the next record must cite. An already-over-cap active file is refused here."""
+    """MAC the next record must cite. An already-over-cap active file is refused here.
+
+    A MAC in the active log wins. An active log with none yields the newest rotated
+    segment's last MAC, then the anchor. Prune order is unchanged.
+    """
     active = _log_path(ws)
     if os.path.lexists(active):
-        return _last_mac(_read_log(ws, active)) or _anchor(ws)
+        mac = _last_mac(_read_log(ws, active))
+        if mac:
+            return mac
     segs = _segment_paths(ws)
     if segs:
         return _last_mac(_read_log(ws, segs[-1])) or _anchor(ws)

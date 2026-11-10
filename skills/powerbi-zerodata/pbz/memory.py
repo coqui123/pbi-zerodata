@@ -37,10 +37,12 @@ def _disclosure(ws) -> str:
 
 
 def _strip_bands(body: dict) -> dict:
-    """Drop size and share bands at every level. Predicates and names stay."""
+    """Drop size, share, segment and RI-count bands at every level. Encoding and ri stay."""
+    drop = {"size_band", "share_band", "segment_band", "ri_count"}
+
     def walk(value):
         if isinstance(value, dict):
-            return {k: walk(v) for k, v in value.items() if k not in ("size_band", "share_band")}
+            return {k: walk(v) for k, v in value.items() if k not in drop}
         if isinstance(value, list):
             return [walk(v) for v in value]
         return value

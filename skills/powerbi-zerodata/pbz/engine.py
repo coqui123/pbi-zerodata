@@ -31,7 +31,7 @@ def call(verb: str, request: dict, timeout: float = 120) -> dict:
     if not exe.is_file():
         return _fail(verb, "ENGINE_UNAVAILABLE")
     try:
-        payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
+        payload = json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (TypeError, ValueError):
         return _fail(verb, "BAD_REQUEST")
     try:

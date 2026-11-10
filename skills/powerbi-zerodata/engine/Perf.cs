@@ -212,7 +212,7 @@ public static class Perf
         EngineTrace.Hit? longest = null;
         foreach (var h in hits)
         {
-            if (h.Class != "QueryEnd") continue;
+            if (h.Class != "QueryEnd" || h.Duration == EngineTrace.Hit.MissingDuration) continue;
             if (longest == null || h.Duration > longest.Duration) longest = h;
             if (QueryTextMatches(h.Text, needle) && (end == null || h.Duration > end.Duration)) end = h;
         }
@@ -234,7 +234,8 @@ public static class Perf
             {
                 case "VertiPaqSEQueryEnd":
                     sample.Se++;
-                    sample.SeMs += h.Duration;
+                    if (h.Duration != EngineTrace.Hit.MissingDuration)
+                        sample.SeMs += h.Duration;
                     if (HasCallback(h.Text)) sample.Callback = true;
                     break;
                 case "VertiPaqSEQueryCacheMatch":

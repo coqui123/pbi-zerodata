@@ -29,6 +29,16 @@ def _insert(mdef, doc, node, block: str, root: str):
     commit_bytes([("write", path, text, bom)], root=root)
 
 
+def _named_calendar(table_node, name: str):
+    want = name.lower()
+    return next((node for node in table_node.children
+                 if node.kind == "calendar" and node.name.lower() == want), None)
+
+
+def _definition_path(mdef: str, doc) -> str:
+    return os.path.join(mdef, *doc.path.split("/"))
+
+
 def add_calendar(ws, project, table: str, name: str, column: str, unit: str = "Day") -> dict:
     units = {"Day", "Month", "Quarter", "Year", "Week"}
     if unit not in units:
@@ -37,16 +47,28 @@ def add_calendar(ws, project, table: str, name: str, column: str, unit: str = "D
     found = next((t for t in model.tables.values() if t.name.lower() == table.lower()), None)
     if found is None or found.node is None:
         raise PbzError("NOT_FOUND", "table not found")
+    if _named_calendar(found.node, name) is not None:
+        raise PbzError("BAD_REQUEST", "calendar already exists")
     ind = "\t" * (found.node.indent + 1)
     block = (f"{ind}calendar {lexers.tmdl_name(name)}\n"
              f"{ind}\tcalendarColumnGroup\n"
              f"{ind}\t\tcolumn: {column}\n"
              f"{ind}\t\tunit: {unit}\n")
     doc = model.docs[found.node.file]
+    path = _definition_path(mdef, doc)
+    with open(path, "rb") as handle:
+        previous = handle.read()
     _insert(mdef, doc, found.node, block, ws.root)
-    again = tmdl.load_model(mdef)
-    node = next((n for n in again.docs[found.node.file].nodes if n.kind == "calendar" and n.name.lower() == name.lower()), None)
+    node = None
+    try:
+        again = tmdl.load_model(mdef)
+        found_again = next((t for t in again.tables.values() if t.name.lower() == found.name.lower()), None)
+        if found_again is not None and found_again.node is not None:
+            node = _named_calendar(found_again.node, name)
+    except Exception:
+        node = None
     if node is None:
+        commit_bytes([("write_bytes", path, previous)], root=ws.root)
         raise PbzError("BAD_REQUEST", "calendar block did not parse")
     return {"verb": "calendar", "action": "add", "table": found.name, "name": node.name, "unit": unit}
 

@@ -14,6 +14,11 @@ from .common import PbzError, commit_bytes, read_text, write_text, _workspace_ro
 from .tokens import TOKEN_RE
 
 
+def _script_expression(expression: str) -> str:
+    """The expression text export writes. Apply uses this same strip."""
+    return expression.strip()
+
+
 def _measures(project):
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
@@ -22,7 +27,8 @@ def _measures(project):
     rows = []
     for table in model.tables.values():
         for measure in table.measures.values():
-            rows.append({"table": table.name, "name": measure.name, "expression": measure.expression.strip()})
+            rows.append({"table": table.name, "name": measure.name,
+                         "expression": _script_expression(measure.expression)})
     return model, rows
 
 
@@ -43,6 +49,7 @@ def apply(ws, project, path: str) -> dict:
     model, _rows = _measures(project)
     by_file: dict[str, list] = {}
     changed = []
+    seen = set()
     for item in doc["measures"]:
         if not isinstance(item, dict):
             raise PbzError("BAD_REQUEST", "each measure needs table, name and expression")
@@ -60,10 +67,13 @@ def apply(ws, project, path: str) -> dict:
         reg = next((r for r in doc_.regions if r.node is found.node and r.kind == "dax"), None)
         if reg is None:
             raise PbzError("BAD_REQUEST", "measure has no expression")
-        by_file.setdefault(found.node.file, [])
         key = (found.node.file, reg.start, reg.end)
-        if any(start == reg.start and end == reg.end for start, end, _expr in by_file[found.node.file]):
+        if key in seen:
             raise PbzError("BAD_REQUEST", "duplicate measure in script")
+        seen.add(key)
+        if _script_expression(expr) == _script_expression(found.expression):
+            continue
+        by_file.setdefault(found.node.file, [])
         by_file[found.node.file].append((reg.start, reg.end, expr))
         changed.append(name)
     ops = []

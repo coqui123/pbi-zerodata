@@ -50,7 +50,14 @@ public sealed class EngineTrace : IDisposable
     {
         public string Class = "";
         public string Subclass = "";
-        public long Duration;
+
+        /// <summary>
+        /// Duration column could not be read. This is not zero milliseconds and must not become a duration band.
+        /// A duration that was read, including a negative value clamped to zero, is never this sentinel.
+        /// </summary>
+        public const long MissingDuration = -1;
+
+        public long Duration = MissingDuration;
         public string ObjectName = "";
         public string Session = "";
         public string Text = "";
@@ -113,7 +120,15 @@ public sealed class EngineTrace : IDisposable
         _accept = false;
         lock (_gate)
         {
-            var copy = _hits.ToList();
+            var copy = new List<Hit>(_hits.Count);
+            foreach (var hit in _hits)
+            {
+                // Refresh treats every negative duration as zero and then emits a band.
+                // Plan text on other classes stays in the process; raw milliseconds are not emitted.
+                if (hit.Duration == Hit.MissingDuration && hit.Class == "ProgressReportEnd")
+                    continue;
+                copy.Add(hit);
+            }
             _hits.Clear();
             return copy;
         }
@@ -238,22 +253,60 @@ public sealed class EngineTrace : IDisposable
         if (!_accept || args == null) return;
         try
         {
-            string cls = args.EventClass.ToString();
-            var hit = new Hit
-            {
-                Class = cls,
-                Subclass = args.EventSubclass.ToString(),
-                Duration = args.Duration < 0 ? 0 : args.Duration,
-                ObjectName = args.ObjectName ?? "",
-                Session = args.SessionID ?? "",
-                Text = Clip(args.TextData ?? "", cls),
-            };
+            var hit = ReadHit(args);
+            if (hit == null) return;
             lock (_gate) _hits.Add(hit);
         }
         catch
         {
             // a bad event must not tear the trace down
         }
+    }
+
+    /// <summary>
+    /// Each of <c>EventSubclass</c>, <c>Duration</c>, <c>ObjectName</c>, <c>SessionID</c> and
+    /// <c>TextData</c> is read in its own guard. One missing column must not discard the rest.
+    /// Plan text stays on the hit. It is not written anywhere.
+    /// </summary>
+    static Hit? ReadHit(AMO.TraceEventArgs args)
+    {
+        string cls;
+        try { cls = args.EventClass.ToString(); }
+        catch { return null; }
+
+        string subclass = "";
+        try { subclass = args.EventSubclass.ToString(); }
+        catch { }
+
+        long duration = Hit.MissingDuration;
+        try
+        {
+            long raw = args.Duration;
+            duration = raw < 0 ? 0 : raw;
+        }
+        catch { }
+
+        string objectName = "";
+        try { objectName = args.ObjectName ?? ""; }
+        catch { }
+
+        string session = "";
+        try { session = args.SessionID ?? ""; }
+        catch { }
+
+        string text = "";
+        try { text = Clip(args.TextData ?? "", cls); }
+        catch { }
+
+        return new Hit
+        {
+            Class = cls,
+            Subclass = subclass,
+            Duration = duration,
+            ObjectName = objectName,
+            Session = session,
+            Text = text,
+        };
     }
 
     static string Clip(string text, string cls)

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-from . import checks, desktop
+from . import checks, desktop, policy as policy_mod
 from .common import PbzError, engine_call
 
 RATIO = 1.25
@@ -33,18 +33,29 @@ def verdict(old: float, new: float, spread: float) -> str:
     return "SAME"
 
 
-def _closed(res: dict) -> dict:
+def _disclosure(ws) -> str:
+    pol = policy_mod.load(ws)
+    return "shape" if pol.get("disclosure", "shape") == "shape" else "strict"
+
+
+def _closed(res: dict, ws=None) -> dict:
+    """Closed perf fields. Outside the shape tier, magnitude bands are omitted.
+
+    timing, trace, callback, agg_rewrite, verdict and baseline stay when they are
+    already closed enums. NO_BASELINE is not a status this function adds.
+    """
+    shape = _disclosure(ws) == "shape" if ws is not None else True
     out = {"verb": "perf"}
     if res.get("timing") in ("BANDED", "UNAVAILABLE"):
         out["timing"] = res["timing"]
-    if res.get("duration_band") in DURATION:
+    if shape and res.get("duration_band") in DURATION:
         out["duration_band"] = res["duration_band"]
-    if res.get("fe_share") in SHARE:
+    if shape and res.get("fe_share") in SHARE:
         out["fe_share"] = res["fe_share"]
     for key in ("se_queries", "dq_events"):
-        if res.get(key) in COUNT:
+        if shape and res.get(key) in COUNT:
             out[key] = res[key]
-    if res.get("cache_hit") in CACHE:
+    if shape and res.get("cache_hit") in CACHE:
         out["cache_hit"] = res["cache_hit"]
     if isinstance(res.get("callback"), bool):
         out["callback"] = res["callback"]
@@ -56,12 +67,13 @@ def _closed(res: dict) -> dict:
         out["verdict"] = res["verdict"]
     if res.get("baseline") in ("SAVED", "MISSING"):
         out["baseline"] = res["baseline"]
-    plan = res.get("plan")
-    if isinstance(plan, dict):
-        kept = {k: plan[k] for k in ("CallbackDataID", "Spool_Iterator", "CrossApply", "LargeMaterialization")
-                if plan.get(k) in PLAN}
-        if kept:
-            out["plan"] = kept
+    if shape:
+        plan = res.get("plan")
+        if isinstance(plan, dict):
+            kept = {k: plan[k] for k in ("CallbackDataID", "Spool_Iterator", "CrossApply", "LargeMaterialization")
+                    if plan.get(k) in PLAN}
+            if kept:
+                out["plan"] = kept
     return out
 
 
@@ -81,7 +93,7 @@ def run(ws, project, query: str, runs: int = 1, baseline: str | None = None, act
                          "TIMEOUT", "ENGINE_UNAVAILABLE", "BAD_REQUEST", "OTHER"}:
             klass = "ENGINE_UNAVAILABLE"
         raise PbzError(klass)
-    return _closed(res)
+    return _closed(res, ws)
 
 
 def expect(ws, project, query: str, expect_verdict: str = "NOT_SLOWER") -> dict:

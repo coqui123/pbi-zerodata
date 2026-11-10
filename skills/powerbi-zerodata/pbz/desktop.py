@@ -196,7 +196,7 @@ def reload(project: Project) -> str:
         data = json.loads(p.stdout.decode("utf-8", errors="replace") or "{}")
     except (ValueError, subprocess.SubprocessError, OSError):
         return "RELOAD_FAILED"
-    ok = p.returncode == 0 and isinstance(data, dict) and data.get("ok") is not False and not data.get("error")
+    ok = p.returncode == 0 and isinstance(data, dict) and data.get("ok") is True and not data.get("error")
     return "RELOADED" if ok else "RELOAD_FAILED"
 
 

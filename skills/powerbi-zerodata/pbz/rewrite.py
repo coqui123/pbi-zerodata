@@ -58,6 +58,81 @@ def _compile(ws, project, model) -> dict:
     return {"compile": "DONE", "compile_counts": note.get("counts", {})}
 
 
+def _span_covers(spans, start: int, end: int) -> bool:
+    return any(start < stop and end > begin for begin, stop in spans)
+
+
+def _outside_brackets(expr: str, spans) -> list[str]:
+    """Bracket tokens whose span does not overlap a deleted unused VAR."""
+    return [tok.text for tok in lexers.lex_dax(expr)
+            if tok.kind == "bracket" and not _span_covers(spans, tok.start, tok.end)]
+
+
+def _require_outside_brackets(expr: str, spans, out: str) -> None:
+    """Refuse when a bracket outside the deleted unused-VAR spans is missing from `out`."""
+    outside = _outside_brackets(expr, spans)
+    after = [tok.text for tok in lexers.lex_dax(out) if tok.kind == "bracket"]
+    if not _sig(out) or outside != after:
+        raise PbzError("REFUSED", "unused-var rewrite did not keep the rest of the expression")
+
+
+def _return_without_var(sig) -> bool:
+    """True when a RETURN is not closing an open VAR block in its parenthesis group.
+
+    One VAR block may contain several VAR lines. A new block starts at the beginning of a
+    group, after RETURN, or after an operator other than ")". RETURN closes one block.
+    A comma ends a function argument, so a later RETURN cannot reuse an earlier block.
+    A comma inside a table constructor does not end that block.
+    """
+    counts = [0]
+    depth = 0
+    braces = 0
+    prev = None
+    for tok in sig:
+        if tok.kind == "op" and tok.text == "(":
+            depth += 1
+            if len(counts) <= depth:
+                counts.append(0)
+            else:
+                counts[depth] = 0
+            prev = tok
+            continue
+        if tok.kind == "op" and tok.text == ")":
+            if depth == 0:
+                return True
+            counts[depth] = 0
+            depth -= 1
+            prev = tok
+            continue
+        if tok.kind == "op" and tok.text == "{":
+            braces += 1
+            prev = tok
+            continue
+        if tok.kind == "op" and tok.text == "}":
+            braces = max(0, braces - 1)
+            prev = tok
+            continue
+        if tok.kind == "op" and tok.text == "," and braces == 0:
+            counts[depth] = 0
+            prev = tok
+            continue
+        if tok.kind == "ident" and tok.text.upper() == "VAR":
+            starts = prev is None or prev.text.upper() == "RETURN" or (
+                prev.kind == "op" and prev.text not in (")", "}"))
+            if starts:
+                counts[depth] += 1
+            prev = tok
+            continue
+        if tok.kind == "ident" and tok.text.upper() == "RETURN":
+            if counts[depth] == 0:
+                return True
+            counts[depth] -= 1
+            prev = tok
+            continue
+        prev = tok
+    return False
+
+
 def _unused(expr: str) -> str | None:
     names = set(suggest._unused_vars(expr))
     if not names:
@@ -65,7 +140,6 @@ def _unused(expr: str) -> str | None:
     sig = lexers.significant(lexers.lex_dax(expr))
     # Drop each unused `VAR name = <simple>` that ends before RETURN or the next VAR.
     spans = []
-    raw = lexers.lex_dax(expr)
     for i, tok in enumerate(sig):
         if not (tok.kind == "ident" and tok.text.upper() == "VAR" and i + 1 < len(sig)):
             continue
@@ -86,16 +160,16 @@ def _unused(expr: str) -> str | None:
     for start, end in sorted(spans, reverse=True):
         out = out[:start] + out[end:]
     sig2 = lexers.significant(lexers.lex_dax(out))
+    # Drop a leading RETURN only when no VAR remains.
     if sig2 and sig2[0].text.upper() == "RETURN" and not any(t.text.upper() == "VAR" for t in sig2):
         out = out[:sig2[0].start] + out[sig2[0].end:]
-    before = [tok for tok in _sig(expr) if tok[1].upper() not in ("VAR", "RETURN")]
-    after = _sig(out)
-    # The unused name and its value leave. Everything else, aside from VAR/RETURN, stays.
-    if not after or any(tok[1].upper() == "RETURN" for tok in after):
+        sig2 = lexers.significant(lexers.lex_dax(out))
+    # A nested VAR does not make a leading RETURN valid: `RETURN SUMX(..., VAR y = ...)` is refused.
+    # A RETURN left inside a call, such as `SUMX(T, RETURN [M])`, is refused the same way.
+    if (sig2 and sig2[0].text.upper() == "RETURN") or _return_without_var(sig2):
         raise PbzError("REFUSED", "unused-var rewrite did not keep the rest of the expression")
-    kept = [tok for tok in before if tok[1] not in names and tok[1] != "1"]
-    if not all(tok in after for tok in kept if tok[0] == "bracket"):
-        raise PbzError("REFUSED", "unused-var rewrite did not keep the rest of the expression")
+    # A RETURN that still has its VAR may remain. A bracket outside the deleted VAR span may not disappear.
+    _require_outside_brackets(expr, spans, out)
     return out
 
 

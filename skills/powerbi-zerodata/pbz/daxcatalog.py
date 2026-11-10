@@ -99,6 +99,26 @@ def _udf_arity(model) -> dict[str, int]:
     return out
 
 
+def _column_dax(model, column) -> str | None:
+    """DAX on the column node, read like a measure region. Column objects do not store it.
+
+    The expression property wins when the node also has another DAX region. No region means skip.
+    """
+    node = column.node
+    if node is None:
+        return None
+    doc = model.docs.get(node.file)
+    if doc is None:
+        return None
+    regs = [r for r in doc.regions if r.node is node and r.kind == "dax"]
+    reg = next((r for r in regs if r.prop == "expression"), None)
+    if reg is None and regs:
+        reg = regs[0]
+    if reg is None:
+        return None
+    return doc.text[reg.start:reg.end]
+
+
 def findings(model) -> list[dict]:
     udf = _udf_arity(model)
     tables = {t.name.upper() for t in model.tables.values()}
@@ -106,7 +126,13 @@ def findings(model) -> list[dict]:
     seen = set()
     for table in model.tables.values():
         exprs = [(f"[{m.name}]", m.expression) for m in table.measures.values()]
-        exprs += [(f"'{table.name}'[{c.name}]", "") for c in table.columns.values() if c.calculated]
+        for column in table.columns.values():
+            if not column.calculated:
+                continue
+            expr = _column_dax(model, column)
+            if expr is None:
+                continue
+            exprs.append((f"'{table.name}'[{column.name}]", expr))
         for label, expr in exprs:
             if not expr:
                 continue

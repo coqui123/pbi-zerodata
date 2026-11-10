@@ -225,26 +225,25 @@ def circular_dependencies(model) -> list[dict]:
             except Exception:
                 continue
             graph[key] = {ref.name.lower() for ref in parsed.refs if ref.kind == "measure"}
-    color = {key: 0 for key in graph}
     cycled: set[str] = set()
 
-    def walk(node: str, stack: list[str]) -> None:
-        color[node] = 1
-        stack.append(node)
-        for nxt in graph.get(node, ()):
-            if nxt not in graph:
+    def on_cycle(start: str) -> bool:
+        """True when a nonempty path from start reaches start. Self-references count."""
+        seen: set[str] = set()
+        pending = list(graph.get(start, ()))
+        while pending:
+            node = pending.pop()
+            if node == start:
+                return True
+            if node in seen or node not in graph:
                 continue
-            if color[nxt] == 1:
-                if nxt in stack:
-                    cycled.update(stack[stack.index(nxt):])
-            elif color[nxt] == 0:
-                walk(nxt, stack)
-        stack.pop()
-        color[node] = 2
+            seen.add(node)
+            pending.extend(graph[node])
+        return False
 
-    for key in list(graph):
-        if color[key] == 0:
-            walk(key, [])
+    for key in graph:
+        if on_cycle(key):
+            cycled.add(key)
     out = []
     for key in sorted(cycled, key=lambda item: (labels[item][0].lower(), labels[item][1].lower())):
         table, name = labels[key]

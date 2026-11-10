@@ -15,9 +15,9 @@ from . import dpapi, mlineage, tmdl, unused
 from .common import PbzError, write_text, _workspace_root
 from .tokens import TOKEN_RE
 
-_SQL_STRING = re.compile(r"(?is)(?:Value\.)?NativeQuery\s*\(\s*[^,]+,\s*(?P<q>\"\"\"|\"|«)(?P<body>.*?)(?P=q)")
 _SQL_DB = re.compile(r"(?is)Sql\.Database\s*\(\s*(?P<q1>\"\"\"|\")(?P<server>.*?)(?P=q1)\s*,\s*(?P<q2>\"\"\"|\")(?P<db>.*?)(?P=q2)")
 _SELECT = re.compile(r"(?is)\bselect\b(?P<cols>.*?)\bfrom\b")
+_NATIVE_CALL = re.compile(r"(?i)(?:Value\.)?NativeQuery\s*\(")
 
 
 def _key(ws, value: str) -> str:
@@ -50,6 +50,149 @@ def _dependents(node, objects: list, visuals: list) -> None:
         if isinstance(name, str) and name and name not in objects:
             objects.append(name)
         _dependents(child, objects, visuals)
+
+
+def _skip_m_string(text: str, i: int) -> int | None:
+    """Index after an M `"` string starting at i, treating `""` as an escaped quote."""
+    if i >= len(text) or text[i] != '"':
+        return None
+    i += 1
+    n = len(text)
+    while i < n:
+        if text[i] == '"':
+            if i + 1 < n and text[i + 1] == '"':
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return None
+
+
+def _comma_after_balanced_arg(text: str, i: int) -> int | None:
+    """Index of the comma that ends NativeQuery's first argument.
+
+    Parentheses, braces, brackets, and quotes nest, so `Sql.Database(server, database)`
+    and `Source{[Schema="x",Item="y"]}[Data]` each stay one argument. A comma inside a
+    quote, comment, or « » token does not end the argument.
+    """
+    n = len(text)
+    paren = brace = bracket = 0
+    while i < n:
+        if text.startswith("«", i):
+            j = text.find("»", i + 1)
+            if j < 0 or "\n" in text[i:j]:
+                return None
+            i = j + 1
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                return None
+            i = j + 2
+            continue
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        ch = text[i]
+        if ch == '"':
+            j = _skip_m_string(text, i)
+            if j is None:
+                return None
+            i = j
+            continue
+        if ch == "(":
+            paren += 1
+            i += 1
+            continue
+        if ch == ")":
+            if paren == 0:
+                return None
+            paren -= 1
+            i += 1
+            continue
+        if ch == "{":
+            brace += 1
+            i += 1
+            continue
+        if ch == "}":
+            if brace == 0:
+                return None
+            brace -= 1
+            i += 1
+            continue
+        if ch == "[":
+            bracket += 1
+            i += 1
+            continue
+        if ch == "]":
+            if bracket == 0:
+                return None
+            bracket -= 1
+            i += 1
+            continue
+        if ch == "," and paren == 0 and brace == 0 and bracket == 0:
+            return i
+        i += 1
+    return None
+
+
+def _skip_ws_and_comments(text: str, i: int) -> int | None:
+    n = len(text)
+    while i < n:
+        if text[i].isspace():
+            i += 1
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                return None
+            i = j + 2
+            continue
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        return i
+    return i
+
+
+def _sql_argument_closed(text: str, end: int) -> bool:
+    """True when the SQL literal is the whole argument, not the start of an `&` chain."""
+    nxt = _skip_ws_and_comments(text, end)
+    return nxt is not None and nxt < len(text) and text[nxt] in ",)"
+
+
+def _sql_literal(text: str, i: int) -> tuple[str, str] | None:
+    """(quote, body) of the SQL argument, or None when it is not one string or token."""
+    i = _skip_ws_and_comments(text, i)
+    if i is None or i >= len(text):
+        return None
+    if text.startswith("«", i):
+        j = text.find("»", i + 1)
+        if j < 0 or "\n" in text[i:j] or not _sql_argument_closed(text, j + 1):
+            return None
+        return "«", text[i + 1:j]
+    # M has no triple-quoted strings. `"""..."""` is a normal string whose value
+    # starts and ends with a quote, so the `""` unescape leaves a `"` in the body.
+    if text[i] != '"':
+        return None
+    j = _skip_m_string(text, i)
+    if j is None or not _sql_argument_closed(text, j):
+        return None
+    return '"', text[i + 1:j - 1].replace('""', '"')
+
+
+def _native_query_sql(text: str) -> tuple[str, str] | None:
+    """SQL string passed to the first NativeQuery in `text`, if its arguments parse."""
+    for match in _NATIVE_CALL.finditer(text):
+        comma = _comma_after_balanced_arg(text, match.end())
+        if comma is None:
+            continue
+        found = _sql_literal(text, comma + 1)
+        if found is not None:
+            return found
+    return None
 
 
 def _select_list(sql: str) -> list[str]:
@@ -87,13 +230,14 @@ def native_sql(ws, project) -> dict:
             if "NativeQuery" not in text and "Sql.Database" not in text:
                 continue
             item = {"table": table.name, "partition": part.name}
-            sql = _SQL_STRING.search(text)
-            if (sql is None or sql.group("q") == "«" or '"' in sql.group("body")
-                    or TOKEN_RE.search(sql.group("body")) or not re.search(r"(?i)\bselect\b", sql.group("body"))):
+            sql = _native_query_sql(text)
+            body = "" if sql is None else sql[1]
+            if (sql is None or sql[0] == "«" or '"' in body or "#(" in body
+                    or TOKEN_RE.search(body) or not re.match(r"(?i)\s*select\b", body)):
                 item["status"] = "OPAQUE"
             else:
                 item["status"] = "PARSED"
-                item["columns"] = _select_list(sql.group("body"))
+                item["columns"] = _select_list(body)
             db = _SQL_DB.search(text)
             server, database = (db.group("server"), db.group("db")) if db else ("", "")
             if db and not TOKEN_RE.search(server) and not TOKEN_RE.search(database):

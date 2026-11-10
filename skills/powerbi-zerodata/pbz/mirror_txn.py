@@ -49,6 +49,6 @@ def transaction(root: str, fn):
             snap[os.path.normcase(path)] = (path, handle.read())
     try:
         return fn()
-    except Exception:
+    except BaseException:
         _restore(root, snap)
         raise

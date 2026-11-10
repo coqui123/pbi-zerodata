@@ -78,16 +78,36 @@ def _stderr(lines: list[str]) -> None:
         sys.stderr.write("\n".join(lines) + "\n")
 
 
+def _github_data(value: str) -> str:
+    """GitHub workflow command data: percent-encode %, CR and LF."""
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _github_property(value: str) -> str:
+    """GitHub workflow property value: data escapes plus colon and comma."""
+    return (value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            .replace(":", "%3A").replace(",", "%2C"))
+
+
+def _azdo_value(value: str) -> str:
+    """Azure DevOps logging command value: percent-encode %, CR, LF, semicolon and ]."""
+    return (value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            .replace(";", "%3B").replace("]", "%5D"))
+
+
 def _ci_lines(kind: str, findings) -> list[str]:
     lines = []
     for ann in _annotations(findings):
         title = ann["rule"] or "pbz"
-        path = ann["path"].replace(",", "_")
+        # Rule and object only. Measure expressions are not annotation fields and stay out.
         message = f"{title} {ann['object']}".strip()
         if kind == "github":
-            lines.append(f"::error file={path},title={title}::{message}")
+            lines.append("::error file=" + _github_property(ann["path"])
+                         + ",title=" + _github_property(title)
+                         + "::" + _github_data(message))
         elif kind == "azdo":
-            lines.append(f"##vso[task.logissue type=error;sourcepath={path}]{message}")
+            lines.append("##vso[task.logissue type=error;sourcepath="
+                         + _azdo_value(ann["path"]) + "]" + _azdo_value(message))
     return lines
 
 

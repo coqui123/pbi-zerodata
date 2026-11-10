@@ -8,6 +8,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 
 from . import desktop, dpapi, lexers, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
@@ -220,20 +221,49 @@ def _state_path(ws) -> str:
     return os.path.join(ws.private, "state.json")
 
 
+# Fixed text only. JSONDecodeError echoes a snippet of the file, and an OSError can name the
+# path. Never put either in the detail.
+_STATE_MALFORMED = "checks state is malformed"
+
 LEDGER_DAYS = 30
 DAILY = {"checks": ("session_checks", 300), "probes": ("probes_per_day", 100),
          "snapshot_queries": ("snapshot_queries_per_day", 200), "smoke": ("smoke_runs_per_day", 50)}
 
 
+def _read_state_file(path: str):
+    """Saved object, {} if the file is missing, or None if it cannot be read or the JSON is corrupt.
+
+    FileNotFoundError stays a fresh budget. Any other OSError is None so the caller refuses
+    without replacing the file. There is no lexists pre-check: lexists swallows OSError from
+    lstat and would report an unstatable file as missing. Parser and OS errors stay here:
+    their text must not leave on an exception chain.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    return loaded
+
+
 def _load_state(ws) -> dict:
     """Daily counters (reset each day) plus a persistent ledger: distinct constants per target fingerprint
-    for LEDGER_DAYS and hashes of literals the agent introduced through pushes."""
+    for LEDGER_DAYS and hashes of literals the agent introduced through pushes.
+
+    A missing file is a fresh budget. A file that exists but cannot be read, or is not a JSON
+    object, is refused and left unchanged so a locked or corrupt ledger is not replaced.
+    """
     today = dt.date.today().isoformat()
-    try:
-        with open(_state_path(ws), encoding="utf-8") as f:
-            st = json.load(f)
-    except (OSError, ValueError):
-        st = {}
+    loaded = _read_state_file(_state_path(ws))
+    if loaded is None:
+        raise PbzError("REFUSED", _STATE_MALFORMED)
+    st = loaded
     ledger = st.get("ledger") or {"constants": {}, "authored": []}
     for th, hs in (st.get("constants") or {}).items():  # migrate the old daily constants
         if st.get("day") == today:
@@ -314,9 +344,27 @@ def _reached_literals(model, res, expr: str, home: str) -> set[str]:
 
 
 def _save_state(ws, st: dict) -> None:
+    """Write state.json via a temp file in the same directory, then os.replace.
+
+    The destination is not opened for write, so a crash mid-write cannot truncate the ledger.
+    """
     os.makedirs(ws.private, exist_ok=True)
-    with open(_state_path(ws), "w", encoding="utf-8") as f:
-        json.dump(st, f)
+    path = _state_path(ws)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".pbz-state-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(st, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        tmp = ""
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _h(s: str) -> str:

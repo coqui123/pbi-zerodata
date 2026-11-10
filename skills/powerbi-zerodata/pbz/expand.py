@@ -20,6 +20,33 @@ def _measure(model, target: str):
     return found
 
 
+def _resolve_function(model, name: str):
+    """Function node by DAX's case-insensitive name, or None."""
+    if not name:
+        return None
+    found = model.functions.get(name)
+    if found is not None:
+        return found
+    low = name.lower()
+    for key, node in model.functions.items():
+        if key.lower() == low or getattr(node, "name", "").lower() == low:
+            return node
+    return None
+
+
+def _function_body(model, node) -> str:
+    doc = model.docs.get(node.file)
+    if doc is None:
+        low = (node.file or "").lower()
+        doc = next((item for path, item in model.docs.items() if path.lower() == low), None)
+    if doc is None:
+        return ""
+    reg = next((r for r in doc.regions if r.node is node and r.kind == "dax"), None)
+    if reg is None:
+        return ""
+    return doc.text[reg.start:reg.end]
+
+
 def run(ws, project, target: str) -> dict:
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
@@ -27,8 +54,31 @@ def run(ws, project, target: str) -> dict:
     model = tmdl.load_model(mdef)
     root = _measure(model, target)
     res = deps.Resolver(model)
-    order, seen, functions = [], set(), []
-    fn_seen = set()
+    order, seen = [], set()
+    functions: list[str] = []
+    bodies: dict[str, str] = {}
+    fn_seen: set[str] = set()
+
+    def walk_function(name: str):
+        key = name.lower()
+        if key in fn_seen:
+            return
+        fn_seen.add(key)
+        node = _resolve_function(model, name)
+        if node is None:
+            return
+        raw = _function_body(model, node)
+        body = " ".join(raw.split())
+        if not body:
+            return
+        info = deps.dax(raw, "", res, function=True)
+        for ref in info.refs:
+            if ref.kind == "measure":
+                walk(ref.name)
+            elif ref.kind == "function":
+                walk_function(ref.name)
+        functions.append(node.name)
+        bodies[node.name] = body
 
     def walk(name: str):
         key = name.lower()
@@ -42,9 +92,8 @@ def run(ws, project, target: str) -> dict:
         for ref in info.refs:
             if ref.kind == "measure":
                 walk(ref.name)
-            elif ref.kind == "function" and ref.name.lower() not in fn_seen:
-                fn_seen.add(ref.name.lower())
-                functions.append(ref.name)
+            elif ref.kind == "function":
+                walk_function(ref.name)
         order.append(found)
 
     walk(root.name)
@@ -53,15 +102,7 @@ def run(ws, project, target: str) -> dict:
         expr = " ".join(measure.expression.split())
         lines.append(f"MEASURE '{measure.table}'[{measure.name}] = {expr}")
     for name in functions:
-        node = model.functions.get(name)
-        body = ""
-        if node is not None:
-            doc = model.docs.get(node.file)
-            if doc is not None:
-                reg = next((r for r in doc.regions if r.node is node and r.kind == "dax"), None)
-                if reg is not None:
-                    body = " ".join(doc.text[reg.start:reg.end].split())
-        lines.append(f"FUNCTION {name} = {body}".rstrip())
+        lines.append(f"FUNCTION {name} = {bodies[name]}")
     return {"verb": "expand", "project": project.name, "measure": root.name,
             "measures": [m.name for m in order], "functions": functions,
             "dax": "\n".join(lines)}

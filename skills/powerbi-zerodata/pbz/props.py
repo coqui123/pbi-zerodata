@@ -359,7 +359,10 @@ def run(ws, project, target: str | None = None, sets: list[str] | None = None, u
 
 def get(ws, project, target: str | None = None, kind: str | None = None, table: str | None = None,
         match: str | None = None, folder: str | None = None) -> dict:
-    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+    mdef = os.path.join(project.mirror_model, "definition")
+    if not os.path.isdir(mdef):
+        raise PbzError("NO_MIRROR", "run `pbz pull` first")
+    model = tmdl.load_model(mdef)
     rows = []
     for k, label, node in _objects(model, target, kind, table, match, folder)[:500]:
         doc = model.docs[node.file]

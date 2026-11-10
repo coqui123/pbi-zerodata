@@ -68,7 +68,8 @@ jobs:
                     "mirror_alias_disclosure", "recipe_paths",
                     "mirror_reader_links", "interactions_static", "interactions_boundary",
                     "guard_protected_mutations", "guard_tree_operations", "guard_false_positives",
-                    "evidence_rotation", "contract_verbs", "plan_pure", "plan_cli"
+                    "evidence_rotation", "contract_verbs", "plan_pure", "plan_cli",
+                    "followup_graph", "followup_state", "followup_engine", "followup_author"
           $failed = @()
           foreach ($t in $suites) {
             Write-Host "::group::test_$t"

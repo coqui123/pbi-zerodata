@@ -15,9 +15,13 @@ def run(ws, project, once: bool = False, seconds: int = 5) -> dict:
     def _once():
         findings = validate.run_mirror(ws, project)
         rules = bpa.run(ws, project, "all")
+        count = (rules.get("model") or {}).get("findings", 0)
+        report = rules.get("report")
+        if isinstance(report, dict):
+            count += report.get("findings", 0)
         return {"validate": len(findings),
                 "validate_errors": sum(1 for f in findings if f.get("severity") == "error"),
-                "bpa": (rules.get("model") or {}).get("findings", 0)}
+                "bpa": count}
 
     passes.append(_once())
     if not once:
