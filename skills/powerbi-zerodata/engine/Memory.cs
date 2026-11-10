@@ -370,7 +370,7 @@ public static class Memory
 
     static ColumnMeta? DataColumn(Ids ids, string dimension, string tableId, string columnId)
     {
-        if (tableId.Contains('$') || columnId.Contains('$')) return null;
+        if (StructureId.IsMatch(tableId) || StructureId.IsMatch(columnId)) return null;
         TableMeta? table = null;
         ulong objId = 0;
         string objName = columnId;

@@ -85,7 +85,7 @@ def _ref_line(mdef: str, kind: str, name: str, add: bool):
     pat = re.compile(rf"(?m)^ref {kind} ('(?:[^']|'')*'|\S+)[ \t]*(?:\r?\n|$)")
     hits = [m for m in pat.finditer(text) if tmdl.unquote(m.group(1)).lower() == name.lower()]
     if add and not hits:
-        refs = list(re.finditer(r"(?m)^ref \w+ .*$", text))
+        refs = list(re.finditer(r"(?m)^ref \w+ [^\r\n]*", text))
         line = f"ref {kind} {_q(name)}"
         new = text[:refs[-1].end()] + eol + line + text[refs[-1].end():] if refs else text.rstrip("\r\n") + eol + eol + line + eol
         return ("write", path, new, bom)
@@ -508,7 +508,7 @@ def _add_ref_text(text: str, kind: str, name: str) -> str:
     pat = re.compile(rf"(?m)^ref {kind} ('(?:[^']|'')*'|\S+)[ \t]*(?:\r?\n|$)")
     if any(tmdl.unquote(m.group(1)).lower() == name.lower() for m in pat.finditer(text)):
         return text
-    refs = list(re.finditer(r"(?m)^ref \w+ .*$", text))
+    refs = list(re.finditer(r"(?m)^ref \w+ [^\r\n]*", text))
     line = f"ref {kind} {_q(name)}"
     if refs:
         return text[:refs[-1].end()] + eol + line + text[refs[-1].end():]

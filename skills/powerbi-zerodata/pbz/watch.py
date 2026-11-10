@@ -1,6 +1,7 @@
 """Re-run mirror validation and best-practice analysis when asked.
 
-`--once` runs a single pass so tests and CI do not loop. A human can omit it and poll.
+`--once` runs a single pass so tests, CI, and MCP do not loop. A human CLI session
+that omits it polls until interrupted.
 """
 from __future__ import annotations
 
@@ -23,9 +24,12 @@ def run(ws, project, once: bool = False, seconds: int = 5) -> dict:
                 "validate_errors": sum(1 for f in findings if f.get("severity") == "error"),
                 "bpa": count}
 
-    passes.append(_once())
-    if not once:
-        # One extra quiet pass is enough to show the poll; callers that want a loop use a terminal.
-        time.sleep(min(max(int(seconds), 1), 30))
+    while True:
         passes.append(_once())
+        if once:
+            break
+        try:
+            time.sleep(min(max(int(seconds), 1), 30))
+        except KeyboardInterrupt:
+            break
     return {"verb": "watch", "once": once, "passes": passes}

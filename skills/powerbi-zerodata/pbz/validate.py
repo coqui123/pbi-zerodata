@@ -197,6 +197,11 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
                 if TOKEN_RE.search(body) or ESC_TOKEN_RE.search(body):
                     findings.append({"severity": "error", "code": "UNRESOLVED_TOKEN",
                                      "where": os.path.relpath(p, stage).replace("\\", "/"), "message": "token left"})
+    for finding in findings:
+        if isinstance(finding.get("where"), str):
+            finding["where"] = scrub(finding["where"])
+        if isinstance(finding.get("message"), str):
+            finding["message"] = scrub(finding["message"])
     return findings
 
 

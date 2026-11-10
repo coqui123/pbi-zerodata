@@ -279,7 +279,7 @@ def run(ws, project, threshold: float = 0.80, max_pairs: int = 100) -> dict:
         name = difflib.SequenceMatcher(None, a.name.casefold(), b.name.casefold(), autojunk=False).ratio()
         score = 0.70 * expr + 0.12 * name + 0.06 * (a.format_string == b.format_string) + \
             0.06 * (a.folder == b.folder) + 0.06 * (a.table == b.table)
-        if score >= 0.90 and expr >= 0.92:
+        if score >= max(threshold, 0.90) and expr >= 0.92:
             cls = "near_duplicate"
         elif score >= threshold and expr >= 0.80:
             cls = "similar"

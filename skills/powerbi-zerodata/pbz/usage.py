@@ -28,8 +28,11 @@ UNSEEN = ["service reports", "Excel / Analyze in Excel", "paginated reports", "c
           "dataflows and notebooks"]
 
 
-def key(kind: str, table: str, name: str) -> tuple:
-    return (kind, (table or "").lower(), (name or "").lower())
+def key(kind: str, table: str, name: str, report: str = "") -> tuple:
+    base = (kind, (table or "").lower(), (name or "").lower())
+    if kind == "report_measure":
+        return base + ((report or "").lower(),)
+    return base
 
 
 @dataclass
@@ -47,7 +50,8 @@ class Obj:
 
     @property
     def key(self) -> tuple:
-        return key(self.kind, self.table, self.name)
+        report = self.extra.get("report", "") if self.kind == "report_measure" else ""
+        return key(self.kind, self.table, self.name, report)
 
     def label(self) -> str:
         if self.kind == "table":

@@ -24,7 +24,7 @@ METHODS = {
 }
 _SET_PROPS = {name.lower(): name for name in props.PROPS}
 _TOKEN = re.compile(
-    r"\s+|\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|<=|>=|<>|!=|[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|[().=,<>]")
+    r"\s+|\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|<=|>=|<>|!=|==|&&|\|\||[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|[().=,<>!]")
 _HEAVY = re.compile(r"(\.\*){2,}|\(\.[*+]\)[*+]|(\([^)]*[+*][^)]*\))[*+]")
 
 
@@ -81,20 +81,23 @@ class _P:
 
     def _or(self):
         left = self._and()
-        while self.peek() == ("id", "or") or (self.peek() and self.peek()[0] == "id" and self.peek()[1].lower() == "or"):
+        while self.peek() in (("id", "or"), ("op", "||")) or (
+                self.peek() and self.peek()[0] == "id" and self.peek()[1].lower() == "or"):
             self.take()
             left = ("or", left, self._and())
         return left
 
     def _and(self):
         left = self._not()
-        while self.peek() and self.peek()[0] == "id" and self.peek()[1].lower() == "and":
+        while self.peek() == ("op", "&&") or (
+                self.peek() and self.peek()[0] == "id" and self.peek()[1].lower() == "and"):
             self.take()
             left = ("and", left, self._not())
         return left
 
     def _not(self):
-        if self.peek() and self.peek()[0] == "id" and self.peek()[1].lower() == "not":
+        if self.peek() == ("op", "!") or (
+                self.peek() and self.peek()[0] == "id" and self.peek()[1].lower() == "not"):
             self.take()
             return ("not", self._not())
         return self._cmp()
@@ -102,7 +105,7 @@ class _P:
     def _cmp(self):
         left = self._sum()
         tok = self.peek()
-        if tok and tok[0] == "op" and tok[1] in ("=", "<>", "!=", "<", ">", "<=", ">="):
+        if tok and tok[0] == "op" and tok[1] in ("=", "==", "<>", "!=", "<", ">", "<=", ">="):
             self.take()
             return ("cmp", tok[1], left, self._sum())
         return left

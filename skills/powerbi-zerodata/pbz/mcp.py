@@ -215,7 +215,7 @@ TOOLS = [
     Tool("validate", "Metadata checks on the mirror: lint, field references, PBIR integrity. "
                      "--fail-on new needs --since. Annotations omit expressions. save-baseline writes fingerprints.",
          ["validate"], opts=dict(CI_OPTS), read_only=False),
-    Tool("watch", "Validation and best-practice counts. The default polls; --once is a single pass.", ["watch"],
+    Tool("watch", "Validation and best-practice counts. MCP always runs one pass.", ["watch"],
          opts={"once": ("--once", D(B, "a single pass"), "flag")}),
     Tool("describe", "Data dictionary: model overview, a table, a [Measure] or a 'Table'[Column] (types, classes, "
                      "buckets, category labels, DAX, dependencies, visuals using it).", ["describe"],
@@ -624,6 +624,8 @@ def build_argv(tool: Tool, args: dict, workspace: str | None, project: str | Non
         elif mode == "multi":
             if v:
                 argv += [flag] + [_no_dash(x, arg) for x in v]
+    if tool.name == "watch" and "--once" not in argv:
+        argv.append("--once")
     return argv, os.path.abspath(ws)
 
 

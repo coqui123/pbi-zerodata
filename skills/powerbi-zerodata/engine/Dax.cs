@@ -34,6 +34,7 @@ public static class Dax
     /// </summary>
     public static void Guard(string expr, string field)
     {
+        RequireClosed(expr, field);
         foreach (var word in BareWords(expr))
         {
             if (word.Equals("EVALUATE", StringComparison.OrdinalIgnoreCase) || word.Equals("DEFINE", StringComparison.OrdinalIgnoreCase))
@@ -49,6 +50,7 @@ public static class Dax
     /// </summary>
     public static void GuardQuery(string query, string field)
     {
+        RequireClosed(query, field);
         string? first = BareWords(query).FirstOrDefault();
         if (first == null || !(first.Equals("EVALUATE", StringComparison.OrdinalIgnoreCase) || first.Equals("DEFINE", StringComparison.OrdinalIgnoreCase)))
             throw new BadRequestException(field + " must be a DAX query (DEFINE or EVALUATE first)");
@@ -72,9 +74,9 @@ public static class Dax
         while (i < s.Length)
         {
             char c = s[i];
-            if (c == '"') { i = SkipDelimited(s, i, '"', '"'); continue; }
-            if (c == '\'') { i = SkipDelimited(s, i, '\'', '\''); continue; }
-            if (c == '[') { i = SkipDelimited(s, i, '[', ']'); continue; }
+            if (c == '"') { i = EndOrClose(SkipDelimited(s, i, '"', '"'), s.Length); continue; }
+            if (c == '\'') { i = EndOrClose(SkipDelimited(s, i, '\'', '\''), s.Length); continue; }
+            if (c == '[') { i = EndOrClose(SkipDelimited(s, i, '[', ']'), s.Length); continue; }
             if (c == '/' && i + 1 < s.Length && s[i + 1] == '/') { i = SkipLine(s, i); continue; }
             if (c == '-' && i + 1 < s.Length && s[i + 1] == '-') { i = SkipLine(s, i); continue; }
             if (c == '/' && i + 1 < s.Length && s[i + 1] == '*')
@@ -107,13 +109,54 @@ public static class Dax
             }
             j++;
         }
-        return s.Length;
+        return -1;
+    }
+
+    static int EndOrClose(int end, int length) => end < 0 ? length : end;
+
+    public static void RequireClosed(string s, string field)
+    {
+        int i = 0;
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c == '"' || c == '\'')
+            {
+                int j = SkipDelimited(s, i, c, c);
+                if (j < 0) throw new BadRequestException(field + " contains an unclosed delimiter");
+                i = j;
+                continue;
+            }
+            if (c == '[')
+            {
+                int j = SkipDelimited(s, i, '[', ']');
+                if (j < 0) throw new BadRequestException(field + " contains an unclosed delimiter");
+                i = j;
+                continue;
+            }
+            if (c == '/' && i + 1 < s.Length && s[i + 1] == '*')
+            {
+                int end = s.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                if (end < 0) throw new BadRequestException(field + " contains an unclosed delimiter");
+                i = end + 2;
+                continue;
+            }
+            if ((c == '/' || c == '-') && i + 1 < s.Length && s[i + 1] == c)
+            {
+                i = SkipLine(s, i);
+                continue;
+            }
+            i++;
+        }
     }
 
     static int SkipLine(string s, int start)
     {
-        int nl = s.IndexOf('\n', start);
-        return nl < 0 ? s.Length : nl + 1;
+        int i = start;
+        while (i < s.Length && s[i] != '\n' && s[i] != '\r') i++;
+        if (i < s.Length && s[i] == '\r') i++;
+        if (i < s.Length && s[i] == '\n') i++;
+        return i;
     }
 
     /// <summary>Wraps a scalar expression with CALCULATE over the 'where' predicates.</summary>

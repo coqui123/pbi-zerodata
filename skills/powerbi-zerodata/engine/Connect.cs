@@ -172,9 +172,10 @@ public sealed class Conn : IDisposable
             conn.Meta = conn.LoadMeta();
             return conn;
         }
-        catch (Exception ex) when (ex is not EngineException and not BadRequestException and not TimeoutException)
+        catch (Exception ex)
         {
             conn.Dispose();
+            if (ex is EngineException or BadRequestException or TimeoutException) throw;
             throw new EngineException(Errors.Classify(ex) == ErrorClass.TIMEOUT ? ErrorClass.TIMEOUT : ErrorClass.ENGINE_UNAVAILABLE,
                 "connect failed", ex);
         }
@@ -206,7 +207,15 @@ public sealed class Conn : IDisposable
         _c = null;
         if (old != null) Bounded.Run(() => old.Dispose());
         var c = new AdomdConnection(ConnectionString());
-        _ctx.Guard(() => { c.Open(); return 0; }, Math.Min(_ctx.TimeoutSec, 60));
+        try
+        {
+            _ctx.Guard(() => { c.Open(); return 0; }, Math.Min(_ctx.TimeoutSec, 60));
+        }
+        catch
+        {
+            Bounded.Run(() => { try { c.Close(); } finally { c.Dispose(); } });
+            throw;
+        }
         _c = c;
         var cats = Dmv("DBSCHEMA_CATALOGS", new[] { "CATALOG_NAME", "COMPATIBILITY_LEVEL" });
         if (cats.Count != 1)

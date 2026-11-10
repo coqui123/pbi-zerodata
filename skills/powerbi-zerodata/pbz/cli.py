@@ -161,6 +161,13 @@ def cmd_status(ws, project, a):
     return out
 
 
+def _vendor_host(host: str) -> bool:
+    """True for microsoft.com, w3.org, schema.org, and their subdomains. Not a suffix of another name."""
+    name = host.lower().rstrip(".")
+    return any(name == suffix or name.endswith("." + suffix)
+               for suffix in ("microsoft.com", "w3.org", "schema.org"))
+
+
 def cmd_init(ws, project, a):
     pbz_state_path(ws)
     os.makedirs(ws.pbz_dir, exist_ok=True)
@@ -175,7 +182,7 @@ def cmd_init(ws, project, a):
             hosts |= set(re.findall(r"(?i)https?://([a-z0-9.-]+)", expr))
     for doc in model.docs.values():
         hosts |= set(re.findall(r"(?i)https?://([a-z0-9.-]+)", doc.text))
-    hosts = sorted(h.lower() for h in hosts if not h.lower().endswith(("microsoft.com", "w3.org", "schema.org")))
+    hosts = sorted(h.lower() for h in hosts if not _vendor_host(h))
     added = policy.tighten(ws, sensitive_hosts=hosts)
     res = {"verb": "init", "policy": os.path.relpath(ws.policy_path, ws.root), "scan": sc["added"],
            "sensitive_hosts": added["sensitive_hosts"]}

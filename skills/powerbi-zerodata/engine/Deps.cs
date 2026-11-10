@@ -17,7 +17,7 @@ public static class Deps
         "SELECT [OBJECT_TYPE], [TABLE], [OBJECT], [REFERENCED_OBJECT_TYPE], [REFERENCED_TABLE], [REFERENCED_OBJECT] " +
         "FROM $SYSTEM.DISCOVER_CALC_DEPENDENCY";
 
-    static readonly Regex TypeRe = new("^[A-Z_]{1,40}$", RegexOptions.CultureInvariant);
+    static readonly Regex TypeRe = new(@"\A[A-Z_]{1,40}\z", RegexOptions.CultureInvariant);
 
     public static JsonObject Run(Req req, Ctx ctx)
     {

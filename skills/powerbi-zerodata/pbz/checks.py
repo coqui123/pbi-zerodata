@@ -555,13 +555,14 @@ def run_checks(ws, project, spec: dict) -> dict:
             col = col[:-1]
             if clf.column_class(t, col) in ("category", "date") or lab in pol.get("reveal_columns", []):
                 reveal.append(b)
+    allowed_ids = {str(c.get("id")) for c in to_engine if c.get("id")}
+    allowed_ids |= {item["id"] for item in compiles_items if item.get("id")}
     if to_engine:
         res = engine_call("check", {"private_dir": ws.private, "port": port, "disclosure": pol.get("disclosure", "shape"),
                                     "reveal": sorted(set(reveal)), "checks": to_engine}, timeout=600)
         if not res.get("ok"):
             raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
         key = dpapi.load_key(ws.private)
-        allowed_ids = {str(c.get("id")) for c in to_engine if c.get("id")}
         for r in res.get("checks", res.get("results", [])):
             r = dict(r)
             if r.get("id") in negate and r.get("status") in ("PASS", "FAIL"):
@@ -598,13 +599,10 @@ def run_checks(ws, project, spec: dict) -> dict:
         res = engine_call("compiles", {"private_dir": ws.private, "port": port, "items": compiles_items}, timeout=300)
         if not res.get("ok"):
             raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
-        from .validate import retokenizer
-        scrub = retokenizer(tm)
         for it in res.get("items", []):
-            it = dict(it)
-            if "message" in it:
-                it["message"] = scrub(it["message"])
-            results.append(it)
+            row = _closed_engine_row(dict(it), allowed_ids)
+            if row is not None:
+                results.append(row)
     tm.save()
     results.extend(row for _index, row in perf_done)
     order = {str(c.get("id") or f"c{i + 1}"): i for i, c in enumerate(spec.get("checks", []))}

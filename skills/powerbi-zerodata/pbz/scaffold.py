@@ -68,7 +68,7 @@ def _plan_table(mdef: str, model, name: str, text: str, model_flags: list[str] =
     mt = model.docs.get("model.tmdl")
     if mt is None:
         raise PbzError("NO_MIRROR", "model.tmdl is missing; run `pbz pull` first")
-    refs = list(re.finditer(r"(?m)^ref table .*$", mt.text))
+    refs = list(re.finditer(r"(?m)^ref table [^\r\n]*", mt.text))
     line = f"ref table {_q(name)}"
     if refs:
         at = refs[-1].end()

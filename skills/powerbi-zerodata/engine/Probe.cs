@@ -20,6 +20,8 @@ public static class Probe
             foreach (var n in colNames)
             {
                 var parsed = Dax.ParseColRef(n);
+                if (parsed != null && !string.Equals(parsed.Value.Table, t.Name, StringComparison.OrdinalIgnoreCase))
+                    throw new EngineException(ErrorClass.UNKNOWN_OBJECT, "probe column not found");
                 string colName = parsed?.Column ?? n;
                 var c = conn.Meta.FindColumn(t.Name, colName) ?? throw new EngineException(ErrorClass.UNKNOWN_OBJECT, "probe column not found");
                 if (!cols.Contains(c)) cols.Add(c);

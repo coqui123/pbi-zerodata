@@ -40,7 +40,7 @@ public sealed class Req
 /// <summary>Helpers for reading request sub-objects.</summary>
 public static class J
 {
-    static readonly Regex IdRx = new(@"^[A-Za-z0-9_.:/\- ]{1,128}$", RegexOptions.Compiled);
+    static readonly Regex IdRx = new(@"\A[A-Za-z0-9_.:/\- ]{1,128}\z", RegexOptions.Compiled);
 
     public static string? Str(JsonObject o, string name)
     {

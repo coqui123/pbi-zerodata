@@ -485,7 +485,7 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
                              read_text(os.path.join(ws.mirror, *rel.split("/")))[0])
         return docs[rel]
 
-    tables = {g.objects[k].name for k in todo if k[0] == "table"}
+    tables = {g.objects[k].name.lower() for k in todo if k[0] == "table"}
     removed_names = {(g.objects[k].kind, g.objects[k].table.lower(), g.objects[k].name.lower()) for k in todo}
     m_cols: dict[str, list[str]] = {}
     for k in todo:
@@ -502,10 +502,10 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
                         doc(lt.file).delete = True
                         _drop_ref_line(doc, model, lt.name)
                         for r in model.relationships:
-                            if lt.name in (r.from_table, r.to_table) and r.node is not None:
+                            if lt.name.lower() in (r.from_table.lower(), r.to_table.lower()) and r.node is not None:
                                 doc(r.node.file).cut(*tmdl.block_span(model.docs[r.node.file], r.node))
             continue
-        if o.table in tables:
+        if o.table.lower() in tables:
             continue  # its table goes as a whole
         node = _node_of(model, o)
         if node is None:
@@ -524,7 +524,7 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
                 doc(lt.file).delete = True
                 _drop_ref_line(doc, model, lt.name)
                 for r in model.relationships:
-                    if lt.name in (r.from_table, r.to_table) and r.node is not None:
+                    if lt.name.lower() in (r.from_table.lower(), r.to_table.lower()) and r.node is not None:
                         doc(r.node.file).cut(*tmdl.block_span(model.docs[r.node.file], r.node))
     for tname, cols in m_cols.items():
         if m_step == "none":
@@ -545,7 +545,7 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
             continue
         doc(p.file).cut(reg.start, reg.end, edit)
     # Power Query editor order lists query names: drop removed tables and queries
-    gone_queries = {g.objects[k].name for k in todo if k[0] in ("table", "m_query")}
+    gone_queries = {g.objects[k].name.lower() for k in todo if k[0] in ("table", "m_query")}
     for rel, d0 in model.docs.items():
         for node in d0.nodes:
             if node.kind == "annotation" and node.name == "PBI_QueryOrder" and node.parent is None and gone_queries:
@@ -554,14 +554,15 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
                     names = json.loads(d0.text[reg.start:reg.end]) if reg else None
                 except ValueError:
                     names = None
-                if isinstance(names, list) and any(n in gone_queries for n in names):
-                    doc(rel).cut(reg.start, reg.end, json.dumps([n for n in names if n not in gone_queries],
-                                                                separators=(",", ":"), ensure_ascii=False))
+                if isinstance(names, list) and any(str(n).lower() in gone_queries for n in names):
+                    doc(rel).cut(reg.start, reg.end, json.dumps(
+                        [n for n in names if str(n).lower() not in gone_queries],
+                        separators=(",", ":"), ensure_ascii=False))
     # perspectives: drop entries of removed objects
     for pname, pnode in model.perspectives.items():
         pdoc = model.docs[pnode.file]
         for pt in (c for c in pnode.children if c.kind == "perspectiveTable"):
-            if pt.name in tables:
+            if pt.name.lower() in tables:
                 doc(pnode.file).cut(*tmdl.block_span(pdoc, pt))
                 continue
             for ch in pt.children:

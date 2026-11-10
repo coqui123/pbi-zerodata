@@ -465,13 +465,14 @@ def import_pbiviz(ws, project, path: str, as_: str = "contract", replace: bool =
     contract = dict(info, source="pbiviz", register_as=as_ if as_ != "contract" else (old or {}).get("register_as"))
     if contract["register_as"] is None:
         contract.pop("register_as")
-    out = {"verb": "visual", "action": "import", "guid": guid, "name": info.get("display_name") or info.get("name"),
-           "version": info.get("version"), "roles": [f"{r['name']}:{r['kind']}" for r in info["roles"]],
-           "conditions": conditions_text(info), "contract": _save_contract(ws, contract)}
     if as_ == "private":
         real_pkg = os.path.join(project.report_dir, "CustomVisuals", guid)
         if os.path.isdir(real_pkg) and not replace:
             raise PbzError("CONFLICT", f"the report already holds a private package for {guid}; pass --replace")
+    out = {"verb": "visual", "action": "import", "guid": guid, "name": info.get("display_name") or info.get("name"),
+           "version": info.get("version"), "roles": [f"{r['name']}:{r['kind']}" for r in info["roles"]],
+           "conditions": conditions_text(info), "contract": _save_contract(ws, contract)}
+    if as_ == "private":
         pend = _pending_dir(ws, guid)
         shutil.rmtree(pend, ignore_errors=True)
         for name, data in files.items():

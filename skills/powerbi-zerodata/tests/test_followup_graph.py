@@ -15,7 +15,7 @@ SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 
 from pbz.common import Workspace  # noqa: E402
-from pbz import evidence, mirror_txn, perf, policy, tmdl, validate, watch  # noqa: E402
+from pbz import cli, evidence, governance, images, mcp, mirror_txn, perf, policy, ruleset, tmdl, usage, validate, watch  # noqa: E402
 
 SENTINEL = "424242"
 
@@ -256,15 +256,23 @@ class WatchCountTests(unittest.TestCase):
         self.assertEqual(bpa_run.call_args.args[2], "all")
         sleep.assert_not_called()
 
+        calls = {"n": 0}
+
+        def stop_after_two(*_args):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise KeyboardInterrupt
+
         with patch("pbz.watch.validate.run_mirror", return_value=findings), \
                 patch("pbz.watch.bpa.run", return_value={"model": {"findings": 4}}) as bpa_run, \
-                patch("pbz.watch.time.sleep") as sleep:
+                patch("pbz.watch.time.sleep", side_effect=stop_after_two) as sleep:
             polled = watch.run(object(), object(), once=False, seconds=9)
         self.assertEqual(len(polled["passes"]), 2)
         self.assertFalse(polled["once"])
         self.assertEqual(polled["passes"][0]["bpa"], 4)
         self.assertEqual(polled["passes"][1]["bpa"], 4)
-        sleep.assert_called_once_with(9)
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_called_with(9)
         self.assertEqual(bpa_run.call_count, 2)
 
         with patch("pbz.watch.validate.run_mirror", return_value=[]), \
@@ -272,6 +280,44 @@ class WatchCountTests(unittest.TestCase):
                 patch("pbz.watch.time.sleep"):
             report_only = watch.run(object(), object(), once=True)
         self.assertEqual(report_only["passes"][0]["bpa"], 3)
+
+
+class PlanFixTests(unittest.TestCase):
+    def test_vendor_host_is_a_domain_not_a_suffix(self):
+        self.assertTrue(cli._vendor_host("learn.microsoft.com"))
+        self.assertTrue(cli._vendor_host("microsoft.com"))
+        self.assertTrue(cli._vendor_host("www.w3.org"))
+        self.assertFalse(cli._vendor_host("notmicrosoft.com"))
+        self.assertFalse(cli._vendor_host("evilschema.org.example"))
+
+    def test_crlf_ref_insert_does_not_split_the_line_ending(self):
+        text = "ref table Sales\r\n"
+        out = governance._add_ref_text(text, "table", "Date")
+        self.assertNotIn("\r\r\n", out)
+        self.assertIn("ref table Date\r\n", out)
+        self.assertTrue(out.startswith("ref table Sales\r\n"))
+
+    def test_ruleset_keeps_equality_and_boolean_operators(self):
+        kinds = ruleset._lex("Name == 1 && Other != 2 || !Flag")
+        ops = [tok for tok in kinds if tok[0] == "op"]
+        self.assertEqual([op for _kind, op in ops], ["==", "&&", "!=", "||", "!"])
+
+    def test_watch_on_mcp_is_a_single_pass(self):
+        tool = mcp.BY_NAME["watch"]
+        argv, _cwd = mcp.build_argv(tool, {}, os.getcwd(), None)
+        self.assertIn("--once", argv)
+
+    def test_report_measures_from_different_reports_do_not_share_a_key(self):
+        one = usage.Obj("report_measure", "Sales", "Total", extra={"report": "East"})
+        other = usage.Obj("report_measure", "Sales", "Total", extra={"report": "West"})
+        same = usage.Obj("measure", "Sales", "Total")
+        self.assertNotEqual(one.key, other.key)
+        self.assertEqual(same.key, ("measure", "sales", "total"))
+        self.assertEqual(len(one.key), 4)
+
+    def test_image_remove_rejects_a_path_item(self):
+        self.assertFalse(images.valid_item(r"..\secret.png"))
+        self.assertFalse(images.valid_item("folder/picture.png"))
 
 
 if __name__ == "__main__":

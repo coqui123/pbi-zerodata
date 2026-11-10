@@ -514,6 +514,8 @@ def list_(ws, project) -> dict:
 def remove(ws, project, item: str) -> dict:
     rjson, rel, text, bom, doc = _parse_report(project)
     item = resolve(ws, project, item)
+    if not valid_item(item):
+        raise PbzError("BAD_REQUEST", "image name is not a single file name")
     where = uses(project.mirror_report, strict=True, mirror=ws.mirror).get(item)
     if where:
         raise PbzError("IN_USE", f"{item} is used by: {'; '.join(where[:8])}"
