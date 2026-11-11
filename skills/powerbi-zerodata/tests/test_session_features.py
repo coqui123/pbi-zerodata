@@ -107,12 +107,22 @@ class Fixture(unittest.TestCase):
 
     def test_human_acceptance_stales_on_layout_change(self):
         spec={'tasks':[{'id':'R1','source':{'file':'Tasks.xlsx','sheet':'Tasks','cells':['AB5']}}]}
-        with patch('pbz.dpapi.write_protected',self.protect):requirements.import_spec(self.ws,self.project,spec)
-        with patch('pbz.requirements._human_terminal',return_value=True):
-            requirements.accept(self.ws,self.project,'R1',human=True)
-        self.assertEqual(requirements.status(self.ws,self.project)['tasks'][0]['status'],'ACCEPTED')
-        self.put('A','page.json',{'name':'A','displayName':'Changed synthetic page'})
-        self.assertEqual(requirements.status(self.ws,self.project)['tasks'][0]['status'],'STALE')
+        store = {}
+
+        def protect(path, data):
+            self.protect(path, data)
+            store[os.path.abspath(path)] = data
+
+        def reveal(path):
+            return store.get(os.path.abspath(path))
+
+        with patch('pbz.dpapi.write_protected', protect), patch('pbz.dpapi.read_protected', reveal):
+            requirements.import_spec(self.ws, self.project, spec)
+            with patch('pbz.requirements._human_terminal', return_value=True):
+                requirements.accept(self.ws, self.project, 'R1', human=True)
+            self.assertEqual(requirements.status(self.ws, self.project)['tasks'][0]['status'], 'ACCEPTED')
+            self.put('A', 'page.json', {'name': 'A', 'displayName': 'Changed synthetic page'})
+            self.assertEqual(requirements.status(self.ws, self.project)['tasks'][0]['status'], 'STALE')
 
 
 class OutcomesAndFreshness(unittest.TestCase):

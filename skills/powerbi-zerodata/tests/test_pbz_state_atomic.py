@@ -477,7 +477,7 @@ class StateAtomicTests(unittest.TestCase):
             return real_open(path, *args, **kwargs)
 
         with patch("builtins.open", counting):
-            self.assertIsNone(audit._memory(self.ws, self.project))
+            self.assertIs(audit._memory(self.ws, self.project), audit._MEMORY_INCOMPLETE)
             with self.assertRaises(PbzError) as caught:
                 memory.load(self.ws, self.project)
         self.assertEqual(caught.exception.code, "UNSAFE_PATH")

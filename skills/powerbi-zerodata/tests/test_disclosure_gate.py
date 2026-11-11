@@ -12,6 +12,7 @@ SKILL = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL))
 
 from pbz import cli, dpapi, tokens  # noqa: E402
+from pbz.common import PbzError  # noqa: E402
 from pbz.classify import Classifier, looks_like_phone  # noqa: E402
 from pbz.outcomes import envelope  # noqa: E402
 
@@ -86,16 +87,10 @@ class InputGateTests(unittest.TestCase):
 
     def test_schema_members_are_independent(self):
         text = '{"$schema":918273,"$schema":true,"title":"CANARY-NAME"}'
-        out = tokens.tokenize_pbir(text, "definition/pages/p1/page.json", None, self.clf, self.tm)
-        self.assertNotIn("918273", out)
-        self.assertNotIn("true", out)
-        self.assertNotIn("CANARY-NAME", out)
-        self.assertIn("«payload:schema#", out)
-        parsed = json.loads(out)
-        self.assertIsInstance(parsed, dict)
-        back, unknown = tokens.detokenize_pbir(out, self.tm)
-        self.assertEqual(unknown, [])
-        self.assertEqual(back, text)
+        with self.assertRaises(PbzError) as caught:
+            tokens.tokenize_pbir(text, "definition/pages/p1/page.json", None, self.clf, self.tm)
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertNotIn("CANARY-NAME", str(caught.exception))
 
     def test_unknown_tmdl_short_and_word_values_are_tokenized(self):
         text = "\ttable Sales\n\t\tnote: Confidential\n\t\tcode: 123456\n\t\tcc: US\n"

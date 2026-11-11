@@ -18,7 +18,18 @@ class Tok:
     value: str = ""  # decoded value for str/table/bracket/qident
 
 
-_NUM = re.compile(r"(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+_NUM = re.compile(r"(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def _match_num(src: str, i: int):
+    """ASCII number at i, False when that start did not match, None when it is not a number.
+
+    Unicode digits are not numbers. Callers must not call end() on a failed match.
+    """
+    c = src[i]
+    if not (("0" <= c <= "9") or (c == "." and i + 1 < len(src) and "0" <= src[i + 1] <= "9")):
+        return None
+    return _NUM.match(src, i) or False
 _IDENT_DAX = re.compile(r"[A-Za-z_À-￿][A-Za-z0-9_.À-￿]*")
 _IDENT_M = re.compile(r"[A-Za-z_À-￿][A-Za-z0-9_.À-￿]*")
 _OPS = ["==", "<>", "<=", ">=", "&&", "||", "=>", "..", "...", "=", "<", ">", "+", "-", "*", "/", "&", "^",
@@ -107,10 +118,13 @@ def lex_dax(src: str, base: int = 0) -> list[Tok]:
             j, v = j_v
             toks.append(Tok("table" if c == "'" else "bracket", base + i, base + j, src[i:j], v))
             i = j
-        elif c.isdigit() or (c == "." and i + 1 < n and src[i + 1].isdigit()):
-            m = _NUM.match(src, i)
-            toks.append(Tok("num", base + i, base + m.end(), m.group(0)))
-            i = m.end()
+        elif (m := _match_num(src, i)) is not None:
+            if m is False:
+                toks.append(Tok("op", base + i, base + i + 1, c))
+                i += 1
+            else:
+                toks.append(Tok("num", base + i, base + m.end(), m.group(0)))
+                i = m.end()
         else:
             m = _IDENT_DAX.match(src, i)
             if m:
@@ -174,10 +188,13 @@ def lex_m(src: str, base: int = 0) -> list[Tok]:
         elif c == "]":
             toks.append(Tok("op", base + i, base + i + 1, "]"))
             i += 1
-        elif c.isdigit() or (c == "." and i + 1 < n and src[i + 1].isdigit()):
-            m = _NUM.match(src, i)
-            toks.append(Tok("num", base + i, base + m.end(), m.group(0)))
-            i = m.end()
+        elif (m := _match_num(src, i)) is not None:
+            if m is False:
+                toks.append(Tok("op", base + i, base + i + 1, c))
+                i += 1
+            else:
+                toks.append(Tok("num", base + i, base + m.end(), m.group(0)))
+                i = m.end()
         else:
             m = _IDENT_M.match(src, i)
             if m:

@@ -107,7 +107,7 @@ def describe(ws, project, target: str | None) -> dict:
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     model = tmdl.load_model(mdef)
-    clf = Classifier(tmdl.load_model(os.path.join(project.model_dir, "definition")), ws.private, policy_mod.load(ws))
+    clf = Classifier(tmdl.load_model(os.path.join(project.mirror_model, "definition")), ws.private, policy_mod.load(ws))
     summ = _index_summary(ws)
     usage = field_usage(project, model)
     kind, table, name = _parse_target(target)
@@ -175,7 +175,7 @@ def values(ws, project, column: str) -> dict:
     kind, table, name = _parse_target(column)
     if kind != "column":
         raise PbzError("BAD_REQUEST", "use 'Table'[Column]")
-    real = tmdl.load_model(os.path.join(project.model_dir, "definition"))
+    real = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
     clf = Classifier(real, ws.private, policy_mod.load(ws))
     lab = f"{table}[{name}]"
     cls = clf.column_class(table, name)

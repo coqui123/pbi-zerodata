@@ -138,9 +138,15 @@ def display_name(item: str) -> str:
 def _file_of(ws, project, item: str) -> str | None:
     if not valid_item(item):
         return None
-    for p in (os.path.join(_pending_dir(ws, project), item), os.path.join(_rr_dir(project.report_dir), item)):
-        if os.path.isfile(p):
-            return p
+    candidates = (
+        (_pending_dir(ws, project), os.path.join(_pending_dir(ws, project), item)),
+        (_rr_dir(project.report_dir), os.path.join(_rr_dir(project.report_dir), item)),
+    )
+    for root, path in candidates:
+        if _reparse_link(root) or _reparse_link(path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        if os.path.isfile(path):
+            return path
     return None
 
 
@@ -494,17 +500,7 @@ def list_(ws, project) -> dict:
             row.update(_facts(p))
         row["used_by"] = used.get(item, [])
         rows.append(row)
-    real_rj = _report_json(project.report_dir)
-    real_reg = registered(read_definition_text(real_rj)[0]) if os.path.exists(real_rj) else {}
-    rr = _rr_dir(project.report_dir)
-    files = sorted(f for f in (os.listdir(rr) if os.path.isdir(rr) else []) if os.path.splitext(f)[1].lower() in KINDS)
     out = {"verb": "image", "action": "list", "project": project.name, "images": rows}
-    drop = sorted(set(real_reg) - set(reg))
-    if drop:
-        out["removed_on_push"] = drop
-    orphans = [f for f in files if f not in reg and f not in real_reg]
-    if orphans:
-        out["unregistered_files"] = orphans
     unknown = sorted(i for i in used if i not in reg)
     if unknown:
         out["unregistered_references"] = {i: used[i] for i in unknown}

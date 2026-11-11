@@ -142,8 +142,10 @@ def main() -> int:
     d, _ = payload(22)
     check(d.get("verb") == "format" and d.get("mode") == "check", "format check")
     for mid, code in ((23, -32602), (24, -32602), (25, -32602), (26, -32602), (27, -32602), (28, -32602),
-                      (29, -32602), (30, -32601)):
+                      (30, -32601)):
         check(by_id.get(mid, {}).get("error", {}).get("code") == code, f"request {mid}: {by_id.get(mid)}")
+    d, err = payload(29)
+    check(d.get("verb") == "status" and err is False, f"tool workspace is ignored: {d} {err}")
     check(any(r.get("id") is None and r.get("error", {}).get("code") == -32600 for r in resp), "batch refused")
     check(any(r.get("id") is None and r.get("error", {}).get("code") == -32700 for r in resp), "parse error")
     check(by_id.get(99, {}).get("error", {}).get("code") == -32600, "request without method")

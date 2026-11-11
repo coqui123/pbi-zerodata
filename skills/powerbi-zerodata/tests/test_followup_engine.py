@@ -178,28 +178,16 @@ class CalendarTests(unittest.TestCase):
             ["Order"],
         )
 
-    def test_unparsed_block_restores_previous_bytes(self):
+    def test_newline_name_is_refused_before_write(self):
         raw = b"\xef\xbb\xbf" + DATE.replace("\n", "\r\n").encode("utf-8")
         ws, project = self._project({"Date.tmdl": raw})
         before = self._bytes(project, "Date.tmdl")
-        seen = []
-        real = calendars.commit_bytes
-
-        def spy(ops, **kwargs):
-            seen.append((ops, kwargs))
-            return real(ops, **kwargs)
-
-        with patch.object(calendars, "commit_bytes", side_effect=spy):
+        with patch.object(calendars, "commit_bytes", side_effect=AssertionError("wrote")):
             with self.assertRaises(PbzError) as caught:
                 calendars.add_calendar(ws, project, "Date", "Order\nLost", "Date")
         self.assertEqual(caught.exception.code, "BAD_REQUEST")
-        self.assertEqual(caught.exception.detail, "calendar block did not parse")
+        self.assertEqual(caught.exception.detail, "names and expressions are a single line")
         self.assertEqual(self._bytes(project, "Date.tmdl"), before)
-        self.assertGreaterEqual(len(seen), 2)
-        restore, kwargs = seen[-1]
-        self.assertEqual(restore[0][0], "write_bytes")
-        self.assertEqual(restore[0][2], before)
-        self.assertEqual(kwargs.get("root"), ws.root)
         self.assertNotIn(b"calendarColumnGroup", self._bytes(project, "Date.tmdl"))
 
     def test_readback_failure_restores_previous_bytes(self):

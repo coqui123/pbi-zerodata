@@ -241,8 +241,11 @@ class Graph:
 # ---------------------------------------------------------------- build
 
 
-def bound_reports(ws, project) -> list[tuple[str, str]]:
-    """[(report name, mirror report dir)] for every mirrored report bound to this project's model by path."""
+def bound_reports(ws, project, graph: Graph | None = None) -> list[tuple[str, str]]:
+    """[(report name, mirror report dir)] for every mirrored report bound to this project's model by path.
+
+    An unreadable or invalid definition.pbir marks the graph incomplete. The report is not treated as unused.
+    """
     out = []
     if not os.path.isdir(ws.mirror):
         return out
@@ -254,6 +257,12 @@ def bound_reports(ws, project) -> list[tuple[str, str]]:
         try:
             ref = json.loads(read_text(os.path.join(rdir, "definition.pbir"))[0])
         except (OSError, ValueError):
+            ref = None
+        if not isinstance(ref, dict):
+            if graph is not None:
+                graph.incomplete = True
+                graph.warnings.append({"code": "UNREADABLE_REPORT_FILE", "report": name[:-7],
+                                       "where": "definition.pbir"})
             continue
         path = ((ref.get("datasetReference") or {}).get("byPath") or {}).get("path", "")
         if path and os.path.basename(os.path.normpath(path.replace("\\", "/"))).lower() == want:
@@ -271,7 +280,7 @@ def build(ws, project, extra_reports=(), model_dir: str | None = None) -> Graph:
     res = deps.Resolver(model)
     _model_objects(g, model)
     _model_edges(g, model, res)
-    reports = bound_reports(ws, project) if ws is not None else []
+    reports = bound_reports(ws, project, g) if ws is not None else []
     for rdir in extra_reports:
         rdir = os.path.abspath(rdir)
         if not os.path.isdir(os.path.join(rdir, "definition")):

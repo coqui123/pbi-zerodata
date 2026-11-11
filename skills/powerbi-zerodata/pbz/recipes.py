@@ -109,6 +109,17 @@ def _subst(arg: str, params: dict) -> str:
     return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", rep, arg)
 
 
+def _workspace_option(arg) -> bool:
+    """True for a flag argparse can take as --workspace or --project, including short and abbreviated forms."""
+    text = str(arg).split("=", 1)[0]
+    if text.startswith(("--workspace", "--project")) or text in ("-w", "-p"):
+        return True
+    if text.startswith("--") and len(text) > 2:
+        body = text[2:]
+        return bool(body) and ("workspace".startswith(body) or "project".startswith(body))
+    return False
+
+
 def load(spec: str, *, root: str | None = None) -> dict:
     if not isinstance(spec, str):
         raise PbzError("BAD_REQUEST", "a recipe is JSON")
@@ -124,7 +135,7 @@ def load(spec: str, *, root: str | None = None) -> dict:
             raise PbzError("BAD_REQUEST", f"step {i}: verb must be one of the mirror-editing verbs ({', '.join(sorted(ALLOWED))})")
         if not isinstance(s.get("args", []), list) or not all(isinstance(a, (str, int, float)) for a in s.get("args", [])):
             raise PbzError("BAD_REQUEST", f"step {i}: args is a list of strings")
-        if any(str(a).startswith(("--workspace", "--project")) for a in s.get("args", [])):
+        if any(_workspace_option(a) for a in s.get("args", [])):
             raise PbzError("BAD_REQUEST", f"step {i}: a recipe works on the current workspace and project only")
     return r
 
@@ -151,7 +162,7 @@ def _prepare(ws, project, steps: list, params: dict) -> list[tuple[dict, list[st
             args = [_subst(str(a), params) for a in s.get("args", [])]
         except PbzError as e:
             raise PbzError(e.code, f"step {i}") from None
-        if any(str(a).startswith(("--workspace", "--project")) for a in args):
+        if any(_workspace_option(a) for a in args):
             raise PbzError("BAD_REQUEST", f"step {i}: a recipe works on the current workspace and project only")
         if _forbidden(s["verb"], args):
             raise PbzError("BAD_REQUEST", f"step {i}: that action is not allowed in a recipe")

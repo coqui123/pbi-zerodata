@@ -32,6 +32,43 @@ def _measures(project):
     return model, rows
 
 
+def _shape(doc, text: str, changed: set[tuple[str, str]]) -> tuple:
+    nodes = []
+    for node in doc.nodes:
+        parent = None if node.parent is None else (node.parent.kind, node.parent.name, node.parent.indent)
+        nodes.append((node.kind, node.name, node.indent, parent, tuple(sorted(node.props.items()))))
+    regions = []
+    for reg in doc.regions:
+        parent_name = reg.node.parent.name if reg.node.parent is not None else None
+        if reg.node.kind == "measure" and reg.prop == "expression" and (parent_name, reg.node.name) in changed:
+            continue
+        parent = None if reg.node.parent is None else (reg.node.parent.kind, reg.node.parent.name)
+        regions.append((reg.kind, reg.prop, reg.node.kind, reg.node.name, parent, text[reg.start:reg.end]))
+    return tuple(nodes), tuple(regions)
+
+
+def _expressions_only(rel: str, before: str, after: str, expected: dict[tuple[str, str], str]) -> bool:
+    """True when the splice is the same document with only those measure expressions changed."""
+    try:
+        old = tmdl.parse(rel, before)
+        new = tmdl.parse(rel, after)
+    except Exception:
+        return False
+    changed = set(expected)
+    if _shape(old, before, changed) != _shape(new, after, changed):
+        return False
+    for (table, name), expr in expected.items():
+        hits = [node for node in new.nodes
+                if node.kind == "measure" and node.name == name and node.parent is not None
+                and node.parent.kind == "table" and node.parent.name == table]
+        if len(hits) != 1:
+            return False
+        regs = [reg for reg in new.regions if reg.node is hits[0] and reg.prop == "expression"]
+        if len(regs) != 1 or after[regs[0].start:regs[0].end] != expr:
+            return False
+    return True
+
+
 def export(ws, project, path: str) -> dict:
     _model, rows = _measures(project)
     doc = {"version": 1, "measures": rows}
@@ -74,13 +111,17 @@ def apply(ws, project, path: str) -> dict:
         if _script_expression(expr) == _script_expression(found.expression):
             continue
         by_file.setdefault(found.node.file, [])
-        by_file[found.node.file].append((reg.start, reg.end, expr))
+        by_file[found.node.file].append((reg.start, reg.end, expr, found.table, found.name))
         changed.append(name)
     ops = []
     for rel, edits in by_file.items():
-        text = model.docs[rel].text
-        for start, end, expr in sorted(edits, reverse=True):
+        before = model.docs[rel].text
+        text = before
+        for start, end, expr, _table, _name in sorted(edits, key=lambda item: item[0], reverse=True):
             text = text[:start] + expr + text[end:]
+        expected = {(table, name): expr for _start, _end, expr, table, name in edits}
+        if not _expressions_only(rel, before, text, expected):
+            raise PbzError("REFUSED", "script did not keep the measure")
         path_ = os.path.join(project.mirror_model, "definition", *rel.split("/"))
         _old, bom = read_text(path_)
         ops.append(("write", path_, text, bom))

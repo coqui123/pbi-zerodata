@@ -142,7 +142,7 @@ class SynthtestHonestyTests(unittest.TestCase):
             with patch("pbz.mcp.subprocess.run", fake_run):
                 mcp_out = mcp.call_tool("consumers", {"action": "add", "objects": ["[Total Sales]"],
                                                       "label": "notes", "workspace": self.ws.root,
-                                                      "project": "Parity"}, None, None)
+                                                      "project": "Parity"}, self.ws.root, None)
         blob = text + json.dumps(mcp_out)
         self.assertNotEqual(rc, 0)
         self.assertTrue(mcp_out["isError"])

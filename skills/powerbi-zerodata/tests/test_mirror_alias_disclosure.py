@@ -32,7 +32,9 @@ class MirrorAliasDisclosureTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        os.environ["PBZ_PRIVATE_ROOT"] = os.path.join(self.tmp.name, "private")
+        self.private_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.private_tmp.cleanup)
+        os.environ["PBZ_PRIVATE_ROOT"] = self.private_tmp.name
         self.addCleanup(lambda: os.environ.pop("PBZ_PRIVATE_ROOT", None))
         self.ws = Workspace(self.tmp.name)
         open(os.path.join(self.tmp.name, "X.pbip"), "w", encoding="utf-8").close()

@@ -7,7 +7,9 @@ Keeps company data out of the agent's context in Power BI workspaces:
 - screenshots, UI automation and Power BI service pages.
 
 Contract: stdin = hook JSON, stdout = deny JSON (or nothing to allow), exit code 0.
-Deny reasons never echo tool input. Stdlib only; run as `python -I -S guard.py --agent <name>`.
+Invalid JSON, a non-object event, or a failure while resolving the workspace exits
+non-zero and still prints a deny decision. Deny reasons never echo tool input.
+Stdlib only; run as `python -I -S guard.py --agent <name>`.
 """
 from __future__ import annotations
 
@@ -134,14 +136,19 @@ DATA_EXT = re.compile(
     r"(?i)\.(xlsx|xls|xlsm|xlsb|csv|tsv|parquet|pbix|pbit|pbids|abf|zip|tgz|7z|rar|dax|trc|xel|measurekiller)\b"
 )
 
+# Listing and launching aliases are not exempt: a denied path in the pipeline must stick.
 SAFE_PATH_VERBS = {
-    "ls", "dir", "gci", "get-childitem", "test-path", "rm", "del", "erase", "rmdir", "rd", "remove-item",
-    "ri", "mkdir", "md", "new-item", "ni", "start-process", "start", "saps", "explorer", "explorer.exe",
-    "stat", "du", "get-item", "gi", "resolve-path", "rvpa", "split-path", "join-path", "tree", "attrib",
+    # Listing and process launchers are not exempt: a denied path in `dir` or
+    # `get-childitem` must still deny, or a later pipeline stage never sees it.
+    "rm", "del", "erase", "rmdir", "rd", "remove-item",
+    "ri", "mkdir", "md", "new-item", "ni",
+    "split-path", "join-path",
     "cd", "chdir", "set-location", "sl", "pushd", "push-location", "popd", "pop-location",
 }
 CONTENT_SEARCH_VERBS = {"rg", "grep", "egrep", "fgrep", "findstr", "select-string", "sls", "ag", "ack"}
 CD_VERBS = {"cd", "chdir", "set-location", "sl", "pushd", "push-location"}
+POP_VERBS = {"popd", "pop-location"}
+PUSH_VERBS = {"pushd", "push-location"}
 GREP_TYPE_EXT = {"py": "py", "js": "js", "ts": "ts", "cs": "cs", "ps": "ps1", "powershell": "ps1",
                  "json": "json", "md": "md", "markdown": "md", "yaml": "yaml", "toml": "toml"}
 
@@ -157,6 +164,9 @@ BROWSER_READ_TOOLS = re.compile(
 UI_TOOLS = re.compile(r"(?i)^mcp__(computer-use|computer_use|claude-in-chrome)__|computer.?use|screenshot|screen_?capture")
 PBI_MCP = re.compile(r"(?i)^mcp__[^_]*(powerbi|power-bi|power_bi|fabric)")
 FILEISH_TOOLS = re.compile(r"(?i)(read|view|open|file|image|filesystem|lsp|notebook|attach|upload)")
+_MUTATING_TOOL = re.compile(
+    r"(?i)(write|edit|patch|delete|remove|move|rename|unlink|trash|upload|save|create|copy|replace)"
+)
 NON_FILE_TOOLS = {"Agent", "Task", "Skill", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "EnterPlanMode",
                   "ToolSearch", "WebSearch", "SendMessage", "ScheduleWakeup"}
 
@@ -388,13 +398,15 @@ def find_root(path: str) -> str | None:
 
 
 def synthetic(path: str) -> bool:
+    """True only when this path's own workspace policy sets synthetic.
+
+    An ancestor policy with synthetic true does not exempt a child workspace.
+    """
     key = norm(path)
     if key not in _SYN:
         root = find_root(key)
-        if root and (read_policy_file(root) or {}).get("_pbz_lockdown"):
-            _SYN[key] = False
-        else:
-            _SYN[key] = any((read_policy_file(d) or {}).get("synthetic") is True for d in ancestors(key))
+        data = read_policy_file(root) if root else None
+        _SYN[key] = bool(data) and not data.get("_pbz_lockdown") and data.get("synthetic") is True
     return _SYN[key]
 
 
@@ -574,8 +586,30 @@ def _mirror_blocked(path: str, root: str) -> bool:
     return False
 
 
+def _reparse_blocked(path: str, root: str) -> bool:
+    """Symlink or junction below the workspace. Same refusal the mirror uses.
+
+    The workspace root itself may be reached through a junction and is not a refusal.
+    Checked before an allow glob can exempt the lexical path.
+    """
+    root = root.rstrip("/")
+    if path != root and not path.startswith(root + "/"):
+        return False
+    if path == root:
+        return False
+    cur = root
+    for part in path[len(root) + 1:].split("/"):
+        if not part:
+            continue
+        cur = cur + "/" + part
+        if _is_link(cur):
+            return True
+    return False
+
+
 def classify_path(path: str) -> str | None:
     """Reason key if content access to path is denied, else None."""
+    path = norm(path)
     if global_denied(path):
         return "global"
     root = active_root(path)
@@ -590,11 +624,13 @@ def classify_path(path: str) -> str | None:
         if _mirror_blocked(path, root):
             return "definition"
         return None
-    if any(glob_to_regex(g).match(r) for g in pol.get("allow", [])):
-        return None
+    if _reparse_blocked(path, root):
+        return "definition"
     if any(p.endswith(".semanticmodel") or p.endswith(".report") for p in parts):
         if parts[-1] not in SAFE_DEFINITION_FILES:
             return "definition"
+    if any(glob_to_regex(g).match(r) for g in pol.get("allow", [])):
+        return None
     if any(glob_to_regex(g).match(r) for g in DEFAULT_WS_DENY + list(pol.get("deny", []))):
         return "data_file"
     return None
@@ -648,14 +684,72 @@ def verb_of(toks: list[str]) -> str:
     return os.path.basename(toks[i].replace("\\", "/")).lower() if i < len(toks) else ""
 
 
-def is_pbz(toks: list[str]) -> bool:
-    v = verb_of(toks)
-    if v in ("pbz", "pbz.cmd", "pbz.ps1", "pbz.exe"):
+def _bare_command(token: str) -> bool:
+    text = token.strip()
+    if re.match(r"^[a-zA-Z]:[\\/]", text) or text.startswith(("/", "\\", "~")):
+        return False
+    return "/" not in text and "\\" not in text
+
+
+def _installed_cli_paths() -> set[str]:
+    """Absolute paths of the pbz launcher shipped with this skill and its install links."""
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if not path:
+            return
+        key = norm(path)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(path)
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            return
+        rkey = norm(real)
+        if rkey not in seen:
+            seen.add(rkey)
+            roots.append(real)
+
+    add(SKILL_DIR)
+    home = os.path.expanduser("~")
+    for parts in (
+        (".agents", "skills", "powerbi-zerodata"),
+        (".claude", "skills", "powerbi-zerodata"),
+        (".codex", "skills", "powerbi-zerodata"),
+    ):
+        add(os.path.join(home, *parts))
+    found = set()
+    for root in roots:
+        for name in ("pbz.cmd", "pbz", "pbz.ps1", "pbz.exe"):
+            found.add(norm(os.path.join(root, "bin", name)))
+    return found
+
+
+def _pbz_basename(toks: list[str]) -> bool:
+    return verb_of(toks) in ("pbz", "pbz.cmd", "pbz.ps1", "pbz.exe")
+
+
+def is_pbz(toks: list[str], cwd: str | None = None) -> bool:
+    """True only when the verb is the installed pbz launcher.
+
+    A command whose basename is pbz is not trusted, and neither is python invoking
+    some path that merely ends in cli.py. Arguments are still scanned by the caller.
+    """
+    i = verb_index(toks)
+    if i >= len(toks) or _bare_command(toks[i]):
+        return False
+    shaped = norm(toks[i], cwd)
+    known = _installed_cli_paths()
+    if shaped in known:
         return True
-    if v.startswith("python") or v in ("py", "py.exe"):
-        for t in toks[verb_index(toks) + 1:]:
-            if not t.startswith("-"):
-                return t.replace("\\", "/").lower().endswith("powerbi-zerodata/pbz/cli.py")
+    try:
+        if os.path.lexists(shaped) and norm(os.path.realpath(shaped)) in known:
+            return True
+    except OSError:
+        return False
     return False
 
 
@@ -672,13 +766,15 @@ def looks_like_path(t: str) -> bool:
 def _lexical_definition(token: str) -> bool:
     """True when a token names a real model or report folder, including a `..` escape.
 
-    A `pbz-workspace` component is the mirror and stays allowed. Resolution can leave
-    the workspace, so this does not depend on `classify_path` finding an active root.
+    A model or report whose parent component is still pbz-workspace after `..` is applied
+    is the mirror and stays allowed.
     """
-    bits = [part.lower() for part in token.replace("\\", "/").split("/") if part not in ("", ".")]
-    if MIRROR_DIR.lower() in bits:
-        return False
-    return any(part.endswith(".semanticmodel") or part.endswith(".report") for part in bits)
+    bits = [part.lower() for part in _collapse_dots(token.replace("\\", "/").split("/"))]
+    for index, part in enumerate(bits):
+        if part.endswith(".semanticmodel") or part.endswith(".report"):
+            if not (index > 0 and bits[index - 1] == MIRROR_DIR.lower()):
+                return True
+    return False
 
 
 def interpreter_targets(toks: list[str]) -> tuple[list[str], list[str]]:
@@ -690,22 +786,37 @@ def interpreter_targets(toks: list[str]) -> tuple[list[str], list[str]]:
     files: list[str] = []
     inline: list[str] = []
 
-    def first_positional(stop_flags=(), code_flags=()):
-        for j, t in enumerate(rest):
+    def first_positional(stop_flags=(), code_flags=(), value_flags=()):
+        values = {flag.lower() for flag in value_flags}
+        j = 0
+        while j < len(rest):
+            t = rest[j]
             tl = t.lower()
             if tl in code_flags and j + 1 < len(rest):
                 inline.append(" ".join(rest[j + 1:]))
                 return
             if tl in stop_flags:
                 return
+            if tl in values and j + 1 < len(rest):
+                j += 2
+                continue
             if not t.startswith("-") and not (t.startswith("/") and len(t) <= 3):
                 files.append(t)
                 return
+            j += 1
 
     if v.startswith("python") or v in ("py", "py.exe"):
-        first_positional(stop_flags=("-m",), code_flags=("-c",))
+        # `-X utf8` is a flag plus a value. The script is the next positional, not `utf8`.
+        first_positional(stop_flags=("-m",), code_flags=("-c",), value_flags=("-x",))
     elif v in ("pwsh", "pwsh.exe", "powershell", "powershell.exe"):
-        for j, t in enumerate(rest):
+        value_flags = {
+            "-executionpolicy", "-inputformat", "-outputformat", "-windowstyle",
+            "-configurationname", "-workingdirectory", "-version", "-psconsolefile",
+            "-custompipename",
+        }
+        j = 0
+        while j < len(rest):
+            t = rest[j]
             tl = t.lower()
             if tl in ("-file", "-f") and j + 1 < len(rest):
                 files.append(rest[j + 1])
@@ -719,6 +830,14 @@ def interpreter_targets(toks: list[str]) -> tuple[list[str], list[str]]:
                 except (ValueError, UnicodeDecodeError):
                     inline.append("EVALUATE")  # undecodable payload: treat as engine access
                 break
+            if tl in value_flags and j + 1 < len(rest):
+                j += 2
+                continue
+            if t.startswith("-") or (t.startswith("/") and len(t) <= 3):
+                j += 1
+                continue
+            files.append(t)  # positional script, e.g. `pwsh .\\tool.ps1`
+            break
     elif v in ("node", "node.exe", "deno", "bun"):
         first_positional(code_flags=("-e", "--eval", "-p"))
     elif v in ("bash", "sh", "zsh", "cmd", "cmd.exe"):
@@ -732,10 +851,55 @@ def hits(text: str, patterns: list[str]) -> bool:
     return any(re.search(p, text) for p in patterns)
 
 
+def _path_token(text: str, start: int, end: int) -> str:
+    breaks = set(" \t\r\n\"'`<>|()[]{};,=+")
+    while start > 0 and text[start - 1] not in breaks:
+        start -= 1
+    while end < len(text) and text[end] not in breaks:
+        end += 1
+    return text[start:end]
+
+
+def _collapse_dots(parts: list[str]) -> list[str]:
+    """Lexical path with `.` dropped and `..` applied. A leading `..` stays."""
+    out: list[str] = []
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if out and out[-1] != "..":
+                out.pop()
+            else:
+                out.append("..")
+            continue
+        out.append(part)
+    return out
+
+
+def _definition_outside_mirror(text: str) -> bool:
+    """True when a model or report reference is not beside a pbz-workspace path component.
+
+    The mirror name has to be its own component in that same path after `..` is applied.
+    A file that merely contains the text pbz-workspace does not cover a separate definition reference.
+    """
+    for match in DEFINITION_REF.finditer(text):
+        bits = _collapse_dots(re.split(r"[\\/]", _path_token(text, match.start(), match.end())))
+        covered = False
+        for index, part in enumerate(bits):
+            leaf = part.lower()
+            if leaf.endswith(".semanticmodel") or leaf.endswith(".report"):
+                if index > 0 and bits[index - 1].lower() == MIRROR_DIR:
+                    covered = True
+                    break
+        if not covered:
+            return True
+    return False
+
+
 def script_bad(text: str, pol: dict) -> bool:
     if hits(text, ENGINE_PATTERNS + DATA_READ_PATTERNS + [re.escape(h) for h in pol.get("sensitive_hosts", [])]):
         return True
-    if DEFINITION_REF.search(text) and MIRROR_DIR not in text.lower():
+    if _definition_outside_mirror(text):
         return True
     return bool(DATA_EXT.search(text))
 
@@ -1257,6 +1421,30 @@ def _ancestor_or_self(shaped: str, root: str) -> bool:
         return True
 
 
+def _shell_redirects(part: str) -> list[str] | None:
+    """Redirect operands, or None when brace expansion must fail closed."""
+    names: list[str] = []
+    for target in re.findall(r">+\s*(\"[^\"]*\"|'[^']*'|\S+)", part):
+        expanded = _brace_expand(strip_arg(target))
+        if expanded is None:
+            return None
+        names.extend(expanded)
+    return names
+
+
+def _redirect_reason(part: str, cur: str, session_root: str | None) -> str | None:
+    """Policy paths and, inside a workspace, redirects onto guard/skill files."""
+    names = _shell_redirects(part)
+    if names is None:
+        return "policy"
+    for target in names:
+        if _mentions_protected(target) or _wildcard_protected(target):
+            return "policy"
+        if session_root and self_protected(norm(target, cur)):
+            return "selfprotect"
+    return None
+
+
 def _r18_shell(part: str, toks: list[str], verb: str, cur: str, session_root: str | None,
                *, home_rebound: bool = False) -> str | None:
     """Round 18 shell gate: protected writes, tree copy/move/delete, and fail-closed operands.
@@ -1269,16 +1457,10 @@ def _r18_shell(part: str, toks: list[str], verb: str, cur: str, session_root: st
     if not session_root or not verb:
         return None
     low = part.lower()
-    redirects = re.findall(r">+\s*(\"[^\"]*\"|'[^']*'|\S+)", part)
-    redirect_names: list[str] = []
-    for target in redirects:
-        expanded = _brace_expand(strip_arg(target))
-        if expanded is None:
-            return "policy"
-        redirect_names.extend(expanded)
+    why = _redirect_reason(part, cur, session_root)
+    if why:
+        return why
     if verb in _CONTENT_VERBS and (_mentions_protected(part) or _wildcard_protected(part)):
-        return "policy"
-    if any(_mentions_protected(target) or _wildcard_protected(target) for target in redirect_names):
         return "policy"
     if verb in _NEW_VERBS and (_mentions_protected(part) or _wildcard_protected(part)) and any(
             strip_arg(t).lower().startswith("-value") for t in toks):
@@ -1374,37 +1556,67 @@ def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int
                 if lead_root and script_bad(body, load_policy(lead_root)):
                     return "script"
     cur = cwd
+    dir_stack: list[str] = []
+    previous: str | None = None
+    made: set[str] = set()
+
+    def _exists(path: str) -> bool:
+        return os.path.isdir(path) or os.path.normcase(path) in made
     for seg in segments(cmd):
         for part in seg:
             toks = tokens(part)
             if not toks:
                 continue
             v = verb_of(toks)
-            if is_pbz(toks):
-                if re.search(r"(?i)\badmin\b", part):
-                    return "admin"
-                continue
-            if v in CD_VERBS and len(toks) > verb_index(toks) + 1:
-                # Policy/redirection targets must be checked before tracking cwd.
+            trusted = is_pbz(toks, cur)
+            # Basename pbz is not the installed CLI. Admin is denied either way.
+            # Arguments of both are scanned below; only the installed launcher may
+            # carry engine text (pbz synth query).
+            if (_pbz_basename(toks) or trusted) and re.search(r"(?i)\badmin\b", part):
+                return "admin"
+            if v in CD_VERBS or v in POP_VERBS:
+                # Policy and self-protected redirects before tracking cwd.
+                why = _redirect_reason(part, cur, session_root)
+                if why:
+                    return why
                 if _policy_shell(part, toks, v, cur, session_root):
                     return "policy"
+                if v in POP_VERBS:
+                    if dir_stack:
+                        target = dir_stack.pop()
+                        if _exists(target):
+                            previous, cur = cur, target
+                    continue
                 dest = None
                 for token in toks[verb_index(toks) + 1:]:
                     value = strip_arg(token)
+                    if value == "-":
+                        dest = "-"
+                        break
                     if value.startswith("-"):
                         continue
                     dest = value
                     break
-                if dest is not None:
-                    cur = norm(dest, cur)
+                if dest == "-":
+                    if previous and _exists(previous):
+                        if v in PUSH_VERBS:
+                            dir_stack.append(cur)
+                        previous, cur = cur, previous
+                elif dest is not None:
+                    target = norm(dest, cur)
+                    if _exists(target):
+                        if v in PUSH_VERBS:
+                            dir_stack.append(cur)
+                        previous, cur = cur, target
                 continue
             if _policy_shell(part, toks, v, cur, session_root):
                 return "policy"
-            if _r18_shell(part, toks, v, cur, session_root, home_rebound=bool(_HOME_ASSIGN.search(cmd))):
-                return "policy"
+            why = _r18_shell(part, toks, v, cur, session_root, home_rebound=bool(_HOME_ASSIGN.search(cmd)))
+            if why:
+                return why
             root = active_root(cur)
             pol = load_policy(root)
-            if not synthetic(cur) and hits(part, ENGINE_PATTERNS):
+            if not trusted and not synthetic(cur) and hits(part, ENGINE_PATTERNS):
                 return "engine"
             if root:
                 if hits(part, DATA_READ_PATTERNS + [re.escape(h) for h in pol.get("sensitive_hosts", [])]):
@@ -1414,7 +1626,17 @@ def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int
             denied, dir_targets, has_path = None, [], False
             for t in toks[verb_index(toks) + 1:]:
                 t = strip_arg(t)
-                if "*" in t and DATA_EXT.search(t):
+                if t.startswith("-"):
+                    attached = ""
+                    for sep in (":", "="):
+                        if sep in t[1:]:
+                            attached = strip_arg(t.split(sep, 1)[1])
+                            break
+                    if not attached or attached.startswith("-"):
+                        continue
+                    t = attached
+                glob_operand = "*" in t or "?" in t
+                if glob_operand and DATA_EXT.search(t):
                     base = norm(os.path.dirname(t) or ".", cur)
                     if active_root(base) or root:
                         denied = denied or "data_file"
@@ -1422,15 +1644,14 @@ def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int
                 # Inline -Command/-c payloads are multi-token strings; classify via recursion, not as paths.
                 if v in INTERPRETERS and (" " in t or "\t" in t):
                     continue
-                if not looks_like_path(t) and not (len(t) < 260 and os.path.exists(norm(t, cur))):
+                # A glob is classified even when the literal pattern is not a file on disk.
+                if not glob_operand and not looks_like_path(t) and not (len(t) < 260 and os.path.exists(norm(t, cur))):
                     continue
                 has_path = True
                 p = norm(t, cur)
                 why = classify_path(p)
-                # Lexical definition fallback is for escapes that leave the root; never
-                # override an explicit valid-policy allow (lockdown still denies above).
-                if (not why and root and _lexical_definition(t)
-                        and not any(glob_to_regex(g).match(rel(p, root)) for g in pol.get("allow", []))):
+                # An allow glob does not exempt a real model or report reference.
+                if not why and root and _lexical_definition(t):
                     why = "definition"
                 if why:
                     denied = denied or why
@@ -1458,15 +1679,28 @@ def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int
                 sroot = active_root(p) or root
                 if sroot or not synthetic(p):
                     try:
-                        if os.path.getsize(p) <= MAX_SCRIPT_BYTES:
-                            with open(p, encoding="utf-8", errors="replace") as fh:
-                                text = fh.read()
-                            if _POLICY_TEXT.search(text):
-                                return "policy"
-                            if (sroot and script_bad(text, load_policy(sroot))) or hits(text, ENGINE_PATTERNS):
-                                return "script"
+                        if os.path.getsize(p) > MAX_SCRIPT_BYTES:
+                            return "error"
+                        with open(p, encoding="utf-8", errors="replace") as fh:
+                            text = fh.read()
                     except OSError:
-                        pass
+                        return "error"
+                    if _POLICY_TEXT.search(text):
+                        return "policy"
+                    if (sroot and script_bad(text, load_policy(sroot))) or hits(text, ENGINE_PATTERNS):
+                        return "script"
+            if v in {"mkdir", "md"}:
+                for token in toks[verb_index(toks) + 1:]:
+                    value = strip_arg(token)
+                    if value.startswith("-"):
+                        attached = ""
+                        for sep in (":", "="):
+                            if sep in value[1:]:
+                                attached = strip_arg(value.split(sep, 1)[1])
+                                break
+                        value = attached
+                    if value and not value.startswith("-"):
+                        made.add(os.path.normcase(norm(value, cur)))
     return None
 
 
@@ -1510,6 +1744,37 @@ def is_memory_path(path: str) -> bool:
     return bool(re.search(r"/\.claude/projects/[^/]+/memory/", path)) or "/.codex/memories/" in path
 
 
+# Same numbers policy.load fills in when a key is absent. Kept here so the hook stays stdlib-only.
+_DEFAULT_BUDGETS = {"session_checks": 300, "per_target": 60, "constants_per_target": 3}
+_DEFAULT_CATEGORY_MAX = 50
+
+
+def _as_limit(value):
+    if type(value) not in (int, float):
+        return None
+    return value
+
+
+def _effective_budgets(pol: dict) -> dict:
+    """policy.load's budget map: defaults, then any numeric keys in the file."""
+    merged = dict(_DEFAULT_BUDGETS)
+    raw = pol.get("budgets")
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            number = _as_limit(value)
+            if number is not None:
+                merged[key] = number
+    return merged
+
+
+def _category_max(pol: dict):
+    if "category_max" in pol:
+        number = _as_limit(pol.get("category_max"))
+        if number is not None:
+            return number
+    return _DEFAULT_CATEGORY_MAX
+
+
 def policy_loosened(old: dict, new: dict) -> bool:
     if new.get("synthetic") and not old.get("synthetic"):
         return True
@@ -1523,8 +1788,14 @@ def policy_loosened(old: dict, new: dict) -> bool:
     for key in ("allow", "category_columns", "reveal_columns", "memory_dirs"):
         if not set(new.get(key, [])) <= set(old.get(key, [])):
             return True
-    ob, nb = old.get("budgets", {}) or {}, new.get("budgets", {}) or {}
-    return any(isinstance(v, (int, float)) and isinstance(ob.get(k), (int, float)) and v > ob[k] for k, v in nb.items())
+    if _category_max(new) > _category_max(old):
+        return True
+    before, after = _effective_budgets(old), _effective_budgets(new)
+    for key, old_value in before.items():
+        new_value = after.get(key)
+        if new_value is None or new_value > old_value:
+            return True
+    return False
 
 
 def edited_text(path: str, ti: dict) -> str | None:
@@ -1579,6 +1850,19 @@ def check_write(p: str, tool: str, ti: dict, session_root: str | None) -> str | 
     return None
 
 
+def _grep_name_filter(glob: str) -> re.Pattern | None:
+    """Filename filter from the glob itself.
+
+    `*.c*` must stay a glob. Taking the first `\\.([a-z0-9]+)` suffix turns it into `\\.c$`
+    and misses denied names the glob would open. A glob that is not a simple filename
+    pattern is not narrowed, so every name is checked.
+    """
+    base = glob.replace("\\", "/").split("/")[-1]
+    if not base or not re.fullmatch(r"[*?a-z0-9._-]+", base):
+        return None
+    return glob_to_regex(base)
+
+
 def check_grep(ti: dict, cwd: str, session_root: str | None) -> str | None:
     p = norm(ti.get("path") or cwd, cwd)
     why = classify_path(p)
@@ -1590,9 +1874,7 @@ def check_grep(ti: dict, cwd: str, session_root: str | None) -> str | None:
     glob = (ti.get("glob") or "").strip().lower()
     gtype = (ti.get("type") or "").strip().lower()
     if glob:
-        exts = re.findall(r"\.([a-z0-9]+)", glob)
-        if exts and re.fullmatch(r"[*/.{},a-z0-9]+", glob):
-            name_filter = re.compile(r"\.(" + "|".join(map(re.escape, exts)) + r")$")
+        name_filter = _grep_name_filter(glob)
     elif gtype in GREP_TYPE_EXT:
         name_filter = re.compile(r"\." + GREP_TYPE_EXT[gtype] + r"$")
     if dir_has_denied(p, name_filter, cap_is_deny=bool(active_root(p) or session_root)):
@@ -1640,8 +1922,15 @@ def decide(event: dict) -> str | None:
         p = ti.get("file_path") or ti.get("notebook_path") or ti.get("path")
         paths = [norm(p, cwd)] if isinstance(p, str) and p else []
         writes = tool != "Read"
-    elif FILEISH_TOOLS.search(tool):
+    elif FILEISH_TOOLS.search(tool) or _MUTATING_TOOL.search(tool):
         paths = [norm(s, cwd) for s in string_values(ti) if looks_like_path(s)]
+        for key in ("file_path", "notebook_path", "path"):
+            val = ti.get(key)
+            if isinstance(val, str) and val:
+                shaped = norm(val, cwd)
+                if shaped not in paths:
+                    paths.append(shaped)
+        writes = bool(_MUTATING_TOOL.search(tool))
     else:
         return None
 
@@ -1695,20 +1984,29 @@ def _stdin_text() -> str:
     return data if isinstance(data, str) else bytes(data).decode("utf-8", errors="replace")
 
 
+def _fail_closed() -> int:
+    """Deny decision plus a non-zero status. Used when the event itself cannot be judged."""
+    try:
+        sys.stdout.write(deny_json("error"))
+    except Exception:
+        pass
+    return 1
+
+
 def main() -> int:
     agent = sys.argv[sys.argv.index("--agent") + 1] if "--agent" in sys.argv[:-1] else "claude"
     try:
         raw = _stdin_text()
         event = json.loads(raw) if raw.strip() else {}
-    except ValueError:
-        return 0
+    except (ValueError, RecursionError):
+        return _fail_closed()
     if not isinstance(event, dict):
-        return 0
+        return _fail_closed()
     name = str(event.get("hook_event_name") or "PreToolUse")
     try:
         root = active_root(norm(event.get("cwd") or os.getcwd()))
-    except Exception:  # cannot tell where we are: never block unrelated work
-        return 0
+    except Exception:
+        return _fail_closed()
     if name == "SessionStart":
         if root:
             sys.stdout.write(json.dumps({"hookSpecificOutput": {
@@ -1720,7 +2018,7 @@ def main() -> int:
     try:
         verdict = decide(event)
     except Exception:
-        verdict = "error" if root else None
+        verdict = "error"
     if verdict:
         log(root, agent, tool, "deny:" + verdict)
         sys.stdout.write(deny_json(verdict))

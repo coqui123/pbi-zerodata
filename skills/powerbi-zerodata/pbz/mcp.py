@@ -544,8 +544,7 @@ TOOLS = [
                "replace": ("--replace", B, "flag"), "tol": ("--tol", N, "value")},
          read_only=False, timeout=900),
     Tool("memscrub", "Preview which memory notes would change (counts only). Showing scrubbed text and applying are human-only.", ["memscrub"],
-         opts={"dir": ("--dir", D(S, "memory folder"), "value"),
-               "show": ("--show", D(S, "one file to show scrubbed"), "value")}, need=["dir"]),
+         opts={"dir": ("--dir", D(S, "memory folder"), "value")}, need=["dir"]),
 ]
 BY_NAME = {t.name: t for t in TOOLS}
 
@@ -592,7 +591,8 @@ def build_argv(tool: Tool, args: dict, workspace: str | None, project: str | Non
     for k, v in args.items():
         if not _type_ok(v, props[k]):
             raise ToolError(f"argument {k} has the wrong type or value")
-    ws = args.get("workspace") or workspace or os.getcwd()
+    # No operator switch exists, so a tool argument cannot replace the server workspace.
+    ws = workspace or os.getcwd()
     if not os.path.isdir(ws):
         raise ToolError("workspace folder not found")
     argv = ["--workspace", os.path.abspath(ws)]
@@ -622,8 +622,9 @@ def build_argv(tool: Tool, args: dict, workspace: str | None, project: str | Non
         elif mode == "append":
             argv += [f"{flag}={x}" for x in v]
         elif mode == "multi":
-            if v:
-                argv += [flag] + [_no_dash(x, arg) for x in v]
+            if arg == "only" and not v:
+                raise ToolError("only cannot be empty")
+            argv += [flag] + [_no_dash(x, arg) for x in v]
     if tool.name == "watch" and "--once" not in argv:
         argv.append("--once")
     return argv, os.path.abspath(ws)

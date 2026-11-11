@@ -25,7 +25,7 @@ import shutil
 import zipfile
 
 from . import pbir
-from .common import PbzError, commit_bytes, read_definition_text, write_text
+from .common import PbzError, _contained, _reparse_link, commit_bytes, read_definition_text, write_text
 
 KINDS = {0: "grouping", 1: "measure", 2: "either", "grouping": "grouping", "measure": "measure",
          "groupingormeasure": "either", "either": "either"}
@@ -474,7 +474,9 @@ def import_pbiviz(ws, project, path: str, as_: str = "contract", replace: bool =
            "conditions": conditions_text(info), "contract": _save_contract(ws, contract)}
     if as_ == "private":
         pend = _pending_dir(ws, guid)
-        shutil.rmtree(pend, ignore_errors=True)
+        pending_root = os.path.join(ws.private, PENDING)
+        if os.path.lexists(pend):
+            _safe_rmtree(pending_root, pend, ignore_errors=True)
         for name, data in files.items():
             dst = os.path.join(pend, *name.split("/"))
             os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -622,6 +624,19 @@ def roles(ws, project, vtype: str) -> dict:
 
 # ---------------------------------------------------------------- push support
 
+def _safe_rmtree(root: str, path: str, *, ignore_errors: bool = False) -> None:
+    """Remove a real directory inside `root`. A link, a junction, or an escape is not removed."""
+    if _reparse_link(root) or _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    try:
+        _contained(path, root)
+    except PbzError:
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+    if _reparse_link(path) or not os.path.isdir(path):
+        return
+    shutil.rmtree(path, ignore_errors=ignore_errors)
+
+
 def pending_for(ws, report_json_text: str) -> dict[str, str]:
     """{guid: unpacked dir} for staged private packages that this report.json registers."""
     try:
@@ -630,23 +645,38 @@ def pending_for(ws, report_json_text: str) -> dict[str, str]:
         return {}
     names = {p.get("name") for p in data.get("resourcePackages") or []
              if isinstance(p, dict) and p.get("type") == "CustomVisual"}
-    return {g: _pending_dir(ws, g) for g in sorted(n for n in names if isinstance(n, str) and n)
-            if os.path.isfile(os.path.join(_pending_dir(ws, g), "package.json"))}
+    out = {}
+    for g in sorted(n for n in names if isinstance(n, str) and GUID_RE.match(n)):
+        pend = _pending_dir(ws, g)
+        if os.path.isfile(os.path.join(pend, "package.json")):
+            out[g] = pend
+    return out
 
 
 def install(pkgs: dict[str, str], report_dir: str, backup_dir: str | None = None) -> list[str]:
     done = []
+    base = os.path.join(report_dir, "CustomVisuals")
     for guid, src in pkgs.items():
-        dst = os.path.join(report_dir, "CustomVisuals", guid)
+        if not isinstance(guid, str) or not GUID_RE.match(guid):
+            continue
+        dst = os.path.join(base, guid)
+        _contained(dst, base)
+        if _reparse_link(dst):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         if os.path.isdir(dst):
             if backup_dir:
                 shutil.copytree(dst, os.path.join(backup_dir, "CustomVisuals", guid), dirs_exist_ok=True)
-            shutil.rmtree(dst)
+            _safe_rmtree(base, dst)
         shutil.copytree(src, dst)
         done.append(guid)
     return done
 
 
 def clear_pending(ws, guids) -> None:
+    root = os.path.join(ws.private, PENDING)
     for g in guids:
-        shutil.rmtree(_pending_dir(ws, g), ignore_errors=True)
+        if not isinstance(g, str) or not GUID_RE.match(g):
+            continue
+        path = _pending_dir(ws, g)
+        if os.path.lexists(path):
+            _safe_rmtree(root, path, ignore_errors=True)

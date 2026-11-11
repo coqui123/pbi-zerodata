@@ -273,15 +273,25 @@ def _index(ws) -> dict:
     return out
 
 
+class _IncompleteMemory:
+    """A memory file that was refused or could not be read. Not the same as no file."""
+
+
+_MEMORY_INCOMPLETE = _IncompleteMemory()
+
+
 def _memory(ws, project):
     try:
         from . import memory
     except ImportError:
         return None
     try:
-        return memory.load(ws, project)
-    except Exception:  # noqa: BLE001  (evidence is optional; a bad file means no evidence)
-        return None
+        loaded = memory.load(ws, project)
+    except Exception:  # noqa: BLE001  (refused and unreadable files are incomplete, not absent)
+        return _MEMORY_INCOMPLETE
+    if loaded is None and os.path.lexists(pbz_state_path(ws, "memory.json")):
+        return _MEMORY_INCOMPLETE
+    return loaded
 
 
 def _mem_index(mem) -> dict:
@@ -1007,6 +1017,18 @@ def _baseline_parts(name: str) -> tuple[str, str, str]:
 _AUDIT_MALFORMED = "audit state is malformed"
 
 
+def _waiver_active(expires, today: _dt.date) -> bool:
+    """No expiry stays active. A value that is not a date does not."""
+    if expires is None or expires == "":
+        return True
+    if not isinstance(expires, str):
+        return False
+    try:
+        return _dt.date.fromisoformat(expires) >= today
+    except ValueError:
+        return False
+
+
 def _check_waivers(data: dict) -> None:
     for key, value in data.items():
         if not isinstance(key, str) or not isinstance(value, dict):
@@ -1109,7 +1131,9 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
         raise PbzError("BAD_REQUEST", f"min severity is one of {', '.join(SEVERITY)}")
     g = usage.build(ws, project)
     idx = _index(ws)
-    mem = _memory(ws, project)
+    mem_raw = _memory(ws, project)
+    memory_incomplete = mem_raw is _MEMORY_INCOMPLETE
+    mem = None if memory_incomplete else mem_raw
     a = Audit(ws, project, g, idx, mem)
     for step in (a.iterators, a.summarize, a.calc_columns, a.relationships, a.memory, a.unused_columns,
                  a.power_query, a.duplicates_and_families, a.subexpressions, a.tables, a.design):
@@ -1129,11 +1153,11 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
         out_f = [f for f in out_f if SEVERITY.index(f["severity"]) <= SEVERITY.index(min_severity)]
     out_f.sort(key=lambda f: (SEVERITY.index(f["severity"]), f["category"], f["rule"], f["object"].lower()))
     waivers = _load_json(ws, ("audit", "waivers.json"), {})
-    today = _dt.date.today().isoformat()
+    today = _dt.date.today()
     waived, expired, active = [], [], []
     for f in out_f:
         w = waivers.get(f["id"])
-        if w and (not w.get("expires") or w["expires"] >= today):
+        if w and _waiver_active(w.get("expires"), today):
             waived.append({"id": f["id"], "rule": f["rule"], "object": f["object"], "reason": w.get("reason"),
                            "expires": w.get("expires")})
         else:
@@ -1144,7 +1168,8 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
         return {"findings": out_f}
     result = {"verb": "audit", "project": project.name,
               "evidence": {"static": True, "index": bool(idx),
-                           "memory": "none" if mem is None else ("stale" if mem.get("stale") else "fresh")}}
+                           "memory": "incomplete" if memory_incomplete else
+                           "none" if mem is None else ("stale" if mem.get("stale") else "fresh")}}
     by_cat, by_sev = {}, {}
     for f in active:
         by_cat[f["category"]] = by_cat.get(f["category"], 0) + 1
@@ -1174,7 +1199,9 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
     skipped = []
     for rid, (cat, need, src, about) in sorted(RULES.items()):
         status = "ran"
-        if need == "memory" and mem is None:
+        if need == "memory" and memory_incomplete:
+            status = "incomplete: memory evidence is unreadable"
+        elif need == "memory" and mem is None:
             status = "skipped: needs pbz audit memory (Desktop open)"
         elif need == "memory" and mem.get("stale"):
             status = "ran on stale memory bands (rerun pbz audit memory)"
@@ -1199,7 +1226,7 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
         bad = [f for f in active if (fail_on == "any" and f["severity"] != "info")
                or (fail_on == "high" and f["severity"] == "high")
                or (fail_on == "new" and f.get("status") == "new")]
-        result["gate"] = "FAIL" if bad else "PASS"
+        result["gate"] = "FAIL" if bad or memory_incomplete else "PASS"
         if bad:
             result["gate_findings"] = [f["id"] for f in bad[:50]]
     result["next"] = ("fix by finding (each has fix / verify), or accept known debt: pbz audit waive <id> --reason ...; "

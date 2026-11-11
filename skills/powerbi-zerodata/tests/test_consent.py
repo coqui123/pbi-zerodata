@@ -1,6 +1,7 @@
 """Synthetic-only per-file human consent and bounded source-broker regressions."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -72,7 +73,9 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual(r['path'],str(p.resolve()))
         self.assertEqual(r['status'],'PENDING')
         self.assertEqual(r['scope'],'utf8-text')
-        self.assertEqual(len(r['sha256']),64)
+        self.assertNotIn('sha256', r)
+        stored = json.loads((self.private / 'source-consents' / (r['id'] + '.bin')).read_text(encoding='utf-8'))
+        self.assertEqual(stored['sha256'], hashlib.sha256(b'CANARY_NOT_YET_APPROVED').hexdigest())
         self.assertNotIn('CANARY',json.dumps(r))
         self.assertTrue(r['requires_human'])
         with self.assertRaises(PbzError) as raised:consent.read(self.ws,r['id'])

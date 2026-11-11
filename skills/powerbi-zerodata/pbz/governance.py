@@ -8,8 +8,8 @@ import os
 import re
 
 from . import deps, lexers, tmdl
-from .common import PbzError, commit_bytes, read_text, write_text
-from .tokens import TOKEN_RE, apply_edits
+from .common import PbzError, commit_bytes, preflight_regular, read_checked, read_text, write_text
+from .tokens import TOKEN_RE, TokenMap, apply_edits
 
 CODE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 REF = (re.compile(r"^\s*'((?:[^']|'')+)'\s*\[(.+)\]\s*$"), re.compile(r"^\s*([^\[\]']+?)\s*\[(.+)\]\s*$"))
@@ -40,14 +40,20 @@ def _write_op(mdef: str, rel: str, text: str) -> tuple:
     return ("write", path, text, bom)
 
 
-def _commit(ops) -> None:
+def _commit(ops, root: str) -> None:
     ops = [op for op in ops if op]
     if ops:
-        commit_bytes(ops)
+        commit_bytes(ops, root=root)
 
 
 def _commit_texts(mdef: str, planned: dict) -> None:
-    _commit([_write_op(mdef, rel, text) for rel, text in planned.items()])
+    _commit([_write_op(mdef, rel, text) for rel, text in planned.items()], mdef)
+
+
+def _require_code(code: str) -> str:
+    if not isinstance(code, str) or not CODE_RE.match(code):
+        raise PbzError("BAD_REQUEST", "culture code like de-DE or fr-FR")
+    return code
 
 
 def _require_model_tmdl(mdef: str) -> None:
@@ -297,12 +303,13 @@ def culture_add(ws, project, code: str) -> dict:
         raise PbzError("NAME_TAKEN", code)
     mname = model.model_node.name if model.model_node is not None else "Model"
     _commit([_write_op(mdef, rel, f"cultureInfo {code}\n\n\ttranslations\n\n\t\tmodel {_q(mname)}\n"),
-             _ref_line(mdef, "cultureInfo", code, True)])
+             _ref_line(mdef, "cultureInfo", code, True)], mdef)
     return {"verb": "culture", "action": "added", "culture": code, "files": [_rel(project, rel), _rel(project, "model.tmdl")],
             "next": f"pbz translate {code} <object> --caption ..., pbz culture missing {code}"}
 
 
 def culture_remove(ws, project, code: str) -> dict:
+    code = _require_code(code)
     mdef = os.path.join(project.mirror_model, "definition")
     _require_model_tmdl(mdef)
     mdef, _model_ = _model(project)
@@ -316,11 +323,12 @@ def culture_remove(ws, project, code: str) -> dict:
     if ref:
         ops.append(ref)
         files.append(_rel(project, "model.tmdl"))
-    _commit(ops)
+    _commit(ops, mdef)
     return {"verb": "culture", "action": "removed", "culture": code, "files": files, "next": "pbz diff, pbz push"}
 
 
 def _culture(mdef: str, code: str):
+    code = _require_code(code)
     rel = f"cultures/{code}.tmdl"
     path = os.path.join(mdef, *rel.split("/"))
     if not os.path.exists(path):
@@ -330,6 +338,7 @@ def _culture(mdef: str, code: str):
 
 def translate(ws, project, code: str, target: str, caption: str | None = None, description: str | None = None,
               folder: str | None = None) -> dict:
+    code = _require_code(code)
     if caption is None and description is None and folder is None:
         raise PbzError("BAD_REQUEST", "give --caption, --description or --folder")
     for s in (caption, description, folder):
@@ -424,12 +433,21 @@ def _translation_rows(mdef: str) -> list[dict]:
     return rows
 
 
+def _anchored(path: str, root: str) -> str:
+    """Absolute local path inside `root`. A link, a junction, or a hard link is refused before any byte moves."""
+    if not isinstance(root, str) or not root:
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    path = os.path.abspath(_local_json(path))
+    preflight_regular(path, root=root)
+    return path
+
+
 def translation_export(ws, project, path: str) -> dict:
     """Flat JSON of culture captions. Counts only come back; the file holds the strings."""
-    path = _local_json(path)
+    path = _anchored(path, ws.root)
     mdef, _model_ = _model(project)
     rows = _translation_rows(mdef)
-    write_text(path, json.dumps({"version": 1, "translations": rows}, indent=1, ensure_ascii=False) + "\n")
+    write_text(path, json.dumps({"version": 1, "translations": rows}, indent=1, ensure_ascii=False) + "\n", root=ws.root)
     return {"verb": "translate", "action": "export", "cultures": len({r["culture"] for r in rows}),
             "translations": len(rows)}
 
@@ -517,9 +535,13 @@ def _add_ref_text(text: str, kind: str, name: str) -> str:
 
 def translation_import(ws, project, path: str) -> dict:
     """Write cultures/{code}.tmdl from flat JSON. Token-like values are refused. Counts only."""
-    path = _local_json(path)
+    path = _anchored(path, ws.root)
+    if not os.path.lexists(path):
+        raise PbzError("BAD_REQUEST", "translations file could not be read")
     try:
-        data = json.loads(open(path, encoding="utf-8-sig").read())
+        data = json.loads(read_checked(path, root=ws.root).decode("utf-8-sig"))
+    except PbzError:
+        raise
     except (OSError, UnicodeError, ValueError) as err:
         raise PbzError("BAD_REQUEST", "translations file could not be read") from err
     if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("translations"), list):
@@ -563,7 +585,7 @@ def translation_import(ws, project, path: str) -> dict:
     ops = [_write_op(mdef, rel, text) for rel, text in texts.items()]
     if new_model != model_text:
         ops.append(("write", model_path, new_model, model_bom))
-    _commit(ops)
+    _commit(ops, mdef)
     return {"verb": "translate", "action": "import", "cultures": len(cultures),
             "translations": len(planned), "files": len(ops)}
 
@@ -595,6 +617,7 @@ def culture_list(ws, project, code: str | None = None) -> dict:
 
 
 def culture_missing(ws, project, code: str) -> dict:
+    code = _require_code(code)
     mdef, model = _model(project)
     rel, path = _culture(mdef, code)
     done = _translated(tmdl.parse(rel, read_text(path)[0]))
@@ -632,7 +655,7 @@ def perspective_add(ws, project, name: str) -> dict:
     if any(p.lower() == name.lower() for p in model.perspectives):
         raise PbzError("NAME_TAKEN", name)
     rel = _destination(mdef, "perspectives", name)
-    _commit([_write_op(mdef, rel, f"perspective {_q(name)}\n"), _ref_line(mdef, "perspective", name, True)])
+    _commit([_write_op(mdef, rel, f"perspective {_q(name)}\n"), _ref_line(mdef, "perspective", name, True)], mdef)
     return {"verb": "perspective", "action": "added", "perspective": name,
             "files": [_rel(project, rel), _rel(project, "model.tmdl")],
             "next": f"pbz perspective include \"{name}\" <objects...>"}
@@ -649,7 +672,7 @@ def perspective_remove(ws, project, name: str) -> dict:
     if ref:
         ops.append(ref)
         files.append(_rel(project, "model.tmdl"))
-    _commit(ops)
+    _commit(ops, mdef)
     return {"verb": "perspective", "action": "removed", "perspective": node.name, "files": files,
             "next": "pbz diff, pbz push"}
 
@@ -734,7 +757,7 @@ def role_add(ws, project, name: str, permission: str = "read") -> dict:
         raise PbzError("NAME_TAKEN", name)
     rel = _destination(mdef, "roles", name)
     _commit([_write_op(mdef, rel, f"role {_q(name)}\n\tmodelPermission: {permission}\n"),
-             _ref_line(mdef, "role", name, True)])
+             _ref_line(mdef, "role", name, True)], mdef)
     return {"verb": "role", "action": "added", "role": name,
             "files": [_rel(project, rel), _rel(project, "model.tmdl")],
             "next": f"pbz role filter \"{name}\" <table> \"<DAX>\", then pbz push; members are usually assigned in the service"}
@@ -751,7 +774,7 @@ def role_remove(ws, project, name: str) -> dict:
     if ref:
         ops.append(ref)
         files.append(_rel(project, "model.tmdl"))
-    _commit(ops)
+    _commit(ops, mdef)
     return {"verb": "role", "action": "removed", "role": node.name, "files": files, "next": "pbz diff, pbz push"}
 
 
@@ -790,6 +813,18 @@ def role_filter(ws, project, name: str, table: str, dax: str | None) -> dict:
             "next": "pbz diff, pbz push; test with View as role in Desktop (the user)"}
 
 
+def _member_token(ws, member: str) -> str:
+    """A token already in hand, or the same `pii` token `tokenize_tmdl` writes for a role member."""
+    if TOKEN_RE.fullmatch(member or ""):
+        return member
+    tm = TokenMap(ws.private)
+    token = tm.raw("pii", member, "tmdl")
+    tm.save()
+    if not TOKEN_RE.fullmatch(token):
+        raise PbzError("REFUSED", "member must be a token")
+    return token
+
+
 def role_member(ws, project, name: str, action: str, member: str) -> dict:
     mdef, model = _model(project)
     rel, doc, node = _role(mdef, model, name)
@@ -797,12 +832,13 @@ def role_member(ws, project, name: str, action: str, member: str) -> dict:
     eol = _eol(text)
     mem = [c for c in node.children if c.kind == "member"]
     if action == "add":
-        if any(c.name.lower() == member.lower() for c in mem):
+        token = _member_token(ws, member)
+        if any(c.name.lower() == token.lower() for c in mem):
             return {"verb": "role", "action": "unchanged", "role": node.name}
-        text = text.rstrip("\r\n") + eol + eol + f"\tmember {_q(member)}" + eol
+        text = text.rstrip("\r\n") + eol + eol + f"\tmember {_q(token)}" + eol
         _write(mdef, rel, text)
         return {"verb": "role", "action": "member-added", "role": node.name, "members": len(mem) + 1,
-                "note": "the member is tokenized in the mirror after the next pull"}
+                "note": "the member is stored as a token"}
     hit = next((c for c in mem if c.name == member or c.name.lower() == member.lower()), None)
     if hit is None:
         raise PbzError("NOT_FOUND", "member (pass the token shown in the mirror)")

@@ -254,7 +254,7 @@ class MemscrubAtomicTests(unittest.TestCase):
 
         with patch("pbz.mcp.subprocess.run", fake_run):
             out = __import__("pbz.mcp", fromlist=["mcp"]).call_tool(
-                "memscrub", {"dir": self.notes, "workspace": self.ws.root}, None, None)
+                "memscrub", {"dir": self.notes, "workspace": self.ws.root}, self.ws.root, None)
         body = json.loads(out["content"][0]["text"])
         dumped = json.dumps(body)
         self.assertIn("files_changed", body)

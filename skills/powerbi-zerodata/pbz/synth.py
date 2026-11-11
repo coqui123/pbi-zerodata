@@ -1029,6 +1029,8 @@ def open_(ws, project, wait: int = 480) -> dict:
     sp = synth_project(ws, project)
     _refuse_incomplete(sp.ws.root)
     _require_synthetic(sp.ws.root)
+    if not _verified_owned(ws, sp.ws.root):
+        raise PbzError("UNSAFE", "not a pbz synthetic folder; refusing to touch it")
     res = desktop.open_(sp, wait)
     inst = desktop.find_instance(sp)
     port = desktop.engine_port(int(inst["pid"])) if inst and inst.get("pid") else None

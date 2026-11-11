@@ -6,6 +6,7 @@ edit: any failure puts the previous bytes back and deletes files the attempt cre
 from __future__ import annotations
 
 import os
+import stat
 
 from .common import PbzError, _reparse_link
 
@@ -30,6 +31,21 @@ def _files(root: str) -> list[str]:
     return out
 
 
+def _refuse_linked(path: str) -> None:
+    """Refuse a symlink, junction, or hardlink that appeared before the truncating write."""
+    if os.path.islink(path) or _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    if not os.path.lexists(path):
+        return
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+    if (os.path.islink(path) or _reparse_link(path) or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+
 def _restore(root: str, snap: dict[str, tuple[str, bytes]]) -> None:
     if os.path.isdir(root):
         for path in _files(root):
@@ -37,6 +53,7 @@ def _restore(root: str, snap: dict[str, tuple[str, bytes]]) -> None:
                 os.remove(path)
     for path, data in snap.values():
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        _refuse_linked(path)
         with open(path, "wb") as handle:
             handle.write(data)
 

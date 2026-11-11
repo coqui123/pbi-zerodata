@@ -7,6 +7,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import uuid
 
@@ -276,13 +277,40 @@ def _read_prepared(path: str, rel: str):
 
 
 def pull(ws: Workspace, project: Project, force: bool = False, rebase: bool = False) -> dict:
+    """Run a pull while this process holds the project commit lock.
+
+    An existing lock is the same refusal as `_pull_blocked`. The lock stays for the
+    whole pull, including recovery checks and mirror writes, then it is removed.
+    """
+    directory = _transaction_dir(ws, project)
+    lock = os.path.join(directory, ".commit-lock")
+    if _reparse_link(ws.private) or _reparse_link(lock):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(lock, ws.private)
+    os.makedirs(directory, exist_ok=True)
+    if _reparse_link(directory) or _reparse_link(lock):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(lock, ws.private)
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return _pull_blocked(ws, project) or {
+            "verb": "pull", "project": project.name, "result": "RECOVERY_REQUIRED", "transactions": []}
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(str(os.getpid()))
+        pending = pending_recovery(ws, project)
+        if pending:
+            return {"verb": "pull", "project": project.name, "result": "RECOVERY_REQUIRED", "transactions": pending}
+        return _pull_body(ws, project, force, rebase)
+    finally:
+        remove_file(lock, root=ws.private)
+
+
+def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: bool = False) -> dict:
     # The mirror root and the guide are checked before recovery scans, mirror walks or pull mutations.
     anchor_mirror(ws)
     preflight_regular(os.path.join(ws.mirror, "MIRROR.md"), root=ws.mirror)
-    # Force and rebase do not bypass an interrupted commit.
-    gate = _pull_blocked(ws, project)
-    if gate:
-        return gate
     pol = policy_mod.load(ws)
     man = load_manifest(ws, project)
     if man and os.path.isdir(ws.mirror):
@@ -864,7 +892,10 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
     pre_mirror = {rel: hashlib.sha256(bom + mtext.encode("utf-8")).hexdigest()
                   for rel, (mtext, bom) in captured_mirror.items()}
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
-    stage = os.path.join(ws.private, "stage", stamp)
+    # The staged copy is not the real project. Name a pbz-workspace directory so
+    # definition reads trust this tree and still refuse the real model folder.
+    stage_root = os.path.join(ws.private, "stage", stamp)
+    stage = os.path.join(stage_root, "pbz-workspace")
     transaction = None
     try:
         for src in (project.model_dir, project.report_dir):
@@ -1042,7 +1073,7 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
                 "error": "COMMIT_FAILED", "transaction": stamp,
                 "hint": "inspect recovery status before retrying; diagnostic content remains private"}
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(stage_root, ignore_errors=True)
 
 
 def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False,
@@ -1051,8 +1082,14 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
     if dry_run or preflight_only:
         return _push(ws, project, reload, dry_run, only, preflight_only)
     directory = _transaction_dir(ws, project)
-    os.makedirs(directory, exist_ok=True)
     lock = os.path.join(directory, ".commit-lock")
+    if _reparse_link(ws.private) or _reparse_link(lock):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(lock, ws.private)
+    os.makedirs(directory, exist_ok=True)
+    if _reparse_link(directory) or _reparse_link(lock):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(lock, ws.private)
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
@@ -1063,7 +1100,7 @@ def push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = 
             f.write(str(os.getpid()))
         return _push(ws, project, reload, dry_run, only, preflight_only)
     finally:
-        remove_file(lock, root=directory)
+        remove_file(lock, root=ws.private)
 
 
 def preflight(ws: Workspace, project: Project, only: list[str] | None = None) -> dict:
@@ -1180,6 +1217,8 @@ def apply_block(text: str, span: tuple[int, int], new: str) -> str:
 # ---------------------------------------------------------------- mirror history (sanitized snapshots)
 
 HISTORY_KEEP = 20
+_SNAPSHOT_STAMP = re.compile(r"^\d{8}_\d{6}(?:_\d{3})?$")
+_BLOB_ID = re.compile(r"^[0-9a-f]{64}$")
 
 
 def history_dir(ws: Workspace, project: Project) -> str:
@@ -1270,13 +1309,32 @@ def history_list(ws: Workspace, project: Project) -> list[dict]:
 
 
 def history_texts(ws: Workspace, project: Project, stamp: str) -> dict[str, str]:
+    if not isinstance(stamp, str) or _SNAPSHOT_STAMP.fullmatch(stamp) is None:
+        shown = stamp if isinstance(stamp, str) else ""
+        raise PbzError("NOT_FOUND", f"snapshot {shown}".rstrip())
     hdir = history_dir(ws, project)
+    path = os.path.join(hdir, "snapshots", stamp + ".json")
     try:
-        with open(os.path.join(hdir, "snapshots", f"{stamp}.json"), encoding="utf-8") as f:
-            files = json.load(f)["files"]
-    except (OSError, ValueError, KeyError):
+        if not os.path.lexists(path):
+            raise FileNotFoundError(path)
+        doc = json.loads(read_checked(path, root=hdir).decode("utf-8"))
+        files = doc["files"]
+    except PbzError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError):
+        raise PbzError("NOT_FOUND", f"snapshot {stamp}") from None
+    if not isinstance(files, dict):
         raise PbzError("NOT_FOUND", f"snapshot {stamp}")
-    return {rel: read_text(os.path.join(hdir, "blobs", h + ".txt"))[0] for rel, h in files.items()}
+    out = {}
+    for rel, blob in files.items():
+        if not isinstance(rel, str) or not isinstance(blob, str) or _BLOB_ID.fullmatch(blob) is None:
+            raise PbzError("NOT_FOUND", f"snapshot {stamp}")
+        blob_path = os.path.join(hdir, "blobs", blob + ".txt")
+        if not os.path.lexists(blob_path):
+            raise PbzError("NOT_FOUND", f"snapshot {stamp}")
+        text, _bom = read_text_checked(blob_path, root=hdir)
+        out[rel] = text
+    return out
 
 
 def preflight_push_log(ws: Workspace) -> str:

@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import sys
 import uuid
 from . import control, dpapi, evidence, checks
 from .common import PbzError, _reparse_link, anchor_mirror, read_checked
@@ -140,7 +139,8 @@ def import_spec(ws, project, spec):
         if not validation.get("valid"):
             raise PbzError("BAD_REQUEST", "invalid registered acceptance checks")
         # Text is intentionally opaque to the agent. Do not echo descriptions or source captions.
-        private[ident] = {"description": task.get("description", ""), "source": source, "checks": spec_checks}
+        private[ident] = {"description": task.get("description", ""), "source": source, "checks": spec_checks,
+                          "depends_on": list(deps)}
         public[ident] = {"id": ident, "source_fingerprint": hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest(),
                          "cells": cells, "targets": targets, "depends_on": deps,
                          "required_checks": seen, "verification": None, "accepted_revision": None}
@@ -189,6 +189,50 @@ def status(ws, project):
     return {"verb": "requirements status", "revision": None if live is None else live["mirror"], "tasks": result}
 
 
+def _private_path(ws, ledger) -> str:
+    config = ledger.get("config", "")
+    if not isinstance(config, str) or not re.fullmatch(r"[a-f0-9]{32}", config):
+        raise PbzError("BAD_REQUEST", "invalid requirement configuration")
+    return os.path.join(ws.private, "requirements", config + ".bin")
+
+
+def _read_private(ws, ledger) -> dict:
+    payload = dpapi.read_protected(_private_path(ws, ledger))
+    if not payload:
+        raise PbzError("BAD_REQUEST", _EVIDENCE)
+    try:
+        private = json.loads(payload.decode())
+    except (UnicodeError, ValueError, AttributeError):
+        raise PbzError("BAD_REQUEST", _EVIDENCE) from None
+    if not isinstance(private, dict):
+        raise PbzError("BAD_REQUEST", _EVIDENCE)
+    return private
+
+
+def _write_private(ws, ledger, private) -> None:
+    dpapi.write_protected(_private_path(ws, ledger), json.dumps(private, ensure_ascii=False).encode())
+
+
+def _failure_beside_pass(output) -> bool:
+    """True when PASS rows sit beside a failure flag. That output is not a pass."""
+    if not isinstance(output, dict):
+        return False
+    rows = output.get("results")
+    if not isinstance(rows, list):
+        return False
+    passed = [row for row in rows if isinstance(row, dict) and row.get("status") == "PASS"]
+    if not passed:
+        return False
+    if (output.get("ok") is False or output.get("spec_valid") is False or output.get("failed") is True
+            or output.get("failure") is True or output.get("error")):
+        return True
+    for row in passed:
+        if (row.get("ok") is False or row.get("failed") is True or row.get("failure") is True
+                or row.get("error") or row.get("class")):
+            return True
+    return False
+
+
 def _check_rows(registered, output):
     ids = []
     for check in registered:
@@ -223,12 +267,11 @@ def verify(ws, project, ident):
     if ident not in ledger["tasks"]:
         raise PbzError("NOT_FOUND", "requirement id")
     task = ledger["tasks"][ident]
-    config = ledger.get("config", "")
-    if not re.fullmatch(r"[a-f0-9]{32}", config):
-        raise PbzError("BAD_REQUEST", "invalid requirement configuration")
-    payload = dpapi.read_protected(os.path.join(ws.private, "requirements", config + ".bin"))
-    private = json.loads(payload.decode())
-    registered = private[ident]["checks"]
+    private = _read_private(ws, ledger)
+    spec = private.get(ident)
+    if not isinstance(spec, dict) or not isinstance(spec.get("checks"), list):
+        raise PbzError("BAD_REQUEST", _EVIDENCE)
+    registered = spec["checks"]
     if not registered:
         return {"verb": "requirements verify", "result": "HUMAN_REVIEW_REQUIRED", "id": ident, "checks": []}
     before = _binding(ws, project, strict=True, need_sync=True)
@@ -237,8 +280,12 @@ def verify(ws, project, ident):
     if before != after:
         raise PbzError("STALE_EVIDENCE", "revision changed during verification")
     statuses = _check_rows(registered, output)
-    passed = all(row["status"] == "PASS" for row in statuses)
-    task["verification"] = {"revision": after, "passed": passed, "checks": statuses}
+    passed = all(row["status"] == "PASS" for row in statuses) and not _failure_beside_pass(output)
+    proof = {"revision": after, "passed": passed, "checks": statuses}
+    spec["verification"] = proof
+    spec["accepted_revision"] = None
+    _write_private(ws, ledger, private)
+    task["verification"] = proof
     task["accepted_revision"] = None
     control.save(_path(ws, project), ledger, root=ws.mirror)
     return {"verb": "requirements verify", "id": ident, "result": "VERIFIED" if passed else "INCOMPLETE",
@@ -246,8 +293,9 @@ def verify(ws, project, ident):
 
 
 def _human_terminal() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty() and not any(os.environ.get(k) for k in
-        ("CLAUDECODE", "CODEX_SANDBOX", "CODEX_MANAGED_BY_NPM"))
+    """Same gate as consent. A local copy would drift from the console rule."""
+    from . import consent
+    return consent._human_terminal()
 
 
 def accept(ws, project, ident, human=False):
@@ -258,12 +306,32 @@ def accept(ws, project, ident, human=False):
     if ident not in ledger["tasks"]:
         raise PbzError("NOT_FOUND", "requirement id")
     task = ledger["tasks"][ident]
-    live = _binding(ws, project, strict=True, need_sync=bool(task["required_checks"]))
-    proof = task.get("verification") or {}
-    if task["required_checks"] and not (_bound(proof.get("revision"), live) and proof.get("passed") is True):
-        raise PbzError("STALE_EVIDENCE", "current passing registered checks are required")
-    if any(not _bound(ledger["tasks"][dep].get("accepted_revision"), live) for dep in task["depends_on"]):
-        raise PbzError("DEPENDENCY_PENDING", "accept dependencies first")
+    private = _read_private(ws, ledger)
+    spec = private.get(ident)
+    if not isinstance(spec, dict):
+        raise PbzError("BAD_REQUEST", _EVIDENCE)
+    registered = spec.get("checks", [])
+    deps = spec.get("depends_on", [])
+    if not isinstance(registered, list) or not isinstance(deps, list):
+        raise PbzError("BAD_REQUEST", _EVIDENCE)
+    live = _binding(ws, project, strict=True, need_sync=bool(registered))
+    if registered:
+        proof = spec.get("verification") if isinstance(spec.get("verification"), dict) else {}
+        if not (_bound(proof.get("revision"), live) and proof.get("passed") is True):
+            raise PbzError("STALE_EVIDENCE", "current passing registered checks are required")
+        try:
+            confirmed = _check_rows(registered, {"results": proof.get("checks")})
+        except PbzError:
+            raise PbzError("STALE_EVIDENCE", "current passing registered checks are required") from None
+        if any(row["status"] != "PASS" for row in confirmed):
+            raise PbzError("STALE_EVIDENCE", "current passing registered checks are required")
+    for dep in deps:
+        other = private.get(dep)
+        revision = other.get("accepted_revision") if isinstance(other, dict) else None
+        if not _bound(revision, live):
+            raise PbzError("DEPENDENCY_PENDING", "accept dependencies first")
+    spec["accepted_revision"] = live
+    _write_private(ws, ledger, private)
     task["accepted_revision"] = live
     control.save(_path(ws, project), ledger, root=ws.mirror)
     return {"verb": "requirements accept", "id": ident, "result": "ACCEPTED", "revision": live["mirror"]}

@@ -111,13 +111,24 @@ def _lint(vis: list[dict], width: float, height: float, page: str) -> list[dict]
     return out
 
 
+def _page_segment(name: str) -> bool:
+    """True when a page id is one path segment. Traversal and nested ids are ignored."""
+    if not isinstance(name, str) or not name or name in (".", ".."):
+        return False
+    if any(c in name for c in "/\\\x00"):
+        return False
+    return os.path.basename(name) == name
+
+
 def run(ws, project, page: str | None = None, show_map: bool = True) -> dict:
     pages_dir = os.path.join(project.mirror_report, "definition", "pages")
     if not os.path.isdir(pages_dir):
         raise PbzError("NO_MIRROR", "run `pbz pull` first (no report pages in the mirror)")
     meta = _load(os.path.join(pages_dir, "pages.json"))
     order = [_s(x) for x in meta.get("pageOrder").items] if isinstance(meta, pbir.JObj) and isinstance(meta.get("pageOrder"), pbir.JArr) else []
-    ids = order + [p for p in sorted(os.listdir(pages_dir)) if os.path.isdir(os.path.join(pages_dir, p)) and p not in order]
+    order = [p for p in order if _page_segment(p)]
+    ids = order + [p for p in sorted(os.listdir(pages_dir))
+                   if _page_segment(p) and os.path.isdir(os.path.join(pages_dir, p)) and p not in order]
     out_pages, findings = [], []
     for pid in ids:
         proot = _load(os.path.join(pages_dir, pid, "page.json"))

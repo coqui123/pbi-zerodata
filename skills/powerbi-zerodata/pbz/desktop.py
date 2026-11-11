@@ -12,16 +12,23 @@ from .common import TOOLS_BIN, PbzError, Project, engine_call
 BRIDGE = os.path.join(TOOLS_BIN, "powerbi-desktop.cmd")
 
 
-def _ps(script: str, timeout: int = 60) -> str:
-    """Run a PowerShell snippet: PowerShell 7 when installed, else the Windows PowerShell every Windows has."""
+def _ps(script: str, timeout: int = 60) -> str | None:
+    """Run a PowerShell snippet. None when PowerShell is missing or the process fails.
+
+    An empty string is a successful run with no output. Callers must not treat None as that.
+    """
     for exe in ("pwsh", "powershell"):
         try:
             p = subprocess.run([exe, "-NoProfile", "-NonInteractive", "-Command", script],
                                capture_output=True, timeout=timeout)
         except FileNotFoundError:
             continue
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if p.returncode != 0:
+            return None
         return p.stdout.decode("utf-8", errors="replace")
-    return ""
+    return None
 
 
 def _json_list(text: str) -> list:
@@ -39,6 +46,10 @@ def processes() -> list[dict]:
     """PBIDesktop.exe processes with their command lines (file paths are metadata)."""
     out = _ps("Get-CimInstance Win32_Process -Filter \"Name='PBIDesktop.exe'\" | "
               "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress")
+    if out is None:
+        raise PbzError("ENGINE_UNAVAILABLE", "Desktop process probe failed")
+    if not out.strip():
+        return []
     return [{"pid": int(p["ProcessId"]), "cmd": p.get("CommandLine") or ""} for p in _json_list(out)]
 
 
@@ -97,6 +108,10 @@ def engine_port(pid: int) -> int | None:
     """Port of the msmdsrv.exe started by this PBIDesktop process."""
     out = _ps("Get-CimInstance Win32_Process -Filter \"Name='msmdsrv.exe'\" | "
               "Select-Object ProcessId, ParentProcessId, CommandLine | ConvertTo-Json -Compress")
+    if out is None:
+        raise PbzError("ENGINE_UNAVAILABLE", "Desktop process probe failed")
+    if not out.strip():
+        return None
     for m in _json_list(out):
         if int(m.get("ParentProcessId") or 0) != pid:
             continue
@@ -115,6 +130,10 @@ def engine_port(pid: int) -> int | None:
                 pass
         ports = _ps(f"Get-NetTCPConnection -OwningProcess {int(m['ProcessId'])} -State Listen -ErrorAction "
                     "SilentlyContinue | Select-Object -ExpandProperty LocalPort")
+        if ports is None:
+            raise PbzError("ENGINE_UNAVAILABLE", "Desktop process probe failed")
+        if not ports.strip():
+            continue
         nums = [int(x) for x in ports.split() if x.isdigit()]
         if nums:
             return min(nums)
@@ -170,8 +189,12 @@ def close(project: Project, wait: int = 60) -> dict:
     _ps(f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ [void]$p.CloseMainWindow() }}")
     deadline = time.monotonic() + max(0, wait)
     while True:
-        alive = _ps(f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'alive' }}").strip()
-        if not alive:
+        alive = _ps(f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'alive' }}")
+        if alive is None:
+            return {"verb": "desktop", "project": project.name, "open": True, "pid": pid,
+                    "action": "unknown", "result": "UNKNOWN",
+                    "hint": "Desktop close could not be confirmed. It may still be open."}
+        if not alive.strip():
             return {"verb": "desktop", "project": project.name, "open": False,
                     "action": "closed", "result": "CLOSED"}
         remaining = deadline - time.monotonic()

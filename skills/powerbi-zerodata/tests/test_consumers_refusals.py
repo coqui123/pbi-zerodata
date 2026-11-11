@@ -62,6 +62,8 @@ class ConsumerRefusalTests(unittest.TestCase):
         _write(os.path.join(mdef, "model.tmdl"), MODEL)
         _write(os.path.join(mdef, "database.tmdl"), DATABASE)
         page = os.path.join(project.mirror_report, "definition", "pages", "p1")
+        _write(os.path.join(project.mirror_report, "definition.pbir"),
+               json.dumps({"version": "4.0", "datasetReference": {"byPath": {"path": "../Mini.SemanticModel"}}}))
         _write(os.path.join(page, "page.json"), json.dumps({"name": "p1", "displayName": "Synthetic"}))
         _write(os.path.join(page, "visuals", "v1", "visual.json"), json.dumps(VISUAL))
         return ws, project

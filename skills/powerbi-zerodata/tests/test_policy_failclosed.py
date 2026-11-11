@@ -396,7 +396,7 @@ class PolicyFailClosedTests(unittest.TestCase):
         self.assertEqual(guard.classify_path(mirror), "error")
         self.assertIs(ws.policy_path, ws.policy_path)
 
-    def test_synthetic_child_without_policy_stays_exempt(self):
+    def test_synthetic_ancestor_does_not_exempt_child(self):
         parent = os.path.join(self.outside.name, "syn-parent")
         os.makedirs(os.path.join(parent, ".pbz"), exist_ok=True)
         with open(os.path.join(parent, ".pbz", "policy.json"), "w", encoding="utf-8") as handle:
@@ -404,8 +404,9 @@ class PolicyFailClosedTests(unittest.TestCase):
         child = os.path.join(parent, "fixture")
         self._workspace(child)
         _reset()
-        self.assertTrue(guard.synthetic(child))
-        self.assertIsNone(self._shell("python -c \"import adomd\"", child))
+        self.assertFalse(guard.synthetic(child))
+        self.assertTrue(guard.synthetic(parent))
+        self.assertEqual(self._shell("python -c \"import adomd\"", child), "engine")
 
     def test_shell_policy_rules(self):
         cwd = self.ws.root
@@ -485,16 +486,16 @@ class PolicyFailClosedTests(unittest.TestCase):
         self._deny(f"Get-Content -LiteralPath:{model}", cwd, "definition")
         self._deny("Get-Content -Path:..\\X.SemanticModel\\definition\\model.tmdl", cwd, "definition")
         self._allow("Get-Content -Path:pbz-workspace\\X.SemanticModel\\definition\\model.tmdl", cwd)
-        # Explicit allow on a real definition must survive shell + Read; lockdown still denies.
+        # An allow glob does not exempt a real definition. Lockdown still denies.
         with open(self.ws.policy_path, "w", encoding="utf-8") as handle:
             handle.write(json.dumps({"version": 1, "allow": ["x.semanticmodel/definition/model.tmdl"]}))
         _reset()
-        self.assertIsNone(guard.classify_path(guard.norm(model)))
-        self._allow(f"Get-Content -LiteralPath:{model}", cwd)
-        self._allow("Get-Content X.SemanticModel\\definition\\model.tmdl", cwd)
+        self.assertEqual(guard.classify_path(guard.norm(model)), "definition")
+        self._deny(f"Get-Content -LiteralPath:{model}", cwd, "definition")
+        self._deny("Get-Content X.SemanticModel\\definition\\model.tmdl", cwd, "definition")
         _reset()
         event = {"tool_name": "Read", "cwd": cwd, "tool_input": {"file_path": model}}
-        self.assertIsNone(guard.decide(event))
+        self.assertEqual(guard.decide(event), "definition")
         with open(self.ws.policy_path, "w", encoding="utf-8") as handle:
             handle.write("{")
         _reset()
@@ -620,6 +621,122 @@ class PolicyFailClosedTests(unittest.TestCase):
         self.assertIn("deny", proc.stdout)
         self.assertNotIn("Traceback", proc.stderr)
         self.assertNotIn("Traceback", proc.stdout)
+
+    def test_hook_fail_closed(self):
+        import io
+        event = {"hook_event_name": "PreToolUse", "tool_name": "Read", "cwd": self.outside.name,
+                 "tool_input": {"file_path": "notes.md"}}
+        buf = io.StringIO()
+        with patch("sys.stdin", io.StringIO("{")), patch("sys.stdout", buf):
+            self.assertEqual(guard.main(), 1)
+        self.assertIn("deny", buf.getvalue())
+        self.assertNotIn("Traceback", buf.getvalue())
+        buf = io.StringIO()
+        with patch("sys.stdin", io.StringIO("[]")), patch("sys.stdout", buf):
+            self.assertEqual(guard.main(), 1)
+        self.assertIn("deny", buf.getvalue())
+        buf = io.StringIO()
+        with patch("sys.stdin", io.StringIO(json.dumps(event))), patch("sys.stdout", buf), \
+             patch("pbz.guard.decide", side_effect=RuntimeError("boom")):
+            self.assertEqual(guard.main(), 0)
+        self.assertIn("deny", buf.getvalue())
+        buf = io.StringIO()
+        with patch("sys.stdin", io.StringIO(json.dumps(event))), patch("sys.stdout", buf), \
+             patch("pbz.guard.active_root", side_effect=RuntimeError("boom")):
+            self.assertEqual(guard.main(), 1)
+        self.assertIn("deny", buf.getvalue())
+        self.assertNotIn("Traceback", buf.getvalue())
+
+    def test_policy_loosened_missing_budget_and_category_max(self):
+        self.assertTrue(guard.policy_loosened({"budgets": {"session_checks": 100}}, {}))
+        self.assertTrue(guard.policy_loosened(
+            {"budgets": {"session_checks": 100, "per_target": 10}},
+            {"budgets": {"session_checks": 100}}))
+        self.assertFalse(guard.policy_loosened(
+            {"budgets": {"session_checks": 100}},
+            {"budgets": {"session_checks": 50, "per_target": 60, "constants_per_target": 3}}))
+        self.assertFalse(guard.policy_loosened({"budgets": {"session_checks": 300}}, {}))
+        self.assertTrue(guard.policy_loosened({"budgets": {"probes_per_day": 1}}, {}))
+        self.assertTrue(guard.policy_loosened({"category_max": 10}, {}))
+        self.assertTrue(guard.policy_loosened({"category_max": 10}, {"category_max": 80}))
+        self.assertFalse(guard.policy_loosened({"category_max": 100}, {}))
+        self.assertFalse(guard.policy_loosened({"category_max": 40}, {"category_max": 10}))
+        self.assertFalse(guard.policy_loosened({}, {}))
+        self.assertFalse(guard.policy_loosened({}, {"literals": "strict"}))
+
+    def test_allow_does_not_cover_reparse_or_loose_mirror_text(self):
+        from _junction import make_junction
+        os.makedirs(self.ws.pbz_dir, exist_ok=True)
+        with open(self.ws.policy_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"version": 1, "allow": ["alias/**", "notes.png"]}))
+        png = os.path.join(self.ws.root, "notes.png")
+        with open(png, "wb") as handle:
+            handle.write(b"png")
+        _reset()
+        self.assertIsNone(guard.classify_path(png))
+        pol = {}
+        self.assertFalse(guard.script_bad("open('pbz-workspace/X.SemanticModel/definition/model.tmdl')", pol))
+        self.assertTrue(guard.script_bad("note pbz-workspace\nopen('X.SemanticModel/definition/model.tmdl')", pol))
+        self.assertTrue(guard.script_bad("open('pbz-workspace-backup/X.SemanticModel/definition/model.tmdl')", pol))
+        link = os.path.join(self.ws.root, "alias")
+        make_junction(self, link, os.path.join(self.ws.root, "X.SemanticModel"))
+        _reset()
+        leaked = os.path.join(link, "definition", "model.tmdl")
+        self.assertEqual(guard.classify_path(leaked), "definition")
+
+    def test_shell_globs_cd_scripts_and_redirects(self):
+        root = self.ws.root
+        os.makedirs(os.path.join(root, "sub"), exist_ok=True)
+        with open(os.path.join(root, "secret.csv"), "w", encoding="utf-8") as handle:
+            handle.write("a,b\n")
+        with open(os.path.join(root, "bad.py"), "w", encoding="utf-8") as handle:
+            handle.write("import openpyxl\n")
+        with open(os.path.join(root, "bad.ps1"), "w", encoding="utf-8") as handle:
+            handle.write("Get-Content data.xlsx\n")
+        with open(os.path.join(root, "big.py"), "wb") as handle:
+            handle.write(b"print(1)\n" + b"#" * (guard.MAX_SCRIPT_BYTES + 1))
+        png = os.path.join(root, "shot.png")
+        with open(png, "wb") as handle:
+            handle.write(b"png")
+        _reset()
+        self.assertEqual(guard.check_grep(
+            {"pattern": "a", "path": root, "glob": "*.c*"}, root, guard.norm(root)), "search")
+        self.assertIsNone(guard.check_grep(
+            {"pattern": "a", "path": root, "glob": "*.md"}, root, guard.norm(root)))
+        self._deny("ls X.SemanticModel\\definition\\model.tmdl", root, "definition")
+        self._deny("gci X.SemanticModel\\definition\\model.tmdl", root, "definition")
+        self._deny("Get-Content *.SemanticModel", root, "definition")
+        missing = os.path.join(self.outside.name, "missing-cd")
+        self._deny(f'cd "{missing}" && Get-Content X.SemanticModel\\definition\\model.tmdl', root, "definition")
+        outside = self.outside.name
+        self._deny(f'cd "{outside}" && cd - && Get-Content X.SemanticModel\\definition\\model.tmdl', root, "definition")
+        self._deny(f'pushd "{outside}" && popd && Get-Content X.SemanticModel\\definition\\model.tmdl', root, "definition")
+        self._deny("python -X utf8 bad.py", root, "script")
+        self._deny("python missing-script.py", root, "error")
+        self._deny("python big.py", root, "error")
+        self._deny("pwsh -NoProfile .\\bad.ps1", root, "script")
+        self._deny("powershell -ExecutionPolicy Bypass .\\bad.ps1", root, "script")
+        self._deny(f'echo hello > "{guard.__file__}"', root, "selfprotect")
+        self._deny(f'pbz image add "{png}"', root, "data_file")
+        cli = os.path.join(SKILL, "bin", "pbz.cmd")
+        self._deny(f'"{cli}" image add "{png}"', root, "data_file")
+        self._allow(f'"{cli}" status', root)
+        fake = os.path.join(root, "pbz.cmd")
+        with open(fake, "w", encoding="utf-8") as handle:
+            handle.write("import pandas\npd.read_csv('a.csv')\n")
+        self._deny(f'"{fake}" pull', root, "script")
+        os.makedirs(self.ws.pbz_dir, exist_ok=True)
+        with open(self.ws.policy_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"version": 1}))
+        _reset()
+        self.assertEqual(guard.decide({
+            "tool_name": "Delete", "cwd": root,
+            "tool_input": {"path": self.ws.policy_path},
+        }), "policy")
+        self.assertEqual(guard.decide({
+            "tool_name": "mcp__filesystem__write_file", "cwd": root,
+            "tool_input": {"path": self.ws.policy_path, "content": json.dumps({"synthetic": True})},
+        }), "policy")
 
     def test_validator_parity(self):
         samples = [{}, {"synthetic": True}, {"version": True}, {"disclosure": "open"}, {"allow": "*"},

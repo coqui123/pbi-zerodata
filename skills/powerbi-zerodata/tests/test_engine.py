@@ -466,7 +466,7 @@ def test_offline(env: Env, tmp: Path) -> None:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     r = mod.call("ping", {"private_dir": str(env.pd)})
-    expect("engine.py call(ping) passes the response through", r == {"ok": True, "verb": "ping", "version": "1"}, r)
+    expect("engine.py call(ping) returns only ok and verb", r == {"ok": True, "verb": "ping"}, r)
     saved = mod.ENGINE_EXE
     try:
         mod.ENGINE_EXE = S / "engine" / "bin" / "missing-engine.exe"
@@ -530,26 +530,34 @@ def test_live(env: Env, key_holder: dict) -> None:
            r and set(r.get("unprocessed_tables", [])) <= {"Notes"}, r)
 
     # index
-    r = engine("index", env.req(category_max=3), "index")
+    def text_classes(resp):
+        return {(t["table"], c["column"]): c.get("class")
+                for t in (resp or {}).get("tables", []) for c in t["columns"] if c.get("type") == "string"}
+
+    r_low = engine("index", env.req(category_max=1), "index-cut-low")
+    r = engine("index", env.req(category_max=100000), "index")
+    expect("index: request category_max does not move the class boundary",
+           r_low and r and r.get("ok") and text_classes(r_low) == text_classes(r)
+           and set(text_classes(r).values()) <= {"category", "high", "empty"}, r)
     cls = {(t["table"], c["column"]): c for t in (r or {}).get("tables", []) for c in t["columns"]}
-    want = {("Person", "Name"): "high", ("Person", "Email"): "category", ("Project", "Title"): "high",
-            ("Project", "Status"): "category", ("Hours", "Person"): "high", ("ExceptionType", "Code"): "category",
-            ("ExceptionType", "Label"): "category"}
-    expect("index: text column classes (category_max=3)", all(cls.get(k, {}).get("class") == v for k, v in want.items()), r)
     expect("index: non-text columns carry no class", all("class" not in cls[k] for k in cls if cls[k]["type"] != "string"), r)
     tb = {t["table"]: t for t in (r or {}).get("tables", [])}
     expect("index: row buckets", tb.get("Hours", {}).get("rows_bucket") == "10-99" and tb.get("DimDate", {}).get("rows_bucket") == "100-999", r)
-    expect("index: blank share bucket and date span",
+    expect("index: blank share bucket and no exact years",
            cls.get(("Hours", "Person"), {}).get("blank_bucket") == "1-10%"
-           and cls.get(("Project", "PlannedEnd"), {}).get("year_min") == 2025 and cls.get(("Project", "PlannedEnd"), {}).get("year_max") == 2031, r)
+           and all("year_min" not in c and "year_max" not in c for c in cls.values()), r)
     key = dpapi_unprotect((env.pd / "key.bin").read_bytes())
     key_holder["key"] = key
     expect("key.bin: DPAPI-protected 32-byte key readable from Python", len(key) == 32)
     idx = json.loads((env.pd / "index.json").read_text("utf-8"))
     cols = idx.get("columns", {})
-    name_h = set(cols.get("Person[Name]", {}).get("hmacs", []))
-    expect("index.json: Person[Name] holds 4 HMACs, Python HMAC of a planted name matches",
-           len(name_h) == 4 and hmac_hex(key, PERSONS[0]) in name_h and hmac_hex(key, PERSONS[3]) in name_h)
+    name_entry = cols.get("Person[Name]", {})
+    name_h = set(name_entry.get("hmacs", []))
+    if name_entry.get("class") == "high":
+        expect("index.json: Person[Name] holds 4 HMACs, Python HMAC of a planted name matches",
+               len(name_h) == 4 and hmac_hex(key, PERSONS[0]) in name_h and hmac_hex(key, PERSONS[3]) in name_h)
+    else:
+        expect("index.json: a category name column has no value hmac list", "hmacs" not in name_entry)
     expect("index.json: numeric/date columns have no hmacs", all("hmacs" not in v for k, v in cols.items() if v.get("type") != "string"))
     wh = set(cols.get("Person[Name]", {}).get("word_hmacs", []))
     expect("index.json v1.1: word_hmacs on name-like columns (Person[Name], Hours[Person]) only",
@@ -557,9 +565,10 @@ def test_live(env: Env, key_holder: dict) -> None:
            and "word_hmacs" not in cols.get("Person[Email]", {}))
     expect("index.json v1.1: word HMAC of a stripped planted word matches", all(hmac_hex(key, w) in wh for w in words(PERSONS[1])))
     cats = json.loads(dpapi_unprotect((env.pd / "categories.bin").read_bytes()).decode("utf-8"))
+    high_cols = [k for k, v in cols.items() if v.get("class") == "high"]
     expect("categories.bin: DPAPI JSON with category values (high-cardinality columns absent)",
            cats.get("Project[Status]") == ["Active", "Closed", "On Hold"] and len(cats.get("ExceptionType[Code]", [])) == 3
-           and "Person[Name]" not in cats)
+           and all(k not in cats for k in high_cols))
     r = engine("index", env.req(category_max=3, disclosure="strict"), "index-strict")
     flat = [c for t in (r or {}).get("tables", []) for c in t["columns"]]
     expect("index strict: no buckets or years", r and r.get("ok") and all(not ({"card_bucket", "blank_bucket", "year_min", "year_max"} & set(c)) for c in flat)
@@ -699,8 +708,8 @@ def test_live(env: Env, key_holder: dict) -> None:
         {"id": "eq-status", "kind": "equal", "left": "[Total Hours]", "right": "[Active Hours]", "by": ["Project[Status]"]},
         {"id": "uq-email", "kind": "unique", "column": "Person[Email]"}]), "check-strict")
     c = by_id((r or {}).get("checks"))
-    expect("check strict: mismatch kept, no groups, no offenders bucket",
-           c.get("eq-status", {}).get("mismatch") == "FEW" and "groups" not in c.get("eq-status", {})
+    expect("check strict: no mismatch bucket, no groups, no offenders bucket",
+           "mismatch" not in c.get("eq-status", {}) and "groups" not in c.get("eq-status", {})
            and c.get("uq-email", {}).get("status") == "FAIL" and "offenders_bucket" not in c.get("uq-email", {}), r)
 
     # snapshots

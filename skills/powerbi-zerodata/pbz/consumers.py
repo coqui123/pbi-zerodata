@@ -93,7 +93,12 @@ def _registry_text(reg: dict) -> str:
     return json.dumps(reg, indent=1, ensure_ascii=False) + "\n"
 
 
+_CACHE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+
+
 def _cache_path(ws, cid: str) -> str:
+    if not isinstance(cid, str) or not _CACHE_ID.fullmatch(cid):
+        raise PbzError("REFUSED", "consumer id is not a single name")
     return os.path.join(ws.private, CACHE, cid + ".json")
 
 
@@ -103,11 +108,12 @@ def _cache_text(sig: str, nh: str, res: dict) -> str:
 
 def _commit_registry(ws, reg: dict, caches: dict[str, str | None]) -> None:
     """One private commit: the registry plus each cache write (text) or delete (None)."""
-    ops: list[tuple] = [("write", _reg_path(ws), _registry_text(reg), b"")]
+    reg_path = _reg_path(ws)
+    ops: list[tuple] = [("write", reg_path, _registry_text(reg), b"")]
     for cid, text in caches.items():
         path = _cache_path(ws, cid)
         ops.append(("write", path, text, b"") if text is not None else ("delete", path))
-    commit_bytes(ops, private=True)
+    commit_bytes(ops, private=True, root=ws.private, roots={reg_path: ws.root})
 
 
 def detect_kind(path: str) -> str:

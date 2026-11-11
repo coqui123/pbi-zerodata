@@ -49,7 +49,7 @@ def scan(ws, apply: bool = True) -> dict:
                         text = fh.read(2_000_000)
                 except OSError:
                     continue
-                if guard.script_bad(text, policy_mod.load(ws)) and not re.search(r"(?i)pbz-workspace", text):
+                if guard.script_bad(text, policy_mod.load(ws)):
                     scripts.append(f)
                     reasons.append((f, "script reads data files, real definitions or a Power BI engine"))
                 continue

@@ -25,6 +25,45 @@ def _fail(verb: str, cls: str) -> dict:
     return {"ok": False, "verb": verb, "class": cls}
 
 
+# Top-level keys production callers read. Nested values stay with the kept key.
+# Owned callers (checks, desktop): ok, class, verb, checks, results, errors, status, tables.
+# Other callers, kept so this filter does not break them:
+#   cli health: objects
+#   evidence health: unprocessed_tables, objects_in_error
+#   validate / synth tmdl: missing_refs, orphan_files
+#   compiles (daxcatalog, modeling, checks): items
+#   memory: model, relationships, other, auto_datetime, coverage, predicates
+#   perf: timing, duration_band, fe_share, se_queries, dq_events, cache_hit, callback,
+#         agg_rewrite, trace, verdict, baseline, plan
+#   synth-query: columns, rows, truncated
+#   smoke: visuals
+#   freshness: partitions, refresh
+#   deps: edges
+#   snapshot / probe pass-through: queries, name, table, rows_bucket
+_RESPONSE_FIELDS = frozenset({
+    "ok", "class", "verb",
+    "checks", "results", "errors", "status", "tables", "objects", "unprocessed_tables",
+    "objects_in_error", "missing_refs", "orphan_files", "items",
+    "model", "relationships", "other", "auto_datetime", "coverage", "predicates",
+    "timing", "duration_band", "fe_share", "se_queries", "dq_events", "cache_hit",
+    "callback", "agg_rewrite", "trace", "verdict", "baseline", "plan",
+    "columns", "rows", "truncated", "visuals", "partitions", "refresh", "edges",
+    "queries", "name", "table", "rows_bucket",
+})
+
+
+def _project(verb: str, response: dict) -> dict:
+    """ok, class, verb, and the fields callers actually read. Anything else is dropped."""
+    out = {key: value for key, value in response.items() if key in _RESPONSE_FIELDS}
+    if verb != "synth-query":
+        for key in ("columns", "rows", "truncated"):
+            out.pop(key, None)
+    out["ok"] = response["ok"]
+    if not isinstance(out.get("verb"), str):
+        out["verb"] = verb
+    return out
+
+
 def call(verb: str, request: dict, timeout: float = 120) -> dict:
     """Run `pbz-engine.exe <verb>` with `request` as JSON on stdin and return the parsed response."""
     exe = Path(ENGINE_EXE)
@@ -54,4 +93,4 @@ def call(verb: str, request: dict, timeout: float = 120) -> dict:
         return _fail(verb, "ENGINE_UNAVAILABLE")
     if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
         return _fail(verb, "ENGINE_UNAVAILABLE")
-    return response
+    return _project(verb, response)

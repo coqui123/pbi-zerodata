@@ -89,7 +89,7 @@ class PreviewAtomicTests(unittest.TestCase):
         with redirect_stdout(buf):
             rc = cli.main(["--workspace", self.ws.root, "--project", "Mini", "preview", "--spec", "spec.json"])
         self.assertEqual(rc, 0)
-        mcp_out = mcp.call_tool("preview", {"spec": spec, "workspace": self.ws.root, "project": "Mini"}, None, None)
+        mcp_out = mcp.call_tool("preview", {"spec": spec, "workspace": self.ws.root, "project": "Mini"}, self.ws.root, None)
         self.assertFalse(mcp_out["isError"])
         self.assertIn("GENERATED", mcp_out["content"][0]["text"])
 

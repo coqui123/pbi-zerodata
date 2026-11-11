@@ -84,9 +84,12 @@ public static class ValueIndex
     public static JsonObject Run(Req req, Ctx ctx)
     {
         int port = req.Port();
-        int categoryMax = req.Int("category_max") ?? 50;
+        int? requested = req.Int("category_max");
+        if (requested is int asked && (asked < 0 || asked > 100000))
+            throw new BadRequestException("category_max out of range");
+        // Policy owns the class boundary. A lower request value must not move it.
+        int categoryMax = PolicyFile.CategoryMax(ctx.RequirePrivateDir());
         int valueCap = req.Int("value_cap") ?? 50000;
-        if (categoryMax < 0 || categoryMax > 100000) throw new BadRequestException("category_max out of range");
         if (valueCap < 1 || valueCap > 5000000) throw new BadRequestException("value_cap out of range");
         string pd = ctx.RequirePrivateDir();
         var vault = Vault.Open(pd);
@@ -126,21 +129,28 @@ public static class ValueIndex
                     if (values != null && NameLikeColumn.IsMatch(c.Name))
                     {
                         var words = new HashSet<string>(StringComparer.Ordinal);
+                        bool wordCapped = false;
                         foreach (var v in values)
+                        {
                             foreach (var w in Words(v))
                             {
-                                if (words.Count >= valueCap) break;
+                                if (words.Count >= valueCap)
+                                {
+                                    wordCapped = true;
+                                    break;
+                                }
                                 words.Add(vault.Hmac(w));
                             }
+                            if (wordCapped) break;
+                        }
                         entry["word_hmacs"] = ToArr(words.OrderBy(h => h, StringComparer.Ordinal));
+                        if (wordCapped) entry["word_capped"] = true;
                     }
                 }
                 if (!ctx.Strict && s != null)
                 {
                     if (c.IsText) o["card_bucket"] = Buckets.Count(s.Distinct);
                     o["blank_bucket"] = Buckets.Share(s.Blanks, rows);
-                    if (c.IsDate && s.YearMin != null) o["year_min"] = s.YearMin;
-                    if (c.IsDate && s.YearMax != null) o["year_max"] = s.YearMax;
                 }
                 indexCols[c.Key] = entry;
                 outCols.Add(o);
@@ -192,6 +202,77 @@ public static class ValueIndex
         var a = new JsonArray();
         foreach (var i in items) a.Add(i);
         return a;
+    }
+}
+
+/// <summary>category_max and reveal_columns from the private policy snapshot. A caller-supplied workspace is ignored.</summary>
+public static class PolicyFile
+{
+    public const int DefaultCategoryMax = 50;
+
+    static JsonObject? Read(string? privateDir)
+    {
+        if (string.IsNullOrWhiteSpace(privateDir) || !Path.IsPathFullyQualified(privateDir)) return null;
+        string root;
+        string path;
+        try
+        {
+            root = Path.GetFullPath(privateDir);
+            path = Path.GetFullPath(Path.Combine(root, "policy-snapshot.json"));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or IOException)
+        {
+            return null;
+        }
+        if (!path.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (!File.Exists(path)) return null;
+        try
+        {
+            if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0) return null;
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) return null;
+            string text = File.ReadAllText(path);
+            if (text.Length > 1_000_000) return null;
+            return JsonNode.Parse(text) as JsonObject;
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    public static int CategoryMax(string? privateDir)
+    {
+        var doc = Read(privateDir);
+        if (doc == null) return DefaultCategoryMax;
+        try
+        {
+            int? n = J.Int(doc, "category_max");
+            if (n == null || n < 0) return DefaultCategoryMax;
+            return n > 100000 ? 100000 : n.Value;
+        }
+        catch (BadRequestException)
+        {
+            return DefaultCategoryMax;
+        }
+    }
+
+    public static HashSet<string> RevealColumns(string? privateDir)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var doc = Read(privateDir);
+        if (doc == null) return set;
+        try
+        {
+            var list = J.StrList(doc, "reveal_columns");
+            if (list != null)
+                foreach (var item in list) set.Add(item);
+        }
+        catch (BadRequestException)
+        {
+        }
+        return set;
     }
 }
 

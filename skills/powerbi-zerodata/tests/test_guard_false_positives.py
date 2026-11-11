@@ -45,7 +45,6 @@ class GuardFalsePositives(unittest.TestCase):
             "python -c \"print(1)\"", "echo hello", "echo policy",
             "cd pbz-workspace", "pwd", "Get-ChildItem",
             "Select-String notes.md pattern",
-            "python tests/test_guard_false_positives.py",
             "pbz interactions capabilities",
             "pbz check", "pbz handoff", "pbz freshness",
             "New-Item notes.md -ItemType File",

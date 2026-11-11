@@ -72,7 +72,7 @@ class OutcomeMappingTests(unittest.TestCase):
                 with patch("pbz.mirror.recover", lambda *a, **k: dict(payload)):
                     cli_rc, body = self._cli(["recover"])
                     with patch("pbz.mcp.subprocess.run", _mcp(None)):
-                        mcp_out = mcp.call_tool("recover", {"workspace": self.ws.root, "project": "Parity"}, None, None)
+                        mcp_out = mcp.call_tool("recover", {"workspace": self.ws.root, "project": "Parity"}, self.ws.root, None)
                 self.assertEqual(cli_rc, rc)
                 self.assertEqual(body["outcome"]["status"], status)
                 self.assertEqual(body["outcome"]["exit_code"], rc)
@@ -144,7 +144,7 @@ class OutcomeMappingTests(unittest.TestCase):
             cli_rc, body = self._cli(["synth-test", "run", "err"])
             with patch("pbz.mcp.subprocess.run", _mcp(None)):
                 mcp_out = mcp.call_tool("synth_test", {"action": "run", "name": "err",
-                                                       "workspace": self.ws.root, "project": "Parity"}, None, None)
+                                                       "workspace": self.ws.root, "project": "Parity"}, self.ws.root, None)
         blob = json.dumps(body) + mcp_out["content"][0]["text"]
         self.assertEqual(cli_rc, 1)
         self.assertTrue(mcp_out["isError"])

@@ -385,7 +385,7 @@ def load_path(path: str) -> dict:
 
 
 def _views(model):
-    tables, columns, measures, rels = [], [], [], []
+    tables, columns, measures, rels, calculated = [], [], [], [], []
     for table in model.tables.values():
         col_views, measure_views = [], []
         for column in table.columns.values():
@@ -397,6 +397,8 @@ def _views(model):
             })
             columns.append(view)
             col_views.append(view)
+            if column.calculated:
+                calculated.append(view)
         for measure in table.measures.values():
             hidden = bool(measure.node and "isHidden" in measure.node.props)
             view = Obj("measure", {
@@ -416,7 +418,20 @@ def _views(model):
             "ToTable": rel.to_table, "ToColumn": rel.to_column, "IsActive": rel.active,
             "CrossFilteringBehavior": "Both" if rel.both else "OneDirection",
         }))
-    return {"table": tables, "column": columns, "measure": measures, "relationship": rels}
+    return {"table": tables, "column": columns, "measure": measures, "relationship": rels,
+            "calculatedcolumn": calculated}
+
+
+def _scope_views(scope, views) -> list[tuple[str, list]]:
+    """Split 'Measure, CalculatedColumn' and keep each known view once."""
+    found = []
+    seen = set()
+    for part in str(scope or "").split(","):
+        key = "".join(ch for ch in part.lower() if ch.isalnum())
+        if key in views and key not in seen:
+            seen.add(key)
+            found.append((key, views[key]))
+    return found
 
 
 def evaluate(model, document: dict) -> dict:
@@ -431,20 +446,24 @@ def evaluate(model, document: dict) -> dict:
             ast = parse(rule.get("expression") or "")
         except Refused:
             continue
-        scope = str(rule.get("scope") or "").lower()
-        executed += 1
         kept = []
         refused = False
-        for obj in views.get(scope, []):
-            try:
-                if _truth(_eval(ast, obj, obj)):
-                    kept.append({"rule": rule["id"], "severity": rule["severity"], "scope": scope,
-                                 "kind": scope, "object": obj.get("Name"), "message": rule.get("name") or rule["id"]})
-            except Refused:
-                refused = True
+        ran = False
+        for scope, objs in _scope_views(rule.get("scope"), views):
+            ran = True
+            for obj in objs:
+                try:
+                    if _truth(_eval(ast, obj, obj)):
+                        kept.append({"rule": rule["id"], "severity": rule["severity"], "scope": scope,
+                                     "kind": scope, "object": obj.get("Name"), "message": rule.get("name") or rule["id"]})
+                except (Refused, TypeError):
+                    refused = True
+                    break
+            if refused:
                 break
-        if refused:
+        if refused or not ran:
             continue
+        executed += 1
         findings.extend(kept)
     return {"executed": executed, "findings": findings}
 

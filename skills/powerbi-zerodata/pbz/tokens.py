@@ -9,9 +9,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 
 from . import dpapi, lexers, pbir, tmdl
-from .common import PbzError, sha
+from .classify import PII_IN_TEXT, looks_like_long_digits, looks_like_phone
+from .common import PbzError, _reparse_link, sha
 
 TOKEN_RE = re.compile(r"«[^«»\r\n]{1,300}»")
 FULL_JSON_TOKEN_RE = re.compile(r'"(«[^«»"\r\n]{1,300}»)"')
@@ -46,9 +48,26 @@ class TokenMap:
         self.dirty = False
 
     def save(self) -> None:
-        if self.dirty:
-            dpapi.write_protected(self.path, json.dumps(self.data, ensure_ascii=False).encode("utf-8"))
-            self.dirty = False
+        if not self.dirty:
+            return
+        directory = os.path.dirname(os.path.abspath(self.path)) or "."
+        if _reparse_link(directory) or _reparse_link(self.path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        os.makedirs(directory, exist_ok=True)
+        payload = dpapi.protect(json.dumps(self.data, ensure_ascii=False).encode("utf-8"))
+        fd, tmp = tempfile.mkstemp(prefix=".tokens-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+            os.replace(tmp, self.path)
+            tmp = ""
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        self.dirty = False
 
     def _new(self, label: str, key: str, rec: dict) -> str:
         existing = self.data["keys"].get(key)
@@ -438,6 +457,17 @@ def _literal_bearing(val: str) -> bool:
     return True
 
 
+def _report_document(relpath: str) -> bool:
+    """Report definition JSON. Semantic-model files that share this tokenizer are not included."""
+    norm = "/" + relpath.replace("\\", "/").lower().lstrip("/")
+    if ".semanticmodel/" in norm:
+        return False
+    name = norm.rsplit("/", 1)[-1]
+    if name in ("report.json", "page.json", "visual.json"):
+        return True
+    return "/definition/" in norm
+
+
 def _pbir_schema_known(relpath: str, root) -> bool | None:
     """True/False for report.json, page.json and visual.json; None for every other file."""
     name = relpath.replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -616,8 +646,9 @@ _DENEB_MALFORMED = _DenebMalformed()
 
 
 def _deneb_values_spans(decoded: str):
-    """Spans of inline data arrays inside a Vega/Deneb spec, or a malformed marker.
+    """Spans of inline data inside a Vega/Deneb spec, or a malformed marker.
 
+    A non-empty values array, a non-array values payload, and datasets are inline data.
     None means this literal is not an embedded spec. A malformed spec is not treated as
     ordinary text: the caller opaques the whole literal instead of publishing its values.
     """
@@ -648,7 +679,9 @@ def _deneb_values_spans(decoded: str):
     def visit(node):
         if isinstance(node, pbir.JObj):
             for k, v in node.pairs:
-                if k.value == "values" and isinstance(v, pbir.JArr) and v.items:
+                inline = k.value == "datasets" or (
+                    k.value == "values" and (not isinstance(v, pbir.JArr) or bool(v.items)))
+                if inline:
                     spans.append((inner_pos[v.start], inner_pos[v.end]))
                 else:
                     visit(v)
@@ -691,12 +724,12 @@ def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
         root = pbir.parse_json(text)
     except pbir.JsonError:
         raise PbzError("REFUSED", "malformed report JSON") from None
-    name = relpath.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if name in ("report.json", "page.json", "visual.json") and not isinstance(root, pbir.JObj):
-        raise PbzError("REFUSED", "malformed report JSON")
-    # Unknown report/page/visual object: fail closed. `$schema` stays when it is a Fabric URI.
-    if _pbir_schema_known(relpath, root) is False:
-        return _opaque_unknown_object(text, root, tm)
+    # Unknown report JSON fails closed the same way an unknown visual.json does.
+    if _report_document(relpath):
+        if not isinstance(root, pbir.JObj):
+            raise PbzError("REFUSED", "malformed report JSON")
+        if _pbir_schema_known(relpath, root) is not True:
+            return _opaque_unknown_object(text, root, tm)
     edits: list[tuple[int, int, str]] = []
     handled: set[int] = set()
 
@@ -726,7 +759,9 @@ def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
                     deneb.append((site.node.start + rs, site.node.start + re_,
                                   tm.raw("payload:deneb", raw_full[rs:re_], "pbir_inner")))
                 edits.extend(deneb)
-                edits.extend(u for u in _uri_edits(text, site.node, tm) if not _overlaps(u[0], u[1], deneb))
+                uris = [u for u in _uri_edits(text, site.node, tm) if not _overlaps(u[0], u[1], deneb)]
+                edits.extend(uris)
+                _free_text_edits(text, site.node, value, clf, tm, edits, numbers=False, avoid=(*deneb, *uris))
                 continue
         label = None
         if vtype in ("string", "int", "double"):
@@ -747,6 +782,8 @@ def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
         uris = _uri_edits(text, node, tm)
         edits.extend(uris)
         if key in STRUCTURAL_KEYS:
+            if key in ("name", "url", "path"):
+                _free_text_edits(text, node, node.value, clf, tm, edits, numbers=False, avoid=uris, pii_only=True)
             continue
         numbers = key == "value" and '"textRuns"' in text
         _free_text_edits(text, node, node.value, clf, tm, edits, numbers=numbers, avoid=uris)
@@ -802,7 +839,15 @@ def _value_to_decoded(decoded: str, value: str) -> list[int] | None:
     return None
 
 
-def _free_text_edits(text, node, value, clf, tm, edits, numbers, avoid=()):
+def _pii_kept(value: str, span: tuple) -> bool:
+    s, e, lab = span
+    if lab == "pii":
+        return True
+    piece = value[s:e]
+    return bool(PII_IN_TEXT.search(piece) or looks_like_phone(piece) or looks_like_long_digits(piece))
+
+
+def _free_text_edits(text, node, value, clf, tm, edits, numbers, avoid=(), pii_only=False):
     """Hide free-text spans inside one JSON string.
 
     `value` is the unquoted literal (PBIR decode) or the JSON string itself. Spans are mapped
@@ -817,6 +862,8 @@ def _free_text_edits(text, node, value, clf, tm, edits, numbers, avoid=()):
     if mapping is None:
         return
     spans = clf.free_text(value, numbers=numbers)
+    if pii_only:
+        spans = [span for span in spans if _pii_kept(value, span)]
     if not spans:
         return
     for s, e, lab in spans:

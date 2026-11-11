@@ -141,7 +141,7 @@ class ImageAtomicTests(unittest.TestCase):
 
             with patch("pbz.mcp.subprocess.run", fake_run):
                 mcp_out = mcp.call_tool("image", {"action": "add", "target": png, "workspace": ws.root, "project": "Mini"},
-                                        None, None)
+                                        ws.root, None)
         blob = text + json.dumps(mcp_out)
         self.assertNotEqual(rc, 0)
         self.assertIn("RECOVERY_REQUIRED", text)

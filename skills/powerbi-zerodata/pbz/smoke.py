@@ -336,14 +336,15 @@ def run(ws, project, page: str | None = None) -> dict:
         loaded.append((pid, pname, proot, has_slicers, visuals))
     if page and not matched:
         raise PbzError("NOT_FOUND", f"page {page}")
-    if not spend(ws, "smoke"):
-        return {"verb": "smoke", "status": "BUDGET", "note": "daily smoke budget reached; the user can reset it"}
-    port = desktop.require_port(project)
     tm = tokens.TokenMap(ws.private)
     mdef = os.path.join(project.mirror_model, "definition")
     model = tmdl.load_model(mdef)
     items, rows = [], []
+    stopped = False
+    budget_note = "daily smoke budget reached; the user can reset it"
     for pid, pname, proot, has_slicers, visuals in loaded:
+        if stopped:
+            break
         if page and page not in (pid, pname):
             continue
         for vid, vroot in visuals:
@@ -356,10 +357,19 @@ def run(ws, project, page: str | None = None) -> dict:
             if dax is None:
                 row["status"] = note if note in ("N/A", "UNSUPPORTED") else "UNSUPPORTED"
                 row["coverage"] = "NONE"
+            elif not spend(ws, "smoke"):
+                stopped = True
+                row["status"] = "BUDGET"
+                row["coverage"] = "NONE"
             else:
                 items.append({"id": f"{pid}/{vid}", "dax": dax})
                 row["coverage"] = note if note in ("FULL", "PARTIAL") else "PARTIAL"
             rows.append(row)
+            if stopped:
+                break
+    if stopped and not items:
+        return {"verb": "smoke", "status": "BUDGET", "note": budget_note}
+    port = desktop.require_port(project) if items else None
     ENGINE_CLASS = {"SYNTAX", "UNKNOWN_OBJECT", "TYPE_MISMATCH", "CONVERSION", "CIRCULAR",
                     "DUPLICATE_KEY", "TIMEOUT", "ENGINE_UNAVAILABLE", "BAD_REQUEST", "OTHER"}
     if items:
@@ -411,6 +421,10 @@ def run(ws, project, page: str | None = None) -> dict:
             bucket = not_executed
         bucket[row["status"]] = bucket.get(row["status"], 0) + 1
     from .outcomes import envelope
-    out, _rc = envelope({"verb": "smoke", "project": project.name,
-                         "summary": {"executed": executed, "not_executed": not_executed}, "visuals": rows})
+    payload = {"verb": "smoke", "project": project.name,
+               "summary": {"executed": executed, "not_executed": not_executed}, "visuals": rows}
+    if stopped:
+        payload["status"] = "BUDGET"
+        payload["note"] = budget_note
+    out, _rc = envelope(payload)
     return out

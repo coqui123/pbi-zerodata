@@ -439,7 +439,7 @@ def restore(ws, project, stamp: str) -> dict:
             ops.append(("write", path, text, bom))
         else:
             ops.append(("delete", path))
-    commit_bytes(ops)
+    commit_bytes(ops, root=ws.mirror)
     return {"verb": "unused-restore", "result": "RESTORED", "objects": man.get("removed", []),
             "next": "pbz diff (if the removal was already pushed, push again)"}
 

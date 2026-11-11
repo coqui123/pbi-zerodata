@@ -15,15 +15,95 @@ from .mirror_txn import transaction
 from .tokens import TOKEN_RE
 
 
+_BRACKETS = {ord("«"), ord("»")}
+
+
+def _unescape(src: str) -> str:
+    """Regex source with \\u, \\U and \\x escapes turned into characters. \\\\ stays a backslash."""
+    out = []
+    i, n = 0, len(src)
+    hexdigits = "0123456789abcdefABCDEF"
+    while i < n:
+        if src[i] != "\\":
+            out.append(src[i])
+            i += 1
+            continue
+        if i + 1 >= n:
+            out.append("\\")
+            break
+        nxt = src[i + 1]
+        if nxt == "\\":
+            out.append("\\")
+            i += 2
+            continue
+        width = {"u": 4, "U": 8, "x": 2}.get(nxt)
+        if width and i + 2 + width <= n and all(c in hexdigits for c in src[i + 2:i + 2 + width]):
+            out.append(chr(int(src[i + 2:i + 2 + width], 16)))
+            i += 2 + width
+            continue
+        out.append("\\")
+        out.append(nxt)
+        i += 2
+    return "".join(out)
+
+
+def _has_bracket(text: str) -> bool:
+    if "«" in text or "»" in text or TOKEN_RE.fullmatch(text):
+        return True
+    decoded = _unescape(text)
+    return "«" in decoded or "»" in decoded or bool(TOKEN_RE.fullmatch(decoded))
+
+
+def _compiled_has_bracket(pattern: str) -> bool:
+    """True when the compiled pattern matches « or » as a literal or a range, not merely as '.'."""
+    from re._parser import LITERAL, RANGE, parse
+    try:
+        tree = parse(pattern)
+    except re.error:
+        return False
+
+    def walk(node) -> bool:
+        if isinstance(node, tuple) and len(node) == 2 and type(node[0]) is not int:
+            op, av = node
+            if op == LITERAL:
+                return isinstance(av, int) and av in _BRACKETS
+            if op == RANGE and isinstance(av, tuple) and len(av) == 2 and all(isinstance(x, int) for x in av):
+                lo, hi = av
+                return any(lo <= b <= hi for b in _BRACKETS)
+            return walk(av)
+        if isinstance(node, (list, tuple)):
+            return any(walk(part) for part in node)
+        if isinstance(node, int) or node is None or isinstance(node, str):
+            return False
+        try:
+            return any(walk(part) for part in node)
+        except TypeError:
+            return False
+
+    return walk(tree)
+
+
+def _template_has_bracket(repl: str) -> bool:
+    if _has_bracket(repl):
+        return True
+    try:
+        from re._parser import parse_template
+        parts = parse_template(repl, re.compile("a"))
+    except re.error:
+        return False
+    return any(isinstance(part, str) and ("«" in part or "»" in part) for part in parts)
+
+
 def _refuse_token_syntax(pattern: str, repl: str | None = None):
-    if "«" in pattern or "»" in pattern or (repl is not None and ("«" in repl or "»" in repl)):
-        raise PbzError("REFUSED", "patterns must not match token syntax")
-    if TOKEN_RE.fullmatch(pattern) or (repl is not None and TOKEN_RE.fullmatch(repl)):
+    if _has_bracket(pattern) or (repl is not None and _template_has_bracket(repl)):
         raise PbzError("REFUSED", "patterns must not match token syntax")
     try:
-        return re.compile(pattern)
+        rx = re.compile(pattern)
     except re.error as err:
         raise PbzError("BAD_REQUEST", "pattern is not a regular expression") from err
+    if _compiled_has_bracket(pattern):
+        raise PbzError("REFUSED", "patterns must not match token syntax")
+    return rx
 
 
 def _model(project):

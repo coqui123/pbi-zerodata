@@ -39,20 +39,29 @@ def _definition_path(mdef: str, doc) -> str:
     return os.path.join(mdef, *doc.path.split("/"))
 
 
+def _one_line(*values: str) -> None:
+    if any("\n" in value or "\r" in value for value in values):
+        raise PbzError("BAD_REQUEST", "names and expressions are a single line")
+
+
 def add_calendar(ws, project, table: str, name: str, column: str, unit: str = "Day") -> dict:
     units = {"Day", "Month", "Quarter", "Year", "Week"}
     if unit not in units:
         raise PbzError("BAD_REQUEST", "unit must be Day, Month, Quarter, Year or Week")
+    _one_line(name, column)
     mdef, model = _model(project)
     found = next((t for t in model.tables.values() if t.name.lower() == table.lower()), None)
     if found is None or found.node is None:
         raise PbzError("NOT_FOUND", "table not found")
     if _named_calendar(found.node, name) is not None:
         raise PbzError("BAD_REQUEST", "calendar already exists")
+    col = model.column(found.name, column)
+    if col is None:
+        raise PbzError("NOT_FOUND", "column not found")
     ind = "\t" * (found.node.indent + 1)
     block = (f"{ind}calendar {lexers.tmdl_name(name)}\n"
              f"{ind}\tcalendarColumnGroup\n"
-             f"{ind}\t\tcolumn: {column}\n"
+             f"{ind}\t\tcolumn: {lexers.tmdl_name(col.name)}\n"
              f"{ind}\t\tunit: {unit}\n")
     doc = model.docs[found.node.file]
     path = _definition_path(mdef, doc)
@@ -76,6 +85,7 @@ def add_calendar(ws, project, table: str, name: str, column: str, unit: str = "D
 def set_kpi(ws, project, measure: str, target: str | None, status: str | None, trend: str | None) -> dict:
     if not any((target, status, trend)):
         raise PbzError("BAD_REQUEST", "pass --target, --status or --trend")
+    _one_line(*(value for value in (target, status, trend) if value is not None))
     mdef, model = _model(project)
     name = measure.strip()
     if name.startswith("[") and name.endswith("]"):
@@ -94,11 +104,19 @@ def set_kpi(ws, project, measure: str, target: str | None, status: str | None, t
     if trend:
         lines.append(f"{ind}\ttrendExpression = {trend}")
     doc = model.docs[found.node.file]
+    path = _definition_path(mdef, doc)
+    with open(path, "rb") as handle:
+        previous = handle.read()
     _insert(mdef, doc, found.node, "\n".join(lines) + "\n", ws.root)
-    again = tmdl.load_model(mdef)
-    node = next((n for n in again.docs[found.node.file].nodes
-                 if n.kind == "kpi" and n.parent is not None and n.parent.name.lower() == found.name.lower()), None)
+    node = None
+    try:
+        again = tmdl.load_model(mdef)
+        node = next((n for n in again.docs[found.node.file].nodes
+                     if n.kind == "kpi" and n.parent is not None and n.parent.name.lower() == found.name.lower()), None)
+    except Exception:
+        node = None
     if node is None:
+        commit_bytes([("write_bytes", path, previous)], root=ws.root)
         raise PbzError("BAD_REQUEST", "kpi block did not parse")
     return {"verb": "kpi", "action": "set", "measure": found.name,
             "set": [p for p, v in (("target", target), ("status", status), ("trend", trend)) if v]}

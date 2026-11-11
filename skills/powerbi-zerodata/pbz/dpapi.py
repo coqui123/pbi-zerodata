@@ -13,6 +13,7 @@ import hmac as _hmac
 import math
 import os
 import secrets
+import tempfile
 import unicodedata
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
@@ -22,9 +23,36 @@ class _Blob(ctypes.Structure):
     _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
 
+def _bind_dpapi():
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    protect_fn = crypt32.CryptProtectData
+    unprotect_fn = crypt32.CryptUnprotectData
+    local_free = kernel32.LocalFree
+    blob_p = ctypes.POINTER(_Blob)
+    protect_fn.argtypes = [blob_p, wt.LPCWSTR, blob_p, ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, blob_p]
+    protect_fn.restype = wt.BOOL
+    unprotect_fn.argtypes = [blob_p, ctypes.c_void_p, blob_p, ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, blob_p]
+    unprotect_fn.restype = wt.BOOL
+    local_free.argtypes = [ctypes.c_void_p]
+    local_free.restype = ctypes.c_void_p
+    return protect_fn, unprotect_fn, local_free
+
+
+_CRYPT_PROTECT, _CRYPT_UNPROTECT, _LOCAL_FREE = _bind_dpapi()
+
+
 def _blob(data: bytes) -> _Blob:
+    # The struct stores a raw pointer. Keep the buffer alive until the DPAPI call returns.
     buf = ctypes.create_string_buffer(data, len(data))
-    return _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob._buf = buf
+    return blob
+
+
+def _free_out(out: _Blob) -> None:
+    if out.pbData:
+        _LOCAL_FREE(ctypes.cast(out.pbData, ctypes.c_void_p))
 
 
 def _call(fn, data: bytes) -> bytes:
@@ -35,40 +63,59 @@ def _call(fn, data: bytes) -> bytes:
     try:
         return ctypes.string_at(out.pbData, out.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(out.pbData)
+        _free_out(out)
 
 
 def protect(data: bytes) -> bytes:
-    fn = ctypes.windll.crypt32.CryptProtectData
     src = _blob(data)
     out = _Blob()
-    if not fn(ctypes.byref(src), None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out)):
+    if not _CRYPT_PROTECT(ctypes.byref(src), None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out)):
         raise OSError("CryptProtectData failed")
     try:
         return ctypes.string_at(out.pbData, out.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(out.pbData)
+        _free_out(out)
 
 
 def unprotect(data: bytes) -> bytes:
-    return _call(ctypes.windll.crypt32.CryptUnprotectData, data)
+    return _call(_CRYPT_UNPROTECT, data)
+
+
+def _read_key_file(path: str) -> bytes:
+    with open(path, "rb") as handle:
+        return unprotect(handle.read())
 
 
 def load_key(private_dir: str, create: bool = True) -> bytes:
     path = os.path.join(private_dir, "key.bin")
-    try:
-        with open(path, "rb") as f:
-            return unprotect(f.read())
-    except FileNotFoundError:
-        if not create:
-            raise
-    os.makedirs(private_dir, exist_ok=True)
-    key = secrets.token_bytes(32)
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(protect(key))
-    os.replace(tmp, path)
-    return key
+    while True:
+        try:
+            return _read_key_file(path)
+        except FileNotFoundError:
+            if not create:
+                raise
+        os.makedirs(private_dir, exist_ok=True)
+        key = secrets.token_bytes(32)
+        payload = protect(key)
+        fd, tmp = tempfile.mkstemp(prefix=".key-", suffix=".tmp", dir=private_dir)
+        published = False
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+            try:
+                # Existing key.bin belongs to the writer that won. Do not replace it.
+                os.rename(tmp, path)
+                published = True
+            except FileExistsError:
+                published = False
+        finally:
+            if not published:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        if published:
+            return key
 
 
 # .NET char.IsWhiteSpace set (String.Trim). Python's str.strip() also strips U+001C..U+001F.

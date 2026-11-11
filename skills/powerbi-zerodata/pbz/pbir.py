@@ -103,6 +103,8 @@ def parse_json(text: str, max_depth: int = 128):
                 if j >= n or text[j] != ":":
                     raise JsonError("expected colon")
                 v, j = value(j + 1, depth + 1)
+                if any(prev.value == k.value for prev, _node in pairs):
+                    raise JsonError("duplicate key")
                 pairs.append((k, v))
                 j = ws(j)
                 if j < n and text[j] == ",":

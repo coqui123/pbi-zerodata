@@ -195,6 +195,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         raise PbzError("AMBIGUOUS", f"a shared query is also named {old}")
     ext = _external_users(ws, project, "table", "", old)
     mdef = os.path.join(project.mirror_model, "definition")
+    _refuse_file_collision(mdef, t.file, new)
     low = old.lower()
     changed, renamed_file = [], None
     ops = []
@@ -312,3 +313,13 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
 
 def _safe_file(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "_", name)
+
+
+def _refuse_file_collision(mdef: str, table_file: str, new: str) -> None:
+    """Refuse a new table name whose sanitized file name is already another table file."""
+    src = os.path.join(mdef, *table_file.split("/"))
+    dest = os.path.join(mdef, *table_file.split("/")[:-1], _safe_file(new) + ".tmdl")
+    if os.path.normcase(os.path.abspath(dest)) == os.path.normcase(os.path.abspath(src)):
+        return
+    if os.path.lexists(dest):
+        raise PbzError("NAME_TAKEN", new)

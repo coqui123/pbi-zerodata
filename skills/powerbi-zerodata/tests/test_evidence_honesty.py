@@ -55,6 +55,47 @@ class EvidenceHonestyTests(unittest.TestCase):
         self.accepts = []
 
     def _write_log(self, text: str) -> str:
+        from pbz import dpapi
+        trailing = text.endswith("\n")
+        pieces = text[:-1].split("\n") if trailing else text.split("\n")
+        if text == "":
+            pieces = []
+        dicts = []
+        for piece in pieces:
+            if not piece.strip():
+                continue
+            try:
+                obj = json.loads(piece)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(obj, dict):
+                dicts.append(obj)
+        if dicts:
+            key = dpapi.load_key(self.ws.private)
+            prev = evidence._anchor(self.ws)
+            stamped = []
+            for obj in dicts:
+                clean = evidence._nocr(obj)
+                clean.pop("chain_mac", None)
+                clean["chain_prev"] = prev
+                clean["chain_mac"] = evidence._mac(key, prev, clean)
+                prev = clean["chain_mac"]
+                stamped.append(clean)
+            out_lines = []
+            index = 0
+            for piece in pieces:
+                parsed = None
+                if piece.strip():
+                    try:
+                        parsed = json.loads(piece)
+                    except (ValueError, RecursionError):
+                        parsed = None
+                if isinstance(parsed, dict):
+                    out_lines.append(json.dumps(stamped[index], ensure_ascii=False))
+                    index += 1
+                else:
+                    out_lines.append(piece)
+            text = "\n".join(out_lines) + ("\n" if trailing else "")
         os.makedirs(self.ws.pbz_dir, exist_ok=True)
         path = os.path.join(self.ws.pbz_dir, "evidence.jsonl")
         with open(path, "wb") as handle:

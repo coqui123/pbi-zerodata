@@ -12,7 +12,8 @@ if __package__ in (None, ""):
     __package__ = "pbz"
 
 from pbz import checks, describe, desktop, dpapi, handoff, memscrub, mirror, policy, rename, scan, smoke, validate  # noqa: E402
-from pbz.common import PbzError, emit, engine_call, file_sha, find_workspace, pbz_state_path  # noqa: E402
+from pbz.common import (  # noqa: E402
+    PbzError, _contained, _reparse_link, emit, engine_call, file_sha, find_workspace, pbz_state_path)
 
 
 def _preview_spec(ws, arg: str | None):
@@ -45,8 +46,8 @@ def _spec(arg: str | None, ws=None) -> dict | None:
 
 
 def _is_human() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty() and not os.environ.get("CLAUDECODE") \
-        and not os.environ.get("CODEX_SANDBOX") and not os.environ.get("CODEX_MANAGED_BY_NPM")
+    from pbz import consent
+    return consent._human_terminal()
 
 
 def _workspace_path(ws, path: str) -> str:
@@ -63,6 +64,9 @@ def _workspace_path(ws, path: str) -> str:
         inside = False
     if not inside:
         raise PbzError("UNSAFE_PATH", "path must stay inside the workspace")
+    if os.path.normcase(resolved) != os.path.normcase(root) and _reparse_link(resolved):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    _contained(resolved, root)
     return resolved
 
 

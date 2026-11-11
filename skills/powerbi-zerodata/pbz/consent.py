@@ -6,6 +6,7 @@ authenticated and workspace-bound. Content is never returned before approval or 
 """
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import hmac
 import io
@@ -41,8 +42,16 @@ REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
 def _human_terminal() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty() and not any(os.environ.get(k) for k in
-        ("CLAUDECODE", "CODEX_SANDBOX", "CODEX_MANAGED_BY_NPM"))
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    if any(k in os.environ for k in ("CLAUDECODE", "CODEX_SANDBOX", "CODEX_MANAGED_BY_NPM", "CURSOR_AGENT", "PBZ_AGENT")):
+        return False
+    try:
+        window = ctypes.windll.kernel32.GetConsoleWindow
+        window.restype = ctypes.c_void_p
+        return bool(window())
+    except (AttributeError, OSError):
+        return False
 
 
 def _workspace(ws) -> str:
@@ -66,16 +75,16 @@ def _record_path(ws, consent_id: str) -> Path:
     return path
 
 
-def _signature(ws, receipt: dict) -> str:
+def _signature(ws, receipt: dict, *, create: bool = False) -> str:
     payload = {k: v for k, v in receipt.items() if k != "signature"}
     text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hmac.new(dpapi.load_key(ws.private), text.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.new(dpapi.load_key(ws.private, create=create), text.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _save(ws, receipt: dict):
     receipt = dict(receipt)
     try:
-        receipt["signature"] = _signature(ws, receipt)
+        receipt["signature"] = _signature(ws, receipt, create=True)
         dpapi.write_protected(str(_record_path(ws, receipt["id"])),
                               json.dumps(receipt, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     except (OSError, ValueError, TypeError):
@@ -99,11 +108,12 @@ def _load(ws, consent_id: str) -> dict:
 
 def _canonical_existing(root: str) -> str:
     """Lexical private root, plus its resolved path when that path exists. Does not invent a target."""
-    lexical = guard.norm(os.path.abspath(os.path.expanduser(root)))
-    if not os.path.lexists(root):
+    expanded = os.path.expanduser(root)
+    lexical = guard.norm(os.path.abspath(expanded))
+    if not os.path.lexists(expanded):
         return lexical
     try:
-        return guard.norm(os.path.realpath(root))
+        return guard.norm(os.path.realpath(expanded))
     except OSError:
         return lexical
 
@@ -198,9 +208,14 @@ def _bytes(ws, path: str) -> tuple[Path, bytes]:
 
 
 def _public(receipt: dict) -> dict:
-    return {"id": receipt["id"], "path": receipt["path"], "sha256": receipt["sha256"],
-            "purpose": receipt["purpose"], "scope": receipt["scope"], "status": receipt["status"],
-            "attested_no_sensitive_data": receipt.get("attested_no_sensitive_data", False)}
+    public = {"id": receipt["id"], "path": receipt["path"]}
+    if receipt.get("status") != "PENDING":
+        public["sha256"] = receipt["sha256"]
+    public["purpose"] = receipt["purpose"]
+    public["scope"] = receipt["scope"]
+    public["status"] = receipt["status"]
+    public["attested_no_sensitive_data"] = receipt.get("attested_no_sensitive_data", False)
+    return public
 
 
 def request(ws, path: str, purpose: str = "requirements") -> dict:
@@ -219,7 +234,8 @@ def request(ws, path: str, purpose: str = "requirements") -> dict:
             "attestation_required": "Inspect the exact file, including hidden sheets, comments, formulas, links and embedded content; attest it contains no sensitive data. Approval permits only the declared broker scope, never general filesystem access."}
 
 
-def _validate(ws, receipt: dict) -> tuple[dict, bytes | None]:
+def _check(ws, receipt: dict) -> tuple[dict, bytes | None]:
+    """Current source state. Does not write the receipt."""
     try:
         canonical, data = _bytes(ws, receipt["path"])
         if str(canonical) == receipt["path"] and hashlib.sha256(data).hexdigest() == receipt["sha256"]:
@@ -229,8 +245,14 @@ def _validate(ws, receipt: dict) -> tuple[dict, bytes | None]:
         state = "MISSING" if exc.code == "NOT_FOUND" else "INVALIDATED"
     changed = dict(receipt)
     changed.update(status=state, attested_no_sensitive_data=False)
-    _save(ws, changed)
     return changed, None
+
+
+def _validate(ws, receipt: dict) -> tuple[dict, bytes | None]:
+    checked, data = _check(ws, receipt)
+    if checked is not receipt:
+        _save(ws, checked)
+    return checked, data
 
 
 def status(ws, consent_id: str | None = None) -> dict:
@@ -241,8 +263,10 @@ def status(ws, consent_id: str | None = None) -> dict:
         files = sorted(folder.glob("*.bin"))
         receipts = []
         for file in files[:100]:
-            receipt, _ = _validate(ws, _load(ws, file.stem))
-            receipts.append(_public(receipt))
+            try:
+                receipts.append(_public(_check(ws, _load(ws, file.stem))[0]))
+            except PbzError:
+                continue
         return {"verb": "consent", "action": "status", "requests": receipts, "truncated": len(files) > 100}
     receipt, _ = _validate(ws, _load(ws, consent_id))
     return {"verb": "consent", "action": "status", **_public(receipt)}
@@ -276,6 +300,23 @@ def _xml(archive: zipfile.ZipFile, name: str):
         return ET.fromstring(data)
     except (KeyError, ET.ParseError, zipfile.BadZipFile, RuntimeError, OSError):
         raise PbzError("UNSUPPORTED", "workbook content cannot be safely read")
+
+
+def _visible_text(node) -> str:
+    """Worksheet text from si/is: a plain t, or t under a rich-text r. Phonetic rPh is not text."""
+    if node is None:
+        return ""
+    t_tag = "{" + NS["m"] + "}t"
+    r_tag = "{" + NS["m"] + "}r"
+    parts = []
+    for child in node:
+        if child.tag == t_tag:
+            parts.append(child.text or "")
+        elif child.tag == r_tag:
+            for part in child:
+                if part.tag == t_tag:
+                    parts.append(part.text or "")
+    return "".join(parts)
 
 
 def _xlsx(data: bytes) -> dict:
@@ -312,7 +353,7 @@ def _xlsx(data: bytes) -> dict:
         strings = []
         if "xl/sharedStrings.xml" in names:
             shared = _xml(archive, "xl/sharedStrings.xml")
-            strings = ["".join(t.text or "" for t in item.findall(".//m:t", NS)) for item in shared.findall("m:si", NS)]
+            strings = [_visible_text(item) for item in shared.findall("m:si", NS)]
         if sum(map(len, strings)) > MAX_TEXT_CHARS:
             raise PbzError("TOO_LARGE", "workbook text exceeds the consent limit")
         sheets = book.findall("m:sheets/m:sheet", NS)
@@ -351,7 +392,7 @@ def _xlsx(data: bytes) -> dict:
                     except (ValueError, IndexError):
                         raise PbzError("UNSUPPORTED", "worksheet shared string reference is unsupported")
                 elif cell.attrib.get("t") == "inlineStr":
-                    text = "".join(t.text or "" for t in cell.findall(".//m:t", NS))
+                    text = _visible_text(cell.find("m:is", NS))
                 characters += len(text)
                 if characters > MAX_TEXT_CHARS:
                     raise PbzError("TOO_LARGE", "workbook text exceeds the consent limit")
@@ -405,6 +446,7 @@ def approved_png(ws, consent_id: str) -> tuple[dict, bytes]:
     out = bytearray(signature)
     offset, seen_header, seen_data, seen_end = 8, False, False, False
     compressed, row_size, expected_size, needs_palette, has_palette = bytearray(), 0, 0, False, False
+    color_type, bit_depth, palette_size, seen_trns = None, 0, 0, False
     while offset < len(data):
         if len(data) - offset < 12:
             raise PbzError("UNSUPPORTED", "approved PNG is malformed")
@@ -432,6 +474,7 @@ def approved_png(ws, consent_id: str) -> tuple[dict, bytes]:
             if expected_size > 40 * 1024 * 1024:
                 raise PbzError("TOO_LARGE", "approved PNG decoded pixels exceed the preview limit")
             needs_palette = kind_code == 3
+            color_type, bit_depth = kind_code, depth
             seen_header = True
         elif kind == b"IHDR":
             raise PbzError("UNSUPPORTED", "approved PNG contains duplicate headers")
@@ -443,9 +486,28 @@ def approved_png(ws, consent_id: str) -> tuple[dict, bytes]:
             seen_data = True
             compressed.extend(payload)
         if kind == b"PLTE":
-            if seen_data or not size or size > 768 or size % 3:
+            if has_palette or seen_data or not size or size > 768 or size % 3:
                 raise PbzError("UNSUPPORTED", "approved PNG palette is invalid")
             has_palette = True
+            palette_size = size // 3
+        if kind == b"tRNS":
+            if seen_trns or seen_data or color_type is None:
+                raise PbzError("UNSUPPORTED", "approved PNG transparency is invalid")
+            seen_trns = True
+            try:
+                if color_type == 0:
+                    if size != 2 or struct.unpack(">H", payload)[0] >= 1 << bit_depth:
+                        raise ValueError()
+                elif color_type == 2:
+                    if size != 6 or any(sample >= 1 << bit_depth for sample in struct.unpack(">HHH", payload)):
+                        raise ValueError()
+                elif color_type == 3:
+                    if not has_palette or size < 1 or size > palette_size:
+                        raise ValueError()
+                else:
+                    raise ValueError()
+            except (struct.error, ValueError):
+                raise PbzError("UNSUPPORTED", "approved PNG transparency is invalid") from None
         if kind == b"IEND":
             if size or not seen_data or end != len(data):
                 raise PbzError("UNSUPPORTED", "approved PNG ending is invalid")

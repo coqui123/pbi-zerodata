@@ -145,7 +145,7 @@ class PushBoundaryTests(unittest.TestCase):
             return Proc()
 
         with patch("pbz.mcp.subprocess.run", fake_run):
-            mcp_out = mcp.call_tool("push", {"reload": True, "workspace": self.ws.root, "project": "Parity"}, None, None)
+            mcp_out = mcp.call_tool("push", {"reload": True, "workspace": self.ws.root, "project": "Parity"}, self.ws.root, None)
         mcp_body = json.loads(mcp_out["content"][0]["text"])
         self.assertTrue(mcp_out["isError"])
         self.assertEqual(mcp_body["outcome"]["exit_code"], 5)

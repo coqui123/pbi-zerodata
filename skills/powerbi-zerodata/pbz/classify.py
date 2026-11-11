@@ -11,6 +11,7 @@ import os
 import re
 
 from . import dpapi
+from .common import PbzError
 
 PII_NAME = re.compile(
     r"(?i)(name|first|last|full|e-?mail|upn|user|login|owner|manager|\bpm\b|leader|\blead\b|supervisor|"
@@ -219,23 +220,30 @@ class Classifier:
         self.hmac_to_col: dict[str, str] = {}
         self.word_hmac_to_col: dict[str, str] = {}
         if private_dir:
+            index_path = os.path.join(private_dir, "index.json")
+            missing = False
             try:
-                with open(os.path.join(private_dir, "index.json"), encoding="utf-8") as f:
-                    self.index = json.load(f)
+                with open(index_path, encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except FileNotFoundError:
+                missing = True
             except (OSError, ValueError):
-                self.index = None
-            raw = dpapi.read_protected(os.path.join(private_dir, "categories.bin")) if self.index else None
+                raise PbzError("REFUSED", "private index could not be read") from None
+            if not missing:
+                if not isinstance(loaded, dict):
+                    raise PbzError("REFUSED", "private index could not be read")
+                self.index = loaded
+                try:
+                    self.key = dpapi.load_key(private_dir, create=False)
+                except (OSError, ValueError):
+                    raise PbzError("REFUSED", "private index could not be read") from None
+            raw = dpapi.read_protected(os.path.join(private_dir, "categories.bin")) if self.index is not None else None
             if raw:
                 try:
                     self.categories = json.loads(raw.decode("utf-8"))
                 except ValueError:
                     self.categories = {}
-            if self.index:
-                try:
-                    self.key = dpapi.load_key(private_dir, create=False)
-                except (OSError, FileNotFoundError):
-                    self.key = None
-        self.mode = "index" if self.index and self.key else "heuristic"
+        self.mode = "index" if self.index is not None and self.key else "heuristic"
         self.sensitive_cols = {c.lower() for c in self.policy.get("sensitive_columns", [])}
         self.category_cols = {c.lower() for c in self.policy.get("category_columns", [])}
         self.model_words: set[str] = set()
@@ -371,10 +379,6 @@ class Classifier:
         if column:
             cls = self.column_class(*column)
             if cls == "sensitive":
-                if self.mode == "heuristic" and vtype == "string" and isinstance(value, str) \
-                        and not is_pii_column(column[1]) and not is_id_column(column[1]) \
-                        and not self._person_like(value):
-                    return None  # label on a non-personal column; the index decides exactly
                 return self.label(*column)
             if cls in ("category", "numeric", "date", "other"):
                 return None
@@ -388,6 +392,8 @@ class Classifier:
 
     def _strict_literal(self, value, vtype: str, column: tuple | None) -> str | None:
         cls = self.column_class(*column) if column else None
+        if cls == "sensitive":
+            return self.label(*column)
         if vtype == "string" and isinstance(value, str):
             s = value.strip()
             if not s or len(s) <= 2 or s.lower() in self.model_names or FORMATISH.match(s):
@@ -482,6 +488,10 @@ class Classifier:
         spans.sort()
         merged: list[tuple[int, int, str]] = []
         for s, e, lab in spans:
+            # A longer indexed value that starts where a shorter number does covers that number.
+            if merged and merged[-1][0] == s and e > merged[-1][1]:
+                merged[-1] = (s, e, lab)
+                continue
             if merged and s < merged[-1][1]:
                 continue
             merged.append((s, e, lab))

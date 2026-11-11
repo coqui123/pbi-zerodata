@@ -88,7 +88,7 @@ def report_author(stage: str, project, scrub) -> list[dict]:
             sev = str(d.get("severity") or d.get("level") or "error").lower()
             sev = "error" if sev.startswith("err") else ("warning" if sev.startswith("warn") else "info")
             where = d.get("path") or d.get("file") or d.get("location") or "report"
-            res.append({"severity": sev, "code": str(d.get("code") or d.get("rule") or "PBIR"),
+            res.append({"severity": sev, "code": scrub(str(d.get("code") or d.get("rule") or "PBIR")),
                         "where": scrub(str(where)), "message": scrub(d["message"])})
         if summary.get("result") and summary.get("result") != "succeeded" and not res:
             res.append({"severity": "error", "code": "PBIR_INVALID", "where": "report",
@@ -198,6 +198,8 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
                     findings.append({"severity": "error", "code": "UNRESOLVED_TOKEN",
                                      "where": os.path.relpath(p, stage).replace("\\", "/"), "message": "token left"})
     for finding in findings:
+        if isinstance(finding.get("code"), str):
+            finding["code"] = scrub(finding["code"])
         if isinstance(finding.get("where"), str):
             finding["where"] = scrub(finding["where"])
         if isinstance(finding.get("message"), str):

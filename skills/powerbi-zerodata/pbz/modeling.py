@@ -17,7 +17,7 @@ import re
 import uuid
 
 from . import deps, lexers, tmdl
-from .common import PbzError, commit_bytes, read_text, write_text
+from .common import PbzError, commit_bytes, preflight_regular, read_checked, read_text, write_text
 from .governance import _eol, _model, _q, _role, _write
 from .tokens import TOKEN_RE, apply_edits
 
@@ -440,11 +440,19 @@ def _parse_function_json(data) -> list[tuple[str, str, str]]:
     return out
 
 
-def _load_functions(path: str) -> list[tuple[str, str, str]]:
-    path = _local_path(path, "function")
+def _load_functions(path: str, root: str) -> list[tuple[str, str, str]]:
+    """Read one function file inside `root`. A URL, a link, a junction, or a hard link is refused."""
+    if not isinstance(root, str) or not root:
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    path = os.path.abspath(_local_path(path, "function"))
+    preflight_regular(path, root=root)
+    if not os.path.lexists(path):
+        raise PbzError("BAD_REQUEST", "function file could not be read")
     try:
-        text = open(path, encoding="utf-8-sig").read()
-    except OSError as err:
+        text = read_checked(path, root=root).decode("utf-8-sig")
+    except PbzError:
+        raise
+    except (OSError, UnicodeError) as err:
         raise PbzError("BAD_REQUEST", "function file could not be read") from err
     stripped = text.strip()
     if stripped.startswith("{") or stripped.startswith("["):
@@ -499,7 +507,7 @@ def _compile_functions(ws, project, model, items: list[tuple[str, str, str]]) ->
 
 def function_import(ws, project, path: str) -> dict:
     """Import one local function file. No network. One commit. Engine down still writes, with compile NOT_RUN."""
-    items = _load_functions(path)
+    items = _load_functions(path, ws.root)
     mdef, model = _model(project)
     seen = set()
     for name, _params, _body in items:
@@ -564,10 +572,11 @@ def role_ols(ws, project, role: str, target: str, permission: str) -> dict:
         block = f"\ttablePermission {_q(tname)}{eol}"
         block += (f"\t\tcolumnPermission {_q(cname)}{eol}\t\t\tmetadataPermission: {permission}{eol}" if cname
                   else f"\t\tmetadataPermission: {permission}{eol}")
-        text = doc.text.rstrip("\r\n") + eol + eol + block
-        _write(mdef, rel, text)
-        return {"verb": "role", "action": "ols", "role": rnode.name, "target": target, "permission": permission,
-                "files": [_rel(project, rel)], "next": "pbz diff, pbz push; the user tests with View as role"}
+        end = tmdl.block_span(doc, rnode)[1]
+        prefix = doc.text[:end]
+        trail = len(prefix) - len(prefix.rstrip("\r\n"))
+        at = end - trail + (len(eol) if trail else 0)
+        edits.append((at, at, block if trail else eol + block))
     elif cname:
         cp = next((c for c in tp.children if c.kind == "columnPermission" and c.name.lower() == cname.lower()), None)
         if cp is not None:

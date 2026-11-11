@@ -91,7 +91,7 @@ class MemoryDisclosureTests(unittest.TestCase):
 
             with patch("pbz.mcp.subprocess.run", fake_run):
                 mcp_out = mcp.call_tool("audit", {"action": "memory", "workspace": self.ws.root,
-                                                  "project": "Parity"}, None, None)
+                                                  "project": "Parity"}, self.ws.root, None)
         combined = buf.getvalue() + mcp_out["content"][0]["text"]
         self.assertFalse(_bands(combined))
         self.assertIn("time_part", combined)
@@ -118,7 +118,7 @@ class MemoryDisclosureTests(unittest.TestCase):
 
             with patch("pbz.mcp.subprocess.run", fake_run):
                 mcp_out = mcp.call_tool("audit", {"action": "memory", "workspace": self.ws.root,
-                                                  "project": "Parity"}, None, None)
+                                                  "project": "Parity"}, self.ws.root, None)
         blob = buf.getvalue() + mcp_out["content"][0]["text"]
         self.assertNotEqual(rc, 0)
         self.assertTrue(mcp_out["isError"])

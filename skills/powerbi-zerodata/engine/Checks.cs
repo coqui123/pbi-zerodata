@@ -6,7 +6,7 @@ namespace PbzEngine;
 /// <summary>
 /// check: data-blind assertions. Values are read and compared inside the engine; the response carries only
 /// PASS/FAIL/EMPTY/UNSUPPORTED/ERROR, mismatch classes, coarse buckets (shape tier), and group keys that are
-/// revealed (only when the exact `by` string is listed in `reveal`) or HMAC'd.
+/// revealed only for an allowlisted date, indexed category, or policy reveal column. Every other key is HMAC'd.
 /// </summary>
 public static class Checks
 {
@@ -23,19 +23,22 @@ public static class Checks
         int port = req.Port();
         var checks = req.Arr("checks") ?? throw new BadRequestException("checks is required");
         var reveal = new HashSet<string>(req.StrList("reveal") ?? new List<string>(), StringComparer.Ordinal);
+        var allow = PolicyFile.RevealColumns(ctx.RequirePrivateDir());
         var vault = Vault.Open(ctx.RequirePrivateDir());
+        string privateDir = ctx.RequirePrivateDir();
         using var conn = Conn.Open(ctx, port);
         var results = new JsonArray();
         foreach (var node in checks)
         {
             if (node is not JsonObject chk) throw new BadRequestException("checks must be objects");
             string id = J.Id(chk);
-            results.Add(RunOne(id, chk, conn, vault, reveal, ctx));
+            results.Add(RunOne(id, chk, conn, vault, reveal, allow, privateDir, ctx));
         }
         return Ctx.Ok("check", new JsonObject { ["checks"] = results });
     }
 
-    static JsonObject RunOne(string id, JsonObject chk, Conn conn, Vault vault, HashSet<string> reveal, Ctx ctx)
+    static JsonObject RunOne(string id, JsonObject chk, Conn conn, Vault vault, HashSet<string> reveal,
+        HashSet<string> allow, string privateDir, Ctx ctx)
     {
         var res = new JsonObject { ["id"] = id };
         try
@@ -68,7 +71,7 @@ public static class Checks
                     break;
                 }
                 case "equal":
-                    Equal(chk, where, res, conn, vault, reveal, ctx);
+                    Equal(chk, where, res, conn, vault, reveal, allow, privateDir, ctx);
                     break;
                 case "additive":
                     Additive(chk, where, res, conn);
@@ -268,7 +271,8 @@ public static class Checks
         if (!ctx.Strict) res["offenders_bucket"] = Buckets.Count(offenders);
     }
 
-    static void Equal(JsonObject chk, List<string> where, JsonObject res, Conn conn, Vault vault, HashSet<string> reveal, Ctx ctx)
+    static void Equal(JsonObject chk, List<string> where, JsonObject res, Conn conn, Vault vault, HashSet<string> reveal,
+        HashSet<string> allow, string privateDir, Ctx ctx)
     {
         string left = Expr(chk, "left");
         string right = Expr(chk, "right");
@@ -288,13 +292,13 @@ public static class Checks
         if (rows.Count == 0)
         {
             res["status"] = "EMPTY";
-            res["mismatch"] = Buckets.Mismatch(0);
+            if (!ctx.Strict) res["mismatch"] = Buckets.Mismatch(0);
             return;
         }
         var bad = rows.Where(r => !ValuesEqual(r[cols.Count], r[cols.Count + 1], tol)).ToList();
         res["status"] = bad.Count == 0 ? "PASS" : "FAIL";
-        res["mismatch"] = Buckets.Mismatch(bad.Count);
-        if (!ctx.Strict && bad.Count > 0) res["groups"] = Groups(bad, by, cols, vault, reveal);
+        if (!ctx.Strict) res["mismatch"] = Buckets.Mismatch(bad.Count);
+        if (!ctx.Strict && bad.Count > 0) res["groups"] = Groups(bad, by, cols, vault, reveal, allow, privateDir);
     }
 
     static void Additive(JsonObject chk, List<string> where, JsonObject res, Conn conn)
@@ -327,7 +331,28 @@ public static class Checks
         res["status"] = NumEqual(t, sum, tol) ? "PASS" : "FAIL";
     }
 
-    static JsonArray Groups(List<object?[]> bad, List<string> by, List<ColumnMeta> cols, Vault vault, HashSet<string> reveal)
+    static bool IndexedCategory(string privateDir, ColumnMeta col)
+    {
+        if (IndexFile.TryLoad(privateDir)?["columns"] is not JsonObject cols) return false;
+        if (cols[col.Key] is not JsonObject entry) return false;
+        string? cls = J.Str(entry, "class");
+        return cls == "category";
+    }
+
+    static bool PolicyAllows(HashSet<string> allow, string by, ColumnMeta col)
+    {
+        if (allow.Count == 0) return false;
+        if (allow.Contains(by) || allow.Contains(col.Key)) return true;
+        string quoted = "'" + col.Table.Name.Replace("'", "''") + "'[" + col.Name.Replace("]", "]]") + "]";
+        return allow.Contains(quoted);
+    }
+
+    /// <summary>
+    /// Raw keys only when the exact by string is on the request list and the column is a date,
+    /// an indexed category, or a policy reveal column. A direct caller cannot widen that set.
+    /// </summary>
+    static JsonArray Groups(List<object?[]> bad, List<string> by, List<ColumnMeta> cols, Vault vault, HashSet<string> reveal,
+        HashSet<string> allow, string privateDir)
     {
         var groups = new List<JsonObject>();
         foreach (var r in bad)
@@ -337,8 +362,10 @@ public static class Checks
             {
                 object? v = r[k];
                 JsonObject key;
+                bool listed = reveal.Contains(by[k]);
+                bool permitted = cols[k].IsDate || IndexedCategory(privateDir, cols[k]) || PolicyAllows(allow, by[k], cols[k]);
                 if (v == null) key = new JsonObject { ["blank"] = true };
-                else if (reveal.Contains(by[k])) key = new JsonObject { ["reveal"] = Reveal(v) };
+                else if (listed && permitted) key = new JsonObject { ["reveal"] = Reveal(v) };
                 else key = new JsonObject { ["hmac"] = vault.Hmac(v) };
                 g[by[k]] = key;
             }

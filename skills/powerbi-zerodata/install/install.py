@@ -76,6 +76,15 @@ def hook_cmd(agent: str) -> str:
     return f"{python_exe()} -I -S {guard} --agent {agent}"
 
 
+def _refuse_spaced_paths() -> None:
+    """A space in Python or the skill path would make the hook command unquoted. Check before any junction."""
+    guard = os.path.join(CANON, "pbz", "guard.py").replace("\\", "/")
+    skill = SKILL.replace("\\", "/")
+    for p in (python_exe(), skill, guard):
+        if " " in p:
+            raise SystemExit(f"path contains a space, hook command would need quoting: {p}")
+
+
 def backup(path: str, what_if: bool) -> None:
     if os.path.exists(path) and not what_if:
         shutil.copy2(path, f"{path}.bak-pbz-{stamp()}")
@@ -276,9 +285,17 @@ def main() -> int:
     what_if = "--what-if" in sys.argv
     uninstall = "--uninstall" in sys.argv
     with_mcp = "--mcp" in sys.argv
+    if not uninstall:
+        _refuse_spaced_paths()
     print(("WHAT-IF: " if what_if else "") + ("uninstall" if uninstall else "install") + f" {NAME} from {SKILL}")
+    skipped = False
     for link in LINKS:
-        print(" ", junction(link, what_if, uninstall))
+        line = junction(link, what_if, uninstall)
+        print(" ", line)
+        if line.startswith("SKIP "):
+            skipped = True
+    if skipped and not uninstall:
+        return 1
 
     data = load_json(CLAUDE_SETTINGS)
     new = merge_denies(merge_hooks(json.loads(json.dumps(data)), "claude", uninstall), uninstall)

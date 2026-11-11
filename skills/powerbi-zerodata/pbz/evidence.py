@@ -144,6 +144,49 @@ def _mac(key: bytes, prev: str, entry: dict) -> str:
     return hmac.new(key, (prev + "\n" + _canon(entry)).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _chain_ok(key, prev: str, obj: dict) -> bool:
+    """True when verify_chain would take this object as the next link."""
+    got_prev = obj.get("chain_prev")
+    got_mac = obj.get("chain_mac")
+    if key is None or got_prev != prev or not isinstance(got_mac, str):
+        return False
+    return _mac(key, prev, obj) == got_mac
+
+
+def _chain_key(ws):
+    try:
+        return dpapi.load_key(ws.private, create=False)
+    except FileNotFoundError:
+        return None
+
+
+def _accepted_macs(ws) -> set[str]:
+    """chain_mac values verify_chain would count before the first break."""
+    key = _chain_key(ws)
+    prev = _anchor(ws)
+    found = set()
+    for path in _log_files(ws):
+        text = _read_log(ws, path)
+        stopped = False
+        for line in (text or "").split("\n"):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(obj, dict) or "chain_mac" not in obj:
+                continue
+            if not _chain_ok(key, prev, obj):
+                stopped = True
+                break
+            prev = obj["chain_mac"]
+            found.add(prev)
+        if stopped:
+            break
+    return found
+
+
 def _index_path(ws) -> str:
     return pbz_state_path(ws, "evidence.chain.json")
 
@@ -285,10 +328,7 @@ def prune(ws, today: dt.date | None = None) -> dict:
 
 def verify_chain(ws) -> dict:
     """Recompute the HMAC chain across rotated segments and the active log."""
-    try:
-        key = dpapi.load_key(ws.private, create=False)
-    except FileNotFoundError:
-        key = None
+    key = _chain_key(ws)
     prev = _anchor(ws)
     chained = 0
     files = _log_files(ws)
@@ -303,13 +343,10 @@ def verify_chain(ws) -> dict:
                 continue
             if not isinstance(obj, dict) or "chain_mac" not in obj:
                 continue
-            if key is None:
-                return {"verb": "evidence", "chain": "BROKEN", "reason": "NO_KEY", "records": chained}
-            got_prev = obj.get("chain_prev")
-            got_mac = obj.get("chain_mac")
-            if got_prev != prev or not isinstance(got_mac, str) or _mac(key, prev, obj) != got_mac:
-                return {"verb": "evidence", "chain": "BROKEN", "reason": "MISMATCH", "records": chained}
-            prev = got_mac
+            if not _chain_ok(key, prev, obj):
+                reason = "NO_KEY" if key is None else "MISMATCH"
+                return {"verb": "evidence", "chain": "BROKEN", "reason": reason, "records": chained}
+            prev = obj["chain_mac"]
             chained += 1
     return {"verb": "evidence", "chain": "OK", "records": chained, "files": len(files)}
 
@@ -567,12 +604,11 @@ def _validate_record(obj: dict, project_name: str) -> dict | None:
     """Whole-record closed shape. Unknown fields are not copied. None means skip."""
     if not isinstance(obj, dict):
         return None
-    if "chain_mac" in obj or "chain_prev" in obj:
-        mac, prev = obj.get("chain_mac"), obj.get("chain_prev")
-        if not (isinstance(mac, str) and _CHAIN_RE.fullmatch(mac)
-                and isinstance(prev, str) and _CHAIN_RE.fullmatch(prev)):
-            return None
-        obj = {k: v for k, v in obj.items() if k not in ("chain_mac", "chain_prev")}
+    mac, prev = obj.get("chain_mac"), obj.get("chain_prev")
+    if not (isinstance(mac, str) and _CHAIN_RE.fullmatch(mac)
+            and isinstance(prev, str) and _CHAIN_RE.fullmatch(prev)):
+        return None
+    obj = {k: v for k, v in obj.items() if k not in ("chain_mac", "chain_prev")}
     try:
         extras = set(obj) - _TOP
     except TypeError:
@@ -602,6 +638,9 @@ def _load_entries(ws, project) -> tuple[list[dict], int]:
         return [], 0
     entries: list[dict] = []
     skipped = 0
+    key = _chain_key(ws)
+    prev = _anchor(ws)
+    broken = False
     # JSONL delimiter is LF only — do not use splitlines() (it splits on U+2028/U+2029).
     for path in files:
         text = _read_log(ws, path)
@@ -618,11 +657,22 @@ def _load_entries(ws, project) -> tuple[list[dict], int]:
             if not isinstance(obj, dict):
                 skipped += 1
                 continue
+            linked = False
+            if not broken and "chain_mac" in obj:
+                if _chain_ok(key, prev, obj):
+                    prev = obj["chain_mac"]
+                    linked = True
+                else:
+                    broken = True
             other = obj.get("project")
             if not isinstance(other, str):
                 skipped += 1
                 continue
             if other != project.name:
+                continue
+            # A line verify_chain would skip or reject does not count, even if the shape is valid.
+            if not linked:
+                skipped += 1
                 continue
             try:
                 clean = _validate_record(obj, project.name)
@@ -1030,12 +1080,17 @@ def review(ws, project, accept: bool = False, current_spec_digest: str | None = 
         accepted = {"ts": dt.datetime.now().replace(microsecond=0).isoformat(), "project": project.name,
                     "stage": "HUMAN_ACCEPTED", "verb": "review --accept", "mirror_rev": cur_m, "real_rev": cur_r,
                     "summary": {"accepted": True}}
-        _append_lines(ws, [accepted])
-        from . import handoff
-        handoff.accept_generated(ws, project, cur_m, cur_r)
-        clean = _validate_record(accepted, project.name)
-        if clean is not None:
-            entries.append(clean)
+        batch = [accepted]
+        _append_lines(ws, batch)
+        # _stamp replaces the list element. The replacement is what was written.
+        stamped = batch[0]
+        mac = stamped.get("chain_mac") if isinstance(stamped, dict) else None
+        if isinstance(mac, str) and mac in _accepted_macs(ws):
+            from . import handoff
+            handoff.accept_generated(ws, project, cur_m, cur_r)
+            clean = _validate_record(stamped, project.name)
+            if clean is not None:
+                entries.append(clean)
     latest: dict = {}
     for e in entries:
         # Latest validated record wins per stage+scope. Superseded outcomes are dropped.

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -26,6 +27,35 @@ class PbzError(Exception):
         self.detail = detail
 
 
+def _path_inside(path: str, root: str) -> bool:
+    """True when `path` is `root` or a descendant. Different drives are not inside."""
+    try:
+        child = os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+        parent = os.path.normcase(os.path.abspath(os.path.expanduser(root)))
+        return os.path.commonpath([child, parent]) == parent
+    except (OSError, ValueError):
+        return False
+
+
+def _reject_private_root(configured: str, workspace: str, mirror: str) -> None:
+    """PBZ_PRIVATE_ROOT must not sit in the workspace, the mirror, or a global deny location."""
+    raw = os.path.expanduser(configured)
+    candidates = [raw]
+    if os.path.lexists(raw):
+        try:
+            candidates.append(os.path.realpath(raw))
+        except OSError:
+            raise PbzError("UNSAFE_PATH", "private root is inside a denied location") from None
+    places = [workspace, mirror, *guard.GLOBAL_DENY_DIRS]
+    for candidate in candidates:
+        normed = guard.norm(candidate)
+        if any(re.search(pat, normed) for pat in guard.GLOBAL_DENY_PATTERNS):
+            raise PbzError("UNSAFE_PATH", "private root is inside a denied location")
+        for place in places:
+            if _path_inside(candidate, place):
+                raise PbzError("UNSAFE_PATH", "private root is inside a denied location")
+
+
 class Workspace:
     """A Power BI workspace root plus its projects (one per *.pbip)."""
 
@@ -37,7 +67,10 @@ class Workspace:
         self.mirror = os.path.join(self.root, MIRROR_DIR)
         # Not under AppData: packaged apps (e.g. the Claude desktop app) get a virtualized AppData,
         # which would split the store between agents launched from different hosts.
-        self.private = os.path.join(os.environ.get("PBZ_PRIVATE_ROOT") or PRIVATE_ROOT, self.id)
+        configured = os.environ.get("PBZ_PRIVATE_ROOT")
+        if configured:
+            _reject_private_root(configured, self.root, self.mirror)
+        self.private = os.path.join(configured or PRIVATE_ROOT, self.id)
 
     @property
     def projects(self) -> list["Project"]:
@@ -76,8 +109,19 @@ class Project:
 def find_workspace(start: str | None = None) -> Workspace:
     start = os.path.abspath(start or os.getcwd())
     probe = start
-    if os.path.basename(probe).lower() == MIRROR_DIR or (MIRROR_DIR + os.sep) in probe.lower():
-        probe = probe[: probe.lower().index(MIRROR_DIR)]
+    parts = probe.split(os.sep)
+    for index, part in enumerate(parts):
+        if part.lower() != MIRROR_DIR:
+            continue
+        # Whole path component only: "old-pbz-workspace" is not the mirror directory.
+        head = parts[:index]
+        if not head:
+            probe = os.sep
+        elif len(head) == 1 and head[0].endswith(":"):
+            probe = head[0] + os.sep
+        else:
+            probe = os.sep.join(head) or os.sep
+        break
     root = guard.find_root(guard.norm(probe))
     if not root:
         raise PbzError("NO_WORKSPACE", "run pbz from a folder that holds a .pbip")
@@ -152,25 +196,18 @@ def read_text_checked(path: str, *, root: str, max_bytes: int | None = None) -> 
 
 
 def definition_root(path: str) -> str:
-    """Trust root for a definition file: the outermost pbz-workspace, else the project folder."""
+    """Trust root for a definition read: the outermost pbz-workspace directory on `path`."""
     cur = os.path.abspath(path)
     mirror = None
-    report_parent = None
     while True:
-        name = os.path.basename(cur)
-        if name.lower() == "pbz-workspace":
+        if os.path.basename(cur).lower() == MIRROR_DIR:
             mirror = cur
-        lower = name.lower()
-        if lower.endswith(".report") or lower.endswith(".semanticmodel"):
-            report_parent = os.path.dirname(cur)
         parent = os.path.dirname(cur)
         if parent == cur:
             break
         cur = parent
     if mirror:
         return mirror
-    if report_parent:
-        return report_parent
     raise PbzError("UNSAFE_PATH", "refusing to write through a link")
 
 
@@ -721,7 +758,7 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
                         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
                     os.remove(path)
             done.append(path)
-    except (OSError, PbzError) as first:
+    except (OSError, PbzError, UnicodeError) as first:
         restore_fail = []
         touched = list(dict.fromkeys(list(reversed(done)) + list(snap.keys())))
         for path in touched:
@@ -738,7 +775,7 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
                         os.remove(path)
                 else:
                     replace_bytes(path, data, root=trust)
-            except (OSError, PbzError) as e:
+            except (OSError, PbzError, UnicodeError) as e:
                 restore_fail.append(f"{path}:{type(e).__name__}")
         if restore_fail:
             if private:

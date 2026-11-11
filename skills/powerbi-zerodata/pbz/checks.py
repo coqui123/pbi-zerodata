@@ -7,12 +7,14 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import tempfile
+import time
 
 from . import desktop, dpapi, lexers, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
-from .common import PbzError, engine_call
+from .common import PbzError, _reparse_link, engine_call
 
 ENGINE_KINDS = {"executes", "nonblank", "nonempty", "equal", "additive", "unique", "no_orphans",
                 "no_blank_keys", "sign", "subset"}
@@ -281,17 +283,90 @@ def _load_state(ws) -> dict:
     return st
 
 
+def _lock_fd(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+        while True:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                time.sleep(0.02)
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+def _unlock_fd(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+class _StateLock:
+    """Exclusive lock file beside state.json, held across a read-modify-write."""
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.fd = -1
+        self.path = ""
+
+    def __enter__(self):
+        if _reparse_link(self.ws.private):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        os.makedirs(self.ws.private, exist_ok=True)
+        self.path = _state_path(self.ws) + ".lock"
+        if _reparse_link(self.path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR)
+        try:
+            if _reparse_link(self.path) or not stat.S_ISREG(os.fstat(self.fd).st_mode):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            if os.fstat(self.fd).st_size < 1:
+                os.write(self.fd, b"\0")
+            _lock_fd(self.fd)
+        except Exception:
+            os.close(self.fd)
+            self.fd = -1
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        fd, path = self.fd, self.path
+        self.fd = -1
+        if fd >= 0:
+            try:
+                _unlock_fd(fd)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return False
+
+
 def spend(ws, kind: str, n: int = 1) -> bool:
     """Charge n units of a daily disclosure budget (checks, probes, snapshot_queries, smoke). False when spent."""
     from . import policy as policy_mod
     budgets = policy_mod.load(ws).get("budgets", {})
-    st = _load_state(ws)
-    key, default = DAILY[kind]
-    if st[kind] + n > int(budgets.get(key, default)):
-        return False
-    st[kind] += n
-    _save_state(ws, st)
-    return True
+    with _StateLock(ws):
+        st = _load_state(ws)
+        key, default = DAILY[kind]
+        if st[kind] + n > int(budgets.get(key, default)):
+            return False
+        st[kind] += n
+        _save_state(ws, st)
+        return True
 
 
 def record_authored(ws, before: dict, after: dict) -> int:
@@ -316,10 +391,11 @@ def record_authored(ws, before: dict, after: dict) -> int:
             new |= lits(text, rel) - (lits(before[rel], rel) if before.get(rel) else set())
     if not new:
         return 0
-    st = _load_state(ws)
-    authored = set(st["ledger"]["authored"]) | {_h(x) for x in new}
-    st["ledger"]["authored"] = sorted(authored)[-5000:]
-    _save_state(ws, st)
+    with _StateLock(ws):
+        st = _load_state(ws)
+        authored = set(st["ledger"]["authored"]) | {_h(x) for x in new}
+        st["ledger"]["authored"] = sorted(authored)[-5000:]
+        _save_state(ws, st)
     return len(new)
 
 
@@ -372,9 +448,9 @@ def _h(s: str) -> str:
 
 
 def model_literals(project) -> set[str]:
-    """Literals visible in the mirror (category labels, constants): free to use in checks."""
+    """Literals in the pushed model. A literal that exists only in the unpushed mirror is not free."""
     out: set[str] = set()
-    mdef = os.path.join(project.mirror_model, "definition")
+    mdef = os.path.join(project.model_dir, "definition")
     if not os.path.isdir(mdef):
         return out
     model = tmdl.load_model(mdef)
@@ -389,6 +465,23 @@ def model_literals(project) -> set[str]:
                 elif t.kind == "num":
                     out.add(t.text)
     return out
+
+
+def _norm_expr(expr: str) -> str:
+    """Budget identity. Comments and extra parentheses do not open a new allowance."""
+    parts = []
+    for t in lexers.significant(lexers.lex_dax(expr)):
+        if t.kind == "op" and t.text in ("(", ")"):
+            continue
+        if t.kind == "str":
+            parts.append('"' + (t.value or "").replace('"', '""') + '"')
+        elif t.kind == "table":
+            parts.append("'" + (t.value or "").replace("'", "''") + "'")
+        elif t.kind == "bracket":
+            parts.append("[" + (t.value or "").replace("]", "]]") + "]")
+        else:
+            parts.append(t.text)
+    return " ".join(parts)
 
 
 def _constants(expr: str) -> set[str]:
@@ -435,117 +528,118 @@ def run_checks(ws, project, spec: dict) -> dict:
     budgets = pol.get("budgets", {})
     strict = pol.get("disclosure") == "strict"
     tm = tokens.TokenMap(ws.private)
-    st = _load_state(ws)
-    known = model_literals(project)
-    real_model = tmdl.load_model(os.path.join(project.model_dir, "definition"))
-    clf = Classifier(real_model, ws.private, pol)
-    from . import deps
-    mdef = os.path.join(project.mirror_model, "definition")
-    mmodel = tmdl.load_model(mdef) if os.path.isdir(mdef) else tmdl.Model()
-    mres = deps.Resolver(mmodel)
-    authored = set(st["ledger"]["authored"])
-    results, to_engine, compiles_items, negate = [], [], [], set()
-    rls_ids = set()
-    for index, raw in enumerate(spec.get("checks", [])):
-        cid = str(raw.get("id") or f"c{index + 1}")
-        kind = raw.get("kind")
-        if kind == "perf":
-            continue
-        if kind == "rls":
-            if not synthetic and not _human_terminal():
-                results.append({"id": cid, "status": "ERROR", "class": "HUMAN_ONLY"})
+    with _StateLock(ws):
+        st = _load_state(ws)
+        known = model_literals(project)
+        real_model = tmdl.load_model(os.path.join(project.model_dir, "definition"))
+        clf = Classifier(real_model, ws.private, pol)
+        from . import deps
+        mdef = os.path.join(project.mirror_model, "definition")
+        mmodel = tmdl.load_model(mdef) if os.path.isdir(mdef) else tmdl.Model()
+        mres = deps.Resolver(mmodel)
+        authored = set(st["ledger"]["authored"])
+        results, to_engine, compiles_items, negate = [], [], [], set()
+        rls_ids = set()
+        for index, raw in enumerate(spec.get("checks", [])):
+            cid = str(raw.get("id") or f"c{index + 1}")
+            kind = raw.get("kind")
+            if kind == "perf":
                 continue
-            query = raw.get("query") if isinstance(raw.get("query"), str) else None
-            if query is not None:
-                _q, unknown = tokens.detokenize_dax(query, tm)
-                if unknown:
-                    results.append({"id": cid, "status": "ERROR", "class": "BAD_REQUEST",
-                                    "note": "unknown or opaque token"})
+            if kind == "rls":
+                if not synthetic and not _human_terminal():
+                    results.append({"id": cid, "status": "ERROR", "class": "HUMAN_ONLY"})
                     continue
-                query = _q
-            th = _h("rls")
+                query = raw.get("query") if isinstance(raw.get("query"), str) else None
+                if query is not None:
+                    _q, unknown = tokens.detokenize_dax(query, tm)
+                    if unknown:
+                        results.append({"id": cid, "status": "ERROR", "class": "BAD_REQUEST",
+                                        "note": "unknown or opaque token"})
+                        continue
+                    query = _q
+                th = _h("rls")
+                if st["checks"] >= int(budgets.get("session_checks", 300)) or \
+                        st["per_target"].get(th, 0) >= int(budgets.get("per_target", 60)):
+                    results.append({"id": cid, "status": "BUDGET",
+                                    "note": "daily check budget reached; the user can reset it"})
+                    continue
+                st["checks"] += 1
+                st["per_target"][th] = st["per_target"].get(th, 0) + 1
+                payload = {"id": cid, "kind": "rls", "expect": raw.get("expect")}
+                for field in _RLS_TEXT:
+                    if field == "query":
+                        if query is not None:
+                            payload["query"] = query
+                        continue
+                    if isinstance(raw.get(field), str):
+                        payload[field] = raw[field]
+                rls_ids.add(cid)
+                to_engine.append(payload)
+                continue
+            if kind not in ALL_KINDS:
+                results.append({"id": cid, "status": "ERROR", "class": "BAD_REQUEST", "note": "unknown kind"})
+                continue
+            if kind == "between":
+                results.append({"id": cid, "status": "UNSUPPORTED", "note": "between is not offered"})
+                continue
+            c, _ = _rewrite({**raw, "id": cid})
+            target = _norm_expr(str(c.get("left") or c.get("expr") or c.get("column") or c.get("from") or ""))
+            th = _h(target)
+            consts = set()
+            for f in EXPR_FIELDS:
+                if isinstance(c.get(f), str):
+                    consts |= _constants(c[f])
+            for w in c.get("where", []) or []:
+                if isinstance(w, str):
+                    consts |= _constants(w)
+            consts = {x for x in consts if x not in known and _h(x) not in authored}
+            # literals the agent pushed into measures this target reaches count as constants too: editing a
+            # measure body must not turn a fixed check into a fresh guessing channel
+            for f in EXPR_FIELDS:
+                if isinstance(c.get(f), str):
+                    consts |= {x for x in _reached_literals(mmodel, mres, c[f], next(iter(mmodel.tables), ""))
+                               if _h(x) in authored}
+            ledger = st["ledger"]["constants"].setdefault(th, [])
+            seen_consts = {e["h"] for e in ledger}
+            if len(seen_consts | {_h(x) for x in consts}) > int(budgets.get("constants_per_target", 3)):
+                results.append({"id": cid, "status": "BUDGET",
+                                "note": f"too many distinct constants against this target in {LEDGER_DAYS} days"})
+                continue
             if st["checks"] >= int(budgets.get("session_checks", 300)) or \
                     st["per_target"].get(th, 0) >= int(budgets.get("per_target", 60)):
-                results.append({"id": cid, "status": "BUDGET",
-                                "note": "daily check budget reached; the user can reset it"})
+                results.append({"id": cid, "status": "BUDGET", "note": "daily check budget reached; the user can reset it"})
+                continue
+            bad = []
+            out = {}
+            for k, v in c.items():
+                if k.startswith("_"):
+                    continue
+                if isinstance(v, str) and k in EXPR_FIELDS:
+                    v, unknown = tokens.detokenize_dax(v, tm)
+                    bad += unknown
+                elif k in ("where", "by") and isinstance(v, list):
+                    vv = []
+                    for item in v:
+                        if isinstance(item, str):
+                            item, unknown = tokens.detokenize_dax(item, tm)
+                            bad += unknown
+                        vv.append(item)
+                    v = vv
+                out[k] = v
+            if bad:
+                results.append({"id": cid, "status": "ERROR", "class": "BAD_REQUEST", "note": "unknown or opaque token"})
                 continue
             st["checks"] += 1
             st["per_target"][th] = st["per_target"].get(th, 0) + 1
-            payload = {"id": cid, "kind": "rls", "expect": raw.get("expect")}
-            for field in _RLS_TEXT:
-                if field == "query":
-                    if query is not None:
-                        payload["query"] = query
-                    continue
-                if isinstance(raw.get(field), str):
-                    payload[field] = raw[field]
-            rls_ids.add(cid)
-            to_engine.append(payload)
-            continue
-        if kind not in ALL_KINDS:
-            results.append({"id": cid, "status": "ERROR", "class": "BAD_REQUEST", "note": "unknown kind"})
-            continue
-        if kind == "between":
-            results.append({"id": cid, "status": "UNSUPPORTED", "note": "between is not offered"})
-            continue
-        c, _ = _rewrite({**raw, "id": cid})
-        target = re.sub(r"\s+", " ", str(c.get("left") or c.get("expr") or c.get("column") or c.get("from") or ""))
-        th = _h(target)
-        consts = set()
-        for f in EXPR_FIELDS:
-            if isinstance(c.get(f), str):
-                consts |= _constants(c[f])
-        for w in c.get("where", []) or []:
-            if isinstance(w, str):
-                consts |= _constants(w)
-        consts = {x for x in consts if x not in known}
-        # literals the agent pushed into measures this target reaches count as constants too: editing a
-        # measure body must not turn a fixed check into a fresh guessing channel
-        for f in EXPR_FIELDS:
-            if isinstance(c.get(f), str):
-                consts |= {x for x in _reached_literals(mmodel, mres, c[f], next(iter(mmodel.tables), ""))
-                           if _h(x) in authored}
-        ledger = st["ledger"]["constants"].setdefault(th, [])
-        seen_consts = {e["h"] for e in ledger}
-        if len(seen_consts | {_h(x) for x in consts}) > int(budgets.get("constants_per_target", 3)):
-            results.append({"id": cid, "status": "BUDGET",
-                            "note": f"too many distinct constants against this target in {LEDGER_DAYS} days"})
-            continue
-        if st["checks"] >= int(budgets.get("session_checks", 300)) or \
-                st["per_target"].get(th, 0) >= int(budgets.get("per_target", 60)):
-            results.append({"id": cid, "status": "BUDGET", "note": "daily check budget reached; the user can reset it"})
-            continue
-        bad = []
-        out = {}
-        for k, v in c.items():
-            if k.startswith("_"):
-                continue
-            if isinstance(v, str) and k in EXPR_FIELDS:
-                v, unknown = tokens.detokenize_dax(v, tm)
-                bad += unknown
-            elif k in ("where", "by") and isinstance(v, list):
-                vv = []
-                for item in v:
-                    if isinstance(item, str):
-                        item, unknown = tokens.detokenize_dax(item, tm)
-                        bad += unknown
-                    vv.append(item)
-                v = vv
-            out[k] = v
-        if bad:
-            results.append({"id": cid, "status": "ERROR", "class": "BAD_REQUEST", "note": "unknown or opaque token"})
-            continue
-        st["checks"] += 1
-        st["per_target"][th] = st["per_target"].get(th, 0) + 1
-        ledger += [{"h": h, "day": st["day"]} for h in sorted({_h(x) for x in consts} - seen_consts)]
-        if c.get("_negate"):
-            negate.add(cid)
-        if out["kind"] == "compiles":
-            compiles_items.append({"id": cid, "table": out.get("table") or next(iter(real_model.tables), ""),
-                                   "expression": out.get("expr", "")})
-        else:
-            to_engine.append(out)
-    _save_state(ws, st)
+            ledger += [{"h": h, "day": st["day"]} for h in sorted({_h(x) for x in consts} - seen_consts)]
+            if c.get("_negate"):
+                negate.add(cid)
+            if out["kind"] == "compiles":
+                compiles_items.append({"id": cid, "table": out.get("table") or next(iter(real_model.tables), ""),
+                                       "expression": out.get("expr", "")})
+            else:
+                to_engine.append(out)
+        _save_state(ws, st)
     port = desktop.require_port(project) if (to_engine or compiles_items) else None
     reveal = []
     for c in to_engine:
@@ -558,7 +652,9 @@ def run_checks(ws, project, spec: dict) -> dict:
     allowed_ids = {str(c.get("id")) for c in to_engine if c.get("id")}
     allowed_ids |= {item["id"] for item in compiles_items if item.get("id")}
     if to_engine:
-        res = engine_call("check", {"private_dir": ws.private, "port": port, "disclosure": pol.get("disclosure", "shape"),
+        _write_policy_snapshot(ws, pol)
+        res = engine_call("check", {"private_dir": ws.private, "port": port,
+                                    "disclosure": pol.get("disclosure", "shape"),
                                     "reveal": sorted(set(reveal)), "checks": to_engine}, timeout=600)
         if not res.get("ok"):
             raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
@@ -652,10 +748,41 @@ def refresh(ws, project, tables: list[str] | None) -> dict:
     return out
 
 
+def _write_policy_snapshot(ws, pol: dict) -> None:
+    """Copy the class boundary and reveal allowlist into the private store.
+
+    The engine reads this file and ignores any workspace path on the request, so a direct
+    caller cannot point the cutoff or the reveal list at a different policy.
+    """
+    doc = {
+        "category_max": int(pol.get("category_max", 50)),
+        "reveal_columns": [c for c in pol.get("reveal_columns", []) if isinstance(c, str)],
+    }
+    dest = os.path.join(ws.private, "policy-snapshot.json")
+    if _reparse_link(ws.private) or _reparse_link(dest):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    os.makedirs(ws.private, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="policy-snapshot.", dir=ws.private)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(doc, handle)
+        if _reparse_link(ws.private) or _reparse_link(dest):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def index(ws, project) -> dict:
     pol = policy_mod.load(ws)
+    _write_policy_snapshot(ws, pol)
     port = desktop.require_port(project)
-    res = engine_call("index", {"private_dir": ws.private, "port": port, "category_max": int(pol.get("category_max", 50)),
+    res = engine_call("index", {"private_dir": ws.private, "port": port,
+                                "category_max": int(pol.get("category_max", 50)),
                                 "value_cap": 50000, "disclosure": pol.get("disclosure", "shape")}, timeout=1800)
     if not res.get("ok"):
         raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
@@ -680,7 +807,7 @@ def harden_index(ws, pol: dict) -> int:
         with open(idx_path, encoding="utf-8") as f:
             idx = json.load(f)
     except (OSError, ValueError):
-        return 0
+        raise PbzError("REFUSED", "index is missing or unreadable") from None
     raw = dpapi.read_protected(cat_path)
     cats = json.loads(raw.decode("utf-8")) if raw else {}
     key = dpapi.load_key(ws.private)
@@ -714,7 +841,21 @@ def harden_index(ws, pol: dict) -> int:
     return moved
 
 
+def _snapshot_spec_path(ws, name: str) -> str:
+    """One path segment under the private snapshots directory. No .., separator, or absolute name."""
+    if not isinstance(name, str) or not name or name != name.strip() or name in (".", ".."):
+        raise PbzError("BAD_REQUEST", "snapshot name must be a single path segment")
+    if ".." in name or any(ch in name for ch in "/\\:\x00") or os.path.isabs(name) or os.path.basename(name) != name:
+        raise PbzError("BAD_REQUEST", "snapshot name must be a single path segment")
+    root = os.path.abspath(os.path.join(ws.private, "snapshots"))
+    path = os.path.abspath(os.path.join(root, name + ".spec.json"))
+    if os.path.dirname(path) != root:
+        raise PbzError("BAD_REQUEST", "snapshot name must be a single path segment")
+    return path
+
+
 def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
+    spec_path = _snapshot_spec_path(ws, name)
     port = desktop.require_port(project)
     tm = tokens.TokenMap(ws.private)
     queries = []
@@ -730,8 +871,8 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
     if not res.get("ok"):
         raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
     if action == "save":
-        os.makedirs(os.path.join(ws.private, "snapshots"), exist_ok=True)
-        with open(os.path.join(ws.private, "snapshots", f"{name}.spec.json"), "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(spec_path), exist_ok=True)
+        with open(spec_path, "w", encoding="utf-8") as f:
             json.dump(spec or {}, f)
     res["verb"] = verb
     return res
@@ -739,7 +880,11 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
 
 def saved_spec(ws, name: str) -> dict | None:
     try:
-        with open(os.path.join(ws.private, "snapshots", f"{name}.spec.json"), encoding="utf-8") as f:
+        path = _snapshot_spec_path(ws, name)
+    except PbzError:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
