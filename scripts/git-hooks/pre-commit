@@ -1,0 +1,16 @@
+#!/bin/sh
+# Refuse the git command unless the offline suites in .github/workflows/tests.yml pass.
+set -e
+root=$(git rev-parse --show-toplevel) || exit 1
+cd "$root/skills/powerbi-zerodata" || exit 1
+export PYTHONIOENCODING=utf-8
+echo "pbz: building the engine, then running the offline CI suites"
+dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+if command -v python >/dev/null 2>&1; then
+  exec python tests/run_offline.py
+fi
+if command -v py >/dev/null 2>&1; then
+  exec py -3 tests/run_offline.py
+fi
+echo "python is required to run the offline CI suites" >&2
+exit 1
