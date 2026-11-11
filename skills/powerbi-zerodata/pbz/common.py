@@ -196,18 +196,28 @@ def read_text_checked(path: str, *, root: str, max_bytes: int | None = None) -> 
 
 
 def definition_root(path: str) -> str:
-    """Trust root for a definition read: the outermost pbz-workspace directory on `path`."""
+    """Trust root for a definition read.
+
+    A pbz-workspace directory on the path wins. Otherwise the read is contained to the
+    .Report or .SemanticModel directory that holds the file, not to the project parent.
+    """
     cur = os.path.abspath(path)
     mirror = None
+    artifact = None
     while True:
-        if os.path.basename(cur).lower() == MIRROR_DIR:
+        base = os.path.basename(cur).lower()
+        if base == MIRROR_DIR.lower():
             mirror = cur
+        elif artifact is None and (base.endswith(".report") or base.endswith(".semanticmodel")):
+            artifact = cur
         parent = os.path.dirname(cur)
         if parent == cur:
             break
         cur = parent
     if mirror:
         return mirror
+    if artifact:
+        return artifact
     raise PbzError("UNSAFE_PATH", "refusing to write through a link")
 
 

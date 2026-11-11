@@ -207,10 +207,10 @@ class PreviewTests(unittest.TestCase):
             spec={'asset_receipt':receipt['id'],'regions':{'sidebar':[0,0,100,240]}}
             with self.assertRaises(PbzError):preview.run(self.ws,self.project,spec=spec)
             with patch('pbz.consent._human_terminal',return_value=True):
-                consent.approve(self.ws,receipt['id'],human=True,attested=True)
+                approved=consent.approve(self.ws,receipt['id'],human=True,attested=True)
             result=preview.run(self.ws,self.project,spec=spec)
             self.assertEqual(result['pages'][0]['images'],'APPROVED_BACKGROUND_ONLY')
-            self.assertEqual(result['pages'][0]['background_sha256'],receipt['sha256'])
+            self.assertEqual(result['pages'][0]['background_sha256'],approved['sha256'])
             svg=ET.fromstring(Path(result['pages'][0]['svg']).read_text(encoding='utf-8'))
             image=svg.find('{http://www.w3.org/2000/svg}image')
             embedded=base64.b64decode(image.attrib['href'].split(',',1)[1])

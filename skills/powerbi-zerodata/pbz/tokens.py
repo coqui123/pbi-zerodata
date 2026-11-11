@@ -724,11 +724,12 @@ def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
         root = pbir.parse_json(text)
     except pbir.JsonError:
         raise PbzError("REFUSED", "malformed report JSON") from None
-    # Unknown report JSON fails closed the same way an unknown visual.json does.
+    # Unknown versions of report.json, page.json, and visual.json are opaque.
+    # Other report JSON keeps its structure and is screened by the literal walk.
     if _report_document(relpath):
         if not isinstance(root, pbir.JObj):
             raise PbzError("REFUSED", "malformed report JSON")
-        if _pbir_schema_known(relpath, root) is not True:
+        if _pbir_schema_known(relpath, root) is False:
             return _opaque_unknown_object(text, root, tm)
     edits: list[tuple[int, int, str]] = []
     handled: set[int] = set()
