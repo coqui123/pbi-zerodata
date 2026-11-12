@@ -209,7 +209,14 @@ class GuardTreeOperations(unittest.TestCase):
         finally:
             if saved_cd is not None:
                 os.environ["CD"] = saved_cd
-        self.assertEqual(self._shell("rm -rf C:\\Users\\ALEXAN~1", child), "policy")
+        profile = os.path.expanduser("~")
+        if os.name == "nt":
+            import ctypes
+            buf = ctypes.create_unicode_buffer(32768)
+            n = ctypes.windll.kernel32.GetShortPathNameW(profile, buf, len(buf))
+            if n > 0:
+                profile = buf.value
+        self.assertEqual(self._shell(f'rm -rf "{profile}"', child), "policy")
         self.assertEqual(self._shell("Remove-Item -Recurse sub\\pkg~1", child), "policy")
         self.assertEqual(self._shell("Remove-Item -Recurse -Force (Split-Path (Get-Location))", child), "policy")
         self.assertEqual(self._shell("Copy-Item -Recurse (Resolve-Path ..) D:\\x", child), "policy")
