@@ -146,7 +146,7 @@ def _column(model, clf, summ, col) -> dict:
         out["sort_by"] = col.sort_by
     if keys:
         out["relationships"] = keys
-    for k in ("card_bucket", "blank_bucket", "year_min", "year_max"):
+    for k in ("card_bucket", "blank_bucket"):
         if k in info:
             out[k] = info[k]
     vals = clf.category_values(col.table, col.name)

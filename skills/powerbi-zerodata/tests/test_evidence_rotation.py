@@ -59,8 +59,9 @@ class EvidenceRotationTests(unittest.TestCase):
             self.assertLess(os.path.getsize(path), evidence.LOG_CAP)
             self.assertIn(b"legacy", open(segment, "rb").read())
             checked = evidence.verify_chain(self.ws)
-            self.assertEqual(checked["chain"], "OK")
-            self.assertGreaterEqual(checked["records"], 2)
+            self.assertEqual(checked["chain"], "BROKEN")
+            self.assertEqual(checked["reason"], "UNCHAINED")
+            self.assertEqual(checked["records"], 1)
             # A chained line must not follow a forged previous MAC.
             lines = open(path, encoding="utf-8").read().splitlines()
             forged = json.loads(lines[-1])
@@ -99,7 +100,7 @@ class EvidenceRotationTests(unittest.TestCase):
             slack = evidence.LOG_CAP - os.path.getsize(path) - 30
             self.assertGreater(slack, 0)
             with open(path, "ab") as handle:
-                handle.write(b"x" * slack)
+                handle.write(b"\n" * slack)
 
         with self._cap(4000), patch("pbz.evidence.dt.date", _HeldDate):
             evidence._append_lines(self.ws, [_entry("2026-01-02T00:00:01", 1)])

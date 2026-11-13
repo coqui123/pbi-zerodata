@@ -24,7 +24,7 @@ import json
 import os
 
 from . import author, filters
-from .common import PbzError, commit_bytes, read_definition_text
+from .common import PbzError, anchor_mirror, commit_bytes, read_definition_text
 from .layout import LABELS
 from .tokens import TOKEN_RE
 
@@ -249,7 +249,7 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
     meta["pageOrder"] = order
     _t, mbom = read_definition_text(meta_p) if os.path.exists(meta_p) else ("", b"")
     plan(meta_p, _json_text(meta), mbom)
-    commit_bytes(ops)
+    commit_bytes(ops, root=anchor_mirror(ws))
     out = {"verb": "copy", "kind": "page", "from": src_display, "page": new_name.strip(), "id": new_pid,
            "position": pos, "visuals": len(vis), "filters_renamed": len(fmap) + vfilters,
            "files": sorted({_rel(ws, f) for f in files}),
@@ -364,7 +364,7 @@ def copy_visual(ws, project, page: str, visual: str, to_page: str | None = None,
             d_f = os.path.join(pdir, dst_pid, "visuals", vmap[vid], rel_name)
             ops.append(("write", d_f, text, fb))
             files.append(d_f)
-    commit_bytes(ops)
+    commit_bytes(ops, root=anchor_mirror(ws))
     tp = (docs[top][0].get("visual") or {}).get("visualType") if isinstance(docs[top][0].get("visual"), dict) else "group"
     out = {"verb": "copy", "kind": "visual", "type": tp or "group", "from": {"page": pages[src_pid].get("displayName", src_pid), "visual": top},
            "page": pages[dst_pid].get("displayName", dst_pid), "id": vmap[top], "copied": len(members),

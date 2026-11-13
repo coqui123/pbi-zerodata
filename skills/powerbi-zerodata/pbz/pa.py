@@ -12,7 +12,9 @@ import math
 import os
 
 from . import perf
-from .common import PbzError
+from .common import PbzError, _reparse_link
+
+_UNSAFE = PbzError("UNSAFE_PATH", "refusing to write through a link")
 
 _BANDS = ((100, "LT_100MS"), (500, "100_500MS"), (2000, "500MS_2S"), (10000, "2_10S"))
 
@@ -44,12 +46,22 @@ def _visuals(project) -> dict[str, str]:
     report = project.mirror_report
     if not os.path.isdir(report):
         return found
-    for dirpath, _dirs, names in os.walk(report):
+    if _reparse_link(report):
+        raise _UNSAFE
+    for dirpath, dirs, names in os.walk(report):
+        if _reparse_link(dirpath):
+            raise _UNSAFE
+        for d in dirs:
+            if _reparse_link(os.path.join(dirpath, d)):
+                raise _UNSAFE
         for name in names:
             if name != "visual.json":
                 continue
+            path = os.path.join(dirpath, name)
+            if _reparse_link(path):
+                raise _UNSAFE
             try:
-                doc = json.loads(open(os.path.join(dirpath, name), encoding="utf-8").read())
+                doc = json.loads(open(path, encoding="utf-8").read())
             except (OSError, UnicodeError, ValueError):
                 continue
             ident = str(doc.get("name") or "")

@@ -14,7 +14,7 @@ import time
 
 from . import desktop, dpapi, lexers, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
-from .common import PbzError, _reparse_link, engine_call
+from .common import PbzError, _reparse_link, engine_call, read_checked
 
 ENGINE_KINDS = {"executes", "nonblank", "nonempty", "equal", "additive", "unique", "no_orphans",
                 "no_blank_keys", "sign", "subset"}
@@ -23,6 +23,7 @@ EXPR_FIELDS = ("expr", "left", "right", "column", "from", "to", "of")
 RLS_EXPECT = ("EMPTY", "NON_EMPTY", "LESS", "EQUAL", "OLS_INACCESSIBLE")
 _RLS_TEXT = ("query", "role", "user", "column", "table")
 _CHECK_STATUS = {"PASS", "FAIL", "EMPTY", "UNSUPPORTED", "ERROR"}
+_REFRESH_STATUS = frozenset({"PASS", "ERROR"})
 
 CHECK_REQUIRED = {
     **{k: ("expr",) for k in ("executes", "nonblank", "nonempty", "sign", "compiles")},
@@ -236,17 +237,24 @@ def _read_state_file(path: str):
     """Saved object, {} if the file is missing, or None if it cannot be read or the JSON is corrupt.
 
     FileNotFoundError stays a fresh budget. Any other OSError is None so the caller refuses
-    without replacing the file. There is no lexists pre-check: lexists swallows OSError from
-    lstat and would report an unstatable file as missing. Parser and OS errors stay here:
-    their text must not leave on an exception chain.
+    without replacing the file. Parser and OS errors stay here: their text must not leave on
+    an exception chain. Reparse points raise UNSAFE_PATH via read_checked.
     """
+    root = os.path.dirname(os.path.abspath(path)) or "."
     try:
-        with open(path, encoding="utf-8") as handle:
-            loaded = json.load(handle)
-    except FileNotFoundError:
-        return {}
+        raw = read_checked(path, root=root)
+    except PbzError as err:
+        if err.code == "UNSAFE_PATH":
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                return {}
+            raise
+        return None
     except OSError:
         return None
+    try:
+        loaded = json.loads(raw.decode("utf-8"))
     except (ValueError, RecursionError):
         return None
     if not isinstance(loaded, dict):
@@ -696,7 +704,9 @@ def run_checks(ws, project, spec: dict) -> dict:
         if not res.get("ok"):
             raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
         for it in res.get("items", []):
-            row = _closed_engine_row(dict(it), allowed_ids)
+            item = dict(it)
+            item.pop("groups", None)
+            row = _closed_engine_row(item, allowed_ids)
             if row is not None:
                 results.append(row)
     tm.save()
@@ -742,9 +752,13 @@ def refresh(ws, project, tables: list[str] | None) -> dict:
     if tables:
         req["tables"] = tables
     res = engine_call("refresh", req, timeout=3600)
-    out = {"verb": "refresh", "project": project.name, "status": res.get("status", "ERROR" if not res.get("ok") else "PASS")}
+    out = {"verb": "refresh", "project": project.name}
     if not res.get("ok"):
-        out["class"] = res.get("class", "OTHER")
+        out["status"] = "ERROR"
+        out["class"] = _class_of(res.get("class"), _PY_CLASS) or "OTHER"
+    else:
+        status = res.get("status")
+        out["status"] = status if status in _REFRESH_STATUS else "ERROR"
     return out
 
 
@@ -786,9 +800,24 @@ def index(ws, project) -> dict:
                                 "value_cap": 50000, "disclosure": pol.get("disclosure", "shape")}, timeout=1800)
     if not res.get("ok"):
         raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
-    # keep an agent-safe summary (no values) for `pbz describe`
-    with open(os.path.join(ws.private, "index-summary.json"), "w", encoding="utf-8") as f:
-        json.dump(res, f)
+    summary_path = os.path.join(ws.private, "index-summary.json")
+    if _reparse_link(ws.private) or _reparse_link(summary_path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    os.makedirs(ws.private, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="index-summary.", dir=ws.private)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(res, handle)
+        if _reparse_link(ws.private) or _reparse_link(summary_path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        os.replace(tmp, summary_path)
+        tmp = ""
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     moved = harden_index(ws, pol)
     cols = [c for t in res.get("tables", []) for c in t.get("columns", [])]
     return {"verb": "index", "project": project.name, "tables": len(res.get("tables", [])), "columns": len(cols),
@@ -804,9 +833,16 @@ def harden_index(ws, pol: dict) -> int:
     idx_path = os.path.join(ws.private, "index.json")
     cat_path = os.path.join(ws.private, "categories.bin")
     try:
-        with open(idx_path, encoding="utf-8") as f:
-            idx = json.load(f)
-    except (OSError, ValueError):
+        os.lstat(idx_path)
+    except FileNotFoundError:
+        raise PbzError("REFUSED", "index is missing or unreadable") from None
+    except OSError:
+        raise PbzError("REFUSED", "index is missing or unreadable") from None
+    try:
+        idx = json.loads(read_checked(idx_path, root=ws.private).decode("utf-8"))
+    except PbzError:
+        raise
+    except ValueError:
         raise PbzError("REFUSED", "index is missing or unreadable") from None
     raw = dpapi.read_protected(cat_path)
     cats = json.loads(raw.decode("utf-8")) if raw else {}
@@ -884,7 +920,8 @@ def saved_spec(ws, name: str) -> dict | None:
     except PbzError:
         return None
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(read_checked(path, root=ws.private).decode("utf-8"))
+    except PbzError:
+        raise
     except (OSError, ValueError):
         return None

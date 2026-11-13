@@ -9,6 +9,10 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from .common import PbzError, _reparse_link
+
+_UNSAFE = PbzError("UNSAFE_PATH", "refusing to write through a link")
+
 DECL_KINDS = {
     "model", "database", "table", "column", "measure", "partition", "expression", "hierarchy", "level",
     "relationship", "role", "tablePermission", "columnPermission", "member", "calculationGroup",
@@ -410,11 +414,22 @@ class Model:
 
 
 def tmdl_files(definition_dir: str) -> list[str]:
+    if _reparse_link(definition_dir):
+        raise _UNSAFE
     out = []
-    for cur, _dirs, files in os.walk(definition_dir):
+    for cur, dirs, files in os.walk(definition_dir):
+        if _reparse_link(cur):
+            raise _UNSAFE
+        for d in dirs:
+            if _reparse_link(os.path.join(cur, d)):
+                raise _UNSAFE
         for f in files:
-            if f.lower().endswith(".tmdl"):
-                out.append(os.path.join(cur, f))
+            if not f.lower().endswith(".tmdl"):
+                continue
+            p = os.path.join(cur, f)
+            if _reparse_link(p):
+                raise _UNSAFE
+            out.append(p)
     return sorted(out)
 
 

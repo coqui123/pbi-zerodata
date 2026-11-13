@@ -46,6 +46,17 @@ def _num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _safe_custom_visual_name(n: str) -> bool:
+    """True when n is a single safe path segment for CustomVisuals/<n>/."""
+    if not n or n in (".", ".."):
+        return False
+    if os.path.isabs(n):
+        return False
+    if os.sep in n or (os.altsep and os.altsep in n):
+        return False
+    return True
+
+
 def _custom_visuals(add, ddir: str, report_dir: str, instances: dict, has_package) -> None:
     """Registration of custom visuals (as Microsoft's validator reads it) and data roles of every
     visual whose capabilities are known (built-in catalog)."""
@@ -144,7 +155,10 @@ def run(report_dir: str, prefix: str = "", has_package=None, has_image=None) -> 
     is the registered image file present (in the report or staged)? None skips that check."""
     out: list[dict] = []
     if has_package is None and os.path.isdir(os.path.join(report_dir, "CustomVisuals")):
-        has_package = lambda n: os.path.isfile(os.path.join(report_dir, "CustomVisuals", n, "package.json"))  # noqa: E731
+        def has_package(n: str) -> bool:  # noqa: F811
+            if not _safe_custom_visual_name(n):
+                return False
+            return os.path.isfile(os.path.join(report_dir, "CustomVisuals", n, "package.json"))
     instances: dict[str, list] = {}
     formatting: list = []
     links: list = []

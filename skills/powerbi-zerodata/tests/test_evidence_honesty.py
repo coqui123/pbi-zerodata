@@ -102,6 +102,35 @@ class EvidenceHonestyTests(unittest.TestCase):
             handle.write(text.encode("utf-8"))
         return path
 
+    def _fill_log_near_cap(self, reserve: int = 80) -> str:
+        """Grow a chained evidence.jsonl to just under the 1 MiB cap."""
+        from pbz import dpapi
+
+        key = dpapi.load_key(self.ws.private)
+        prev = evidence._anchor(self.ws)
+        lines: list[str] = []
+        nbytes = 0
+        recent = (dt.date.today() - dt.timedelta(days=1)).isoformat() + "T03:04:05"
+        base = {"ts": recent, "project": "Canary", "verb": "validate", "mirror_rev": M, "real_rev": R,
+                "stage": "PARSED", "scope": "validate", "summary": {"errors": 0, "warnings": 0, "outcome": "PASS"}}
+        while True:
+            clean = evidence._nocr(dict(base))
+            clean.pop("chain_mac", None)
+            clean["chain_prev"] = prev
+            clean["chain_mac"] = evidence._mac(key, prev, clean)
+            prev = clean["chain_mac"]
+            line = json.dumps(clean, ensure_ascii=False) + "\n"
+            encoded = line.encode("utf-8")
+            if nbytes + len(encoded) > evidence.LOG_CAP - reserve:
+                break
+            lines.append(line)
+            nbytes += len(encoded)
+        os.makedirs(self.ws.pbz_dir, exist_ok=True)
+        path = os.path.join(self.ws.pbz_dir, "evidence.jsonl")
+        with open(path, "wb") as handle:
+            handle.write("".join(lines).encode("utf-8"))
+        return path
+
     def _review(self, accept=False):
         def packet(ws, alias, text, folder):
             self.packets.append(text)
@@ -436,7 +465,7 @@ class EvidenceHonestyTests(unittest.TestCase):
         self.assertEqual(self.packets, [])
 
     def test_accept_near_cap_rotates_and_keeps_segment_bytes(self):
-        path = self._write_log("z" * (evidence.LOG_CAP - 10))
+        path = self._fill_log_near_cap(reserve=10)
         before = open(path, "rb").read()
         out = self._review(accept=True)
         segment = os.path.join(self.ws.pbz_dir, "evidence.d", "0001.jsonl")
@@ -569,16 +598,7 @@ class EvidenceHonestyTests(unittest.TestCase):
         self.assertEqual(open(outside, "rb").read(), b"EXTERNAL\n")
 
     def test_near_cap_check_batch_rotates_and_records(self):
-        recent = (dt.date.today() - dt.timedelta(days=1)).isoformat() + "T03:04:05"
-        filler = {"ts": recent, "project": "Canary", "verb": "validate", "mirror_rev": M, "real_rev": R,
-                  "stage": "PARSED", "scope": "validate", "summary": {"errors": 0, "warnings": 0, "outcome": "PASS"}}
-        blob = (json.dumps(filler) + "\n").encode()
-        os.makedirs(self.ws.pbz_dir, exist_ok=True)
-        path = os.path.join(self.ws.pbz_dir, "evidence.jsonl")
-        with open(path, "wb") as handle:
-            handle.write(blob * ((evidence.LOG_CAP // len(blob))))
-            if evidence.LOG_CAP - os.path.getsize(path) > 80:
-                handle.write(b"x" * (evidence.LOG_CAP - os.path.getsize(path) - 40))
+        path = self._fill_log_near_cap(reserve=80)
         before = open(path, "rb").read()
         self.assertLess(len(before), evidence.LOG_CAP)
         primary = {"verb": "check", "ok": True, "results": [
@@ -725,6 +745,26 @@ class EvidenceHonestyTests(unittest.TestCase):
         evidence._append_lines(self.ws, [{"k": "a\r\nb"}])
         body = open(os.path.join(self.ws.pbz_dir, "evidence.jsonl"), "rb").read()
         self.assertNotIn(b"\r", body)
+
+    def test_verify_chain_breaks_on_object_without_chain_mac(self):
+        good = _line("validate", "PARSED", "validate", {"errors": 0, "warnings": 0, "outcome": "PASS"})
+        path = self._write_log(good + "\n")
+        unchained = json.dumps({"project": "Canary", "verb": "validate"}) + "\n"
+        with open(path, "ab") as handle:
+            handle.write(unchained.encode("utf-8"))
+        checked = evidence.verify_chain(self.ws)
+        self.assertEqual(checked["chain"], "BROKEN")
+        self.assertEqual(checked["reason"], "UNCHAINED")
+        self.assertEqual(checked["records"], 1)
+
+    def test_verify_chain_skips_blank_lines_between_chained_records(self):
+        good = _line("validate", "PARSED", "validate", {"errors": 0, "warnings": 0, "outcome": "PASS"})
+        second = _line("health", "EXECUTED", "health",
+                       {"health_errors": 0, "unprocessed_tables": 0, "outcome": "PASS", "executed": True})
+        self._write_log("\n".join([good, "", second]) + "\n")
+        checked = evidence.verify_chain(self.ws)
+        self.assertEqual(checked["chain"], "OK")
+        self.assertEqual(checked["records"], 2)
 
 
 if __name__ == "__main__":

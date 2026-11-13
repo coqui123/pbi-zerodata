@@ -172,12 +172,12 @@ class FollowupStateTests(unittest.TestCase):
         before = _bytes(self.state)
         message = "state file is locked"
 
-        def locked_open(path, *args, **kwargs):
+        def locked_read(path, *, root, max_bytes=None):
             if os.path.abspath(path) == os.path.abspath(self.state):
                 raise OSError(message)
-            return open(path, *args, **kwargs)
+            return common.read_checked(path, root=root, max_bytes=max_bytes)
 
-        with patch("pbz.checks.open", locked_open):
+        with patch("pbz.checks.read_checked", locked_read):
             with self.assertRaises(PbzError) as caught:
                 checks.spend(self.ws, "probes")
         err = caught.exception

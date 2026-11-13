@@ -340,9 +340,9 @@ def verify_chain(ws) -> dict:
             try:
                 obj = json.loads(line)
             except (ValueError, RecursionError):
-                continue
+                return {"verb": "evidence", "chain": "BROKEN", "reason": "UNCHAINED", "records": chained}
             if not isinstance(obj, dict) or "chain_mac" not in obj:
-                continue
+                return {"verb": "evidence", "chain": "BROKEN", "reason": "UNCHAINED", "records": chained}
             if not _chain_ok(key, prev, obj):
                 reason = "NO_KEY" if key is None else "MISMATCH"
                 return {"verb": "evidence", "chain": "BROKEN", "reason": reason, "records": chained}

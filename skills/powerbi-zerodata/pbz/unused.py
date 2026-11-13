@@ -9,7 +9,7 @@ import os
 import re
 
 from . import lexers, pbir, tmdl, usage
-from .common import PbzError, commit_bytes, file_sha, read_text, sha
+from .common import PbzError, commit_bytes, file_sha, read_checked, read_text, sha
 from .usage import key
 
 KIND_ORDER = ["table", "column", "measure", "hierarchy", "calc_item", "relationship", "m_query", "function",
@@ -19,11 +19,16 @@ _STAMP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 
 def _index_summary(ws) -> dict:
-    try:
-        with open(os.path.join(ws.private, "index-summary.json"), encoding="utf-8") as f:
-            return {t.get("table"): t for t in json.load(f).get("tables", [])}
-    except (OSError, ValueError):
+    path = os.path.join(ws.private, "index-summary.json")
+    if not os.path.lexists(path):
         return {}
+    try:
+        data = json.loads(read_checked(path, root=ws.private).decode("utf-8"))
+    except PbzError:
+        raise
+    except (OSError, ValueError, UnicodeError):
+        raise PbzError("REFUSED", "index summary is unreadable") from None
+    return {t.get("table"): t for t in data.get("tables", [])}
 
 
 def translated(project) -> set[tuple]:
@@ -393,11 +398,15 @@ def restore(ws, project, stamp: str) -> dict:
     tdir = os.path.join(trash, stamp)
     if not _under(trash, tdir):
         raise PbzError("BAD_REQUEST", "restore point id is not a single name")
-    try:
-        with open(os.path.join(tdir, "manifest.json"), encoding="utf-8") as f:
-            man = json.load(f)
-    except (OSError, ValueError):
+    manifest_path = os.path.join(tdir, "manifest.json")
+    if not os.path.lexists(manifest_path):
         raise PbzError("NOT_FOUND", f"restore point {stamp}")
+    try:
+        man = json.loads(read_checked(manifest_path, root=trash).decode("utf-8"))
+    except PbzError:
+        raise
+    except (OSError, ValueError, UnicodeError):
+        raise PbzError("NOT_FOUND", f"restore point {stamp}") from None
     files = man.get("files")
     if not isinstance(files, dict):
         raise PbzError("INVALID", "restore point is unreadable")

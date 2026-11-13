@@ -2,7 +2,7 @@ using System.Text.Json.Nodes;
 
 namespace PbzEngine;
 
-/// <summary>probe: fixed shape facts for one table (booleans in both tiers, buckets and years in shape tier).</summary>
+/// <summary>probe: fixed shape facts for one table (booleans in both tiers, buckets in shape tier).</summary>
 public static class Probe
 {
     public static JsonObject Run(Req req, Ctx ctx)
@@ -41,8 +41,6 @@ public static class Probe
                 {
                     o["blank_bucket"] = Buckets.Share(s.Blanks, rows);
                     o["card_bucket"] = Buckets.Count(s.Distinct);
-                    if (c.IsDate && s.YearMin != null) o["year_min"] = s.YearMin;
-                    if (c.IsDate && s.YearMax != null) o["year_max"] = s.YearMax;
                 }
             }
             outCols.Add(o);

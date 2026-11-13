@@ -498,7 +498,11 @@ def _compile_functions(ws, project, model, items: list[tuple[str, str, str]]) ->
         if klass in (None, "ENGINE_UNAVAILABLE", "NOT_READY", "TIMEOUT"):
             return "NOT_RUN"
         raise PbzError(klass or "ENGINE_UNAVAILABLE", "function did not compile")
-    for item in res.get("items") or []:
+    raw_items = res.get("items") or []
+    by_id = {item["id"]: item for item in raw_items
+             if isinstance(item, dict) and isinstance(item.get("id"), str)}
+    for entry in payload:
+        item = by_id.get(entry["id"])
         if not isinstance(item, dict) or item.get("status") != "PASS":
             klass = item.get("class") if isinstance(item, dict) else None
             raise PbzError(str(klass or "ERROR"), "function did not compile")

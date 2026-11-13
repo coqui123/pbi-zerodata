@@ -11,7 +11,7 @@ import unittest
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 
-from pbz.common import PbzError, open_mirror_file_readonly  # noqa: E402
+from pbz.common import PbzError, _contained, open_mirror_file_readonly, read_checked  # noqa: E402
 
 # Committed inventory. GATED call sites must use the helper. DEFERRED stays residual #8.
 READER_INVENTORY = [
@@ -266,6 +266,34 @@ class MirrorReaderLinks(unittest.TestCase):
                     layout._load(os.path.join(pages, "pbz-workspace", "page.json"))
                 self.assertEqual(caught.exception.code, "UNSAFE_PATH")
                 self.assertNotIn("PBZ_CANARY_PAGE", str(caught.exception))
+
+    def test_contained_refuses_dotdot_through_link(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "root")
+            outside = os.path.join(tmp, "outside")
+            os.makedirs(root)
+            os.makedirs(outside)
+            with open(os.path.join(outside, "sibling.txt"), "wb") as handle:
+                handle.write(b"PBZ_CANARY_SECRET")
+            link = os.path.join(root, "link")
+            made = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", link, outside],
+                capture_output=True,
+                text=True,
+            )
+            if made.returncode != 0:
+                try:
+                    os.symlink(outside, link, target_is_directory=True)
+                except OSError:
+                    self.skipTest("symlinks/junctions unavailable")
+            trap = os.path.join(root, "link", "..", "sibling.txt")
+            with self.assertRaises(PbzError) as caught:
+                _contained(trap, root)
+            self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+            with self.assertRaises(PbzError) as caught:
+                read_checked(trap, root=root)
+            self.assertEqual(caught.exception.code, "UNSAFE_PATH")
 
     def test_definition_reader_refuses_symlink(self):
         from pbz import layout

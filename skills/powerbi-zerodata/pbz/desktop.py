@@ -38,7 +38,7 @@ def _json_list(text: str) -> list:
     try:
         data = json.loads(text)
     except ValueError:
-        return []
+        raise PbzError("ENGINE_UNAVAILABLE", "Desktop process probe failed")
     return data if isinstance(data, list) else [data]
 
 

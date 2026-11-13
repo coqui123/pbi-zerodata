@@ -125,8 +125,11 @@ def base_dir(ws: Workspace, project: Project) -> str:
 
 
 def load_manifest(ws: Workspace, project: Project) -> dict:
+    path = manifest_path(ws, project)
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     try:
-        with open(manifest_path(ws, project), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
@@ -1155,7 +1158,7 @@ def revert(ws: Workspace, project: Project, paths: list[str] | None = None, obj:
         ops.append(("delete", os.path.join(ws.mirror, *rel.split("/"))))
         done.append(rel)
     if ops:
-        commit_bytes(ops, root=ws.root)
+        commit_bytes(ops, root=anchor_mirror(ws))
     return {"verb": "revert", "project": project.name, "files": sorted(done),
             "result": "REVERTED" if done else "NOTHING_TO_REVERT"}
 
@@ -1205,7 +1208,7 @@ def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict
         new = apply_block(doc.text, tmdl.block_span(doc, n), bdoc.text[slice(*tmdl.block_span(bdoc, bn))])
     path = os.path.join(mdef, *rel.split("/"))
     _text, bom = _read_prepared(path, f"{project.name}.SemanticModel/definition/{rel}")
-    commit_bytes([("write", path, new, bom)], root=ws.root)
+    commit_bytes([("write", path, new, bom)], root=anchor_mirror(ws))
     return {"verb": "revert", "project": project.name, "object": f"{kind} {table}[{name}]",
             "result": "REVERTED", "files": [f"{project.name}.SemanticModel/definition/{rel}"]}
 
@@ -1273,7 +1276,10 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
     live, readable = set(), True
     for name in kept:
         try:
-            with open(os.path.join(snaps, name), encoding="utf-8") as f:
+            snap_path = os.path.join(snaps, name)
+            if _reparse_link(snap_path):
+                raise OSError("link")
+            with open(snap_path, encoding="utf-8") as f:
                 doc = json.load(f)
             blob_ids = doc.get("files") if isinstance(doc, dict) else None
             if not isinstance(blob_ids, dict):
@@ -1297,7 +1303,10 @@ def history_list(ws: Workspace, project: Project) -> list[dict]:
     out = []
     for name in sorted(os.listdir(snaps)) if os.path.isdir(snaps) else []:
         try:
-            with open(os.path.join(snaps, name), encoding="utf-8") as f:
+            snap_path = os.path.join(snaps, name)
+            if _reparse_link(snap_path):
+                raise OSError("link")
+            with open(snap_path, encoding="utf-8") as f:
                 s = json.load(f)
             if not isinstance(s, dict) or not isinstance(s.get("stamp"), str) or not isinstance(s.get("files"), dict):
                 raise ValueError("snapshot")

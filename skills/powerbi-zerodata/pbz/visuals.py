@@ -235,13 +235,18 @@ def _save_contract(ws, c: dict) -> str:
 
 
 def _pending_dir(ws, guid: str) -> str:
+    if not isinstance(guid, str) or not GUID_RE.match(guid):
+        raise PbzError("BAD_REQUEST", "a custom visual guid has letters, digits and _ only")
     return os.path.join(ws.private, PENDING, guid)
 
 
 def _package_dirs(ws, project, guid: str) -> list[str]:
     """Unpacked private packages for this guid: pending (imported, not pushed yet) and in the real report."""
-    return [d for d in (_pending_dir(ws, guid), os.path.join(project.report_dir, "CustomVisuals", guid))
-            if os.path.isfile(os.path.join(d, "package.json"))]
+    if not isinstance(guid, str) or not GUID_RE.match(guid):
+        return []
+    pending = _pending_dir(ws, guid)
+    report = os.path.join(project.report_dir, "CustomVisuals", guid)
+    return [d for d in (pending, report) if os.path.isfile(os.path.join(d, "package.json"))]
 
 
 def package_present(ws, project, guid: str) -> bool:
@@ -473,8 +478,12 @@ def import_pbiviz(ws, project, path: str, as_: str = "contract", replace: bool =
            "version": info.get("version"), "roles": [f"{r['name']}:{r['kind']}" for r in info["roles"]],
            "conditions": conditions_text(info), "contract": _save_contract(ws, contract)}
     if as_ == "private":
-        pend = _pending_dir(ws, guid)
         pending_root = os.path.join(ws.private, PENDING)
+        if _reparse_link(pending_root):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        pend = _pending_dir(ws, guid)
+        if _reparse_link(pend):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         if os.path.lexists(pend):
             _safe_rmtree(pending_root, pend, ignore_errors=True)
         for name, data in files.items():
@@ -592,7 +601,7 @@ def list_visuals(ws, project) -> dict:
             rec["version"] = info["version"]
         if reg.get(n, {}).get("kind") == "private":
             rec["package"] = "present" if os.path.isdir(os.path.join(project.report_dir, "CustomVisuals", n)) else \
-                ("staged" if os.path.isdir(_pending_dir(ws, n)) else "missing")
+                ("staged" if isinstance(n, str) and GUID_RE.match(n) and os.path.isdir(_pending_dir(ws, n)) else "missing")
         if reg.get(n, {}).get("conflict"):
             rec["conflict"] = True
         if n in reg and not used.get(n):

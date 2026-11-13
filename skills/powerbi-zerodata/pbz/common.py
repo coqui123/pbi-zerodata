@@ -8,6 +8,7 @@ import re
 import stat
 import sys
 import tempfile
+from pathlib import PurePath
 
 from . import guard
 
@@ -339,6 +340,30 @@ def remove_file(path: str, *, root: str | None = None) -> None:
     os.remove(path)
 
 
+def _refuse_dotdot_through_link(path: str) -> None:
+    """Refuse when ``..`` crosses a reparse point without ``abspath`` collapsing it away."""
+    pure = PurePath(path)
+    parts = pure.parts
+    if not parts:
+        return
+    anchor_parts = PurePath(pure.anchor).parts if pure.anchor else ()
+    stack = list(anchor_parts)
+    for part in parts[len(anchor_parts):]:
+        if part == ".":
+            continue
+        if part == "..":
+            if len(stack) <= len(anchor_parts):
+                continue
+            cancelled = stack.pop()
+            if cancelled in (".", ".."):
+                continue
+            target = os.path.join(*stack, cancelled)
+            if os.path.lexists(target) and _reparse_link(target):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            continue
+        stack.append(part)
+
+
 def _contained(path: str, root: str | None) -> None:
     """Refuse when a path component at or below `root` resolves outside that root.
 
@@ -349,6 +374,7 @@ def _contained(path: str, root: str | None) -> None:
     if root is None:
         return
     root_abs = os.path.abspath(root)
+    _refuse_dotdot_through_link(path)
     path_abs = os.path.abspath(path)
     try:
         rel = os.path.relpath(path_abs, root_abs)

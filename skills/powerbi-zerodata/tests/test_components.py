@@ -165,11 +165,12 @@ def main() -> int:
 
     # ---------------------------------------------------------------- Microsoft's validator on the Desktop-made fixture
     validate.report_author = real_author
-    st = os.path.join(tmp, "fx")
+    fxroot = os.path.join(tmp, "fxroot")
+    st = os.path.join(fxroot, "pbz-workspace")
     shutil.copytree(os.path.join(SKILL, "tests", "fixture"), st)
     fx = types.SimpleNamespace(name="Canary", mirror_report=os.path.join(st, "Canary.Report"),
                                mirror_model=os.path.join(st, "Canary.SemanticModel"))
-    fws = types.SimpleNamespace(mirror=st)
+    fws = types.SimpleNamespace(root=fxroot, mirror=st)
     base = validate.report_author(st, fx, lambda s: s)
     if any(f.get("code") == "REPORT_VALIDATOR_MISSING" for f in base):
         print("note: Microsoft's report validator is not installed; fixture comparison skipped")

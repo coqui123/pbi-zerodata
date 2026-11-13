@@ -580,7 +580,7 @@ def test_live(env: Env, key_holder: dict) -> None:
     expect("probe Hours: rows bucket, blanks, negatives, future dates",
            r and r.get("rows_bucket") == "10-99" and pc["Person"]["has_blanks"] is True and pc["Hours"]["has_negatives"] is True
            and pc["ProjectID"]["has_negatives"] is False and pc["Date"]["has_future_dates"] is False
-           and pc["Date"].get("year_min") == 2025 and pc["Date"].get("year_max") == 2026, r)
+           and "year_min" not in pc["Date"] and "year_max" not in pc["Date"], r)
     r = engine("probe", env.req(table="Project", columns=["PlannedEnd", "Status"], disclosure="strict"), "probe-strict")
     pc = {c["column"]: c for c in (r or {}).get("columns", [])}
     expect("probe strict: booleans only (future date planted)",

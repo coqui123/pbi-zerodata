@@ -11,6 +11,7 @@ import re
 import shutil
 import sys
 import tempfile
+import unittest.mock as mock
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
@@ -72,6 +73,38 @@ def main() -> int:
                  "DUPLICATE_REPORT_MEASURE", "PAGE_JSON_MISSING"):
         check(want in codes, f"PBIR check missed {want}: {sorted(codes)}")
     shutil.rmtree(tmp, ignore_errors=True)
+
+    # default has_package must not leave CustomVisuals via resourcePackages.name
+    evil = r"..\..\outside"
+    trav_tmp = tempfile.mkdtemp(prefix="pbztrav-")
+    rdir = os.path.join(trav_tmp, "Trav.Report")
+    ddir = os.path.join(rdir, "definition")
+    os.makedirs(os.path.join(rdir, "CustomVisuals"))
+    os.makedirs(ddir)
+    json.dump({"version": "4.0", "datasetReference": {"byPath": {"path": "../model"}}},
+              open(os.path.join(rdir, "definition.pbir"), "w", encoding="utf-8"))
+    json.dump({"resourcePackages": [{"name": evil, "type": "CustomVisual", "items": []}]},
+              open(os.path.join(ddir, "report.json"), "w", encoding="utf-8"))
+    report_norm = os.path.normpath(rdir)
+    real_isfile = os.path.isfile
+    probed_outside: list[str] = []
+
+    def guarded_isfile(path):
+        norm = os.path.normpath(path)
+        try:
+            inside = os.path.commonpath([norm, report_norm]) == report_norm
+        except ValueError:
+            inside = False
+        if not inside:
+            probed_outside.append(path)
+        return real_isfile(path)
+
+    with mock.patch("os.path.isfile", side_effect=guarded_isfile):
+        trav_findings = pbircheck.run(rdir)
+    check(not probed_outside, f"default has_package probed outside report: {probed_outside}")
+    miss = [f for f in trav_findings if f["code"] == "PBIR_PRIVATE_VISUAL_PACKAGE_MISSING"]
+    check(miss and evil in miss[0]["message"], f"traversal package name not flagged missing: {trav_findings}")
+    shutil.rmtree(trav_tmp, ignore_errors=True)
 
     # ---------------------------------------------------------------- no third-party binaries at runtime
     src = ""
