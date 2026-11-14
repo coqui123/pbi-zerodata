@@ -283,8 +283,24 @@ def load_contract(ws, project, vtype: str) -> tuple[dict | None, str]:
 # ---------------------------------------------------------------- .pbiviz
 
 def _read_file(root: str, name: str) -> bytes:
-    with open(os.path.join(root, *name.split("/")), "rb") as f:
-        return f.read()
+    if _reparse_link(root):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    path = root
+    for part in name.replace("\\", "/").split("/"):
+        if not part or part in (".", "..") or ":" in part or "\\" in part:
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        path = os.path.join(path, part)
+        if _reparse_link(path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    root_abs = os.path.abspath(root)
+    path_abs = os.path.abspath(path)
+    try:
+        if os.path.normcase(os.path.commonpath([path_abs, root_abs])) != os.path.normcase(root_abs):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    except ValueError:
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+    with open(path, "rb") as handle:
+        return handle.read()
 
 
 def _list_dir(root: str) -> list[str]:

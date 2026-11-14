@@ -352,7 +352,25 @@ public static class Perf
         string root = Path.GetFullPath(dir + Path.DirectorySeparatorChar);
         if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
             throw new BadRequestException("baseline name is not allowed");
+        RefuseLink(dir);
+        RefuseLink(path);
         return path;
+    }
+
+    static void RefuseLink(string path)
+    {
+        try
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new EngineException(ErrorClass.OTHER, "refusing to read through a link");
+        }
+        catch (EngineException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+        }
     }
 
     static void SaveBaseline(string privateDir, string name, double median, double spread)
@@ -374,6 +392,10 @@ public static class Perf
             if (!TryDouble(o["median"], out median)) return false;
             if (!TryDouble(o["spread"], out spread) || spread < 0 || !double.IsFinite(spread)) spread = 0;
             return true;
+        }
+        catch (EngineException)
+        {
+            throw;
         }
         catch
         {

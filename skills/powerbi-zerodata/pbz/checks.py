@@ -869,10 +869,23 @@ def harden_index(ws, pol: dict) -> int:
         info["class"] = "high"
         moved += 1
     if moved:
-        tmp = idx_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(idx, f)
-        os.replace(tmp, idx_path)
+        if _reparse_link(ws.private) or _reparse_link(idx_path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        directory = os.path.dirname(idx_path) or "."
+        fd, tmp = tempfile.mkstemp(prefix="index.", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(idx, handle)
+            if _reparse_link(idx_path):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            os.replace(tmp, idx_path)
+            tmp = ""
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         dpapi.write_protected(cat_path, json.dumps(cats, ensure_ascii=False).encode("utf-8"))
     return moved
 
@@ -907,9 +920,26 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
     if not res.get("ok"):
         raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
     if action == "save":
-        os.makedirs(os.path.dirname(spec_path), exist_ok=True)
-        with open(spec_path, "w", encoding="utf-8") as f:
-            json.dump(spec or {}, f)
+        directory = os.path.dirname(spec_path)
+        if _reparse_link(ws.private) or _reparse_link(directory) or _reparse_link(spec_path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        os.makedirs(directory, exist_ok=True)
+        if _reparse_link(directory) or _reparse_link(spec_path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        fd, tmp = tempfile.mkstemp(prefix="snapshot-spec.", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(spec or {}, handle)
+            if _reparse_link(directory) or _reparse_link(spec_path):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            os.replace(tmp, spec_path)
+            tmp = ""
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
     res["verb"] = verb
     return res
 

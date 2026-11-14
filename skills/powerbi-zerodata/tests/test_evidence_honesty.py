@@ -629,8 +629,8 @@ class EvidenceHonestyTests(unittest.TestCase):
                                        {"errors": 0, "warnings": 0, "outcome": "PASS"}) + "\n")
         out = self._review(accept=True)
         self.assertEqual(out["result"], "INCOMPLETE")
-        self.assertEqual(out["skipped"], 1)
-        self.assertTrue(self.accepts)
+        self.assertEqual(out["skipped"], 2)
+        self.assertEqual(self.accepts, [])
         self.assertIn("HUMAN_ACCEPTED", open(os.path.join(self.ws.pbz_dir, "evidence.jsonl"), encoding="utf-8").read())
 
     def test_suggested_junction_appends_nothing(self):
@@ -686,8 +686,8 @@ class EvidenceHonestyTests(unittest.TestCase):
         self._write_log(nested + "\n" + good + "\n")
         out = self._review(accept=True)
         self.assertEqual(out["result"], "INCOMPLETE")
-        self.assertEqual(out["skipped"], 1)
-        self.assertTrue(self.accepts)
+        self.assertEqual(out["skipped"], 2)
+        self.assertEqual(self.accepts, [])
         rendered = self._rendered(out)
         self.assertNotIn("[[" * 20, rendered)
         self.assertIn("HUMAN_ACCEPTED", open(os.path.join(self.ws.pbz_dir, "evidence.jsonl"), encoding="utf-8").read())
@@ -756,6 +756,21 @@ class EvidenceHonestyTests(unittest.TestCase):
         self.assertEqual(checked["chain"], "BROKEN")
         self.assertEqual(checked["reason"], "UNCHAINED")
         self.assertEqual(checked["records"], 1)
+
+    def test_accepted_macs_stop_at_the_unchained_line(self):
+        first = _line("validate", "PARSED", "validate", {"errors": 0, "warnings": 0, "outcome": "PASS"})
+        second = _line("health", "EXECUTED", "health",
+                       {"health_errors": 0, "unprocessed_tables": 0, "outcome": "PASS", "executed": True})
+        path = self._write_log(first + "\n" + second + "\n")
+        lines = open(path, encoding="utf-8").read().splitlines()
+        hole = json.dumps({"project": "Canary", "verb": "validate"})
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join([lines[0], hole, lines[1]]) + "\n")
+        macs = evidence._accepted_macs(self.ws)
+        self.assertIn(json.loads(lines[0])["chain_mac"], macs)
+        self.assertNotIn(json.loads(lines[1])["chain_mac"], macs)
+        loaded, _skipped = evidence._load_entries(self.ws, self.project)
+        self.assertEqual(len(loaded), 1)
 
     def test_verify_chain_skips_blank_lines_between_chained_records(self):
         good = _line("validate", "PARSED", "validate", {"errors": 0, "warnings": 0, "outcome": "PASS"})

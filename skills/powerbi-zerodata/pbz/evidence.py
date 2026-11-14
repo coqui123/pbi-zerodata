@@ -174,9 +174,11 @@ def _accepted_macs(ws) -> set[str]:
             try:
                 obj = json.loads(line)
             except (ValueError, RecursionError):
-                continue
+                stopped = True
+                break
             if not isinstance(obj, dict) or "chain_mac" not in obj:
-                continue
+                stopped = True
+                break
             if not _chain_ok(key, prev, obj):
                 stopped = True
                 break
@@ -652,9 +654,11 @@ def _load_entries(ws, project) -> tuple[list[dict], int]:
             try:
                 obj = json.loads(line)
             except (ValueError, RecursionError):
+                broken = True
                 skipped += 1
                 continue
-            if not isinstance(obj, dict):
+            if not isinstance(obj, dict) or "chain_mac" not in obj:
+                broken = True
                 skipped += 1
                 continue
             linked = False
