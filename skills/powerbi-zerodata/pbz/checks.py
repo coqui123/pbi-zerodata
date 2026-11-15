@@ -600,7 +600,7 @@ def run_checks(ws, project, spec: dict) -> dict:
             for w in c.get("where", []) or []:
                 if isinstance(w, str):
                     consts |= _constants(w)
-            consts = {x for x in consts if x not in known and _h(x) not in authored}
+            consts = {x for x in consts if x not in known}
             # literals the agent pushed into measures this target reaches count as constants too: editing a
             # measure body must not turn a fixed check into a fresh guessing channel
             for f in EXPR_FIELDS:

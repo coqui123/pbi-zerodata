@@ -10,7 +10,7 @@ import os
 import re
 
 from . import mirror, rename as rename_mod, tmdl
-from .common import PbzError, commit_bytes, read_text
+from .common import PbzError, anchor_mirror, commit_bytes, read_text
 from .mirror_txn import transaction
 from .tokens import TOKEN_RE
 
@@ -217,7 +217,7 @@ def replace(ws, project, pattern: str, repl: str, kind: str = "any", apply: bool
                     _old, bom = read_text(path)
                     ops.append(("write", path, new_text, bom))
             if ops:
-                commit_bytes(ops, root=ws.root)
+                commit_bytes(ops, root=anchor_mirror(ws))
         return {**out, "dry_run": False, "result": "CHANGED" if planned or ops else "NOTHING_TO_CHANGE"}
 
     if jobs or outside:

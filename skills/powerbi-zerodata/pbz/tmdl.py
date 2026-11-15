@@ -290,7 +290,9 @@ def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tu
             continue
         m = PROP_RE.match(ln)
         if m and m.group("prop") == prop:
-            if value is None or m.group("val").strip() == value:
+            if value is None:
+                return [(off + m.end("prop"), off + len(ln.rstrip("\r\n")), "")]
+            if m.group("val").strip() == value:
                 return []
             return [(off + m.start("val"), off + len(ln), value)]
         if ln.strip() == prop:

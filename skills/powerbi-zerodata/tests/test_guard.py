@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -217,7 +218,9 @@ def main() -> int:
 
     memo_failures, memo_checks = _private_root_memo()
     failures += memo_failures
-    total = len(cases) * 2 + 3 + memo_checks
+    link_failures, link_checks = _link_dotdot()
+    failures += link_failures
+    total = len(cases) * 2 + 3 + memo_checks + link_checks
     print(f"{total - failures}/{total} passed")
     return 1 if failures else 0
 
@@ -684,6 +687,121 @@ def _private_root_memo() -> tuple[int, int]:
         else:
             os.environ["PBZ_PRIVATE_ROOT"] = previous
         guard._PRIVATE["stamp"] = None
+    return failures, checks
+
+
+def _link_dotdot() -> tuple[int, int]:
+    """`..` through a junction stays visible, including when the path has a short name."""
+    skill = os.path.dirname(HERE)
+    sys.path.insert(0, skill)
+    from pbz import guard
+    sys.path.insert(0, HERE)
+    from _junction import make_junction
+
+    failures = 0
+    checks = 0
+    tmp = tempfile.mkdtemp(prefix="pbzguard-dotdot-")
+    links: list[str] = []
+    try:
+        checks += 1
+        plain = guard.norm(os.path.join(tmp, "a", "..", "b"))
+        if ".." in plain.split("/"):
+            failures += 1
+            print(f"FAIL ordinary .. was kept: {plain}")
+        ws = os.path.join(tmp, "ws")
+        os.makedirs(os.path.join(ws, ".pbz"))
+        with open(os.path.join(ws, ".pbz", "policy.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        mirror = os.path.join(ws, "pbz-workspace")
+        outside = os.path.join(tmp, "outside")
+        os.makedirs(mirror)
+        os.makedirs(outside)
+        link = os.path.join(mirror, "link")
+        if not make_junction(None, link, outside):
+            print("SKIP link dotdot junction")
+            return failures, checks
+        links.append(link)
+        escaped = os.path.join(mirror, "link", "..", "secret.txt")
+        checks += 1
+        got = guard.norm(escaped)
+        parts = got.split("/")
+        if "link" not in parts or ".." not in parts:
+            failures += 1
+            print(f"FAIL link .. collapsed: {got}")
+        short = os.path.join(mirror, "NAME~1")
+        os.makedirs(short)
+        short_link = os.path.join(short, "link")
+        if not make_junction(None, short_link, outside):
+            print("SKIP short-name link junction")
+            return failures, checks
+        links.append(short_link)
+        checks += 1
+        got = guard.norm(os.path.join(short, "link", "..", "secret.txt"))
+        parts = got.split("/")
+        if "link" not in parts or ".." not in parts:
+            failures += 1
+            print(f"FAIL short-name link .. collapsed: {got}")
+        checks += 1
+        reason = guard.classify_path(escaped)
+        if reason != "definition":
+            failures += 1
+            print(f"FAIL classify escaped mirror: {reason}")
+        normal = os.path.join(mirror, "table.tmdl")
+        with open(normal, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        checks += 1
+        reason = guard.classify_path(normal)
+        if reason is not None:
+            failures += 1
+            print(f"FAIL classify ordinary mirror file: {reason}")
+        model = os.path.join(ws, "Sales.SemanticModel", "definition", "model.tmdl")
+        os.makedirs(os.path.dirname(model))
+        with open(model, "w", encoding="utf-8") as handle:
+            handle.write("table T")
+        jump = os.path.join(tmp, "jump")
+        if not make_junction(None, jump, outside):
+            print("SKIP outside junction")
+            return failures, checks
+        links.append(jump)
+        via_model = os.path.join(tmp, "jump", "..", "ws", "Sales.SemanticModel", "definition", "model.tmdl")
+        checks += 1
+        if not os.path.isfile(via_model):
+            failures += 1
+            print("FAIL junction path did not open the model")
+        reason = guard.classify_path(via_model)
+        if reason != "definition":
+            failures += 1
+            print(f"FAIL classify model through junction: {reason}")
+        private = os.path.join(tmp, "private")
+        os.makedirs(private)
+        secret = os.path.join(private, "state.json")
+        with open(secret, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        previous_private = os.environ.get("PBZ_PRIVATE_ROOT")
+        os.environ["PBZ_PRIVATE_ROOT"] = private
+        guard._PRIVATE["stamp"] = None
+        try:
+            via_private = os.path.join(tmp, "jump", "..", "private", "state.json")
+            checks += 1
+            if not os.path.isfile(via_private):
+                failures += 1
+                print("FAIL junction path did not open the private file")
+            if not guard.global_denied(guard.norm(via_private)):
+                failures += 1
+                print("FAIL private file through junction was not denied")
+        finally:
+            guard._PRIVATE["stamp"] = None
+            if previous_private is None:
+                os.environ.pop("PBZ_PRIVATE_ROOT", None)
+            else:
+                os.environ["PBZ_PRIVATE_ROOT"] = previous_private
+    finally:
+        for link in links:
+            try:
+                os.rmdir(link)
+            except OSError:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
     return failures, checks
 
 

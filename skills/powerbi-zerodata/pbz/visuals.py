@@ -371,7 +371,8 @@ def read_pbiviz(path: str) -> tuple[dict, dict[str, bytes]]:
             if i.is_dir():
                 continue
             parts = n.split("/")
-            if n.startswith("/") or re.match(r"^[A-Za-z]:", n) or ".." in parts or "" in parts or "\0" in n:
+            if (n.startswith("/") or ".." in parts or "" in parts or "\0" in n
+                    or any(":" in part for part in parts)):
                 raise PbzError("UNSAFE_PACKAGE", "entry path escapes the package")
             if (i.external_attr >> 16) & 0o170000 == 0o120000:
                 raise PbzError("UNSAFE_PACKAGE", "symbolic link entry")

@@ -627,7 +627,9 @@ def check(ws, project, spec) -> dict:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     out = {"verb": "synth-check", "project": project.name, "data": "synthetic", "profile": info.get("profile", "standard"),
            "summary": counts, "results": results}
-    if _stale(project, info):
+    if not _built_stamp_ok(info):
+        out["drift"] = {"built": "the synthetic build timestamp is not comparable"}
+    elif _stale(project, info):
         out["drift"] = {"synth_stale": "the synthetic copy is older than the mirror model and still runs the old DAX: "
                                        "rebuild and reopen it (`pbz synth build`, `pbz synth open`)"}
     if info.get("profile", "standard") != "edge":

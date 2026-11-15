@@ -197,6 +197,26 @@ REASONS = {
 
 # ---------------------------------------------------------------- paths
 
+def _crosses_link(path: str) -> bool:
+    """True when `..` would cancel a symlink or junction. Missing parts are not links."""
+    stack: list[str] = []
+    for part in path.replace("\\", "/").split("/"):
+        if part in ("", "."):
+            if not stack:
+                stack.append(part)
+            continue
+        if part == "..":
+            if stack and stack[-1] not in ("", ".."):
+                if _is_link("/".join(stack)):
+                    return True
+                stack.pop()
+            else:
+                stack.append(part)
+            continue
+        stack.append(part)
+    return False
+
+
 def norm(p: str, base: str | None = None) -> str:
     """Normalize Windows / Git Bash / relative paths: absolute, lowercase, forward slashes."""
     p = str(p).strip().strip("'\"")
@@ -206,9 +226,15 @@ def norm(p: str, base: str | None = None) -> str:
     p = os.path.expandvars(os.path.expanduser(p))
     if base and not os.path.isabs(p):
         p = os.path.join(base, p)
-    p = os.path.normpath(p)
-    if "~" in p:
-        p = _long_existing(p)
+    crossed = _crosses_link(p)
+    if crossed:
+        # Keep the link component visible. _long_existing calls normpath and would
+        # collapse `link/..` back into a path that still looks inside the root.
+        p = p.replace("\\", "/")
+    else:
+        p = os.path.normpath(p)
+        if "~" in p:
+            p = _long_existing(p)
     return os.path.normcase(p).replace("\\", "/")
 
 
@@ -549,7 +575,15 @@ def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root + "/")
 
 
-def global_denied(path: str) -> bool:
+def _lexical(path: str) -> str:
+    """Path Win32 opens: `..` collapsed, then an 8.3 prefix expanded."""
+    collapsed = os.path.normpath(path)
+    if "~" in collapsed:
+        collapsed = _long_existing(collapsed)
+    return os.path.normcase(collapsed).replace("\\", "/")
+
+
+def _global_hit(path: str) -> bool:
     for d in GLOBAL_DENY_DIRS:
         if _under(path, norm(d)):
             return True
@@ -557,6 +591,14 @@ def global_denied(path: str) -> bool:
         if _under(path, root):
             return True
     return any(re.search(p, path) for p in GLOBAL_DENY_PATTERNS)
+
+
+def global_denied(path: str) -> bool:
+    if _global_hit(path):
+        return True
+    # A preserved `link/..` still opens the collapsed path. Check that spelling too.
+    lexical = _lexical(path)
+    return lexical != path and _global_hit(lexical)
 
 
 def _mirror_blocked(path: str, root: str) -> bool:
@@ -607,9 +649,8 @@ def _reparse_blocked(path: str, root: str) -> bool:
     return False
 
 
-def classify_path(path: str) -> str | None:
-    """Reason key if content access to path is denied, else None."""
-    path = norm(path)
+def _classify_normed(path: str) -> str | None:
+    """Reason key for one already-normalized spelling, else None."""
     if global_denied(path):
         return "global"
     root = active_root(path)
@@ -634,6 +675,16 @@ def classify_path(path: str) -> str | None:
     if any(glob_to_regex(g).match(r) for g in DEFAULT_WS_DENY + list(pol.get("deny", []))):
         return "data_file"
     return None
+
+
+def classify_path(path: str) -> str | None:
+    """Reason key if content access to path is denied, else None."""
+    path = norm(path)
+    reason = _classify_normed(path)
+    if reason is not None or ".." not in path.split("/"):
+        return reason
+    # Win32 opens the collapsed spelling, which can be the private store or a real model.
+    return _classify_normed(_lexical(path))
 
 
 def dir_has_denied(d: str, name_filter: re.Pattern | None = None, cap_is_deny: bool = True) -> bool:

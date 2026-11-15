@@ -133,6 +133,11 @@ def main() -> int:
     evil = os.path.join(tmp, "evil.pbiviz")
     make_pbiviz(evil, guid="pbzEvilVisual99", evil=True)
     refused(visuals.import_pbiviz, ws, project, evil, code="UNSAFE_PACKAGE")
+    drive = os.path.join(tmp, "drive.pbiviz")
+    with zipfile.ZipFile(drive, "w") as z:
+        z.writestr("package.json", "{}")
+        z.writestr("resources/D:../escaped.txt", "x")
+    refused(visuals.import_pbiviz, ws, project, drive, code="UNSAFE_PACKAGE")
 
     # ---------------------------------------------------------------- AppSource, organizational, observed roles
     deneb = "deneb7E15AEF80B9E4D4F8E12924291ECE89A"
