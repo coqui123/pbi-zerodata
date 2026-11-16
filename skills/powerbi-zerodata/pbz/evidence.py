@@ -826,8 +826,9 @@ def summarize(verb: str, action: str | None, out: dict) -> tuple[str, dict] | No
         counts: dict = {}
         for row in res:
             status = row.get("status")
-            if status in _STATIC_RESULTS:
-                counts[status] = counts.get(status, 0) + 1
+            if status not in _STATIC_RESULTS:
+                status = "OTHER"
+            counts[status] = counts.get(status, 0) + 1
         digest = out.get("spec_digest")
         if not isinstance(digest, str) or not re.fullmatch(r"s[0-9a-f]{12}", digest):
             return None
@@ -936,7 +937,8 @@ NEXT = {
 
 # ---------------------------------------------------------------- review
 
-def _status(e: dict | None, cur_m: str, cur_r: str, pending: bool, stage: str) -> str:
+def _status(e: dict | None, cur_m: str, cur_r: str, pending: bool, stage: str,
+            edits_unknown: bool = False) -> str:
     if e is None:
         return "NOT_RUN"
     if e.get("mirror_rev") != cur_m:
@@ -947,6 +949,8 @@ def _status(e: dict | None, cur_m: str, cur_r: str, pending: bool, stage: str) -
         return "STALE"
     if stage in ("LOADED", "EXECUTED", "HANDOFF", "HUMAN_ACCEPTED") and pending:
         return "STALE (pending edits not pushed)"
+    if stage in ("LOADED", "EXECUTED", "HANDOFF", "HUMAN_ACCEPTED") and edits_unknown:
+        return "STALE"
     return "CURRENT"
 
 
@@ -1003,6 +1007,7 @@ def static_proof_ok(entries: list[dict], *, mirror_rev: str, spec_digest: str) -
         return False
     if not isinstance(mirror_rev, str) or not _MREV.fullmatch(mirror_rev):
         return False
+    chosen: dict[str, dict] = {}
     for entry in entries:
         if entry.get("stage") != "STATIC_CONTRACT":
             continue
@@ -1018,6 +1023,11 @@ def static_proof_ok(entries: list[dict], *, mirror_rev: str, spec_digest: str) -
             continue
         if summary.get("spec_digest") != spec_digest:
             continue
+        chosen[str(scope)] = entry
+    if not chosen:
+        return False
+    for entry in chosen.values():
+        summary = entry.get("summary")
         if summary.get("outcome") != "INCOMPLETE":
             return False
         if summary.get("executed") is not False or summary.get("native_executed") is not False:
@@ -1030,8 +1040,7 @@ def static_proof_ok(entries: list[dict], *, mirror_rev: str, spec_digest: str) -
         failing = counts.keys() - {"MATCH"}
         if failing or not counts.get("MATCH"):
             return False
-        return True
-    return False
+    return True
 
 
 def consume_static(entries: list[dict], *, mirror_rev: str, spec_digest: str | None) -> dict:
@@ -1051,10 +1060,12 @@ def review(ws, project, accept: bool = False, current_spec_digest: str | None = 
         if not _is_human():
             raise PbzError("HUMAN_ONLY", "acceptance is the reviewer's: run `pbz review --accept` yourself in a terminal")
     entries, skipped = _load_entries(ws, project)
+    edits_unknown = False
     try:
         ch = changes.run(ws, project, "last", "mirror")
     except PbzError:
         ch = {"result": "NO_HISTORY"}
+        edits_unknown = True
     model, report = ch.get("model") or [], ch.get("report") or []
     pending = ch.get("result") == "CHANGED"
     rows, by_class = [], {}
@@ -1103,7 +1114,7 @@ def review(ws, project, accept: bool = False, current_spec_digest: str | None = 
     for stage in STAGES:
         scoped = [e for (st, _scope), e in latest.items() if st == stage]
         items = [{"scope": e.get("scope") or e.get("verb"),
-                  "status": _status(e, cur_m, cur_r, pending, stage), "verb": e["verb"],
+                  "status": _status(e, cur_m, cur_r, pending, stage, edits_unknown=edits_unknown), "verb": e["verb"],
                   "when": e["ts"], "summary": e.get("summary", {})} for e in scoped]
         statuses = {i["status"] for i in items}
         freshness = ("NOT_RUN" if not items else "CURRENT" if statuses == {"CURRENT"} else

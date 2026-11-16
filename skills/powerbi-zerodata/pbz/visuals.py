@@ -679,6 +679,18 @@ def pending_for(ws, report_json_text: str) -> dict[str, str]:
     return out
 
 
+def _refuse_tree(path: str) -> None:
+    """Refuse a symlink or junction at `path` or anywhere under it. copytree would follow it."""
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    if not os.path.isdir(path):
+        return
+    for cur, dirs, files in os.walk(path, followlinks=False):
+        for name in list(dirs) + list(files):
+            if _reparse_link(os.path.join(cur, name)):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+
 def install(pkgs: dict[str, str], report_dir: str, backup_dir: str | None = None) -> list[str]:
     done = []
     base = os.path.join(report_dir, "CustomVisuals")
@@ -691,8 +703,10 @@ def install(pkgs: dict[str, str], report_dir: str, backup_dir: str | None = None
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         if os.path.isdir(dst):
             if backup_dir:
+                _refuse_tree(dst)
                 shutil.copytree(dst, os.path.join(backup_dir, "CustomVisuals", guid), dirs_exist_ok=True)
             _safe_rmtree(base, dst)
+        _refuse_tree(src)
         shutil.copytree(src, dst)
         done.append(guid)
     return done

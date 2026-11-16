@@ -47,12 +47,17 @@ def _refuse_linked(path: str) -> None:
 
 
 def _restore(root: str, snap: dict[str, tuple[str, bytes]]) -> None:
+    if _reparse_link(root):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     if os.path.isdir(root):
         for path in _files(root):
             if os.path.normcase(path) not in snap:
                 os.remove(path)
     for path, data in snap.values():
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        parent = os.path.dirname(path)
+        if _reparse_link(parent):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        os.makedirs(parent, exist_ok=True)
         _refuse_linked(path)
         with open(path, "wb") as handle:
             handle.write(data)
@@ -60,6 +65,8 @@ def _restore(root: str, snap: dict[str, tuple[str, bytes]]) -> None:
 
 def transaction(root: str, fn):
     """Run `fn`. On any exception, restore `root` to the bytes it had before the call."""
+    if _reparse_link(root):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     snap = {}
     for path in _files(root):
         with open(path, "rb") as handle:

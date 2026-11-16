@@ -284,7 +284,9 @@ def impact(ws, project, source: str, mode: str, new_name: str | None = None) -> 
         try:
             tree = unused.lineage(ws, project, ref, "down", 3)
         except PbzError:
-            tree = None
+            objects.append({"column": ref, "origin": row.get("origin"),
+                            "dependents": [], "visuals": [], "lineage": "UNAVAILABLE"})
+            continue
         for node in (tree or {}).get("trees") or []:
             _dependents(node, dependents, visuals)
         objects.append({"column": ref, "origin": row.get("origin"),

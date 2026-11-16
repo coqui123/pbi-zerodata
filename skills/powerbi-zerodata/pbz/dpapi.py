@@ -81,7 +81,14 @@ def unprotect(data: bytes) -> bytes:
     return _call(_CRYPT_UNPROTECT, data)
 
 
+def _refuse_link(path: str) -> None:
+    from .common import PbzError, _reparse_link
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+
 def _read_key_file(path: str) -> bytes:
+    _refuse_link(path)
     with open(path, "rb") as handle:
         return unprotect(handle.read())
 
@@ -185,8 +192,12 @@ def hmac_hex(key: bytes, value) -> str:
 
 
 def write_protected(path: str, data: bytes) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path)
+    _refuse_link(parent)
+    _refuse_link(path)
+    os.makedirs(parent, exist_ok=True)
     tmp = path + ".tmp"
+    _refuse_link(tmp)
     with open(tmp, "wb") as f:
         f.write(protect(data))
     os.replace(tmp, path)
@@ -194,6 +205,7 @@ def write_protected(path: str, data: bytes) -> None:
 
 def read_protected(path: str) -> bytes | None:
     try:
+        _refuse_link(path)
         with open(path, "rb") as f:
             return unprotect(f.read())
     except FileNotFoundError:

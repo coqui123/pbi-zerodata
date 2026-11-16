@@ -64,6 +64,8 @@ def bridge_status() -> list[dict]:
         return []
     try:
         p = subprocess.run([BRIDGE, "status"], capture_output=True, timeout=60)
+        if p.returncode != 0:
+            return []
         data = json.loads(p.stdout.decode("utf-8", errors="replace") or "{}")
     except (ValueError, subprocess.SubprocessError, OSError):
         return []

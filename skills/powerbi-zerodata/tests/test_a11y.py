@@ -32,6 +32,25 @@ def main() -> int:
         if not cond:
             fails.append(msg)
 
+    td = tempfile.mkdtemp(prefix="pbz-a11y-order-")
+    try:
+        report = os.path.join(td, "pbz-workspace", "Sales.Report")
+        pages = os.path.join(report, "definition", "pages")
+        outside = os.path.join(td, "outside", "Other.Report", "definition", "pages", "Secret")
+        os.makedirs(pages)
+        os.makedirs(outside)
+        with open(os.path.join(outside, "page.json"), "w", encoding="utf-8") as handle:
+            handle.write('{"displayName":"OUTSIDE"}')
+        pid = os.path.relpath(outside, pages)
+        with open(os.path.join(pages, "pages.json"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"pageOrder": [pid]}))
+        from types import SimpleNamespace
+        got = a11y._pages(SimpleNamespace(mirror_report=report))
+        check(not any(item[1] == "OUTSIDE" for item in got), f"pageOrder .. left the mirror: {got}")
+    finally:
+        import shutil
+        shutil.rmtree(td, ignore_errors=True)
+
     def refused(fn, *args, code, **kw):
         try:
             fn(*args, **kw)

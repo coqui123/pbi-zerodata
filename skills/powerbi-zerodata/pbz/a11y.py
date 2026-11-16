@@ -36,6 +36,15 @@ HEX_RE = re.compile(r"^'#([0-9a-fA-F]{6})'$")
 
 # ---------------------------------------------------------------- helpers
 
+def _page_segment(name: str) -> bool:
+    """True when a page id is one path segment. Traversal and drive ids are ignored."""
+    if not isinstance(name, str) or not name or name in (".", ".."):
+        return False
+    if any(c in name for c in "/\\\x00"):
+        return False
+    return os.path.basename(name) == name
+
+
 def _pages(project) -> list[tuple[str, str, dict, str]]:
     """[(page id, display name, page.json, page dir)] in report order."""
     pdir = os.path.join(project.mirror_report, "definition", "pages")
@@ -48,7 +57,9 @@ def _pages(project) -> list[tuple[str, str, dict, str]]:
             order = list(json.loads(read_definition_text(meta)[0]).get("pageOrder") or [])
         except ValueError:
             order = []
-    ids = order + [p for p in sorted(os.listdir(pdir)) if os.path.isdir(os.path.join(pdir, p)) and p not in order]
+    order = [p for p in order if _page_segment(p)]
+    ids = order + [p for p in sorted(os.listdir(pdir))
+                   if _page_segment(p) and os.path.isdir(os.path.join(pdir, p)) and p not in order]
     out = []
     for pid in ids:
         pj = os.path.join(pdir, pid, "page.json")

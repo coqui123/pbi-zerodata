@@ -414,13 +414,44 @@ _POL: dict[str, dict] = {}
 _PRIVATE: dict[str, object] = {"stamp": None, "roots": []}
 
 
+def _link_between(inner: str, outer: str) -> bool:
+    """True when a symlink or junction sits strictly between two directories."""
+    current = norm(inner)
+    stop = norm(outer)
+    while current != stop:
+        parent = norm(os.path.dirname(current))
+        if parent == current or parent == stop:
+            return False
+        if _is_link(parent):
+            return True
+        current = parent
+    return False
+
+
 def find_root(path: str) -> str | None:
     key = norm(path)
     if key in _ROOT:
         return _ROOT[key]
-    root = next((d for d in ancestors(key) if is_workspace_root(d)), None)
-    _ROOT[key] = root
-    return root
+    # Nearest workspace wins. A directory reached through a junction inside a
+    # real workspace must not become that root, even when the directory itself
+    # is not a link: its target can hold a nested policy or a .pbip and would
+    # hide the mirror boundary. A workspace that is only a junction (Dev Drive,
+    # a redirected profile) is still the root when nothing outside it qualifies.
+    candidates = [d for d in ancestors(key) if is_workspace_root(d)]
+    chosen = None
+    for index, cand in enumerate(candidates):
+        if _is_link(cand):
+            continue
+        # A later junction workspace still counts. Skipping it would let a
+        # nested directory inside the mirror become the root.
+        if any(_link_between(cand, other) for other in candidates[index + 1:]):
+            continue
+        chosen = cand
+        break
+    if chosen is None and candidates:
+        chosen = candidates[-1]
+    _ROOT[key] = chosen
+    return chosen
 
 
 def synthetic(path: str) -> bool:
@@ -2001,7 +2032,13 @@ def decide(event: dict) -> str | None:
 def log(root: str | None, agent: str, tool: str, verdict: str) -> None:
     try:
         d = os.path.join(root, ".pbz", "logs") if root else os.path.join(PRIVATE_ROOT, "guard-log")
+        # A junction already at the log directory is followed by makedirs and open.
+        # The private store itself may be redirected; only this directory and the file are refused.
+        if _is_link(d):
+            return
         os.makedirs(d, exist_ok=True)
+        if _is_link(d) or _is_link(os.path.join(d, "guard.log")):
+            return
         with open(os.path.join(d, "guard.log"), "a", encoding="utf-8") as f:
             f.write(f"{_dt.datetime.now().isoformat(timespec='seconds')}\t{agent}\t{tool}\t{verdict}\n")
     except OSError:

@@ -220,7 +220,9 @@ def main() -> int:
     failures += memo_failures
     link_failures, link_checks = _link_dotdot()
     failures += link_failures
-    total = len(cases) * 2 + 3 + memo_checks + link_checks
+    log_failures, log_checks = _log_junction()
+    failures += log_failures
+    total = len(cases) * 2 + 3 + memo_checks + link_checks + log_checks
     print(f"{total - failures}/{total} passed")
     return 1 if failures else 0
 
@@ -795,10 +797,135 @@ def _link_dotdot() -> tuple[int, int]:
                 os.environ.pop("PBZ_PRIVATE_ROOT", None)
             else:
                 os.environ["PBZ_PRIVATE_ROOT"] = previous_private
+        ext = os.path.join(tmp, "ext-root")
+        os.makedirs(os.path.join(ext, ".pbz"))
+        with open(os.path.join(ext, ".pbz", "policy.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        with open(os.path.join(ext, "note.txt"), "w", encoding="utf-8") as handle:
+            handle.write("x")
+        jump_in = os.path.join(mirror, "jump")
+        if not make_junction(None, jump_in, ext):
+            print("SKIP mirror workspace junction")
+        else:
+            links.append(jump_in)
+            note = os.path.join(jump_in, "note.txt")
+            checks += 1
+            guard._ROOT.clear()
+            reason = guard.classify_path(note)
+            if reason != "definition":
+                failures += 1
+                print(f"FAIL junction workspace inside mirror was allowed: {reason}")
+            nested = os.path.join(ext, "inner")
+            os.makedirs(os.path.join(nested, ".pbz"))
+            with open(os.path.join(nested, ".pbz", "policy.json"), "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            with open(os.path.join(nested, "note.txt"), "w", encoding="utf-8") as handle:
+                handle.write("x")
+            checks += 1
+            guard._ROOT.clear()
+            reason = guard.classify_path(os.path.join(jump_in, "inner", "note.txt"))
+            if reason != "definition":
+                failures += 1
+                print(f"FAIL nested workspace through mirror junction was allowed: {reason}")
+        real = os.path.join(tmp, "real-ws")
+        os.makedirs(os.path.join(real, ".pbz"))
+        with open(os.path.join(real, ".pbz", "policy.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        os.makedirs(os.path.join(real, "pbz-workspace"))
+        via = os.path.join(tmp, "via")
+        if not make_junction(None, via, real):
+            print("SKIP junction workspace root")
+        else:
+            links.append(via)
+            child = os.path.join(via, "child")
+            os.makedirs(os.path.join(child, ".pbz"))
+            with open(os.path.join(child, ".pbz", "policy.json"), "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            with open(os.path.join(child, "note.txt"), "w", encoding="utf-8") as handle:
+                handle.write("x")
+            checks += 1
+            guard._ROOT.clear()
+            child_root = guard.active_root(os.path.join(child, "note.txt"))
+            if child_root != guard.norm(child):
+                failures += 1
+                print(f"FAIL child of a junction workspace was not its own root: {child_root}")
+            outside = os.path.join(tmp, "via-ext")
+            os.makedirs(os.path.join(outside, "inner", ".pbz"))
+            with open(os.path.join(outside, "inner", ".pbz", "policy.json"), "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            with open(os.path.join(outside, "inner", "note.txt"), "w", encoding="utf-8") as handle:
+                handle.write("x")
+            via_jump = os.path.join(via, "pbz-workspace", "jump")
+            if not make_junction(None, via_jump, outside):
+                print("SKIP junction inside a junction workspace")
+            else:
+                links.append(via_jump)
+                checks += 1
+                guard._ROOT.clear()
+                nested_note = os.path.join(via_jump, "inner", "note.txt")
+                reason = guard.classify_path(nested_note)
+                if reason != "definition":
+                    failures += 1
+                    print(f"FAIL nested root inside a junction workspace was allowed: {reason}")
     finally:
         for link in links:
             try:
                 os.rmdir(link)
+            except OSError:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+    return failures, checks
+
+
+def _log_junction() -> tuple[int, int]:
+    """guard.log must not follow a junction at private/guard-log.
+
+    Returns (failures, checks). A missing mklink skips with (0, 1).
+    """
+    skill = os.path.dirname(HERE)
+    sys.path.insert(0, skill)
+    from pbz import guard
+    sys.path.insert(0, HERE)
+    from _junction import make_junction
+
+    failures = 0
+    checks = 0
+    tmp = tempfile.mkdtemp(prefix="pbzguard-log-")
+    previous = guard.PRIVATE_ROOT
+    links: list[str] = []
+    try:
+        private = os.path.join(tmp, "private")
+        outside = os.path.join(tmp, "outside")
+        os.makedirs(private)
+        os.makedirs(outside)
+        guard.PRIVATE_ROOT = private
+        link = os.path.join(private, "guard-log")
+        if not make_junction(None, link, outside):
+            print("SKIP")
+            return 0, 1
+        links.append(link)
+        guard.log(None, "agent", "tool", "deny")
+        checks += 1
+        leaked = []
+        for dirpath, _dirs, filenames in os.walk(outside):
+            leaked.extend(os.path.join(dirpath, name) for name in filenames)
+        if os.path.isfile(os.path.join(outside, "guard.log")) or leaked:
+            failures += 1
+            print(f"FAIL guard.log followed the guard-log junction: {leaked}")
+        os.rmdir(link)
+        links.remove(link)
+        os.makedirs(link)
+        guard.log(None, "agent", "tool", "deny")
+        checks += 1
+        written = os.path.join(private, "guard-log", "guard.log")
+        if not os.path.isfile(written):
+            failures += 1
+            print("FAIL guard.log did not write private/guard-log/guard.log")
+    finally:
+        guard.PRIVATE_ROOT = previous
+        for item in links:
+            try:
+                os.rmdir(item)
             except OSError:
                 pass
         shutil.rmtree(tmp, ignore_errors=True)

@@ -493,6 +493,9 @@ class Classifier:
                 merged[-1] = (s, e, lab)
                 continue
             if merged and s < merged[-1][1]:
+                # A later span that runs past this one still has to be hidden.
+                if e > merged[-1][1]:
+                    merged[-1] = (merged[-1][0], e, lab)
                 continue
             merged.append((s, e, lab))
         return merged

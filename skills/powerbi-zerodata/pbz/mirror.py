@@ -627,13 +627,27 @@ def _journal_ok(journal) -> bool:
 
 
 def pending_recovery(ws, project) -> list[dict]:
-    """Closed metadata only; journal payloads and backups remain private."""
+    """Closed metadata only; journal payloads and backups remain private.
+
+    A junction on the transaction directory, a transaction child, or journal.json is
+    unreadable. Nothing inside that link is listed or opened. The private root itself
+    may be a junction; only this directory is refused.
+    """
     out = []
     directory = _transaction_dir(ws, project)
+    if _reparse_link(directory):
+        return [{"id": project.name, "state": "UNREADABLE"}]
     for name in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
-        if not os.path.isdir(os.path.join(directory, name)):
+        child = os.path.join(directory, name)
+        if _reparse_link(child):
+            out.append({"id": name, "state": "UNREADABLE"})
             continue
-        path = os.path.join(directory, name, "journal.json")
+        if not os.path.isdir(child):
+            continue
+        path = os.path.join(child, "journal.json")
+        if _reparse_link(path):
+            out.append({"id": name, "state": "UNREADABLE"})
+            continue
         try:
             with open(path, encoding="utf-8") as f:
                 journal = json.load(f)
@@ -777,7 +791,11 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
     """Roll back interrupted, uncommitted pushes. Never resume a half-validated commit."""
     if desktop.find_instance(project):
         return {"verb": "recover", "result": "DESKTOP_OPEN"}
-    lock = os.path.join(_transaction_dir(ws, project), ".commit-lock")
+    directory = _transaction_dir(ws, project)
+    if _reparse_link(directory):
+        return {"verb": "recover", "result": "RECOVERY_REQUIRED",
+                "transactions": [{"id": project.name, "result": "RECOVERY_REQUIRED"}]}
+    lock = os.path.join(directory, ".commit-lock")
     stale_lock = False
     if os.path.exists(lock):
         try:
@@ -797,9 +815,17 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
         pending = [p for p in pending if p["id"] == transaction_id]
     results = []
     for item in pending:
+        # pending_recovery already refused this link. Do not open it from here either.
+        if item.get("state") == "UNREADABLE":
+            results.append({"id": item["id"], "result": "RECOVERY_REQUIRED"})
+            continue
         directory = os.path.join(_transaction_dir(ws, project), item["id"])
+        journal_path = os.path.join(directory, "journal.json")
+        if _reparse_link(directory) or _reparse_link(journal_path):
+            results.append({"id": item["id"], "result": "RECOVERY_REQUIRED"})
+            continue
         try:
-            with open(os.path.join(directory, "journal.json"), encoding="utf-8") as f:
+            with open(journal_path, encoding="utf-8") as f:
                 journal = json.load(f)
             if not _journal_ok(journal):
                 result = {"result": "RECOVERY_REQUIRED"}
@@ -810,7 +836,7 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
         results.append({"id": item["id"], **result})
     failed = any(r["result"] != "ROLLED_BACK" for r in results)
     if stale_lock and not failed:
-        remove_file(lock, root=os.path.dirname(lock))
+        remove_file(lock, root=ws.private)
     return {"verb": "recover", "result": "RECOVERY_REQUIRED" if failed
             else "RECOVERED" if results or stale_lock else "NOTHING_TO_RECOVER", "transactions": results}
 
@@ -899,6 +925,8 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
     # definition reads trust this tree and still refuse the real model folder.
     stage_root = os.path.join(ws.private, "stage", stamp)
     stage = os.path.join(stage_root, "pbz-workspace")
+    # A junction at private/stage would make copytree write the real model outside the store.
+    _contained(stage_root, ws.private)
     transaction = None
     try:
         for src in (project.model_dir, project.report_dir):
@@ -1254,6 +1282,8 @@ def mirror_texts(ws: Workspace, project: Project) -> dict[str, str]:
 def snapshot(ws: Workspace, project: Project, event: str) -> str:
     """Record the mirror as a history snapshot (content-addressed, deduplicated, last HISTORY_KEEP kept)."""
     hdir = history_dir(ws, project)
+    # A junction at mirror-history would make makedirs create the snapshot outside the store.
+    _contained(hdir, ws.private)
     blobs, snaps = os.path.join(hdir, "blobs"), os.path.join(hdir, "snapshots")
     os.makedirs(blobs, exist_ok=True)
     os.makedirs(snaps, exist_ok=True)
@@ -1262,7 +1292,7 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
         h = sha(text)
         bp = os.path.join(blobs, h + ".txt")
         if not os.path.exists(bp):
-            write_text(bp, text)
+            write_text(bp, text, root=ws.private)
         files[rel] = h
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     n = 1
@@ -1270,7 +1300,7 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
         n += 1
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{n:03d}"  # sorts after the bare stamp
     write_text(os.path.join(snaps, f"{stamp}.json"),
-               json.dumps({"stamp": stamp, "event": event, "files": files}))
+               json.dumps({"stamp": stamp, "event": event, "files": files}), root=ws.private)
     names = sorted(os.listdir(snaps))
     kept = names[-HISTORY_KEEP:]
     live, readable = set(), True

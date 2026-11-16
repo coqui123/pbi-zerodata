@@ -21,6 +21,11 @@ class DesktopTests(unittest.TestCase):
         self.project=SimpleNamespace(name='Synthetic',pbip='Synthetic.pbip',ws=SimpleNamespace(private='synthetic-private'))
         self.inst={'pid':123,'via':'bridge','unsaved':False}
 
+    def test_failed_bridge_status_is_not_clean(self):
+        proc = SimpleNamespace(returncode=1, stdout=b'{"instances":[{"pid":5,"pbixPath":"Synthetic.pbip","unsaved":false}]}')
+        with patch.object(desktop.os.path, "exists", return_value=True), patch.object(desktop.subprocess, "run", return_value=proc):
+            self.assertEqual(desktop.bridge_status(), [])
+
     def test_dirty_is_tristate(self):
         self.assertIsNone(desktop._dirty_state({}))
         self.assertIsNone(desktop._dirty_state({'hasUnsavedChanges':None}))
@@ -103,6 +108,25 @@ class DesktopTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_unknown_interaction_status_is_counted(self):
+        digest = "s" + "ab" * 6
+        got = evidence.summarize("interactions", None, {
+            "stage": "STATIC_CONTRACT", "spec_digest": digest,
+            "results": [{"id": "a", "status": "MATCH"}, {"id": "b", "status": "EXPLODED"}],
+        })
+        self.assertIsNotNone(got)
+        self.assertEqual(got[1]["counts"].get("OTHER"), 1)
+        rev = "m" + "cd" * 6
+        self.assertFalse(evidence.static_proof_ok(
+            [{"stage": "STATIC_CONTRACT", "scope": "interactions", "mirror_rev": rev,
+              "summary": got[1]}],
+            mirror_rev=rev, spec_digest=digest))
+
+    def test_unknown_edits_are_not_current(self):
+        row = {"mirror_rev": "m", "real_rev": "r"}
+        self.assertEqual(evidence._status(row, "m", "r", False, "LOADED", edits_unknown=True), "STALE")
+        self.assertEqual(evidence._status(row, "m", "r", False, "LOADED"), "CURRENT")
+
     def test_reload_legacy_and_typed_payloads(self):
         for value in ['RELOADED',{'ok':True}]:
             stage,summary=evidence.summarize('desktop','reload',{'reload':value})
@@ -231,6 +255,18 @@ class HandoffTests(unittest.TestCase):
         self.assertNotEqual(first,second)
         self.assertIn('Manual review note',alias.read_text(encoding='utf-8'))
         self.assertNotIn('Generated one',alias.read_text(encoding='utf-8'))
+
+    def test_later_mismatch_supersedes_earlier_match(self):
+        digest = "s" + "ab" * 6
+        rev = "m" + "cd" * 6
+        def row(counts):
+            return {"stage": "STATIC_CONTRACT", "scope": "interactions", "mirror_rev": rev,
+                    "summary": {"spec_digest": digest, "outcome": "INCOMPLETE", "executed": False,
+                                "native_executed": False, "counts": counts}}
+        self.assertFalse(evidence.static_proof_ok(
+            [row({"MATCH": 1}), row({"MISMATCH": 1})], mirror_rev=rev, spec_digest=digest))
+        self.assertTrue(evidence.static_proof_ok(
+            [row({"MISMATCH": 1}), row({"MATCH": 1})], mirror_rev=rev, spec_digest=digest))
 
 
 if __name__=='__main__':unittest.main()

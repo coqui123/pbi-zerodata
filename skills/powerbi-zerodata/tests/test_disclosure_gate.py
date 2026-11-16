@@ -167,6 +167,13 @@ class IndexMatchTests(unittest.TestCase):
         self.assertIsNone(self.clf.literal("2024-01-01", "string", None))
         self.assertEqual(self.clf.literal("+1 (415) 555-1212", "string", None), "pii")
 
+    def test_overlapping_number_does_not_uncover_indexed_tail(self):
+        token = "12345-ABC"
+        self._index(token)
+        text = "-" + token
+        hidden = [text[s:e] for s, e, _lab in self.clf.free_text(text, numbers=True)]
+        self.assertTrue(any("ABC" in piece for piece in hidden), hidden)
+
 
 _VISUAL_SCHEMA = (
     "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/"

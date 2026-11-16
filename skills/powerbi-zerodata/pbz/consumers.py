@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from . import lexers, pbir, tmdl
-from .common import PbzError, commit_bytes, read_text, write_text
+from .common import PbzError, _reparse_link, commit_bytes, read_text, write_text
 
 REG = (".pbz", "consumers.json")
 CACHE = "consumers"
@@ -73,6 +73,8 @@ def load_registry(ws) -> dict:
     path = _reg_path(ws)
     if not os.path.lexists(path):
         return {"version": 1, "consumers": []}
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -281,6 +283,8 @@ def evaluate(ws, project, entry: dict, force: bool = False, names: set[str] | No
     sig = _signature(entry)
     cpath = _cache_path(ws, entry["id"])
     if not force and sig != "missing":
+        if _reparse_link(cpath):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         try:
             with open(cpath, encoding="utf-8") as f:
                 cached = json.load(f)

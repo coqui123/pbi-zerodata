@@ -14,6 +14,7 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 import test_parity  # noqa: E402
+from _junction import make_junction  # noqa: E402
 from pbz import common, mirror  # noqa: E402
 
 SECRET = "SECRET_JOURNAL_PAYLOAD_9f3a"
@@ -68,6 +69,27 @@ class RecoveryHonestyTests(unittest.TestCase):
         self.assertNotIn(SECRET, blob)
         self.assertNotIn("note", blob)
         self.assertEqual(file_map(self.ws.root), before)
+
+    def test_pending_recovery_refuses_transaction_junction(self):
+        outside = os.path.join(self.tmp.name, "outside-journal")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "journal.json"), "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "state": "APPLYING", "entries": []}, handle)
+        link = os.path.join(mirror._transaction_dir(self.ws, self.project), "tx1")
+        make_junction(self, link, outside)
+        journal = os.path.join(outside, "journal.json")
+        with open(journal, encoding="utf-8") as handle:
+            before = handle.read()
+        try:
+            pending = mirror.pending_recovery(self.ws, self.project)
+            self.assertEqual(pending, [{"id": "tx1", "state": "UNREADABLE"}])
+            self.assertNotIn("APPLYING", json.dumps(pending))
+            out = mirror.recover(self.ws, self.project, "tx1")
+            self.assertEqual(out["result"], "RECOVERY_REQUIRED")
+            with open(journal, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), before)
+        finally:
+            os.rmdir(link)
 
 
 if __name__ == "__main__":
