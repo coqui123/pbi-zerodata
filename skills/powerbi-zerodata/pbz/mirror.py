@@ -1179,6 +1179,7 @@ def revert(ws: Workspace, project: Project, paths: list[str] | None = None, obj:
             continue
         readable.append((rel, bp))
     for rel, bp in readable:
+        _must_stay(bp, ws.private)
         text, bom = _read_prepared(bp, rel)
         ops.append(("write", os.path.join(ws.mirror, *rel.split("/")), text, bom))
         done.append(rel)

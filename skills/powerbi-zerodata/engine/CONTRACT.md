@@ -135,9 +135,10 @@ Response (no values):
 ```json
 {"ok": true, "verb": "index", "tables": [{"table": "T", "rows_bucket": "100-999",
   "columns": [{"column": "C", "type": "string", "class": "category", "card_bucket": "1-9", "blank_bucket": "none"},
-              {"column": "D", "type": "dateTime", "year_min": 2023, "year_max": 2028, "blank_bucket": "<1%"}]}]}
+              {"column": "D", "type": "dateTime", "blank_bucket": "<1%"}]}]}
 ```
-`year_min`/`year_max` and buckets only in shape tier.
+Buckets only in the shape tier. Text columns may include `card_bucket`. The response has no
+calendar year endpoints.
 
 ### `check`
 Request:
@@ -154,7 +155,7 @@ Request:
 Kinds the engine implements: `executes`, `nonblank`, `nonempty` (table expr), `equal`
 (`left`, `right`, optional `by`, `where`, `tol` relative, BLANK equals BLANK only), `additive`
 (`expr`, `by`: total equals sum over `by` groups), `unique` (`column`), `no_orphans` (`from`, `to`),
-`no_blank_keys` (`column`), `sign` (`expr`), `subset` (`column`, `of`), `rls`.
+`no_blank_keys` (`column`), `sign` (`expr`, optional `expect` of `NEG`, `ZERO`, `POS`, or `BLANK`), `subset` (`column`, `of`), `rls`.
 Python rewrites `differs`, `filter_independent` and `compiles` into these before calling.
 `where` items are boolean single-column filter predicates applied with CALCULATE/CALCULATETABLE.
 Response per check:
@@ -165,7 +166,7 @@ Response per check:
 - `status`: `PASS`, `FAIL`, `EMPTY` (no rows/groups to compare), `UNSUPPORTED`, `ERROR` (+ `class`, `log_id`).
 - `groups`: at most 10 failing groups. A key is revealed only if its column is in `reveal`;
   otherwise `hmac` (Python turns it into a token). Strict tier: no `groups`, still `mismatch`.
-- `sign` adds `"sign": "NEG|ZERO|POS|BLANK"`. `unique`/`no_orphans`/`no_blank_keys` add
+- `sign` adds `"sign": "NEG|ZERO|POS|BLANK"`. Status is `PASS` when `expect` is omitted or contains that sign, and `FAIL` otherwise. `unique`/`no_orphans`/`no_blank_keys` add
   `"offenders_bucket"` in shape tier.
 - `rls` request fields: `expect` (`EMPTY`, `NON_EMPTY`, `LESS`, `EQUAL` or `OLS_INACCESSIBLE`),
   at least one of `role` and `user` (neither may contain `;`, `'` or `"`), and one of `query`
@@ -181,8 +182,8 @@ Response per check:
 Request `{"private_dir", "port", "table": "T", "columns": ["C"]?, "disclosure": "shape"}`
 Response `{"table": "T", "rows_bucket": "...", "columns": [{"column": "C", "type": "...",
 "has_blanks": true, "blank_bucket": "1-10%", "card_bucket": "10-99", "has_negatives": false,
-"has_future_dates": false, "year_min": 2023, "year_max": 2028}]}` (booleans in both tiers,
-buckets and years only in shape tier).
+"has_future_dates": false}]}` (booleans in both tiers, buckets only in the shape tier).
+There is no calendar year field.
 
 ### `snapshot-save` / `snapshot-compare`
 Request `{"private_dir", "port", "name": "before-refactor", "queries": [{"id": "q1",
@@ -196,7 +197,8 @@ Request `{"private_dir", "port", "name": "before-refactor", "queries": [{"id": "
 
 ### `smoke`
 Request `{"private_dir", "port", "visuals": [{"id": "page/visual", "dax": "EVALUATE TOPN(1, ...)"}]}`
-Response `{"visuals": [{"id": "page/visual", "status": "OK|EMPTY|ERROR", "class": "..."}]}`.
+Response `{"visuals": [{"id": "page/visual", "status": "OK|EMPTY|UNSUPPORTED|ERROR"}]}`.
+`class` is present only when `status` is `ERROR`. A visual with no `dax` is `UNSUPPORTED`.
 
 ## Safety rules for the implementation
 
@@ -277,7 +279,7 @@ the same guard as snapshot / smoke (DEFINE or EVALUATE first, no INFO.* or EVALU
 ### `memory`
 
 Request `{"private_dir", "port", "disclosure"?, "predicates"?: true}` (`predicates` must be a boolean). VertiPaq
-storage attributed to model objects the way VertiPaq Analyzer does, released only as fixed bands.
+storage attributed to model objects the way VertiPaq Analyzer does. Sizes and counts leave only as fixed bands. Names, `dictionary_heavy`, `encoding`, `ri`, predicate booleans, `coverage`, and `predicates` are the other closed fields.
 
 **Sources.** The second exception to the DMV rule and the only read of storage DMVs: `Conn.StorageDmv` accepts exactly
 `$SYSTEM.DISCOVER_STORAGE_TABLE_COLUMNS` (columns `DIMENSION_NAME, TABLE_ID, COLUMN_ID, COLUMN_TYPE, DICTIONARY_SIZE`)

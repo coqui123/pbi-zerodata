@@ -16,9 +16,10 @@ from dataclasses import dataclass, field
 CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cli.py")
 SERVER = {"name": "pbz", "title": "pbz (data-blind Power BI PBIP tools)", "version": "1.0"}
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
-INSTRUCTIONS = ("pbz edits Power BI PBIP projects without exposing data: work on the sanitized mirror in "
-                "pbz-workspace, review with diff / validate, apply with push. Every tool returns names, ids, "
-                "verdicts and fixed buckets only, never data values. Never try to read data files or query "
+INSTRUCTIONS = ("pbz edits Power BI PBIP projects without exposing company rows: work on the sanitized mirror in "
+                "pbz-workspace, review with diff / validate, apply with push. Tools return names, ids, verdicts, "
+                "fixed buckets, and low-cardinality category labels. They do not return rows, totals, or query "
+                "grids. synth query returns rows from the fake copy only. Never try to read data files or query "
                 "an engine another way.")
 
 S, B, I, N, O = {"type": "string"}, {"type": "boolean"}, {"type": "integer"}, {"type": "number"}, {"type": "object"}
@@ -220,7 +221,7 @@ TOOLS = [
     Tool("describe", "Data dictionary: model overview, a table, a [Measure] or a 'Table'[Column] (types, classes, "
                      "buckets, category labels, DAX, dependencies, visuals using it).", ["describe"],
          pos=[("target", D(S, "table name, [Measure] or 'Table'[Column]; omit for the overview"), False)]),
-    Tool("values", "Category labels of a column, or for a sensitive column a distinct-count bucket and its tokens.",
+    Tool("values", "Category labels of a column, or a distinct-count bucket and any mirror tokens for that column.",
          ["values"], pos=[("column", D(S, "'Table'[Column]"), True)]),
     Tool("find", "Find object names and mirror lines matching a regular expression. Token syntax is refused.", ["find"],
          pos=[("pattern", S, True)],
@@ -427,9 +428,9 @@ TOOLS = [
                "fit": ("--fit", E("fit", "fill", "normal"), "value"),
                "alt": ("--alt", D(S, "alt text for screen readers"), "value")},
          need=["page"], read_only=False),
-    Tool("health", "Objects in error state in the open Desktop model (classes, never error text).", ["health"],
+    Tool("health", "Objects in error in the open Desktop model. A measure message is scrubbed; other kinds are the class only.", ["health"],
          timeout=600),
-    Tool("check", "Data-blind assertions against the open Desktop model (PASS / FAIL / EMPTY / BUDGET / ERROR).",
+    Tool("check", "Data-blind assertions against the open Desktop model (PASS / FAIL / EMPTY / UNSUPPORTED / BUDGET / ERROR).",
          ["check"], pos=[("spec", D(O, "checks spec: {\"checks\": [...]} (see reference/checks.md)"), True)],
          opts={"validate_only": ("--validate-only", B, "flag"),
                "diagnostic": ("--diagnostic", B, "flag")},
@@ -440,7 +441,7 @@ TOOLS = [
          ["snapshot"], pos=[("action", E("save", "compare"), True), ("name", S, True)],
          opts={"spec": ("--spec", D(O, "queries spec (compare reuses the saved one when omitted)"), "json")},
          timeout=1800),
-    Tool("smoke", "Run each visual's query: OK / EMPTY / UNSUPPORTED / ERROR per visual.", ["smoke"],
+    Tool("smoke", "Run each visual's query. Status is OK, EMPTY, ERROR with a class, UNSUPPORTED, N/A, BUDGET, or PROTOCOL_ERROR. Coverage is FULL, PARTIAL, or NONE.", ["smoke"],
          opts={"page": ("--page", S, "value")}, timeout=1800),
     Tool("perf", "Performance bands for a DAX query (duration band, shares, compare verdict). No durations.", ["perf"],
          opts={"dax": ("--dax", D(S, "DAX query"), "value"),
@@ -452,8 +453,8 @@ TOOLS = [
          pos=[("file", D(S, "analyzer export"), True)]),
     Tool("handoff", "Visual review checklist for the human (names only).", ["handoff"],
          opts={"all": ("--all", D(B, "include every pushed change, not just new ones"), "flag")}, read_only=False),
-    Tool("evidence", "The `pbz review` packet: pending changes by release class (security, refresh, recalc, logic, metadata, report), "
-                   "impact, revision-bound evidence (CURRENT / STALE / NOT_RUN per stage) and coverage; writes "
+    Tool("evidence", "The `pbz review` packet: pending changes by release class (security, refresh, recalc, logic, metadata, report, unknown), "
+                   "impact, revision-bound evidence (CURRENT / PARTIAL / STALE / NOT_RUN per stage) and coverage; writes "
                    "pbz-workspace/REVIEW.md. Acceptance is the human's (terminal only).", ["review"], read_only=False),
     Tool("set_props", "Typed model properties on one object or a selection: description, displayFolder, formatString, "
                       "isHidden, isKey, dataCategory, summarizeBy, sortByColumn, isAvailableInMdx, encodingHint, "

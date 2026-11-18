@@ -38,13 +38,13 @@ pbz capabilities  # what pbz can and cannot certify
 After `init`, edit only under `pbz-workspace/`. Never open real `*.SemanticModel` / `*.Report`
 folders in the agent.
 
-## 3. Orient on the model (metadata only)
+## 3. Orient on the model
 
 ```powershell
 pbz describe
 pbz describe Sales
 pbz describe "[Total Sales]"
-pbz values 'Date'[Year]     # shape / tokenized samples from the mirror — not live query grids
+pbz values 'Date'[Year]     # category labels from the private index, or a bucket and mirror tokens — not a live grid
 pbz unused
 pbz lineage "[Total Sales]"
 ```

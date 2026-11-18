@@ -1739,7 +1739,9 @@ def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int
                     denied = denied or why
                 elif os.path.isdir(p):
                     dir_targets.append(p)
-            if denied and v not in SAFE_PATH_VERBS:
+            if denied and (v not in SAFE_PATH_VERBS or (
+                    v in _NEW_VERBS and any(
+                        strip_arg(token).lower().strip("\"'") in _LINK_TYPES for token in toks))):
                 return denied
             if v in CONTENT_SEARCH_VERBS:
                 for d in dir_targets or ([] if has_path else [cur]):
@@ -2032,7 +2034,6 @@ def decide(event: dict) -> str | None:
 def log(root: str | None, agent: str, tool: str, verdict: str) -> None:
     try:
         d = os.path.join(root, ".pbz", "logs") if root else os.path.join(PRIVATE_ROOT, "guard-log")
-        # A junction already at the log directory is followed by makedirs and open.
         # The private store itself may be redirected; only this directory and the file are refused.
         if _is_link(d):
             return

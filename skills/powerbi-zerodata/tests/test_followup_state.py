@@ -358,6 +358,23 @@ class FollowupStateTests(unittest.TestCase):
             props.get(self.ws, self.project, "[Missing]")
         self.assertEqual(caught.exception.code, "NOT_FOUND")
 
+    def test_open_engine_class_becomes_engine_unavailable(self):
+        bad = {"ok": False, "class": "not-closed"}
+        calls = (
+            lambda: checks.health(self.ws, self.project),
+            lambda: checks.probe(self.ws, self.project, "T", None),
+            lambda: checks.index(self.ws, self.project),
+            lambda: checks.snapshot(self.ws, self.project, "save", "snap", None),
+        )
+        with patch("pbz.checks.desktop.require_port", return_value=1), \
+                patch("pbz.checks.engine_call", return_value=bad):
+            for call in calls:
+                with self.subTest(call=call):
+                    with self.assertRaises(PbzError) as caught:
+                        call()
+                    self.assertEqual(caught.exception.code, "ENGINE_UNAVAILABLE")
+                    self.assertNotIn("not-closed", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,7 @@ They never quote a literal value from DAX, M or PBIR.
   `message`, `fix`, plus `table`, `id` (page, visual or bookmark id) and `excess` (threshold rules).
 - `suppressed`: findings silenced by a Tabular Editor ignore annotation, with `by`.
 - `coverage`: rules `evaluated`, `applicable` (rules that found something to check), `disabled`
-  (opinion rules, overlay), `skipped_data_rules` (need data, never run).
+  (opinion rules, overlay), `skipped_data_rules` (no saved memory document, so they did not run).
 - `ruleset`: hash of the effective rules (ids, severities, on/off, thresholds). Compare scores only
   between runs with the same hash.
 
@@ -52,7 +52,13 @@ They never quote a literal value from DAX, M or PBIR.
 - `--fail-on new|any|high`, `--since <baseline>`, `--ci github|azdo`, and `--format sarif|trx|junit`
   are the same gate `validate` accepts. `--fail-on new` requires `--since`. Workflow commands go to
   stderr. A sample for another repo is `docs/examples/bpa-annotations.yml`. Data-derived rules run
-  only when `pbz audit memory` has saved bands; otherwise they stay skipped.
+  only when `pbz audit memory` has saved a document; otherwise they stay in `skipped_data_rules`.
+  A saved document is not a pass for every relationship. Referential integrity is examined only
+  when that relationship, or one of its columns, has `RI_OK` or `RI_VIOLATION`. The
+  high-cardinality bidirectional rule is a clean pass only when both ends have `size_band`
+  `<1 MiB`. A larger band on either end is a finding, including when the other end has no band.
+  A relationship with no `RI_OK` or `RI_VIOLATION`, and a bidirectional relationship whose bands
+  are both missing or only one end is `<1 MiB`, is not examined.
 
 ## Model rules
 
@@ -72,7 +78,7 @@ They never quote a literal value from DAX, M or PBIR.
 | `INACTIVE_RELATIONSHIPS_THAT_ARE_NEVER_ACTIVATED` | 2 | on | no USERELATIONSHIP or CROSSFILTER names it |
 | `ENSURE_TABLES_HAVE_RELATIONSHIPS` | 1 | on | isolated table; measure tables, field parameters, what-if parameters, calculation groups and auto date tables are exempt |
 | `SNOWFLAKE_SCHEMA_ARCHITECTURE` | 1 | on | table on the one side of one relationship and the many side of another |
-| `UNNECESSARY_COLUMNS` / `_MEASURES` | 2 | on | hidden and unused by reports, model and security (`pbz unused` states) |
+| `UNNECESSARY_COLUMNS` / `UNNECESSARY_MEASURES` | 2 | on | hidden and unused by reports, model and security (`pbz unused` states) |
 | `REDUCE_USAGE_OF_CALCULATED_COLUMNS_THAT_USE_THE_RELATED_FUNCTION` | 2 | on | calculated column calls RELATED |
 | `REDUCE_USAGE_OF_CALCULATED_TABLES` | 1 | on | calculated table that is not a field parameter, what-if parameter, calculation group or auto date table |
 | `USE_THE_DIVIDE_FUNCTION_FOR_DIVISION` | 2 | on | `/` operator, except division by a non-zero constant |
@@ -103,7 +109,7 @@ They never quote a literal value from DAX, M or PBIR.
 | `ADD_DATA_CATEGORY_FOR_COLUMNS` | 1 | on | text column named with a geographic word and no dataCategory |
 | `INTEGER_FORMATTING` / `PERCENTAGE_FORMATTING` / `DATECOLUMN_FORMATSTRING` | 1 | opinion | format conventions |
 | `FIRST_LETTER_OF_OBJECTS_MUST_BE_CAPITALIZED` | 1 | opinion | name starts lowercase |
-| `SPLIT_DATE_AND_TIME`, `LARGE_TABLES_SHOULD_BE_PARTITIONED`, `AVOID_BI-DIRECTIONAL_RELATIONSHIPS_AGAINST_HIGH-CARDINALITY_COLUMNS`, `REDUCE_USAGE_OF_LONG-LENGTH_COLUMNS_WITH_HIGH_CARDINALITY`, `FIX_REFERENTIAL_INTEGRITY_VIOLATIONS` | 2 | data | need data; listed, never run |
+| `SPLIT_DATE_AND_TIME`, `LARGE_TABLES_SHOULD_BE_PARTITIONED`, `AVOID_BI-DIRECTIONAL_RELATIONSHIPS_AGAINST_HIGH-CARDINALITY_COLUMNS`, `REDUCE_USAGE_OF_LONG-LENGTH_COLUMNS_WITH_HIGH_CARDINALITY`, `FIX_REFERENTIAL_INTEGRITY_VIOLATIONS` | 2 | data | run when a memory document is saved. A missing `time_part` or table size band is not examined. Referential integrity and the bidirectional high-cardinality rule do not treat a missing status or band as a clean pass |
 
 Name tests match whole words, split at spaces, underscores and case changes: `DimDate` contains
 the word date, `Updates` does not; `Capacity Band` does not contain city.

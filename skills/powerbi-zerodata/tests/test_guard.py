@@ -222,7 +222,9 @@ def main() -> int:
     failures += link_failures
     log_failures, log_checks = _log_junction()
     failures += log_failures
-    total = len(cases) * 2 + 3 + memo_checks + link_checks + log_checks
+    link_shell_failures, link_shell_checks = _new_item_link_outside()
+    failures += link_shell_failures
+    total = len(cases) * 2 + 3 + memo_checks + link_checks + log_checks + link_shell_checks
     print(f"{total - failures}/{total} passed")
     return 1 if failures else 0
 
@@ -929,6 +931,52 @@ def _log_junction() -> tuple[int, int]:
             except OSError:
                 pass
         shutil.rmtree(tmp, ignore_errors=True)
+    return failures, checks
+
+
+def _new_item_link_outside() -> tuple[int, int]:
+    """New-Item link types outside a workspace still deny a private target.
+
+    An ordinary directory in a temp folder stays allowed. Returns (failures, checks).
+    """
+    skill = os.path.dirname(HERE)
+    sys.path.insert(0, skill)
+    from pbz import guard
+
+    failures = 0
+    checks = 0
+    private = tempfile.mkdtemp(prefix="pbzguard-priv-")
+    cwd = tempfile.mkdtemp(prefix="pbzguard-cwd-")
+    previous = os.environ.get("PBZ_PRIVATE_ROOT")
+    try:
+        os.environ["PBZ_PRIVATE_ROOT"] = private
+        guard._PRIVATE["stamp"] = None
+        link = os.path.join(cwd, "link")
+        secret = os.path.join(private, "secret")
+        folder = os.path.join(cwd, "folder")
+        junction = f"New-Item -ItemType Junction -Path {link} -Target {secret}"
+        hard = f"New-Item -ItemType HardLink -Path {link} -Target {secret}"
+        directory = f"New-Item -ItemType Directory -Path {folder}"
+        checks += 1
+        if guard.check_shell(junction, cwd) is None:
+            failures += 1
+            print("FAIL New-Item Junction outside a workspace was allowed")
+        checks += 1
+        if guard.check_shell(hard, cwd) is None:
+            failures += 1
+            print("FAIL New-Item HardLink outside a workspace was allowed")
+        checks += 1
+        if guard.check_shell(directory, cwd) is not None:
+            failures += 1
+            print("FAIL New-Item Directory of an ordinary folder was denied")
+    finally:
+        if previous is None:
+            os.environ.pop("PBZ_PRIVATE_ROOT", None)
+        else:
+            os.environ["PBZ_PRIVATE_ROOT"] = previous
+        guard._PRIVATE["stamp"] = None
+        shutil.rmtree(private, ignore_errors=True)
+        shutil.rmtree(cwd, ignore_errors=True)
     return failures, checks
 
 

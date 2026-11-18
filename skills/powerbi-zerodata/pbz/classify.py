@@ -11,7 +11,7 @@ import os
 import re
 
 from . import dpapi
-from .common import PbzError
+from .common import PbzError, _reparse_link
 
 PII_NAME = re.compile(
     r"(?i)(name|first|last|full|e-?mail|upn|user|login|owner|manager|\bpm\b|leader|\blead\b|supervisor|"
@@ -221,6 +221,8 @@ class Classifier:
         self.word_hmac_to_col: dict[str, str] = {}
         if private_dir:
             index_path = os.path.join(private_dir, "index.json")
+            if _reparse_link(index_path):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
             missing = False
             try:
                 with open(index_path, encoding="utf-8") as f:

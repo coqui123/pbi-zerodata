@@ -40,8 +40,9 @@ pbz style --list --type lineChart [--object legend]                             
 | text from a field | `measure:[Measure]` | a field-value expression |
 | date | `YYYY-MM-DD[THH:MM:SS]` | `datetime'...'` |
 
-Images, conditional formatting rules, error bars, filters and other complex values are refused:
-set those in Desktop. Data-point selectors (one bar, one category value) are never written: they
+A registered image (`pbz image add`, then the item name) is accepted for an image property.
+Conditional formatting rules, error bars, filters and other complex values are refused: set those
+in Desktop. Data-point selectors (one bar, one category value) are never written: they
 carry data values. Custom visuals accept their contract's object and property names
 (`pbz visual import`), with the value type inferred.
 

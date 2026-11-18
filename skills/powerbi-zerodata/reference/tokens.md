@@ -36,7 +36,8 @@ replaces the whole literal (`"Value": "«Person[Name]#4»"`).
   `docs/reference-projects.md` in the repo.
 - Without an index (**heuristic** mode, shown in `MIRROR.md` and `pbz status`): column-name rules
   plus a person-name pattern. It can miss a lone first name typed into a formula; run `pbz index`
-  before deep work.
+  before deep work. A link at the private `index.json` is refused (`UNSAFE_PATH`). A missing
+  file is still heuristic mode.
 - Personal-name columns (Name, Owner, Manager, PM, Leader, Supervisor, Resource, Person,
   Employee, Email, Title, Description, ...) are always sensitive. IDs are sensitive.
 - The user can force a column readable: `pbz admin category "Table[Column]"` (their terminal).
@@ -47,7 +48,7 @@ replaces the whole literal (`"Value": "«Person[Name]#4»"`).
   file round-trips byte for byte. A token copied into a new place is encoded for that place.
 - A token that is not in the map (typo, invented) fails the push with `UNKNOWN_TOKEN`.
 - A JSON writer that escapes non-ASCII (Python `json.dump` default) turns `«x#1»` into
-  `«x#1»`; push still reads it as the token (an unknown one fails as `UNKNOWN_TOKEN`), and
+  `\u00abx#1\u00bb`; push still reads it as the token (an unknown one fails as `UNKNOWN_TOKEN`), and
   staged validation flags any escaped token left over. Prefer `ensure_ascii=False`.
 - Files that could not round-trip at pull time are marked `lossy` and are not pushed; edit those
   objects in Desktop.

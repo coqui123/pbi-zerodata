@@ -1,6 +1,6 @@
 ---
 name: powerbi-zerodata
-description: Data-blind workflow for Power BI PBIP projects (PBIR report JSON + TMDL semantic model). Use for ANY work in a folder holding a .pbip, *.SemanticModel or *.Report - editing measures, columns, relationships, visuals, pages, slicers, filters, themes, bookmarks, renames, debugging wrong numbers, validating, or checking a model - in Claude Code, Codex or any agent. Company data (rows, totals, counts, names, query results, cached data, screenshots) must never enter the agent's context; every read and edit goes through the sanitized pbz-workspace mirror and the `pbz` CLI. Trigger even when the user just says "fix this measure", "move that visual", "why is this card wrong" in a Power BI workspace.
+description: Data-blind workflow for Power BI PBIP projects (PBIR report JSON + TMDL semantic model). Use for ANY work in a folder holding a .pbip, *.SemanticModel or *.Report - editing measures, columns, relationships, visuals, pages, slicers, filters, themes, bookmarks, renames, debugging wrong numbers, validating, or checking a model - in Claude Code, Codex or any agent. Object names and formulas are visible. Company rows, totals, exact counts, real-model query results, cached data, and screenshots must never enter the agent's context. Low-cardinality category labels are the readable exception. Every read and edit goes through the sanitized pbz-workspace mirror and the `pbz` CLI. Trigger even when the user just says "fix this measure", "move that visual", "why is this card wrong" in a Power BI workspace.
 compatibility: Windows; Claude Code and Codex (same SKILL.md). Python 3.11+, .NET 10 for the engine, Power BI Desktop for engine checks.
 ---
 
@@ -12,14 +12,15 @@ Human onboarding and the full CLI catalog live in the repo docs:
 [reference/workspace.md](reference/workspace.md).
 
 You work on Power BI projects **without ever seeing company data**. You see every name and every
-formula. You never see values: no rows, totals, counts, distinct values, query results, cached
+formula. You never see company rows, totals, exact counts, real-model query results, cached
 data, screenshots of populated visuals, or error text that echoes values.
+Low-cardinality category labels are the readable exception. `pbz synth query` returns rows from the fake copy only.
 
 CLI: `${CLAUDE_SKILL_DIR}/bin/pbz.cmd` (Codex, ChatGPT, and Cursor follow the same clone through
 `%USERPROFILE%\.agents\skills\powerbi-zerodata\bin\pbz.cmd`). Setup that keeps those folders
 on `git pull`: [docs/install.md](../../docs/install.md).
 Below it is written as `pbz`. Run it from the workspace folder (the one holding the `.pbip`).
-Every command prints JSON with metadata or closed-vocabulary verdicts only.
+Every command prints JSON. On a real model that is names, formulas, category labels, or a closed-vocabulary verdict.
 
 ## Hard rules
 
@@ -31,7 +32,7 @@ Every command prints JSON with metadata or closed-vocabulary verdicts only.
    permits reading real model/report definitions, caches, private stores or engine results.
 2. Never query a model or service yourself: no DAX query view, no ADOMD/XMLA/TOM scripts, no
    executeQueries, no OData pulls, no Power BI MCP servers, no `powerbi-desktop screenshot`. Use
-   `pbz` verbs; they return verdicts, never values.
+   `pbz` verbs; they return verdicts. Category labels are the readable exception, not rows or grids.
 3. Never take screenshots or read UI/browser pages of Power BI Desktop or the service. The user
    verifies visuals; you give them a checklist (`pbz handoff`).
 4. Never write data values (amounts, percentages, counts, people or project names) into memory,
@@ -95,7 +96,7 @@ First time in a workspace: `pbz init` (policy + scan + first pull). If `status` 
 
 ## The loop
 
-1. **Orient** (metadata only): read files in `pbz-workspace\`; `pbz describe <Table>`,
+1. **Orient**: read files in `pbz-workspace\`; `pbz describe <Table>`,
    `pbz describe "[Measure]"` (DAX, dependencies, visuals using it),
    `pbz describe "'Table'[Column]"` (type, class, buckets, category labels), `pbz values "'T'[C]"`.
 2. **Edit** the mirror with your normal file tools. TMDL is tab-indented; PBIR is JSON. For
@@ -105,13 +106,15 @@ First time in a workspace: `pbz init` (policy + scan + first pull). If `status` 
    Report-only changes with Desktop open: `pbz push --reload`. Push stages the real files,
    validates them (TOM, PBIR schema, references, lint, tokens), backs up, then writes.
 5. **Verify without data**: `pbz desktop open --wait 300` (after model changes, `pbz refresh`
-   recalculates calculated tables/columns; source-data refresh is the user's Refresh button), `pbz health` (objects in error),
-   `pbz check spec.json` (assertions), `pbz smoke --page <name>` (each visual OK/EMPTY/ERROR),
+   recalculates calculated tables/columns; source-data refresh is the user's Refresh button), `pbz health` (objects in error; a measure message is scrubbed, other kinds are the class only),
+   `pbz check spec.json` (assertions), `pbz smoke --page <name>` (OK, EMPTY, ERROR with a class, UNSUPPORTED, or N/A),
    `pbz snapshot save|compare` around refactors.
 6. **Hand off**: `pbz handoff` writes `pbz-workspace\HANDOFF.md`. Give it to the user; they
    check the real visuals and tell you what looks wrong in words. `pbz review` writes
    `pbz-workspace\REVIEW.md`: changes by release class, impact, and which checks ran on which
-   revision (stale evidence is marked STALE); the user accepts with `pbz review --accept`.
+   revision (a stage is `CURRENT`, `PARTIAL`, `STALE`, or `NOT_RUN`; unpushed edits mark loaded,
+   executed, handoff, and acceptance records `STALE (pending edits not pushed)`); the user accepts
+   with `pbz review --accept`.
 
 ## Tokens in the mirror
 
@@ -132,8 +135,8 @@ diverge, and whether the data has a shape problem. See [reference/checks.md](ref
 2. `pbz check` with `equal` at finer grains (Year -> Quarter -> Month -> category columns);
    mismatch comes back as `NONE/ONE/FEW/MANY` plus group keys (date and category columns) or tokens.
 3. Identity checks: `additive`, `filter_independent`, `no_orphans`, `unique`, `no_blank_keys`.
-4. `pbz probe <Table>` for blanks, duplicate keys, orphans, negatives, future dates (booleans +
-   coarse buckets).
+4. `pbz probe <Table>` for blanks, negatives, and future dates (booleans plus coarse buckets).
+   Duplicate keys and orphans are `unique` and `no_orphans` checks, not probe fields.
 5. Fix, re-check, `snapshot compare` = SAME where nothing should change, then `pbz handoff`.
 Constants in checks are limited (3 distinct per target, remembered for 30 days, including literals
 you pushed into measures the target reaches) and checks, probes, snapshot queries and smoke runs have
@@ -157,7 +160,7 @@ freely, use `pbz synth` instead of the real model.
 | `INCOMPLETE` (unused --remove) | a report file or a registered consumer could not be read or fully covered, so nothing is provably unused | `pbz consumers list`: fix the file or register the missing definitions, rerun |
 | `NOT_REGISTERED` / `NO_CONTRACT` (add visual) | the custom visual is not registered in report.json, or its data roles are unknown | `pbz visual import <file.pbiviz> --as public\|private`, or `pbz visual register <guid> --role ...` |
 | `PENDING_PQ_CHANGES` (push) | Desktop holds Power Query edits that were never applied | ask the user to apply or discard them in Desktop and save, then `pbz pull --rebase` |
-| `COMPAT_LEVEL` | the feature needs a newer model compatibility level (formats 1601, functions 1702) | ask the user before `--upgrade-compat` (one way) |
+| `COMPAT_LEVEL` | the feature needs a newer model compatibility level (formats 1601, functions 1702, object-level security 1400) | `--upgrade-compat` is for formats and new functions; object-level security does not take it |
 | `IN_USE` (hierarchy / function / image remove) | visuals use the hierarchy or the image, or DAX calls the function | rewrite the users first (or `--force` for hierarchies and functions) |
 | `BAD_IMAGE` / `TOO_LARGE` (image add) | not a PNG, JPEG, GIF, BMP or SVG (by its header), an SVG with scripts or a DTD, or over 10 MiB | ask the user for another file or a smaller export |
 | `PBIR_IMAGE_*` (validate / push) | an image reference is flat, unregistered, or its file is missing | set images with `pbz style` / `pbz add visual image`; `pbz image list` shows status and users |
@@ -218,7 +221,8 @@ Details: [reference/authoring.md](reference/authoring.md#themes-page-backgrounds
   `visualStyles`). Never edit `SharedResources\BaseThemes\` (Microsoft's base theme). A new theme
   needs its file, its `"name"`, `themeCollection.customTheme.name` and its `resourcePackages` item
   (`type: CustomTheme`) to carry the same file name ending in `.json`; keep `reportVersionAtImport`.
-  Push runs Microsoft's theme checks (registration, JSON, value types, formatting object names).
+  pbz does not compare those three names. Push runs Microsoft's report validator when
+  `powerbi-report-author` is installed.
 - Prefer theme colors (`theme:<n>`) over fixed colors on single visuals.
 - **Page colors**: `pbz style <page> --canvas` (or `--all`). Canvas and wallpaper colors cannot be
   driven by a measure.
@@ -251,7 +255,7 @@ These read the mirror and print names, states, counts, scores and rule ids. Deta
 | Verb | Use it for |
 |---|---|
 | `pbz unused [--all] [--what-if] [--report <dir>]` | state of every object; `--what-if` uses saved memory bands only |
-| `pbz bpa [model\|report] [--labels measure-killer] [--import-rules file] [--fail-on new\|any\|high] [--ci github\|azdo] [--format sarif\|trx\|junit]` | best-practice findings; data rules run only when memory bands exist |
+| `pbz bpa [model\|report] [--labels measure-killer] [--import-rules file] [--fail-on new\|any\|high] [--ci github\|azdo] [--format sarif\|trx\|junit]` | best-practice findings; data rules run only when a memory document is saved |
 | `pbz similar [--models name name] [--against project]` | duplicate measures, or structural overlap of projects |
 | `pbz changes [--from previous --to last] [--against <workspace>]` | semantic diff of mirrors; `--against` refuses a raw SemanticModel folder |
 | `pbz relationship paths <left> <right>` | one, none, or ambiguous active path |

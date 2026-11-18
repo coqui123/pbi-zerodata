@@ -112,6 +112,53 @@ class HandoffAtomicTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "FAILED")
         self.assertEqual(open(self.state, encoding="utf-8").read(), raw)
 
+    def test_page_segment_skips_escape_and_reraises_checked_read(self):
+        outside = os.path.join(self.tmp.name, "outside")
+        os.makedirs(outside)
+        outside_page = os.path.join(outside, "page.json")
+        payload = b'{"displayName":"OUTSIDE"}'
+        with open(outside_page, "wb") as f:
+            f.write(payload)
+        pages = os.path.join(self.project.mirror_report, "definition", "pages")
+        rel = os.path.relpath(outside, pages)
+        self.assertNotIn("/", rel)
+        self.assertIn("\\", rel)
+        self.assertIn("..", rel)
+        self.assertEqual(self.project.name, "Parity")
+        self._log(json.dumps({
+            "project": "Parity",
+            "stamp": "2026-01-01T00:00:00",
+            "objects": ["/pages/" + rel + "/"],
+        }))
+        with patch("pbz.evidence.mirror_rev", return_value="m"), patch("pbz.evidence.real_rev", return_value="r"):
+            out = handoff.build(self.ws, self.project)
+        self.assertIn("checklist", out)
+        self.assertNotIn("OUTSIDE", out["checklist"])
+        self.assertNotIn("OUTSIDE", json.dumps(out))
+        for path in Path(self.tmp.name).rglob("HANDOFF.md"):
+            self.assertNotIn("OUTSIDE", path.read_text(encoding="utf-8"))
+            path.unlink()
+        self.assertEqual(Path(outside_page).read_bytes(), payload)
+
+        self._log(json.dumps({
+            "project": "Parity",
+            "stamp": "2026-01-02T00:00:00",
+            "objects": ["/pages/p1/visuals/v1/"],
+        }))
+        original = handoff.read_checked
+
+        def refuse(path, *, root=None, max_bytes=None):
+            if os.path.basename(path) == "page.json":
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            return original(path, root=root, max_bytes=max_bytes)
+
+        with patch("pbz.handoff.read_checked", side_effect=refuse):
+            with self.assertRaises(PbzError) as caught:
+                handoff.build(self.ws, self.project)
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+        self.assertEqual(list(Path(self.tmp.name).rglob("HANDOFF.md")), [])
+        self.assertEqual(Path(outside_page).read_bytes(), payload)
+
 
 if __name__ == "__main__":
     unittest.main()

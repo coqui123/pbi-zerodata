@@ -721,7 +721,7 @@ def health(ws, project) -> dict:
     port = desktop.require_port(project)
     res = engine_call("health", {"private_dir": ws.private, "port": port}, timeout=300)
     if not res.get("ok"):
-        raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
+        raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
     from .validate import retokenizer
     scrub = retokenizer(tokens.TokenMap(ws.private))
     for e in res.get("errors", []):
@@ -741,7 +741,7 @@ def probe(ws, project, table: str, columns: list[str] | None) -> dict:
         req["columns"] = columns
     res = engine_call("probe", req, timeout=300)
     if not res.get("ok"):
-        raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
+        raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
     res["verb"] = "probe"
     return res
 
@@ -799,7 +799,7 @@ def index(ws, project) -> dict:
                                 "category_max": int(pol.get("category_max", 50)),
                                 "value_cap": 50000, "disclosure": pol.get("disclosure", "shape")}, timeout=1800)
     if not res.get("ok"):
-        raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
+        raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
     summary_path = os.path.join(ws.private, "index-summary.json")
     if _reparse_link(ws.private) or _reparse_link(summary_path):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
@@ -918,7 +918,7 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
         return {"verb": verb, "status": "BUDGET", "note": "daily snapshot query budget reached; the user can reset it"}
     res = engine_call(verb, {"private_dir": ws.private, "port": port, "name": name, "queries": queries}, timeout=1800)
     if not res.get("ok"):
-        raise PbzError(res.get("class", "ENGINE_UNAVAILABLE"))
+        raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
     if action == "save":
         directory = os.path.dirname(spec_path)
         if _reparse_link(ws.private) or _reparse_link(directory) or _reparse_link(spec_path):

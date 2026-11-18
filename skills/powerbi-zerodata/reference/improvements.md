@@ -89,7 +89,9 @@ and `refresh_cutoff`. Cutoffs must be timezone-aware ISO timestamps. Contract fi
 
 What the agent may see is a closed list: metadata names and ids, fixed verdicts
 (`OK`, `EMPTY`, `ERROR`, `UNSUPPORTED`, `PROTOCOL_ERROR`, `BUDGET`, and the other codes in the
-contract), and the storage bands plus three memory predicates already shipped by `pbz audit memory`.
+contract), category labels, and the memory fields already shipped by `pbz audit memory`
+(size and share bands, `dictionary_heavy`, `encoding`, `segment_band`, `ri_count`, `ri`, and
+three yes/no predicates).
 Those derived outputs are grandfathered, not reopened. Heuristic mode is not OS-isolated, and a
 closed verdict does not prove a fact cannot be inferred. Private artifacts and excluded operations
 (native interactions, screenshots, real DAX dumps) are listed in
@@ -183,8 +185,10 @@ current mirror revision. The mirror reader gate covers interactiontest, preview,
 refs, describe, docs, filters, layout, style, a11y, author, smoke, images, repair, components,
 pbircheck, visuals, bookmarks, suggest, usage report files, consolidate visual reads, the synth
 ownership marker, and mirror rebase reads of the sanitized copy. Residual #8 is closed for those
-reads. Model TMDL reads through `tmdl.load_model` stay under residual #8. Pull of the real
-project and history blobs stay outside that gate.
+reads. `tmdl.load_model` refuses a reparse on the definition directory, each directory it
+walks, and each `.tmdl` file before opening it. Pull of the real project and history blobs
+stay outside that gate. The guard log refuses a junction or symlink on its directory or on
+`guard.log`; the private store itself may still be a redirected folder.
 
 The guard denies a path component containing `~` followed by a digit (an 8.3 short name), a
 `{a..b}` brace, a tree operand containing `$`, `%`, `!`, parentheses, or `::`, and a `~`
@@ -195,12 +199,14 @@ is denied. A move is always a tree operation, so a bare star at the workspace is
 recursive delete whose wildcard sits in the workspace or an ancestor and can match
 `policy.json` or `.pbz` is denied. Named shell content writes to protected paths, script-level
 deletion of a named policy path, recursive copy or move that names `.pbz` or copies the
-workspace root, and recursive deletion of the workspace root are denied.
+workspace root, and recursive deletion of the workspace root are denied. Creating a
+junction, symlink, or hardlink with `New-Item` keeps a denial of a private or other denied
+path. Creating an ordinary directory does not.
 
 Still open: runtime-built policy paths (#2), a delete whose names arrive only through a
-pipeline and a `\\?\` prefix that `os.path.commonpath` rejects (#7), guard-log hardening (#9),
-evidence rotation (#10), crash-proof rollback (#11), and `admin memory-dir` (#12). This is
-not OS isolation.
+pipeline and a `\\?\` prefix that `os.path.commonpath` rejects (#7), crash-proof rollback
+(#11), and `admin memory-dir` (#12). Guard-log links are refused, and the evidence log
+rotates. This is not OS isolation.
 
 `--diagnostic` explicitly permits check-result collection without assertion failure exit codes.
 Do not interpret an artifact being generated as validation passing. Unexpected CLI exceptions

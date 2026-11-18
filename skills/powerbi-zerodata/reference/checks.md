@@ -35,7 +35,7 @@ Power BI Desktop. Results are verdicts, never values.
 | `unique` | `column` | no duplicate values |
 | `no_orphans` | `from`, `to` | every non-blank `from` value exists in `to` |
 | `no_blank_keys` | `column` | no blanks |
-| `sign` | `expr` | always PASS; adds `sign`: NEG, ZERO, POS or BLANK |
+| `sign` | `expr`, optional `expect` | PASS when `expect` is omitted or includes the result; otherwise FAIL. Adds `sign`: NEG, ZERO, POS, or BLANK. A non-numeric value is `TYPE_MISMATCH` |
 | `subset` | `column`, `of` | values of `column` are all in `of` |
 | `rls` | `expect`, `role` or `user`, and `query` or `column` or `table` | role-scoped count matches `expect`. Real models need a human terminal. A verified `pbz-synth` tree does not. `OLS_INACCESSIBLE` passes only when the role query fails as an unknown object |
 | `perf` | `query`, `expect` = `NOT_SLOWER` | median is not slower than the saved baseline (`FASTER`, `SAME`, or `NOISY`). No milliseconds leave the engine |
@@ -75,12 +75,23 @@ Only HMACs of results are stored, in the private store.
 
 ## Smoke and probe
 
-- `pbz smoke [--page <name or id>]`: per visual `OK`, `EMPTY`, `ERROR:<class>`, `UNSUPPORTED`,
-  `N/A` (text boxes, images, buttons). The query approximates the visual (bindings plus simple
-  In / comparison filters; `note: filters partial` when some were skipped). Cross-filtering from
-  other slicers is not applied.
-- `pbz probe <Table> [--columns A B]`: has_blanks, dup keys, negatives, future dates, plus
-  row / blank-share / cardinality buckets and year span in the shape tier.
+- `pbz smoke [--page <name or id>]`: per visual `OK`, `EMPTY`, `ERROR` with a separate `class`,
+  `UNSUPPORTED`, `N/A` (text box, image, shape, button, navigator, or iframe), `BUDGET`, or
+  `PROTOCOL_ERROR`. Coverage is `FULL`, `PARTIAL`, or `NONE`. The query uses bindings plus simple
+  In and comparison filters. A skipped filter, or a page that has slicers, sets coverage to
+  `PARTIAL`. Cross-filtering from other slicers is not applied.
+- `pbz probe <Table> [--columns A B]`: `has_blanks`, `has_negatives` on numeric columns,
+  `has_future_dates` on date columns, plus row, blank-share and cardinality buckets in the
+  shape tier. It does not return duplicate-key or orphan counts, and it does not return
+  calendar year endpoints. Duplicate keys and orphans are `pbz check` kinds (`unique`,
+  `no_orphans`).
+- `pbz health`: objects in error. A measure may include a scrubbed message. Column, partition,
+  hierarchy, and relationship errors are the class alone. An unknown class from health, probe,
+  index, or snapshot is `ENGINE_UNAVAILABLE`.
+- `pbz index`: type for every column; text columns also get `class` (`empty`, `category`, or
+  `high`). In the shape tier, text columns may include `card_bucket`, and every column may
+  include `blank_bucket`. There is no calendar year field. A link at the private `index.json`
+  is refused before it is opened.
 
 ## Disclosure ledger
 

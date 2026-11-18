@@ -19,7 +19,7 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | `diff` | Pending mirror vs real | `--patch` | tokens |
 | `push` | Validate and write real files | `--reload`, `--dry-run`, `--only` | tokens |
 | `revert` | Discard mirror edits | paths, `--object` | workspace |
-| `validate` | Mirror metadata lint / PBIR | `--fail-on`, `--since`, `--ci`, `--format`, `--out` | workspace |
+| `validate` | Mirror metadata lint / PBIR | `--fail-on`, `--since`, `--ci`, `--format`, `--out`, `--save-baseline` | workspace |
 | `preflight` | Full staged validation, no apply | `--only` | [improvements.md](../skills/powerbi-zerodata/reference/improvements.md) |
 | `recover` | Interrupted push recovery | `--transaction` | improvements |
 
@@ -27,8 +27,8 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 
 | Verb | Purpose | Notes | Docs |
 |---|---|---|---|
-| `describe` | Data dictionary (model / table / measure / column) | Metadata only | workspace |
-| `values` | Column shape from the mirror | Not a live grid | workspace |
+| `describe` | Data dictionary (model / table / measure / column) | Names, types, buckets, and category labels | workspace |
+| `values` | Category labels, or a distinct bucket and mirror tokens | Not a live grid | workspace |
 | `rename` | Rename measure/column/table + fix refs, or a pattern | `--match`, `--to`, `--dry-run`, kind `any` | [authoring.md](../skills/powerbi-zerodata/reference/authoring.md) |
 | `move` | Move measure to another table | `--to` | authoring |
 
@@ -38,8 +38,8 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 |---|---|---|---|
 | `desktop` | Drive Desktop without screenshots | `status` \| `open` \| `close` \| `reload` | [checks.md](../skills/powerbi-zerodata/reference/checks.md) |
 | `index` | Column classification index in Desktop | — | checks |
-| `refresh` | Refresh open model | `--tables` | checks |
-| `health` | Objects in error (classes only) | — | checks |
+| `refresh` | Recalculate calculated tables and columns. Not a source refresh | `--tables` | checks |
+| `health` | Objects in error. Classes are closed; a measure message is scrubbed | — | checks |
 | `check` | Data-blind assertions, including `rls` and `perf` | `--validate-only`, `--diagnostic` | checks |
 | `perf` | DAX query bands and baseline verdict | `--dax`, `--runs`, `--baseline`, `--action save\|compare` | checks |
 | `perf-import` | Performance Analyzer file as bands | `--replay` (human terminal only) | checks |
@@ -53,7 +53,7 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | Verb | Purpose | Nested | Docs |
 |---|---|---|---|
 | `preview` | Watermarked synthetic layout SVG | `--page`, `--spec` | [preview.md](../skills/powerbi-zerodata/reference/preview.md) |
-| `interactions` | Navigation / slicer contracts (contract 2 tokens; native is `UNSUPPORTED`) | `capabilities` \| `check`; `--mode static\|native` | improvements |
+| `interactions` | Navigation / slicer contracts (contract 2; native is `UNSUPPORTED`) | `capabilities` \| `check`; `--mode static\|native` | improvements |
 | `freshness` | Refresh provenance contracts | `capture` \| `compare` | improvements |
 | `requirements` | Revision-bound requirement checks | `import` \| `status` \| `verify` \| `accept` | improvements |
 | `consent` | Human file approval receipts | `request` \| `status` \| `approve` \| `read` | improvements |
@@ -71,7 +71,7 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | `find` | Names and mirror lines matching a pattern | `--kind` | analysis |
 | `replace` | Rename matches or replace text outside tokens | `--apply` (default is dry run), `--kind` | analysis |
 | `suggest` | Cleanup suggestions | `--report` | analysis |
-| `bpa` | Best-practice analysis | `--import-rules`, `--fail-on`, `--since`, `--ci`, `--format`, `--out` | [bpa.md](../skills/powerbi-zerodata/reference/bpa.md) |
+| `bpa` | Best-practice analysis | `--import-rules`, `--fail-on`, `--since`, `--ci`, `--format`, `--out`, `--save-baseline` | [bpa.md](../skills/powerbi-zerodata/reference/bpa.md) |
 | `similar` | Near-duplicate measures, or project overlap | `--models`, `--against` | analysis |
 | `changes` | Semantic diff of mirror snapshots | `--from`, `--to`, `--against` | analysis |
 | `watch` | Re-run validate and bpa. The CLI polls until interrupted; MCP runs one pass | `--once` | analysis |
@@ -108,8 +108,8 @@ Deep docs are linked per group. For flags not listed here, run `pbz <verb> -h`.
 | `script` | Measure script JSON under the workspace | `export` \| `apply` | authoring |
 | `set` / `get` | Typed model properties | `--kind`, `--table`, `--match`, `--folder` | authoring |
 | `hierarchy` | User hierarchies | `add` \| `levels` \| `remove` | authoring |
-| `format-expr` | Dynamic format string | `--remove` | authoring |
-| `function` | DAX UDFs | `add` \| `update` \| `rename` \| `remove` \| `list` \| `import` | authoring |
+| `format-expr` | Dynamic format string | `--remove`, `--upgrade-compat` | authoring |
+| `function` | DAX UDFs | `add` \| `update` \| `rename` \| `remove` \| `list` \| `import`; `--upgrade-compat` on `add` | authoring |
 
 ## Model governance
 

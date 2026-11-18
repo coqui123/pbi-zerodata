@@ -883,7 +883,7 @@ def _free_text_edits(text, node, value, clf, tm, edits, numbers, avoid=(), pii_o
 def detokenize_pbir(text: str, tm: TokenMap) -> tuple[str, list[str]]:
     unknown: list[str] = []
 
-    def esc(m):  # «...» escaped as «...» by a JSON writer: the same token
+    def esc(m):  # \u00ab...\u00bb escaped by a JSON writer: the same token
         try:
             tok = "«" + json.loads('"' + m.group(1) + '"') + "»"
         except ValueError:

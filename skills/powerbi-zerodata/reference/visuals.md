@@ -12,7 +12,7 @@ charts, maps, `textbox`, shapes and buttons. `pbz visual roles <type>` prints a 
 - A field goes to the first role that fits: measures to measure roles, numeric columns to a measure
   role as an implicit sum, other columns to grouping roles. `ROLE=field` picks the role.
 - Field counts are checked against the visual's data view mapping conditions (for example a card
-  takes one field). Images need a registered resource: add them in Desktop.
+  takes one field). An image visual needs a registered image (`pbz image add <file>`).
 
 ## Custom visuals
 

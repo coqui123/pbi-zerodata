@@ -26,7 +26,7 @@ output goes to `engine\build\` and `engine\obj\` (safe to delete). `pbz\engine.p
 ## Invocation
 
 ```
-pbz-engine.exe <verb>      one JSON request on stdin, one JSON response on stdout, exit code 0
+pbz-engine.exe <verb>      one JSON request on stdin, one JSON response on stdout; exit 0 when that response is written, 1 when the write fails
 ```
 
 stderr is never written (it is redirected to null inside the process). Raw diagnostics go only to

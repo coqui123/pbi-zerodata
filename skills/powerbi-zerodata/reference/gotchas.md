@@ -15,7 +15,8 @@ Technical lessons only. No values.
 - OneDrive can briefly lock folders; retry the push.
 - A custom theme survives publish only when registered the way Desktop does it: the theme file's
   `"name"`, `themeCollection.customTheme.name` and the `RegisteredResources` item all carry the same
-  `<theme>.json` (a bare name breaks the theme in the service; push checks this). Editing an imported
+  `<theme>.json` (a bare name breaks the theme in the service). pbz does not compare those three
+  names. Push runs Microsoft's report validator when `powerbi-report-author` is installed. Editing an imported
   theme in the mirror is fine; when in doubt the user imports a new one through Desktop (Themes > Browse).
 
 ## TMDL

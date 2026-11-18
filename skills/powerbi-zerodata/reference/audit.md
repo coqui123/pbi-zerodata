@@ -7,8 +7,8 @@ It reads the mirror (names, DAX, M) and, when available, two kinds of bucketed e
 | Evidence | From | What it adds |
 |---|---|---|
 | static | the mirror | every rule runs on names and formulas |
-| index buckets | `pbz index` (Desktop open) | distinct and row buckets (`0`, `1-9`, ... `10k+`) raise or lower severity |
-| storage bands | `pbz audit memory` (Desktop open) | per column and table: size band, share band, dictionary-heavy flag, and three yes/no predicates |
+| index buckets | `pbz index` (Desktop open) | distinct and row buckets (`0`, `1-9`, ... `10k+`) raise or lower severity. A missing index still runs those rules and reports `ran without buckets`; it is not a skipped check |
+| storage bands | `pbz audit memory` (Desktop open) | size and share bands, `dictionary_heavy`, `encoding`, `segment_band`, `ri_count`, `ri`, and three yes/no predicates |
 
 A smell is a candidate, not a measurement: a nested iterator or a large column says "look here", not "this
 is slow". The top distinct bucket is `10k+`, so rules whose published thresholds are higher (Microsoft's
@@ -21,7 +21,7 @@ pbz audit                                   # all findings, most severe first
 pbz audit --category consolidation          # or efficiency, design
 pbz audit --rule CALC_COLUMN_AS_MEASURE --rule NESTED_ITERATOR
 pbz audit --min-severity medium
-pbz audit --coverage                        # every rule: source, evidence it needs, ran or skipped
+pbz audit --coverage                        # every rule: source, evidence it needs, and whether it ran
 pbz audit memory                            # storage bands from the open Desktop model, saved to .pbz/memory.json
 ```
 
@@ -45,8 +45,8 @@ Efficiency
 | `MIXED_STORAGE_DIMENSION` | an Import dimension filtering a DirectQuery table (limited relationship): make it Dual | static |
 | `MEMORY_HOTSPOT` | a column with `5-20%` / `>=20%` of storage or `100-1000 MiB` and up, with its usage state | bands |
 | `DATETIME_TIME_PART` | date/time columns that store times of day (split or truncate; a format string keeps the time) | predicate |
-| `DOUBLE_WITHOUT_FRACTIONS` | decimal columns holding whole numbers only | predicate |
-| `LONG_TEXT` | text columns with values over 100 characters and a large band | predicate |
+| `DOUBLE_WITHOUT_FRACTIONS` | double or decimal columns holding whole numbers only | predicate |
+| `LONG_TEXT` | text columns with values over 100 characters; with a size band, only `10-100 MiB` and larger | predicate |
 | `DICTIONARY_HEAVY` | columns whose storage is mostly the dictionary of distinct values | bands |
 | `LARGE_RELATIONSHIP` | a relationship structure of `10-100 MiB` or more: a key with very many distinct values | bands |
 | `AUTO_DATETIME_STORAGE` | hidden auto date/time tables holding `1-5%` of the model or more | bands |
@@ -143,16 +143,19 @@ Waivers record who added them (agent or human).
 
 The engine reads two storage DMVs (`DISCOVER_STORAGE_TABLE_COLUMNS`, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS`,
 fixed column lists) inside the broker and maps dictionary, data, attribute-hierarchy, user-hierarchy and
-relationship structures to model objects by their ids, like VertiPaq Analyzer. Only fixed bands leave the
+relationship structures to model objects by their ids, like VertiPaq Analyzer. Only this closed vocabulary leaves the
 process: size `<1 MiB`, `1-10 MiB`, `10-100 MiB`, `100-1000 MiB`, `>=1000 MiB`; share of the model `<1%`,
-`1-5%`, `5-20%`, `>=20%`; `dictionary_heavy`; and three yes/no predicates computed with fixed DAX on Import
-tables only (`time_part` for date/time columns, `fractional` for decimal columns, `long_text` for text over
+`1-5%`, `5-20%`, `>=20%`; `dictionary_heavy`; column `encoding` (`Hash` or `Value`); `segment_band`
+and `ri_count` in the same count buckets as probes (`0`, `1-9`, `10-99`, `100-999`, `1k-9k`, `10k+`);
+`ri` (`RI_OK` or `RI_VIOLATION`); and three yes/no predicates computed with fixed DAX on Import
+tables only (`time_part` for date/time columns, `fractional` for double or decimal columns, `long_text` for text over
 100 characters). Output is sorted by name, never by size.
 
 ```
 {"verb": "memory", "model": {"size_band"}, "tables": [{"name", "size_band", "share_band",
-  "columns": [{"name", "size_band", "share_band", "dictionary_heavy", "time_part" | "fractional" | "long_text"}],
-  "hierarchies": [{"name", "size_band"}]}], "relationships": [{"name", "from", "to", "size_band"}],
+  "columns": [{"name", "size_band", "share_band", "dictionary_heavy", "encoding", "segment_band",
+  "ri", "ri_count", "time_part" | "fractional" | "long_text"}],
+  "hierarchies": [{"name", "size_band"}]}], "relationships": [{"name", "from", "to", "size_band", "ri", "ri_count"}],
  "other": {...}, "auto_datetime": {...}, "coverage": "FULL" | "PARTIAL", "predicates": "OFF" | "DONE" | "PARTIAL"}
 ```
 
@@ -160,8 +163,9 @@ tables only (`time_part` for date/time columns, `fractional` for decimal columns
   summed into `auto_datetime`; storage that maps to no listed object is `other` and makes coverage PARTIAL.
 - Each run is charged to the daily probe budget (`BUDGET` when spent). `--no-predicates` skips the DAX
   checks; predicates are capped (largest columns first, bounded time) and a failing one is left out.
-- Strict disclosure (`"disclosure": "strict"` in the policy) withholds every band; names,
-  `dictionary_heavy` and the predicates stay, and audit then reports the predicate rules at low severity.
+- Strict disclosure (`"disclosure": "strict"` in the policy) withholds size, share, segment, and
+  referential-integrity count bands. Names, `dictionary_heavy`, `encoding`, `ri`, and the predicates stay,
+  and audit then reports the predicate rules at low severity.
 - Text columns reserve dictionary space, so small text columns sit in `1-10 MiB`; audit ignores shares
   when the whole model is under 10 MiB and needs `10-100 MiB` or more before calling an unused column
   expensive from bands alone.

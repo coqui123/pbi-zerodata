@@ -27,16 +27,17 @@ canary e2e. Deviations from the plan below:
   Bookmarks pane), and are removed only with `--only bookmark`.
 - A table is removable only when nothing outside it, other than its own relationships, refers to it
   or to one of its objects; relationships are kept (locked) only when both of their tables survive.
-- Translations in `cultures/` are not pruned: cultures are never mirrored, so objects with a
-  translation are skipped as manual removals (pbz reads the real culture files for names only). TOM
-  on push also refuses a removal that would leave a dangling translation (verified).
+- Translations in `cultures/` are mirrored. Removal prunes those translations with the object.
+  A mirror pulled before cultures were mirrored still leaves those removals manual until
+  `pbz pull`.
 
-  **Current behavior:** Round 3 mirrors cultures, and rename, move and remove keep translations
-  when they are mirrored. Legacy mirrors without cultures still refuse rename and move with "run pbz pull".
-
-- BPA catalog: 53 model rules (42 on by default, 6 opinion, 5 data-derived and never run) and 21
-  report rules (20 on, 1 opinion). Every rule citing `BPARules.json` uses the upstream rule id
-  (checked against the file on 2026-11-04); other rules cite semantic-link-labs or are pbz's own.
+- BPA catalog: 53 model rules (42 on by default, 6 opinion, 5 data-derived) and 21
+  report rules (20 on, 1 opinion). The five data rules run when `pbz audit memory` has saved a
+  document. A missing referential-integrity status is not a passed check, and the
+  high-cardinality bidirectional rule is a clean pass only when both ends are under 1 MiB.
+  Every rule citing
+  `BPARules.json` uses the upstream rule id (checked against the file on 2026-11-04); other
+  rules cite semantic-link-labs or are pbz's own.
 
 Verified on an internal development mirror (counts and object names only, no values retained in
 this document): `unused`, `lineage`, `suggest`, `bpa`, `similar`, `docs`, `m-lineage` and
@@ -153,8 +154,9 @@ Built from that list (three pieces by parallel agents):
 - Declarative recipes with transactional rollback (`recipe run|check`).
 - `copy page|visual` with id remapping; `a11y` audit and tab-order fix; `mobile` phone layouts.
 - DAX user-defined functions (`function`), object-level security (`role ols`); compatibility levels
-  checked (1601 for dynamic formats, 1702 for functions, confirmed against TOM) with an explicit
-  `--upgrade-compat`.
+  checked (1601 for dynamic formats, 1702 for functions, 1400 for object-level security).
+  `--upgrade-compat` raises the level for a format string or a new function. Object-level security
+  does not take that flag.
 - Push refuses model changes while Desktop holds unapplied Power Query edits.
 - Synthetic edge-case fixtures and checks with visible fake counterexamples (`synth build --edge`,
   `synth check`).
@@ -642,8 +644,9 @@ spec's digest and the current mirror revision.
 
 Page and visual JSON under the mirror is read through `open_mirror_file_readonly`. The same
 checked reader covers the other definition reads named in
-`skills/powerbi-zerodata/reference/improvements.md`. Model TMDL reads through `tmdl.load_model`
-stay outside that gate. Pull of the real project and history blobs stay outside it.
+`skills/powerbi-zerodata/reference/improvements.md`. `tmdl.load_model` refuses a reparse on
+the definition directory, each walked directory, and each `.tmdl` file. Pull of the real
+project and history blobs stay outside that gate.
 
 `pbz interaction --show` reports stored cross-filter metadata for a page: one closed mode per
 source and target, with page and visual ids only. Setting one pair leaves the other stored pairs
@@ -655,5 +658,6 @@ recursive copies and moves that carry `.pbz` or the workspace, and recursive del
 workspace root, an ancestor, a bare drive root, or a wildcard in that directory that can match
 `policy.json` or `.pbz`. A move is a tree operation even without a recurse flag. Unexpanded
 `$`, `%`, and `!`, parentheses, and `::` fail closed. Pipeline-only delete names and a `\\?\`
-prefix stay residual #7. Evidence rotation and `admin memory-dir` stay open. This is not OS
+prefix stay residual #7. `admin memory-dir` stays open. The evidence log rotates, and a
+junction or symlink on the guard-log directory or on `guard.log` is refused. This is not OS
 isolation.

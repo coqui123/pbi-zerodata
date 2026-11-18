@@ -1,9 +1,10 @@
 # Leak vectors and controls
 
-The guarantee: no value read from a data source reaches the agent. Authored literals reach it
-only when classified non-sensitive. Real-data feedback is limited to verdicts, error classes and
-fixed coarse buckets under a budget. This is accident prevention on native Windows (hooks,
-deny rules, a broker CLI), not an OS security boundary.
+The guarantee: company rows, totals, exact counts, real-model query grids, and cached data read from a source do not
+reach the agent. Authored literals reach it only when classified non-sensitive. Low-cardinality
+category labels from the private index are the readable exception. `pbz synth query` returns rows from the fake copy only. Other real-data feedback is
+verdicts, error classes, and fixed coarse buckets under a budget. This is accident prevention on
+native Windows (hooks, deny rules, a broker CLI), not an OS security boundary.
 
 | Vector | Control |
 |---|---|
@@ -22,8 +23,8 @@ deny rules, a broker CLI), not an OS security boundary.
 | DATATABLE, `#table`, Enter Data blobs, RLS members, M literals | tokenized or payload markers |
 | Figures and names in descriptions, comments, titles, text boxes | free-text scan (`«num»`, `«lit»`, `«pii»`) |
 | DAX query results, counts, distinct values | only via pbz-engine verdicts |
-| Engine / DMV statistics (`DISCOVER_STORAGE_*`, sessions, traces) | engine allows `TMSCHEMA_*` and `DBSCHEMA_CATALOGS`; the one exception, `memory` (`pbz audit memory`), reads two storage DMVs with fixed columns inside the broker and releases only fixed size / share bands and three yes/no predicates, sorted by name (reference/audit.md) |
-| Error text echoing values ("duplicate value 'X'", `Details:`) | engine emits classes; raw text DPAPI-encrypted, human-only log |
+| Engine / DMV statistics (`DISCOVER_STORAGE_*`, sessions, traces) | engine allows `TMSCHEMA_*` and `DBSCHEMA_CATALOGS`; the one exception, `memory` (`pbz audit memory`), reads two storage DMVs with fixed columns inside the broker and releases size and share bands, `dictionary_heavy`, `encoding` (`Hash` or `Value`), `segment_band`, `ri_count`, `ri`, and three yes/no predicates, sorted by name (reference/audit.md). Strict disclosure withholds the size, share, segment, and referential-integrity count bands |
+| Error text echoing values ("duplicate value 'X'", `Details:`) | check and query errors are classes. `pbz health` may include a scrubbed measure message; other health kinds are the class alone. Raw text stays in the DPAPI log, which is human-only |
 | Boolean oracle / bisection | no `between`; a ledger keeps distinct constants per target for 30 days, including literals the agent pushed into measures the target reaches; daily budgets for checks, probes, snapshot queries and smoke runs; opaque group keys |
 | Timing side channel | no durations printed |
 | ADOMD / XMLA / executeQueries / OData / clipboard from shells or scripts | guard command and script scanning |

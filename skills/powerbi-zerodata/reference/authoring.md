@@ -11,8 +11,9 @@ real files and validates them again with TOM before writing. None of them reads 
   M references to the table's query (`#"T"`), relationship endpoints, RLS `tablePermission`,
   perspectives, the `PBI_QueryOrder` annotation, and in PBIR every `Entity`, `From` alias entity,
   report-level measure entity and `queryRef` / `metadata` string. Tokens in the mirror keep their old
-  label until the next pull; that is cosmetic. Refused when the table has translations in `cultures/`
-  (not mirrored) or when a shared query has the same name.
+  label until the next pull; that is cosmetic. Refused when that table still has translations in
+  real culture files this mirror does not hold (`pbz pull` first), or when a shared query has
+  the same name.
 - `pbz move measure <name> --to <table>` moves the TMDL block (description, format string, KPI,
   annotations) into the target table, rewrites `'Old'[Measure]` references and the PBIR entity of every
   visual, filter, sort and bookmark reference. A filter whose single `From` alias also serves other
@@ -95,9 +96,10 @@ file. To add one: write the file, then register it in `definition/report.json`:
 `themeCollection.customTheme = {"name": "<theme>.json", "reportVersionAtImport": <copy of the base
 theme's>, "type": "RegisteredResources"}` plus an item `{"name": "<theme>.json", "path": "<theme>.json",
 "type": "CustomTheme"}` in the `RegisteredResources` package. The theme file's own `"name"` must be the
-same `<theme>.json`. Push runs Microsoft's report validator, which checks the registration, the JSON,
-value types (`dataColors` an array, positive font sizes) and the formatting object names in
-`visualStyles`. Images embedded in a theme (`"url": "data:image/..."`) show as `«payload:image#n»`:
+same `<theme>.json`. pbz does not compare those three names. When `powerbi-report-author` is
+installed, push and validate run it against the staged report; a missing CLI is recorded as
+`REPORT_VALIDATOR_MISSING` and does not by itself fail the push. Images embedded in a theme
+(`"url": "data:image/..."`) show as `«payload:image#n»`:
 keep, move or delete the token, never type inside it.
 
 **Page canvas and wallpaper.** `pbz style <page> --canvas` (or `--all` for every page) edits the

@@ -12,11 +12,12 @@ how it ships, which checks ran on which revision, and what is still unverified. 
   | Class | Means | Next |
   |---|---|---|
   | `SECURITY_REVIEW` | roles, RLS filters, OLS, members | a human reviews; test with View as role |
-  | `REFRESH_REQUIRED` | partitions, M, sources, refresh policy, new or removed import tables and columns | the user refreshes in Desktop, then `pbz health` |
+  | `REFRESH_REQUIRED` | partitions, M, parameters, sources, refresh policy, new or removed tables, and new or removed columns that carry no expression | the user refreshes in Desktop, then `pbz health` |
   | `RECALC_REQUIRED` | calculated columns and tables, relationships, calculation groups | `pbz desktop open`, `pbz refresh`, `pbz health` |
   | `LOGIC` | measure and function DAX | `pbz check`, `pbz snapshot compare`, `pbz synth test run` |
   | `METADATA_ONLY` | descriptions, folders, formats, visibility, renames | validate and push |
   | `REPORT_ONLY` | PBIR pages, visuals, filters, bookmarks | `pbz push --reload`, `pbz smoke`, the user's visual review |
+  | `UNKNOWN` | a change that did not match a class above | inspect it by hand |
 
 - **Impact**: dependents and visuals of each changed model object.
 - **Suggested verification**: compiles checks for changed measures, saved snapshots, synthetic
@@ -36,12 +37,17 @@ how it ships, which checks ran on which revision, and what is still unverified. 
   | `HANDOFF` | `pbz handoff` |
   | `HUMAN_ACCEPTED` | `pbz review --accept`, typed by the reviewer in a terminal (agents get `HUMAN_ONLY`) |
 
-  Each stage is `CURRENT` (ran on this revision), `STALE` (an older revision, or real-data evidence
-  while edits are still pending) or `NOT_RUN`. Stale evidence is never reported as a pass.
+  A record is `CURRENT` when its mirror revision matches and, except for `PARSED`, its real-file
+  revision matches too. `LOADED`, `EXECUTED`, `HANDOFF`, and `HUMAN_ACCEPTED` are
+  `STALE (pending edits not pushed)` while mirror edits are still unpushed. They are `STALE` when
+  the revision differs or the pending-edit check cannot be read. A missing record is `NOT_RUN`.
+  The stage is `CURRENT` only when every record on it is current, `PARTIAL` when at least one is
+  current and another is not, and `STALE` when none are current. Stale evidence is not a pass.
   `pbz review --interactions-spec <file>` binds a static interaction proof to that spec's digest.
   A later mirror revision or a different digest invalidates it.
 - **Coverage**: whether external consumers are registered and whether the human accepted the
   revision. Changed pages are drawn as layout maps (boxes and labels, no data).
+- `pbz handoff` skips a page id that is not one path segment and does not read that page.
 
 ## Recipes: `pbz recipe run <file.json> [--param name=value]`
 
@@ -62,7 +68,7 @@ A recipe is a reviewable batch of mirror edits applied as one transaction: data,
 
 - Steps call pbz verbs that edit only the mirror (set, rename, move, new, relationship, add, style,
   filter, interaction, link, bookmark, copy, hierarchy, format-expr, function, culture, translate,
-  perspective, role, refresh-policy, format, repair, bpa, a11y, mobile) plus read-only ones (validate,
+  perspective, role, refresh-policy, format, repair, bpa, a11y, mobile, image) plus read-only ones (validate,
   diff, layout, get, unused, lineage, describe). Push, pull, Desktop, engine checks, consumers, admin
   and arbitrary code are not available, and steps cannot point at another workspace.
 - `{name}` placeholders take `params` from the recipe or `--param name=value`.
@@ -79,4 +85,5 @@ A recipe is a reviewable batch of mirror edits applied as one transaction: data,
   or discards them in Desktop, saves, then `pbz pull --rebase`.
 - Features that need a newer compatibility level refuse with `COMPAT_LEVEL` and name the level:
   dynamic format strings 1601, DAX user-defined functions 1702, object-level security 1400.
-  `--upgrade-compat` raises it (one way: older Desktop builds cannot open the model).
+  `--upgrade-compat` raises the level for a dynamic format string or a new function. Object-level
+  security does not take that flag. Raising the level is one way: older Desktop builds cannot open the model.

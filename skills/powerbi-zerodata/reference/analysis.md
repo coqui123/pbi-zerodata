@@ -57,8 +57,9 @@ to one of its objects. Hidden is not unused. Auto date/time tables are counted
 - removes the auto date/time table and relationship of a removed date column.
 
 Manual only (listed under `skipped`): columns of calculated tables (edit the table expression),
-columns of tables with an incremental refresh policy, objects with translations in `cultures/`
-(never mirrored; TOM would refuse the push), parameters, calculation items, roles.
+columns of tables with an incremental refresh policy, objects with translations on a mirror
+pulled before cultures were mirrored (run `pbz pull` so those translations are pruned with the
+object), parameters, calculation items, roles.
 
 Each run writes a restore point to `pbz-workspace\.pbz-trash\<stamp>\` (the previous mirror text of
 every touched file). `pbz unused --restore <stamp>` puts it back if the files have not changed since;

@@ -1215,15 +1215,21 @@ def _large_tables(cx, rule):
 def _bi_high_card(cx, rule):
     doc = _memory_doc(cx)
     hits = []
+    examined = 0
     for rel in cx.rels:
         if not rel.both:
             continue
+        sizes = []
         for table, column in ((rel.from_table, rel.from_column), (rel.to_table, rel.to_column)):
             size = _mem_column(doc, table, column).get("size_band")
-            if size and size != "<1 MiB":
-                hits.append(Hit(_rel_label(rel), "relationship", node=rel.node))
-                break
-    return len(cx.rels), hits
+            sizes.append(size if isinstance(size, str) and size else None)
+        if any(size and size != "<1 MiB" for size in sizes):
+            examined += 1
+            hits.append(Hit(_rel_label(rel), "relationship", node=rel.node))
+            continue
+        if all(size == "<1 MiB" for size in sizes):
+            examined += 1
+    return examined, hits
 
 
 @check("REDUCE_USAGE_OF_LONG-LENGTH_COLUMNS_WITH_HIGH_CARDINALITY")
@@ -1246,17 +1252,23 @@ def _long_high(cx, rule):
 def _ri_violations(cx, rule):
     doc = _memory_doc(cx)
     hits = []
+    examined = 0
+    known = ("RI_OK", "RI_VIOLATION")
     for rel in cx.rels:
-        info = _mem_rel(doc, rel)
-        bad = info.get("ri") == "RI_VIOLATION"
-        if not bad:
-            for table, column in ((rel.from_table, rel.from_column), (rel.to_table, rel.to_column)):
-                if _mem_column(doc, table, column).get("ri") == "RI_VIOLATION":
-                    bad = True
-                    break
-        if bad:
+        statuses = []
+        rel_ri = _mem_rel(doc, rel).get("ri")
+        if rel_ri in known:
+            statuses.append(rel_ri)
+        for table, column in ((rel.from_table, rel.from_column), (rel.to_table, rel.to_column)):
+            col_ri = _mem_column(doc, table, column).get("ri")
+            if col_ri in known:
+                statuses.append(col_ri)
+        if not statuses:
+            continue
+        examined += 1
+        if "RI_VIOLATION" in statuses:
             hits.append(Hit(_rel_label(rel), "relationship", node=rel.node))
-    return len(cx.rels), hits
+    return examined, hits
 
 
 def catalog(scope: str = "all") -> list[dict]:

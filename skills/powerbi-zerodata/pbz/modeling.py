@@ -51,7 +51,7 @@ def compat_upgrade_text(mdef: str, feature: str) -> tuple[str, str, bytes] | Non
     return path, new, bom
 
 
-def require_compat(mdef: str, feature: str, upgrade: bool) -> str | None:
+def require_compat(mdef: str, feature: str, upgrade: bool, offer: bool = True) -> str | None:
     """Raise COMPAT_LEVEL unless the model's compatibility level supports the feature; with upgrade,
     raise the level (one way: older Desktop builds cannot open it) and return a note."""
     need = COMPAT[feature]
@@ -59,8 +59,9 @@ def require_compat(mdef: str, feature: str, upgrade: bool) -> str | None:
     if cur is None or cur >= need:
         return None
     if not upgrade:
-        raise PbzError("COMPAT_LEVEL", f"{feature} needs compatibility level {need}; the model is at {cur}. "
-                                       "Pass --upgrade-compat to raise it (one way: older Desktop builds cannot open it)")
+        hint = (" Pass --upgrade-compat to raise it (one way: older Desktop builds cannot open it)"
+                if offer else "")
+        raise PbzError("COMPAT_LEVEL", f"{feature} needs compatibility level {need}; the model is at {cur}.{hint}")
     path, text, bom = compat_upgrade_text(mdef, feature)
     write_text(path, text, bom)
     return f"compatibility level raised from {cur} to {need}"
@@ -545,7 +546,7 @@ def role_ols(ws, project, role: str, target: str, permission: str) -> dict:
     if permission not in ("none", "read", "default"):
         raise PbzError("BAD_REQUEST", "permission: none (hidden), read, or default (remove the rule)")
     mdef, model = _model(project)
-    require_compat(mdef, "ols", False)
+    require_compat(mdef, "ols", False, offer=False)
     rel, doc, rnode = _role(mdef, model, role)
     m = re.match(r"^'((?:[^']|'')+)'\s*\[(.+)\]$", target.strip()) or re.match(r"^([^\[\]']+?)\s*\[(.+)\]$", target.strip())
     if m:

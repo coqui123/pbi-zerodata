@@ -6,6 +6,22 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- `pbz probe` and `pbz index` do not return calendar year endpoints. Probe reports blanks,
+  negatives, future dates, and coarse buckets. Duplicate keys and orphans stay on `pbz check`.
+- Best-practice data rules run when `pbz audit memory` has saved a document. A missing
+  referential-integrity status is not a passed check. The high-cardinality bidirectional rule
+  is clean only when both ends are under 1 MiB; a missing band on that rule is not a clean pass.
+- `pbz revert` refuses a link under the private base before reading it. Handoff skips a page id
+  that is not a single path segment. A link at the private `index.json` is refused; a missing
+  index still means heuristic mode.
+- Creating a junction, symlink, or hardlink with `New-Item` no longer skips a denial of a
+  private or other denied path. Creating an ordinary directory is unchanged.
+- Health, probe, index, and snapshot errors use a closed class. An unknown class is reported
+  as `ENGINE_UNAVAILABLE`.
+- `pbz smoke` reports `N/A` for a text box, image, shape, button, navigator, or iframe, and
+  coverage `FULL`, `PARTIAL`, or `NONE`. `pbz values` returns category labels from the private
+  index, or a distinct bucket and mirror tokens. It is not a live grid.
+
 ## 2026-11-10
 
 - Fail closed on a few edges that could reset a good file or publish the wrong name. An unreadable

@@ -200,9 +200,14 @@ class EvidenceTests(unittest.TestCase):
 class HandoffTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
-        self.ws=SimpleNamespace(pbz_dir=os.path.join(self.tmp.name,'.pbz'),mirror=os.path.join(self.tmp.name,'pbz-workspace'))
-        self.project=SimpleNamespace(name='Synthetic',mirror_model=os.path.join(self.tmp.name,'model'),mirror_report=os.path.join(self.tmp.name,'report'))
+        mirror=os.path.join(self.tmp.name,'pbz-workspace')
+        self.ws=SimpleNamespace(pbz_dir=os.path.join(self.tmp.name,'.pbz'),mirror=mirror)
+        report=os.path.join(mirror,'Synthetic.Report')
+        self.project=SimpleNamespace(name='Synthetic',mirror_model=os.path.join(mirror,'Synthetic.SemanticModel'),mirror_report=report)
         Path(self.ws.pbz_dir).mkdir()
+        page=Path(report,'definition','pages','page','page.json')
+        page.parent.mkdir(parents=True)
+        page.write_text('{"displayName": "Page"}',encoding='utf-8')
 
     def push(self,stamp,project='Synthetic'):
         with open(Path(self.ws.pbz_dir,'push-log.jsonl'),'a',encoding='utf-8') as f:f.write(json.dumps({'project':project,'stamp':stamp,'objects':['Synthetic.Report/definition/pages/page/page.json']})+'\n')
@@ -242,7 +247,7 @@ class HandoffTests(unittest.TestCase):
 
     def test_legacy_generation_cursor_does_not_consume_review(self):
         Path(self.ws.pbz_dir,'handoff.json').write_text(json.dumps({'last':'999'}),encoding='utf-8')
-        Path(self.ws.mirror).mkdir()
+        Path(self.ws.mirror).mkdir(exist_ok=True)
         Path(self.ws.mirror,'HANDOFF.md').write_text('Legacy checklist\nManual synthetic note\n',encoding='utf-8')
         self.push('001');self.build()
         self.assertIn('Manual synthetic note',Path(self.ws.mirror,'HANDOFF.md').read_text(encoding='utf-8'))

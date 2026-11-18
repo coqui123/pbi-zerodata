@@ -1,7 +1,7 @@
 # Disclosure contract
 
 What an agent may see from pbz. This is the closed contract for Release 1. It does not add new
-derived outputs. The full slot allowlist tokenizer remains an R2 follow-up; Release 1 stays fail-closed without it. Storage bands and the three memory predicates below are grandfathered as they
+derived outputs. The full slot allowlist tokenizer remains an R2 follow-up; Release 1 stays fail-closed without it. The memory fields listed below are grandfathered as they
 already ship; this note cites them and does not reopen that policy.
 
 Heuristic classification is **not** an OS boundary. Closed verdicts do **not** prove that a fact
@@ -29,16 +29,20 @@ in it.
 
 | Family | Values |
 |---|---|
-| Smoke / query | `OK`, `EMPTY`, `ERROR`, `UNSUPPORTED`, `PROTOCOL_ERROR`, `BUDGET`, `PARTIAL` |
-| Checks | `PASS`, `FAIL`, `EMPTY`, `BUDGET`, `ERROR` |
+| Smoke status | `OK`, `EMPTY`, `ERROR`, `UNSUPPORTED`, `N/A`, `PROTOCOL_ERROR`, `BUDGET` |
+| Smoke coverage | `FULL`, `PARTIAL`, `NONE` |
+| Checks | `PASS`, `FAIL`, `EMPTY`, `UNSUPPORTED`, `BUDGET`, `ERROR` |
 | Snapshots | `SAME`, `DIFF`, `NEW`, `MISSING`, `STALE_DATA` |
 | Availability | `ENGINE_UNAVAILABLE`, `NOT_AVAILABLE`, `UNSUPPORTED`, `TIMEOUT`, `NOT_READY` |
 | Blocks | `DESKTOP_OPEN`, `DESKTOP_DIRTY`, `DESKTOP_STATE_UNKNOWN`, `CONFLICT`, `BUDGET`, `INCOMPLETE` |
 | Requests | `BAD_REQUEST`, `INVALID`, `UNKNOWN_TOKEN` |
 | Outcome envelope | `SUCCEEDED`, `FAILED`, `BLOCKED`, `UNAVAILABLE`, `INVALID`, `PARTIAL` |
 
-`ERROR` is a class (`SYNTAX`, `UNKNOWN_OBJECT`, …), never the engine's message. Anything outside
-these sets is not a successful disclosure; treat it as a bug.
+`ERROR` on a check is a class (`SYNTAX`, `UNKNOWN_OBJECT`, …), not the engine's raw message.
+`pbz health` may include a scrubbed message for a measure. Column, partition, hierarchy, and
+relationship errors are the class alone. An unknown class from health, probe, index, or snapshot
+is `ENGINE_UNAVAILABLE`. Anything outside these sets is not a successful disclosure; treat it as
+a bug.
 
 ## Approved derived outputs (grandfathered)
 
@@ -48,18 +52,23 @@ DMV exception) and [audit.md](audit.md) (Storage bands). Not expanded here.
 - Size bands: `<1 MiB`, `1-10 MiB`, `10-100 MiB`, `100-1000 MiB`, `>=1000 MiB`
 - Share bands: `<1%`, `1-5%`, `5-20%`, `>=20%`
 - `dictionary_heavy`
+- `encoding`: `Hash` or `Value`
+- `segment_band` and `ri_count`: `0`, `1-9`, `10-99`, `100-999`, `1k-9k`, `10k+`
+- `ri`: `RI_OK` or `RI_VIOLATION`
 - Three yes/no predicates on Import columns only: `time_part`, `fractional`, `long_text`
 
-Sorted by name, never by size. Strict disclosure withholds the bands; names, `dictionary_heavy`
-and the predicates stay. Other coarse buckets already documented for checks and probes (row
-buckets, `NONE`/`ONE`/`FEW`/`MANY`, blank/duplicate/orphan flags) stay as specified in
-[checks.md](checks.md). No new band, predicate or statistic is in scope.
+Sorted by name, never by size. Strict disclosure withholds size, share, segment, and
+referential-integrity count bands. Names, `dictionary_heavy`, `encoding`, `ri`, and the predicates
+stay. Other coarse buckets already documented for checks and probes stay as
+specified in [checks.md](checks.md): row buckets, `NONE`/`ONE`/`FEW`/`MANY`, and blank-share
+buckets. Duplicate keys and orphans are `unique` and `no_orphans` checks, not probe fields.
+No new band, predicate or statistic is in scope.
 
 ## Private-only artifacts
 
 These never enter chat, the mirror, memory notes or commit messages:
 
-- token map and category index (`tokens.bin`, `categories.bin`, `index.json` value HMACs)
+- token map and category-index files (`tokens.bin`, `categories.bin`, `index.json` value HMACs). Category labels permitted above are what `describe` and `values` return; the files stay private
 - DPAPI engine log, diagnostic tracebacks, push journals and file backups
 - `.pbi` caches, `cache.abf`, images, custom-visual packages, consumer cell/pivot caches
 - consent file bytes (the receipt exposes digest, purpose and status only)

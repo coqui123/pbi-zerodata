@@ -14,6 +14,7 @@ sys.path.insert(0, str(SKILL))
 from pbz import cli, dpapi, tokens  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 from pbz.classify import Classifier, looks_like_phone  # noqa: E402
+from _junction import make_junction  # noqa: E402
 from pbz.outcomes import envelope  # noqa: E402
 
 
@@ -256,6 +257,26 @@ class Round15ClassifierTests(unittest.TestCase):
                 tokens.tokenize_pbir(raw, rel, None, self.clf, self.tm)
             self.assertEqual(caught.exception.code, "REFUSED")
             self.assertNotIn("918273", str(caught.exception))
+
+
+class IndexLinkTests(unittest.TestCase):
+    def test_index_junction_is_unsafe_and_missing_stays_heuristic(self):
+        private = tempfile.TemporaryDirectory()
+        outside = tempfile.TemporaryDirectory()
+        bare = tempfile.TemporaryDirectory()
+        self.addCleanup(private.cleanup)
+        self.addCleanup(outside.cleanup)
+        self.addCleanup(bare.cleanup)
+        link = os.path.join(private.name, "index.json")
+        if not make_junction(None, link, outside.name):
+            self.skipTest("creating a junction is unavailable")
+        self.addCleanup(os.rmdir, link)
+        with self.assertRaises(PbzError) as caught:
+            Classifier(None, private.name, {})
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+        heuristic = Classifier(None, bare.name, {})
+        self.assertEqual(heuristic.mode, "heuristic")
+        self.assertIsNone(heuristic.index)
 
 
 if __name__ == "__main__":

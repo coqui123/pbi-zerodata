@@ -5,7 +5,7 @@
 `pbi-zerodata` (`pbz`) is built so coding agents can edit Power BI PBIP projects **without
 company data values entering the agent context**. Safety rests on several layers:
 
-1. **Sanitized mirror** (`pbz-workspace/`) — agents edit tokenized metadata only.
+1. **Sanitized mirror** (`pbz-workspace/`) — agents edit names, formulas, and tokens. Sensitive literals are tokenized. Low-cardinality category labels stay readable.
 2. **PreToolUse / SessionStart guard** (`pbz/guard.py`) — blocks reads and writes of real
    model/report folders, caches, data files, and policy-denied paths.
 3. **Engine broker** (`pbz-engine`) — Desktop checks return closed-vocabulary verdicts, never

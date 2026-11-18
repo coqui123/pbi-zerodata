@@ -3,9 +3,10 @@
 **Develop Power BI PBIP projects with coding agents — without company data values entering the
 agent context.**
 
-Agents see every **name** and every **formula**. They must never see rows, totals, distinct counts,
-query results, cached data, or screenshots of populated visuals. The `pbz` CLI and guard keep work
-inside a sanitized mirror (`pbz-workspace/`) and return closed-vocabulary verdicts from Desktop.
+Agents see every **name** and every **formula**. They must never see company rows, totals, exact counts,
+real-model query grids, cached data, or screenshots of populated visuals. Low-cardinality category labels
+are the readable exception. `pbz synth query` returns rows from the fake copy only. The `pbz` CLI and guard keep work inside a sanitized mirror
+(`pbz-workspace/`) and return closed-vocabulary verdicts from Desktop.
 
 | | |
 |---|---|

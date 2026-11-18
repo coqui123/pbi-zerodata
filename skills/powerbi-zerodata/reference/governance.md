@@ -39,7 +39,7 @@ in step.
 | `pbz role filter <name> <table> "<DAX>"` | sets (or replaces) the table's row filter; every reference is resolved first (`UNKNOWN_REF` otherwise) |
 | `pbz role unfilter <name> <table>` | drops the filter |
 | `pbz role member-add <name> <member>` / `member-remove <name> <member or token>` | members are personal data: they appear as `«pii#n»` tokens after the next pull; remove one by its token |
-| `pbz role ols <name> <Table or 'T'[C]> none\|read\|default` | object-level security: `metadataPermission` on the table permission or a `columnPermission` (none hides the object from the role; default removes the rule) |
+| `pbz role ols <name> <Table or 'T'[C]> none\|read\|default` | object-level security: `metadataPermission` on the table permission or a `columnPermission` (none hides the object from the role; default removes the rule). Needs compatibility level 1400. This command does not take `--upgrade-compat` |
 
 Effective security is a data question: ask the user to test with View as role in Desktop.
 
@@ -67,5 +67,6 @@ publish, and query folding cannot be proven offline. `pbz refresh-policy show` l
   validation sees the real files plus only those changes, so a dependency on a held-back file fails
   validation instead of slipping through.
 - `pbz revert [<paths...>]` puts mirror files back to their last pulled or pushed text (deleting
-  added files); `pbz revert --object "measure 'Table'[Name]"` restores one object's block (also
-  column, hierarchy, partition, calculationItem).
+  added files). A link or junction under the private base is refused (`UNSAFE_PATH`) and the
+  mirror is left unchanged. `pbz revert --object "measure 'Table'[Name]"` restores one object's
+  block (also column, hierarchy, partition, calculationItem).

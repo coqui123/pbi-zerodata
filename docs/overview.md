@@ -13,13 +13,14 @@ into the model context.
 | Layer | Role | Agent may see |
 |---|---|---|
 | Real PBIP (`*.SemanticModel`, `*.Report`) | Source of truth on disk | **No** (guard blocks) |
-| `pbz-workspace/` sanitized mirror | Editable metadata with reversible tokens | **Yes** (names + formulas) |
-| `.pbz/` private state | Policy, evidence, snapshots, ledgers | Metadata / closed verdicts only |
-| `pbz-engine` | Talks to Power BI Desktop locally | Closed vocabulary (OK / EMPTY / ERROR classes), never cells |
+| `pbz-workspace/` sanitized mirror | Editable metadata with reversible tokens | **Yes** (names, formulas, and category labels) |
+| `.pbz/` private state | Policy, evidence, snapshots, ledgers, private index | Closed verdicts. Category labels from the index are the readable exception |
+| `pbz-engine` | Talks to Power BI Desktop locally | Verdicts, booleans, and coarse buckets. A measure health error may include a scrubbed message. Never cells |
 | Human terminal | Consent, review accept, admin, memscrub apply | Full responsibility for approvals |
 
-Agents see **every name and every formula**. They must never see rows, totals, distinct counts,
-query grids, populated screenshots, or error text that echoes values.
+Agents see **every name and every formula**. They must never see company rows, totals, exact counts,
+real-model query grids, populated screenshots, or error text that echoes values. Low-cardinality category
+labels are the readable exception. `pbz synth query` returns rows from the fake copy only.
 
 ## Typical loop
 
@@ -39,7 +40,7 @@ pbz handoff / review         → human verifies visuals and acceptance
 - Tokenize sensitive literals in the mirror and restore them on push.
 - Block agent tool access to real definitions, data files, and denied paths.
 - Fail closed when policy is present but unusable or aliased.
-- Refuse aliased/hardlinked mirror paths on disclosure-sensitive verbs, and read mirror definition files through the checked reader (single link, no reparse). Model TMDL loads through `tmdl.load_model` stay outside that gate.
+- Refuse aliased or hardlinked mirror paths on disclosure-sensitive verbs, and read mirror definition files through the checked reader. The opened file must still be that regular file, and the path must stay inside the mirror or the definition folder. `tmdl.load_model` refuses a reparse on the definition directory, each directory it walks, and each `.tmdl` file before it opens them. Pull of the real project and history blobs stay outside that gate.
 - Keep Desktop verification on a disclosure budget with closed outcomes.
 
 **pbz does not claim:**

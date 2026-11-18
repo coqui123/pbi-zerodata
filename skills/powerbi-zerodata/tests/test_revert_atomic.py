@@ -13,6 +13,7 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 import test_parity  # noqa: E402
+from _junction import make_junction  # noqa: E402
 from pbz import common, mirror  # noqa: E402
 
 
@@ -85,6 +86,32 @@ class RevertAtomicTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "REFUSED")
         self.assertNotIn("bad", caught.exception.detail)
         self.assertEqual(file_map(self.ws.mirror), before)
+
+    def test_private_base_junction_refuses_before_read(self):
+        before = file_map(self.ws.mirror)
+        mirror_file = self.paths[0]
+        rel = os.path.relpath(mirror_file, self.ws.mirror).replace("\\", "/")
+        base = os.path.abspath(os.path.join(mirror.base_dir(self.ws, self.project), *rel.split("/")))
+        self.assertTrue(os.path.isfile(base))
+        private = os.path.abspath(self.ws.private)
+        ancestor = os.path.dirname(base)
+        self.assertNotEqual(os.path.normcase(ancestor), os.path.normcase(private))
+        self.assertTrue(os.path.normcase(ancestor).startswith(os.path.normcase(private) + os.sep))
+        outside = os.path.join(self.tmp.name, "outside")
+        outside_file = os.path.join(outside, os.path.relpath(base, ancestor))
+        os.makedirs(os.path.dirname(outside_file), exist_ok=True)
+        with open(outside_file, "wb") as handle:
+            handle.write(b"OUTSIDE")
+        os.rename(ancestor, os.path.join(self.tmp.name, "parked-base"))
+        if not make_junction(None, ancestor, outside):
+            self.skipTest("creating a junction is unavailable")
+        self.addCleanup(os.rmdir, ancestor)
+        with self.assertRaises(common.PbzError) as caught:
+            mirror.revert(self.ws, self.project)
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+        self.assertEqual(file_map(self.ws.mirror), before)
+        with open(outside_file, "rb") as handle:
+            self.assertEqual(handle.read(), b"OUTSIDE")
 
 
 if __name__ == "__main__":

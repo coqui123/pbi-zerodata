@@ -1,14 +1,17 @@
-"""VertiPaq storage per table, column, user hierarchy and relationship, in fixed bands only (`pbz audit memory`).
+"""VertiPaq storage per table, column, user hierarchy and relationship (`pbz audit memory`).
 
 pbz-engine `memory` attributes the model's storage the way VertiPaq Analyzer does (per column: dictionary + data
-segments + attribute hierarchy; user hierarchies; relationships) and releases fixed bands, never sizes or counts:
-`size_band` (<1 MiB, 1-10 MiB, 10-100 MiB, 100-1000 MiB, >=1000 MiB), `share_band` of the whole model (<1%, 1-5%, 5-20%,
->=20%), `dictionary_heavy`, and constant-free booleans on the larger columns of imported tables (`time_part` for date/time
-columns, `fractional` for double/decimal, `long_text` for text longer than 100 characters).
+segments + attribute hierarchy; user hierarchies; relationships) and releases a closed vocabulary, never raw sizes
+or counts: `size_band` (<1 MiB, 1-10 MiB, 10-100 MiB, 100-1000 MiB, >=1000 MiB), `share_band` of the whole model
+(<1%, 1-5%, 5-20%, >=20%), `dictionary_heavy`, `encoding` (`Hash` or `Value`), `segment_band` and `ri_count`
+(0, 1-9, 10-99, 100-999, 1k-9k, 10k+), `ri` (`RI_OK` or `RI_VIOLATION`), and constant-free booleans on imported
+tables (`time_part` for date/time columns, `fractional` for double/decimal, `long_text` for text longer than 100
+characters).
 
-run() saves the banded result to <workspace>/.pbz/memory.json (bands, booleans and object names only, so the agent may
-read it) together with the mirror revision it ran on; load() returns it with "stale": true once the mirror changed.
-Each run is charged to the daily probe budget. In the strict disclosure tier the engine omits every band.
+run() saves that result to <workspace>/.pbz/memory.json together with the mirror revision it ran on; load() returns
+it with "stale": true once the mirror changed. Each run is charged to the daily probe budget. Strict disclosure
+withholds size, share, segment, and referential-integrity count bands. Names, `dictionary_heavy`, `encoding`,
+`ri`, and the predicates stay.
 """
 from __future__ import annotations
 

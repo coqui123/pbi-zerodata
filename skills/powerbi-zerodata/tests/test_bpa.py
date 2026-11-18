@@ -330,6 +330,64 @@ def build(root):
 # ---------------------------------------------------------------- checks
 
 
+def check_omitted_probes(check):
+    """A missing memory key is not examined and is not a clean pass."""
+
+    class Rel:
+        def __init__(self, both):
+            self.name = "SalesCustomer"
+            self.from_table = "Sales"
+            self.from_column = "CustomerKey"
+            self.to_table = "Customer"
+            self.to_column = "CustomerKey"
+            self.both = both
+            self.node = None
+
+    class StandIn:
+        def __init__(self, both, doc):
+            self.rels = [Rel(both)]
+            self._memory_doc = doc
+
+    def ri_doc(ri=None):
+        item = {"name": "SalesCustomer", "from": "Sales[CustomerKey]", "to": "Customer[CustomerKey]"}
+        if ri is not None:
+            item["ri"] = ri
+        return {"relationships": [item]}
+
+    def band_doc(size=None):
+        column = {"name": "CustomerKey"}
+        if size is not None:
+            column["size_band"] = size
+        return {"tables": [
+            {"name": "Sales", "columns": [column]},
+            {"name": "Customer", "columns": [{"name": "CustomerKey"}]},
+        ]}
+
+    examined, hits = bpa._ri_violations(StandIn(False, ri_doc()), {})
+    check(examined == 0 and not hits, "relationship with no ri key was examined or hit")
+    examined, hits = bpa._ri_violations(StandIn(False, ri_doc("RI_VIOLATION")), {})
+    check(examined == 1 and len(hits) == 1, "RI_VIOLATION was not one examined hit")
+    examined, hits = bpa._ri_violations(StandIn(False, ri_doc("RI_OK")), {})
+    check(examined == 1 and not hits, "RI_OK was not examined clean")
+
+    def both_small():
+        return {"tables": [
+            {"name": "Sales", "columns": [{"name": "CustomerKey", "size_band": "<1 MiB"}]},
+            {"name": "Customer", "columns": [{"name": "CustomerKey", "size_band": "<1 MiB"}]},
+        ]}
+
+    examined, hits = bpa._bi_high_card(StandIn(True, band_doc()), {})
+    check(examined == 0 and not hits, "bidirectional relationship with no size_band was examined or hit")
+    examined, hits = bpa._bi_high_card(StandIn(True, band_doc("<1 MiB")), {})
+    check(examined == 0 and not hits, "one measured small column passed an unmeasured end")
+    examined, hits = bpa._bi_high_card(StandIn(True, both_small()), {})
+    check(examined == 1 and not hits, "both small columns were not examined clean")
+    examined, hits = bpa._bi_high_card(StandIn(True, band_doc("10-100 MiB")), {})
+    check(examined == 1 and len(hits) == 1, "bidirectional high-cardinality column was not one examined hit")
+    examined, hits = bpa._bi_high_card(StandIn(False, band_doc("10-100 MiB")), {})
+    check(examined == 0 and not hits, "one-direction relationship was examined")
+
+
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="pbzbpa-")
     root = os.path.join(tmp, "ws")
@@ -341,6 +399,8 @@ def main() -> int:
     def check(cond, msg):
         if not cond:
             fails.append(msg)
+
+    check_omitted_probes(check)
 
     main_p, lite_p = ws.project("Bpa"), ws.project("Lite")
     for p in (main_p, lite_p):

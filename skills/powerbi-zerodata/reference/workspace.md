@@ -53,10 +53,13 @@ pbz describe                     # model overview from the mirror
 pbz describe Sales               # one table
 pbz describe "[Total Sales]"     # one measure
 pbz describe "'Sales'[Amount]"   # one column
-pbz values "'Date'[Year]"        # shape / tokenized samples from mirror metadata
+pbz values "'Date'[Year]"        # category labels, or a distinct bucket and mirror tokens
 ```
 
-These read the sanitized mirror only. They are not Desktop queries and never print live grids.
+`describe` reads the sanitized mirror, plus index buckets when they exist. A category column's
+labels come from the private index, the same labels the mirror leaves readable. `values` returns
+those labels, or a distinct-count bucket and any mirror tokens for that column. Neither command
+is a live query grid.
 
 ## Handoff and memory scrub
 
@@ -68,8 +71,10 @@ pbz memscrub --dir <folder> --apply    # human-only
 pbz memscrub --dir <folder> --show <file>  # human-only scrubbed text
 ```
 
-Agents prepare the checklist; humans confirm visuals. `--apply` and `--show` refuse non-human
-terminals.
+Agents prepare the checklist; humans confirm visuals. A page id that is not one path segment
+is skipped and is not read. `--apply` and `--show` refuse non-human terminals. A missing
+private index still scrubs with the pattern rules and reports `name_detection` as
+`none (run pbz index first)`. `applied` is whether `--apply` was passed.
 
 ## Admin (human-only)
 

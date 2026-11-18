@@ -138,6 +138,15 @@ def accept_generated(ws, project, mirror_revision: str, real_revision: str) -> b
     return True
 
 
+def _page_segment(name: str) -> bool:
+    """True when a page id is one path segment. Traversal and drive ids are ignored."""
+    if not isinstance(name, str) or not name or name in (".", ".."):
+        return False
+    if any(c in name for c in "/\\\x00"):
+        return False
+    return os.path.basename(name) == name
+
+
 def build(ws, project, include_all: bool = False) -> dict:
     anchor_mirror(ws)
     log = pbz_state_path(ws, "push-log.jsonl")
@@ -192,12 +201,16 @@ def build(ws, project, include_all: bool = False) -> dict:
             m = re.search(r"/pages/([^/]+)/(?:visuals/([^/]+)/)?", obj)
             if m:
                 pid, vid = m.groups()
+                if not _page_segment(pid):
+                    continue
                 pjson = os.path.join(project.mirror_report, "definition", "pages", pid, "page.json")
                 pname = pid
                 try:
                     raw = read_checked(pjson, root=ws.mirror)
                     pname = json.loads(raw.decode("utf-8-sig")).get("displayName", pid)
-                except (OSError, ValueError, UnicodeError, PbzError):
+                except PbzError:
+                    raise
+                except (OSError, ValueError, UnicodeError):
                     pass
                 pages.setdefault(pname, set()).add(f"{vid}: layout/format/binding changed" if vid else "page settings changed")
             elif obj.strip():
