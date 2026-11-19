@@ -6,6 +6,7 @@ raw text it replaced in each context, so detokenize(tokenize(x)) == x byte for b
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -60,24 +61,44 @@ class WorkspaceLock:
         os.makedirs(self.directory, exist_ok=True)
         self.fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            if _reparse_link(path) or not stat.S_ISREG(os.fstat(self.fd).st_mode):
+            opened = os.fstat(self.fd)
+            try:
+                live = os.stat(path)
+            except FileNotFoundError:
+                raise PbzError("UNSAFE_PATH", "lock path changed while opening") from None
+            if (_reparse_link(path) or not stat.S_ISREG(opened.st_mode)
+                    or getattr(opened, "st_nlink", 1) > 1
+                    or (opened.st_dev, opened.st_ino) != (live.st_dev, live.st_ino)):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")
             if os.fstat(self.fd).st_size == 0:
-                os.write(self.fd, b"\0")
+                try:
+                    os.write(self.fd, b"\0")
+                except OSError:
+                    # A competing initializer may already hold the byte lock.
+                    pass
             os.lseek(self.fd, 0, os.SEEK_SET)
             if os.name == "nt":
                 import msvcrt
+                deadline = time.monotonic() + 120
                 while True:
                     try:
                         msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
                         break
-                    except OSError:
+                    except OSError as exc:
+                        if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                            raise
+                        if time.monotonic() >= deadline:
+                            raise PbzError("COMMIT_BUSY", "workspace allocator lock timed out") from None
                         time.sleep(0.02)
             else:
                 import fcntl
                 fcntl.flock(self.fd, fcntl.LOCK_EX)
+            if os.fstat(self.fd).st_size == 0:
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                os.write(self.fd, b"\0")
         except BaseException:
             os.close(self.fd)
+            self.fd = -1
             raise
         return self
 
@@ -85,6 +106,35 @@ class WorkspaceLock:
         # Closing releases the OS lock, including on process death. Never unlink.
         os.close(self.fd)
         self.fd = -1
+
+
+def _flush_windows_directory(directory: str) -> None:
+    import ctypes
+    from ctypes import wintypes as wt
+
+    try:
+        kernel = ctypes.windll.kernel32
+        create = kernel.CreateFileW
+        create.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p,
+                           wt.DWORD, wt.DWORD, wt.HANDLE]
+        create.restype = wt.HANDLE
+        flush = kernel.FlushFileBuffers
+        flush.argtypes = [wt.HANDLE]
+        flush.restype = wt.BOOL
+        close = kernel.CloseHandle
+        close.argtypes = [wt.HANDLE]
+        close.restype = wt.BOOL
+        # GENERIC_WRITE, share read/write/delete, OPEN_EXISTING, BACKUP_SEMANTICS.
+        handle = create(directory, 0x40000000, 7, None, 3, 0x02000000, None)
+        if handle in (None, ctypes.c_void_p(-1).value):
+            raise OSError("directory open failed")
+        try:
+            if not flush(handle):
+                raise OSError("directory flush failed")
+        finally:
+            close(handle)
+    except (OSError, AttributeError):
+        raise PbzError("REFUSED", "token map directory durability could not be established") from None
 
 
 class TokenMap:
@@ -116,6 +166,8 @@ class TokenMap:
                     os.fsync(dir_fd)
                 finally:
                     os.close(dir_fd)
+            else:
+                _flush_windows_directory(directory)
         finally:
             if tmp:
                 try:

@@ -7,7 +7,7 @@ import json
 import os
 import re
 
-from . import deps, lexers, tmdl
+from . import deps, lexers, tmdl, tokens
 from .common import PbzError, definition_root, commit_bytes, preflight_regular, read_checked, read_text, write_text, list_names
 from .tokens import TOKEN_RE, TokenMap, apply_edits
 
@@ -843,9 +843,10 @@ def _member_token(ws, member: str) -> str:
     """A token already in hand, or the same `pii` token `tokenize_tmdl` writes for a role member."""
     if TOKEN_RE.fullmatch(member or ""):
         return member
-    tm = TokenMap(ws.private)
-    token = tm.raw("pii", member, "tmdl")
-    tm.save()
+    with tokens.WorkspaceLock(ws.private):
+        tm = TokenMap(ws.private)
+        token = tm.raw("pii", member, "tmdl")
+        tm.save()
     if not TOKEN_RE.fullmatch(token):
         raise PbzError("REFUSED", "member must be a token")
     return token

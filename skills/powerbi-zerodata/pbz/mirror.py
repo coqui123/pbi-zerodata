@@ -739,13 +739,15 @@ def _begin_transaction(ws, project, stamp, targets, authorized_before: dict | No
     return directory, journal
 
 
-def _restore_transaction(ws, project, directory, journal, *, preserve_external=False):
+def _restore_transaction(ws, project, directory, journal, *, preserve_external=False, applied=None):
     if not _journal_ok(journal):
         return {"result": "RECOVERY_REQUIRED"}
     conflicts = []
     # Recovery refuses third-party changes. A live push conflict instead preserves
     # those bytes while undoing every other push-owned write.
     for entry in journal["entries"]:
+        if preserve_external and applied is not None and (entry["scope"], entry["path"]) not in applied:
+            continue
         target = _transaction_path(ws, project, entry)
         trust = ws.root if entry.get("scope") == "workspace" else ws.private
         _must_stay(target, trust)
@@ -760,10 +762,15 @@ def _restore_transaction(ws, project, directory, journal, *, preserve_external=F
         _journal_save(directory, journal)
         return {"result": "RECOVERY_CONFLICT", "conflicts": conflicts}
     for entry in reversed(journal["entries"]):
-        if preserve_external and entry["path"] in conflicts:
+        if preserve_external and (entry["path"] in conflicts or
+                (applied is not None and (entry["scope"], entry["path"]) not in applied)):
             continue
         target = _transaction_path(ws, project, entry)
-        if file_sha(target) == entry["before"]:
+        current = file_sha(target)
+        if preserve_external and current not in (entry["before"], entry["after"]):
+            conflicts.append(entry["path"])
+            continue
+        if current == entry["before"]:
             continue
         if entry["before"] is None:
             if os.path.lexists(target):
@@ -776,7 +783,7 @@ def _restore_transaction(ws, project, directory, journal, *, preserve_external=F
             replace_bytes(target, content, root=trust)
     journal["state"] = "ROLLED_BACK"
     _journal_save(directory, journal)
-    return {"result": "ROLLED_BACK"}
+    return {"result": "ROLLED_BACK", **({"conflicts": conflicts} if conflicts else {})}
 
 
 def _process_alive(pid: int) -> bool:
@@ -1110,6 +1117,7 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
                                          [("private", p, h) for p, h in sorted(private_targets.items())],
                                          pre_real)
         directory, journal = transaction
+        applied = set()
         if any(file_sha(_transaction_path(ws, project, e)) != e["before"] for e in journal["entries"]):
             journal["state"] = "ROLLED_BACK"
             _journal_save(directory, journal)
@@ -1134,13 +1142,16 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
                 replace_bytes(dst, f.read(), root=ws.private)
         if any(file_sha(_real_path(ws, rel)) != h for rel, h in pre_real.items()) or \
                 any(_post_mirror_hash(ws, rel) != h for rel, h in pre_mirror.items()):
-            restored = _restore_transaction(ws, project, directory, journal, preserve_external=True)
+            restored = _restore_transaction(ws, project, directory, journal, preserve_external=True, applied=applied)
             transaction = None
-            return {"verb": "push", **restored, "result": "CONFLICT"}
+            return {"verb": "push", "project": project.name, **restored,
+                    "result": "CONFLICT" if restored.get("result") == "ROLLED_BACK" else restored["result"]}
         for rel, (rtext, bom) in new_real.items():
             write_text(_real_path(ws, rel), rtext, bom, root=ws.root)
+            applied.add(("workspace", rel))
         for rel in ch["deleted"]:
             remove_file(_real_path(ws, rel), root=ws.root)
+            applied.add(("workspace", rel))
             _prune_empty(_real_path(ws, rel), os.path.join(ws.root, rel.split("/")[0]))
         # Commit staged resources by atomic file replacement as well; directory replacement
         # could otherwise leave a partially copied package with an unrecognizable hash.
@@ -1150,27 +1161,34 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
             _must_stay(target, ws.root)
             if os.path.isfile(source):
                 _copy_atomic(source, target, root=ws.root)
+                applied.add(("workspace", rel))
             elif os.path.lexists(target):
                 remove_file(target, root=ws.root)
+                applied.add(("workspace", rel))
                 _prune_empty(target, project.report_dir)
         if any(file_sha(_real_path(ws, rel)) != h for rel, h in real_targets.items()) or \
                 any(_post_mirror_hash(ws, rel) != h for rel, h in pre_mirror.items()):
-            restored = _restore_transaction(ws, project, directory, journal, preserve_external=True)
+            restored = _restore_transaction(ws, project, directory, journal, preserve_external=True, applied=applied)
             transaction = None
-            return {"verb": "push", **restored, "result": "CONFLICT"}
+            return {"verb": "push", "project": project.name, **restored,
+                    "result": "CONFLICT" if restored.get("result") == "ROLLED_BACK" else restored["result"]}
         installed, img_in, img_out = sorted(pkgs), sorted(imgs_new), sorted(imgs_drop)
         for rel in ch["changed"] + ch["added"]:
             mtext, bom = captured_mirror[rel]
             mirror_hash = hashlib.sha256(bom + mtext.encode("utf-8")).hexdigest()
             files[rel] = {"real": real_targets[rel], "mirror": mirror_hash}
-            write_text(os.path.join(base_dir(ws, project), *rel.split("/")), mtext, bom, root=ws.private)
+            bp = os.path.join(base_dir(ws, project), *rel.split("/"))
+            write_text(bp, mtext, bom, root=ws.private)
+            applied.add(("private", os.path.relpath(bp, ws.private).replace("\\", "/")))
         for rel in ch["deleted"]:
             files.pop(rel, None)
             bp = os.path.join(base_dir(ws, project), *rel.split("/"))
             if os.path.exists(bp):
                 remove_file(bp, root=ws.private)
+                applied.add(("private", os.path.relpath(bp, ws.private).replace("\\", "/")))
         man["files"] = files
         save_manifest(ws, project, man)
+        applied.add(("private", os.path.relpath(manifest_path(ws, project), ws.private).replace("\\", "/")))
         journal["state"] = "COMMITTED"
         _journal_save(directory, journal)
         transaction = None  # Project and synchronization metadata have committed together.

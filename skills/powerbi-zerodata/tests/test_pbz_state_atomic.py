@@ -4,6 +4,7 @@ Run: python tests/test_pbz_state_atomic.py
 """
 from __future__ import annotations
 
+import errno
 import json
 import multiprocessing
 import time
@@ -12,14 +13,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pbz.common import PbzError, Workspace, append_checked, read_checked  # noqa: E402
-from pbz import audit, checks, docs, handoff, memory, mirror, tokens  # noqa: E402
+from pbz import audit, checks, docs, governance, handoff, memory, mirror, tokens  # noqa: E402
 
 
 CANARY = b"CANARY-STATE-LINE\n"
@@ -30,9 +31,39 @@ def allocation_pull(root, private, name, barrier=None, kill=False):
     ws = Workspace(root)
     original = tokens.TokenMap.__init__
 
+    locked = False
+    real_lock = getattr(tokens, "WorkspaceLock", None)
+
+    def rendezvous():
+        if barrier is not None:
+            barrier.wait(timeout=20)
+
+    class ObservedLock:
+        def __init__(self, directory):
+            self.directory = directory
+            self.inner = real_lock(directory)
+
+        def __enter__(self):
+            nonlocal locked
+            # Both workers hold an actual pre-lock map before either can save.
+            snapshot = tokens.TokenMap.__new__(tokens.TokenMap)
+            original(snapshot, self.directory)
+            rendezvous()
+            self.inner.__enter__()
+            locked = True
+            return self
+
+        def __exit__(self, *exc):
+            nonlocal locked
+            locked = False
+            return self.inner.__exit__(*exc)
+
     def slow_load(self, directory):
         original(self, directory)
-        time.sleep(0.3)  # Widen the old unlocked load/save race; no barrier inside the lock.
+        if not locked:
+            # The old implementation loads without a lock. Rendezvous after that
+            # load makes its lost update deterministic, rather than sleep-based.
+            rendezvous()
 
     def crash_before_publication(*args, **kwargs):
         os._exit(77)
@@ -40,9 +71,8 @@ def allocation_pull(root, private, name, barrier=None, kill=False):
     def crash_while_locked(*args):
         os._exit(78)
 
-    if barrier is not None:
-        barrier.wait(timeout=20)  # Both processes arrive BEFORE acquiring any lock.
-    with patch.object(tokens.TokenMap, "__init__", slow_load):
+    with patch.object(tokens, "WorkspaceLock", ObservedLock, create=True), \
+            patch.object(tokens.TokenMap, "__init__", slow_load):
         if kill == "locked":
             with patch.object(tokens.TokenMap, "save", crash_while_locked):
                 mirror.pull(ws, ws.project(name))
@@ -51,6 +81,18 @@ def allocation_pull(root, private, name, barrier=None, kill=False):
                 mirror.pull(ws, ws.project(name))
         else:
             mirror.pull(ws, ws.project(name))
+
+
+def lock_worker(private, ready, completed, output, hold):
+    if not hold:
+        ready.set()
+    with tokens.WorkspaceLock(private):
+        if hold:
+            ready.set()
+            time.sleep(60)
+        else:
+            output.put("acquired-after-holder")
+            completed.set()
 
 
 class StateAtomicTests(unittest.TestCase):
@@ -73,8 +115,7 @@ class StateAtomicTests(unittest.TestCase):
                 "model.tmdl": "model Model\n\tref table T\n",
                 "tables/T.tmdl": 'table T\n\tmeasure M = "' + name + '@example.invalid"\n',
             }.items():
-                with open(os.path.join(definition, rel), "w", encoding="utf-8") as handle:
-                    handle.write(text)
+                Path(definition, rel).write_bytes(text.encode("utf-8"))
         return root, private
 
     def _join_process(self, process, expected=0):
@@ -157,12 +198,28 @@ class StateAtomicTests(unittest.TestCase):
     def test_allocator_lock_released_on_process_death(self):
         root, private = self._allocation_projects()
         ctx = multiprocessing.get_context("spawn")
-        process = ctx.Process(target=allocation_pull, args=(root, private, "A", None, "locked"))
-        process.start()
-        self._join_process(process, 78)
-        process = ctx.Process(target=allocation_pull, args=(root, private, "B"))
-        process.start()
-        self._join_process(process)
+        ready, attempted, completed = ctx.Event(), ctx.Event(), ctx.Event()
+        output = ctx.Queue()
+        holder = ctx.Process(target=lock_worker, args=(private, ready, None, None, True))
+        waiter = ctx.Process(target=lock_worker, args=(private, attempted, completed, output, False))
+        holder.start()
+        try:
+            self.assertTrue(ready.wait(10), "holder did not acquire lock")
+            waiter.start()
+            self.assertTrue(attempted.wait(10), "waiter did not attempt lock")
+            self.assertFalse(completed.wait(0.3), "waiter bypassed live holder")
+            self.assertTrue(waiter.is_alive())
+            holder.kill()
+            holder.join(5)
+            self._join_process(waiter)
+            self.assertTrue(completed.is_set())
+            self.assertEqual(output.get(timeout=5), "acquired-after-holder")
+        finally:
+            for child in (holder, waiter):
+                if child.pid and child.is_alive():
+                    child.terminate()
+                    child.join(5)
+            output.close()
 
     def test_kill_after_map_save_before_publication(self):
         root, private = self._allocation_projects()
@@ -186,6 +243,126 @@ class StateAtomicTests(unittest.TestCase):
             text = Path(os.path.join(ws.mirror, *rel.split("/"))).read_text(encoding="utf-8")
             self.assertEqual(mirror._detokenize(rel, text, tm)[0].encode(),
                              Path(mirror._real_path(ws, rel)).read_bytes())
+
+    def test_governance_allocator_lock_wraps_load_allocate_save(self):
+        active = []
+
+        class Lock:
+            def __init__(self, directory):
+                self.directory = directory
+
+            def __enter__(inner):
+                self.assertEqual(inner.directory, self.ws.private)
+                active.append(True)
+
+            def __exit__(inner, *exc):
+                active.pop()
+
+        tm = Mock()
+        tm.raw.side_effect = lambda *a: self.assertTrue(active) or "«pii#1»"
+        tm.save.side_effect = lambda: self.assertTrue(active)
+
+        def load(directory):
+            self.assertTrue(active)
+            return tm
+
+        with patch.object(tokens, "WorkspaceLock", Lock), patch.object(governance, "TokenMap", load):
+            self.assertEqual(governance._member_token(self.ws, "member@example.invalid"), "«pii#1»")
+        tm.save.assert_called_once_with()
+        self.assertFalse(active)
+
+    def test_allocator_hardlink_refused(self):
+        os.makedirs(self.ws.private, exist_ok=True)
+        source = Path(self.ws.private, "source")
+        source.write_bytes(b"canary")
+        os.link(source, Path(self.ws.private, "tokens.lock"))
+        with self.assertRaises(PbzError) as caught:
+            with tokens.WorkspaceLock(self.ws.private):
+                self.fail("hardlink accepted")
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+        self.assertEqual(source.read_bytes(), b"canary")
+
+    def test_allocator_replaced_path_refused(self):
+        original_open = os.open
+
+        def swap(path, *args, **kwargs):
+            fd = original_open(path, *args, **kwargs)
+            if str(path).endswith("tokens.lock"):
+                os.rename(path, str(path) + ".old")
+                Path(path).write_bytes(b"replacement")
+            return fd
+
+        with patch("os.open", swap), self.assertRaises(PbzError) as caught:
+            with tokens.WorkspaceLock(self.ws.private):
+                self.fail("replaced path accepted")
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+
+    def test_windows_allocator_retry_classification_and_deadline(self):
+        for errors, clock, expected in (
+            ([OSError(errno.EACCES, "busy"), None], [0, 1], None),
+            ([OSError(errno.EAGAIN, "busy"), None], [0, 1], None),
+            ([OSError(errno.EIO, "broken")], [0], OSError),
+            ([OSError(errno.EACCES, "busy")], [0, 120], PbzError),
+        ):
+            msvcrt = Mock(LK_NBLCK=1)
+            msvcrt.locking.side_effect = errors
+            with patch.dict(sys.modules, {"msvcrt": msvcrt}), \
+                    patch.object(tokens.os, "name", "nt"), \
+                    patch.object(tokens.time, "monotonic", side_effect=clock), \
+                    patch.object(tokens.time, "sleep"):
+                if expected:
+                    with self.assertRaises(expected) as caught:
+                        with tokens.WorkspaceLock(self.ws.private):
+                            self.fail("lock should fail")
+                    if expected is PbzError:
+                        self.assertEqual(caught.exception.code, "COMMIT_BUSY")
+                else:
+                    with tokens.WorkspaceLock(self.ws.private):
+                        pass
+                self.assertEqual(msvcrt.locking.call_count, len(errors))
+
+    def test_allocator_competing_initializer_retries_under_lock(self):
+        real_write = os.write
+        writes = []
+
+        def write(fd, data):
+            writes.append(data)
+            if len(writes) == 1:
+                raise OSError(errno.EACCES, "initializer busy")
+            return real_write(fd, data)
+
+        with patch.object(tokens.os, "write", write):
+            with tokens.WorkspaceLock(self.ws.private) as lock:
+                self.assertEqual(os.fstat(lock.fd).st_size, 1)
+        self.assertEqual(writes, [b"\0", b"\0"])
+
+    def test_windows_token_save_directory_flush_and_refusal(self):
+        import ctypes
+        kernel = Mock()
+        kernel.CreateFileW.return_value = 123
+        kernel.FlushFileBuffers.return_value = 1
+        tm = tokens.TokenMap(self.ws.private)
+        tm.raw("pii", "secret", "tmdl")
+        with patch.object(tokens.os, "name", "nt"), \
+                patch.object(ctypes, "windll", Mock(kernel32=kernel), create=True):
+            tm.save()
+        self.assertEqual(kernel.CreateFileW.call_args.args[5], 0x02000000)
+        kernel.FlushFileBuffers.assert_called_once_with(123)
+        kernel.CloseHandle.assert_called_once_with(123)
+        self.assertFalse(tm.dirty)
+        for opened, flushed in ((123, 0), (ctypes.c_void_p(-1).value, 1)):
+            kernel.reset_mock()
+            kernel.CreateFileW.return_value = opened
+            kernel.FlushFileBuffers.return_value = flushed
+            tm.raw("pii", str(opened), "tmdl")
+            tm.dirty = True
+            with patch.object(tokens.os, "name", "nt"), \
+                    patch.object(ctypes, "windll", Mock(kernel32=kernel), create=True):
+                with self.assertRaises(PbzError) as caught:
+                    tm.save()
+            self.assertEqual(caught.exception.code, "REFUSED")
+            self.assertTrue(tm.dirty)
+            self.assertEqual(kernel.CloseHandle.call_count, int(opened == 123))
 
     def _junction(self, link: str, target: str) -> None:
         from _junction import make_junction

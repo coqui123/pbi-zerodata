@@ -19,7 +19,7 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 import test_parity  # noqa: E402
-from pbz import cli, common, mcp, mirror, outcomes  # noqa: E402
+from pbz import cli, common, mcp, mirror, outcomes, tokens  # noqa: E402
 
 
 def file_map(root):
@@ -69,6 +69,7 @@ class PushBoundaryTests(unittest.TestCase):
         with patch("pbz.mirror.validate.run_stage", validate), patch("pbz.mirror.desktop.find_instance", lambda p: None):
             out = mirror.push(self.ws, self.project)
         self.assertEqual(out["result"], "CONFLICT")
+        self.assertEqual(mirror.pending_recovery(self.ws, self.project), [])
         self.assertEqual(file_map(os.path.dirname(mirror.manifest_path(self.ws, self.project))), manifest)
 
     def test_addition_appearing_during_validation_is_not_adopted(self):
@@ -88,6 +89,7 @@ class PushBoundaryTests(unittest.TestCase):
         with patch("pbz.mirror.validate.run_stage", validate), patch("pbz.mirror.desktop.find_instance", lambda p: None):
             out = mirror.push(self.ws, self.project)
         self.assertEqual(out["result"], "CONFLICT")
+        self.assertEqual(mirror.pending_recovery(self.ws, self.project), [])
         self.assertEqual(open(real, encoding="utf-8").read(), "CANARY-ADDED")
 
     def _project_bytes(self):
@@ -114,6 +116,7 @@ class PushBoundaryTests(unittest.TestCase):
                 patch("pbz.mirror.desktop.find_instance", return_value=None):
             out = mirror.push(self.ws, self.project)
         self.assertEqual(out["result"], "CONFLICT")
+        self.assertEqual(mirror.pending_recovery(self.ws, self.project), [])
         before[rel] = injected
         self.assertEqual(self._project_bytes(), before)
         self.assertEqual(self._sync_bytes(), manifest)
@@ -127,8 +130,28 @@ class PushBoundaryTests(unittest.TestCase):
         manifest = self._sync_bytes()
         injected = b"EDITOR-RECREATED-MIRROR\n"
         original = mirror.write_text
+        original_hash = mirror._post_mirror_hash
+        original_journal = mirror._journal_save
+        original_remove = mirror.remove_file
+        events = []
+
+        def journal(directory, journal):
+            result = original_journal(directory, journal)
+            events.append(journal["state"])
+            return result
+
+        def remove(path, **kwargs):
+            if kwargs.get("root") == self.ws.root:
+                events.append("remove")
+            return original_remove(path, **kwargs)
+
+        def checked(*args, **kwargs):
+            result = original_hash(*args, **kwargs)
+            events.append("check")
+            return result
 
         def recreate(*args, **kwargs):
+            events.append("inject")
             with open(path, "wb") as handle:
                 handle.write(injected)
             return []
@@ -136,18 +159,32 @@ class PushBoundaryTests(unittest.TestCase):
         def write(*args, **kwargs):
             result = original(*args, **kwargs)
             if kwargs.get("root") == self.ws.root:
+                events.append("write")
                 recreate()
             return result
 
         with patch("pbz.mirror.validate.run_stage", return_value=[]) if late else \
                 patch("pbz.mirror.validate.run_stage", recreate), \
                 patch("pbz.mirror.write_text", write), \
+                patch("pbz.mirror._post_mirror_hash", checked), \
+                patch("pbz.mirror._journal_save", journal), \
+                patch("pbz.mirror.remove_file", remove), \
                 patch("pbz.mirror.desktop.find_instance", return_value=None):
             out = mirror.push(self.ws, self.project)
         self.assertEqual(out["result"], "CONFLICT")
+        self.assertEqual(mirror.pending_recovery(self.ws, self.project), [])
         self.assertEqual(Path(path).read_bytes(), injected)
         self.assertEqual(self._project_bytes(), before)
         self.assertEqual(self._sync_bytes(), manifest)
+        if late:
+            first_write = events.index("write")
+            applying = events.index("APPLYING")
+            self.assertIn("check", events[applying + 1:first_write])
+            self.assertEqual(events[first_write + 1], "inject")
+            self.assertIn("check", events[first_write + 2:])
+        else:
+            self.assertNotIn("write", events)
+            self.assertNotIn("remove", events)
 
     def test_deleted_mirror_recreated_during_staging(self):
         self._recreated_deletion(False)
@@ -157,13 +194,17 @@ class PushBoundaryTests(unittest.TestCase):
 
     def test_editor_save_after_push_write_survives_and_other_writes_rollback(self):
         rel, _ = self._touch_mirror(".SemanticModel/")
-        self._touch_mirror(".Report/")
+        other_rel, _ = self._touch_mirror(".Report/")
         before = self._project_bytes()
+        manifest = self._sync_bytes()
+        writes = {}
         original = mirror.write_text
         injected = b"EDITOR-SAVE-AFTER-WRITE\n"
 
         def write(path, *args, **kwargs):
             result = original(path, *args, **kwargs)
+            if kwargs.get("root") == self.ws.root:
+                writes[path] = Path(path).read_bytes()
             if path == mirror._real_path(self.ws, rel):
                 with open(path, "wb") as handle:
                     handle.write(injected)
@@ -174,8 +215,113 @@ class PushBoundaryTests(unittest.TestCase):
                 patch("pbz.mirror.desktop.find_instance", return_value=None):
             out = mirror.push(self.ws, self.project)
         self.assertEqual(out["result"], "CONFLICT")
+        self.assertEqual(mirror.pending_recovery(self.ws, self.project), [])
         before[rel] = injected
         self.assertEqual(self._project_bytes(), before)
+        self.assertEqual(self._sync_bytes(), manifest)
+        other_real = mirror._real_path(self.ws, other_rel)
+        self.assertIn(other_real, writes)
+        self.assertNotEqual(writes[other_real], before[other_rel])
+
+    def test_untouched_candidate_bytes_survive_staging_conflict(self):
+        trigger, _ = self._touch_mirror(".SemanticModel/")
+        candidate, candidate_path = self._touch_mirror(".Report/")
+        before = self._project_bytes()
+        sync = self._sync_bytes()
+        tm = tokens.TokenMap(self.ws.private)
+        text, bom = common.read_text(candidate_path)
+        after, unknown = mirror._detokenize(candidate, text, tm)
+        self.assertFalse(unknown)
+        candidate_bytes = bom + after.encode("utf-8")
+        garbage = b"EDITOR-TRIGGER\x00\xff\n"
+        original = mirror._journal_save
+        real_writes = []
+        original_write = mirror.write_text
+
+        def journal(directory, journal):
+            result = original(directory, journal)
+            if journal["state"] == "APPLYING":
+                Path(mirror._real_path(self.ws, trigger)).write_bytes(garbage)
+                Path(mirror._real_path(self.ws, candidate)).write_bytes(candidate_bytes)
+            return result
+
+        def write(path, *args, **kwargs):
+            if kwargs.get("root") == self.ws.root:
+                real_writes.append(path)
+            return original_write(path, *args, **kwargs)
+
+        with patch("pbz.mirror._journal_save", journal), \
+                patch("pbz.mirror.write_text", write), \
+                patch("pbz.mirror.validate.run_stage", return_value=[]), \
+                patch("pbz.mirror.desktop.find_instance", return_value=None):
+            out = mirror.push(self.ws, self.project)
+        self.assertEqual(out["result"], "CONFLICT")
+        self.assertEqual(out["project"], self.project.name)
+        self.assertEqual(real_writes, [])
+        before[trigger], before[candidate] = garbage, candidate_bytes
+        self.assertEqual(self._project_bytes(), before)
+        self.assertEqual(self._sync_bytes(), sync)
+        self.assertEqual(mirror.pending_recovery(self.ws, self.project), [])
+
+    def test_restore_rechecks_applied_target_before_overwrite(self):
+        rel = next(iter(self._project_bytes()))
+        real = mirror._real_path(self.ws, rel)
+        after = b"push-candidate"
+        directory, journal = mirror._begin_transaction(
+            self.ws, self.project, "restore-recheck", [("workspace", rel, common.sha(after))])
+        Path(real).write_bytes(after)
+        original_hash = mirror.file_sha
+        reads = []
+
+        def hash_file(path):
+            if path == real:
+                reads.append(path)
+                if len(reads) == 2:
+                    Path(real).write_bytes(b"third-party-during-restore")
+            return original_hash(path)
+
+        with patch("pbz.mirror.file_sha", hash_file):
+            out = mirror._restore_transaction(
+                self.ws, self.project, directory, journal, preserve_external=True,
+                applied={("workspace", rel)})
+        self.assertEqual(out, {"result": "ROLLED_BACK", "conflicts": [rel]})
+        self.assertEqual(Path(real).read_bytes(), b"third-party-during-restore")
+        self.assertEqual(mirror.pending_recovery(self.ws, self.project), [])
+
+    def test_conflict_preserves_nonclean_restore_result(self):
+        for late in (False, True):
+            with self.subTest(late=late):
+                rel, _ = self._touch_mirror(".SemanticModel/")
+                real = mirror._real_path(self.ws, rel)
+                before_real = Path(real).read_bytes()
+                original_save, original_write = mirror._journal_save, mirror.write_text
+
+                def journal(directory, journal):
+                    result = original_save(directory, journal)
+                    if not late and journal["state"] == "APPLYING":
+                        Path(real).write_bytes(b"external")
+                    return result
+
+                def write(path, *args, **kwargs):
+                    result = original_write(path, *args, **kwargs)
+                    if late and path == real:
+                        Path(real).write_bytes(b"external")
+                    return result
+
+                restore_result = {"result": "RECOVERY_REQUIRED", "conflicts": [rel], "detail": "retained"}
+                with patch("pbz.mirror._journal_save", journal), \
+                        patch("pbz.mirror.write_text", write), \
+                        patch("pbz.mirror._restore_transaction", return_value=restore_result), \
+                        patch("pbz.mirror.validate.run_stage", return_value=[]), \
+                        patch("pbz.mirror.desktop.find_instance", return_value=None):
+                    out = mirror.push(self.ws, self.project)
+                self.assertEqual(out, {"verb": "push", "project": self.project.name, **restore_result})
+                # This intentionally mocked restore leaves a pending transaction.
+                # Finish it before the next subcase with the saved original bytes.
+                directory = mirror._transaction_dir(self.ws, self.project)
+                import shutil
+                shutil.rmtree(directory)
+                Path(real).write_bytes(before_real)
 
     def test_excluded_directory_addition_is_refused(self):
         folder = os.path.join(self.ws.mirror, self.project.name + ".SemanticModel", ".pbi")
@@ -283,8 +429,10 @@ class PushBoundaryTests(unittest.TestCase):
         self.assertNotIn("CANARY-OTHER", json.dumps(out))
         # Item R-2: the mirror text collector now refuses the whole collection on an
         # unsafe in-scope entry instead of silently omitting it, so no text is served.
-        with self.assertRaises(common.PbzError):
+        with self.assertRaises(common.PbzError) as caught:
             mirror.mirror_texts(self.ws, self.project)
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+        self.assertNotIn("CANARY-OTHER", str(caught.exception))
 
     def test_cross_project_directory_junction_is_not_walked(self):
         other = os.path.join(self.ws.mirror, "Other.Report", "definition", "secret")
