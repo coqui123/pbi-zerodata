@@ -260,24 +260,12 @@ def _dax_text(model, node) -> str:
 
 
 def _index(ws) -> dict:
-    path = os.path.join(ws.private, "index-summary.json")
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return {}
-    except OSError:
-        raise PbzError("REFUSED", "index summary is unreadable") from None
-    try:
-        data = json.loads(read_checked(path, root=ws.private).decode("utf-8"))
-    except PbzError:
-        raise
-    except (OSError, ValueError, UnicodeError):
-        raise PbzError("REFUSED", "index summary is unreadable") from None
+    from .describe import _index_summary
     out = {}
-    for t in data.get("tables", []):
-        out[(t.get("table") or "").lower()] = {"rows": t.get("rows_bucket"),
-                                               "cols": {(c.get("column") or "").lower(): c.get("card_bucket")
-                                                        for c in t.get("columns", [])}}
+    for name, table in _index_summary(ws).items():
+        out[name.lower()] = {"rows": table.get("rows_bucket"),
+                             "cols": {c["column"].lower(): c.get("card_bucket")
+                                      for c in table["columns"]}}
     return out
 
 

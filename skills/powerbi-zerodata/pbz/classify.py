@@ -211,10 +211,11 @@ def is_common_word(word: str) -> bool:
 
 
 class Classifier:
-    def __init__(self, model, private_dir: str | None, policy: dict):
+    def __init__(self, model, private_dir: str | None, policy: dict, project: str | None = None):
         self.model = model
         self.policy = policy or {}
         self.index = None
+        self.untrusted_index = False
         self.categories: dict = {}
         self.key = None
         self.hmac_to_col: dict[str, str] = {}
@@ -223,28 +224,22 @@ class Classifier:
             index_path = os.path.join(private_dir, "index.json")
             if _reparse_link(index_path):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-            missing = False
-            try:
-                with open(index_path, encoding="utf-8") as f:
-                    loaded = json.load(f)
-            except FileNotFoundError:
-                missing = True
-            except (OSError, ValueError):
-                raise PbzError("REFUSED", "private index could not be read") from None
-            if not missing:
-                if not isinstance(loaded, dict):
-                    raise PbzError("REFUSED", "private index could not be read")
-                self.index = loaded
+            from . import index_store
+            stored = index_store.load(private_dir, project) if project is not None else None
+            self.untrusted_index = stored is None and any(os.path.lexists(os.path.join(private_dir, name))
+                                                         for name in ("index.json", "index-current.json"))
+            if stored:
                 try:
+                    loaded = json.loads(stored["index.json"])
+                    cats = json.loads(dpapi.unprotect(stored["categories.bin"]))
+                    if not isinstance(loaded, dict) or not isinstance(loaded.get("columns"), dict) or not isinstance(cats, dict):
+                        raise ValueError()
+                    self.index = loaded
                     self.key = dpapi.load_key(private_dir, create=False)
-                except (OSError, ValueError):
+                    self.categories = {k: v for k, v in cats.items() if isinstance(v, list)
+                                       and all(isinstance(x, str) for x in v)}
+                except (OSError, ValueError, UnicodeError):
                     raise PbzError("REFUSED", "private index could not be read") from None
-            raw = dpapi.read_protected(os.path.join(private_dir, "categories.bin")) if self.index is not None else None
-            if raw:
-                try:
-                    self.categories = json.loads(raw.decode("utf-8"))
-                except ValueError:
-                    self.categories = {}
         self.mode = "index" if self.index is not None and self.key else "heuristic"
         self.sensitive_cols = {c.lower() for c in self.policy.get("sensitive_columns", [])}
         self.category_cols = {c.lower() for c in self.policy.get("category_columns", [])}
@@ -312,6 +307,8 @@ class Classifier:
                 return "category"
             if cls == "high":
                 return "sensitive"
+        if self.untrusted_index:
+            return "sensitive"
         return "category" if name_words(column) & CATEGORY_WORDS else "sensitive"
 
     def category_values(self, table: str, column: str) -> list | None:
@@ -376,6 +373,10 @@ class Classifier:
         if vtype == "string" and isinstance(value, str) and (
                 _EMAIL_VALUE.match(value.strip()) or looks_like_phone(value) or looks_like_long_digits(value)):
             return "pii"
+        if column and self.mode == "index" and self.column_class(*column) == "category" \
+                and self.label(*column).lower() not in self.category_cols:
+            if value not in (self.category_values(*column) or []):
+                return self.label(*column)
         if self.strict:
             return self._strict_literal(value, vtype, column)
         if column:

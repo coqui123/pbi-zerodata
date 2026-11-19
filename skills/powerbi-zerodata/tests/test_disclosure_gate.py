@@ -6,12 +6,15 @@ import os
 import sys
 import tempfile
 import unittest
+import subprocess
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL))
 
-from pbz import cli, dpapi, tokens  # noqa: E402
+from pbz import audit, checks, cli, describe, dpapi, index_store, tmdl, tokens, unused  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 from pbz.classify import Classifier, looks_like_phone  # noqa: E402
 from _junction import make_junction  # noqa: E402
@@ -277,6 +280,122 @@ class IndexLinkTests(unittest.TestCase):
         heuristic = Classifier(None, bare.name, {})
         self.assertEqual(heuristic.mode, "heuristic")
         self.assertIsNone(heuristic.index)
+
+
+class IndexGenerationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = SimpleNamespace(private=self.tmp.name)
+        self.a = SimpleNamespace(name="A", mirror_model=self.tmp.name)
+        self.b = SimpleNamespace(name="B", mirror_model=self.tmp.name)
+        self.pol = {"disclosure": "shape"}
+        self.cls = "category"
+        self.model = tmdl.Model()
+        definition = Path(self.tmp.name) / "definition"
+        (definition / "tables").mkdir(parents=True)
+        (definition / "tables" / "T.tmdl").write_text(
+            "table T\n\tcolumn Status\n\t\tdataType: string\n\tcolumn Owner\n\t\tdataType: string\n")
+        self.model = tmdl.load_model(str(definition))
+
+    def engine(self, verb, payload, timeout=30):
+        cols = {"T[Status]": {"type": "string", "class": self.cls},
+                "T[Owner]": {"type": "string", "class": "category"}}
+        (Path(self.ws.private) / "index.json").write_text(json.dumps({"columns": cols}))
+        dpapi.load_key(self.ws.private)
+        cats = {"T[Owner]": ["Ada Jones"]}
+        if self.cls == "category":
+            cats["T[Status]"] = ["Shared", "Member"]
+        dpapi.write_protected(str(Path(self.ws.private) / "categories.bin"), json.dumps(cats).encode())
+        return {"ok": True, "tables": [{"table": "T", "rows_bucket": "1-9", "columns": [
+            {"column": "Status", "class": self.cls, "card_bucket": "1-9"},
+            {"column": "Owner", "class": "category", "card_bucket": "1-9"}]}]}
+
+    def run_index(self, project):
+        with patch("pbz.checks.policy_mod.load", return_value=self.pol), \
+                patch("pbz.checks.desktop.require_port", return_value=1), \
+                patch("pbz.checks.engine_call", self.engine):
+            return checks.index(self.ws, project)
+
+    def test_project_b_after_index_a_last_and_membership(self):
+        self.cls = "high"
+        self.run_index(self.b)
+        self.cls = "category"
+        self.run_index(self.a)  # Pin the order: A overwrites the shared staging store last.
+        a = Classifier(self.model, self.ws.private, {}, "A")
+        b = Classifier(self.model, self.ws.private, {}, "B")
+        self.assertEqual(a.category_values("T", "Status"), ["Shared", "Member"])
+        self.assertIsNone(a.literal("Member", "string", ("T", "Status")))
+        self.assertEqual(a.literal("New", "string", ("T", "Status")), "T[Status]")
+        self.assertIsNone(b.category_values("T", "Status"))
+        # Shared is a member in A: rejecting it in B requires identity, not membership.
+        self.assertEqual(b.literal("Shared", "string", ("T", "Status")), "T[Status]")
+        self.assertEqual(b.literal("Other", "string", ("T", "Status")), "T[Status]")
+        with patch("pbz.describe.policy_mod.load", return_value={}):
+            self.assertEqual(describe.values(self.ws, self.a, "T[Status]")["values"], ["Shared", "Member"])
+            labels_b = describe.values(self.ws, self.b, "T[Status]")
+        self.assertNotIn("values", labels_b)
+        self.assertNotIn("Shared", json.dumps(labels_b))
+
+
+    def test_hardened_summary_and_all_artifacts_are_one_generation(self):
+        out = self.run_index(self.a)
+        stored = index_store.load(self.ws.private, "A")
+        idx = json.loads(stored["index.json"])
+        cats = json.loads(dpapi.unprotect(stored["categories.bin"]))
+        summary = json.loads(stored["index-summary.json"])
+        self.assertEqual(out["personal_or_id_columns_hashed"], 1)
+        self.assertEqual(idx["columns"]["T[Owner]"]["class"], "high")
+        self.assertNotIn("T[Owner]", cats)
+        self.assertEqual(summary["tables"][0]["columns"][1]["class"], "high")
+        manifest = json.loads((Path(self.ws.private) / "index-current.json").read_text())
+        path = Path(self.ws.private) / manifest["generation"] / "categories.bin"
+        path.write_bytes(b"mixed generation")
+        self.assertIsNone(index_store.load(self.ws.private, "A"))
+        self.assertIsNone(Classifier(self.model, self.ws.private, {}, "A").category_values("T", "Status"))
+        self.assertEqual(describe._index_summary(self.ws), {})
+        self.assertEqual(audit._index(self.ws), {})
+        self.assertEqual(unused._index_summary(self.ws), {})
+
+    def test_kill_before_hardening_never_publishes_personal_category(self):
+        # A real child dies after the engine writes a low-cardinality PERSONAL column,
+        # before hardening. This fixture would move Owner to high if allowed to finish.
+        script = r"""
+import json, os, signal, sys
+from types import SimpleNamespace
+from unittest.mock import patch
+from pbz import checks, dpapi
+ws = SimpleNamespace(private=sys.argv[1])
+def engine(*args, **kwargs):
+    with open(os.path.join(ws.private, "index.json"), "w") as f:
+        json.dump({"columns": {"T[Owner]": {"type": "string", "class": "category"}}}, f)
+    dpapi.load_key(ws.private)
+    dpapi.write_protected(os.path.join(ws.private, "categories.bin"), b'{"T[Owner]":["Ada Jones"]}')
+    return {"ok": True, "tables": [{"table": "T", "columns": [{"column": "Owner", "class": "category"}]}]}
+def kill(*args):
+    os.kill(os.getpid(), signal.SIGTERM)
+with patch("pbz.checks.policy_mod.load", return_value={}), patch("pbz.checks.desktop.require_port", return_value=1), patch("pbz.checks.engine_call", engine), patch("pbz.checks.harden_index", kill):
+    checks.index(ws, SimpleNamespace(name="A"))
+"""
+        proc = subprocess.run([sys.executable, "-c", script, self.ws.private], cwd=SKILL,
+                              capture_output=True, timeout=30)
+        self.assertNotEqual(proc.returncode, 0, proc.stderr.decode())
+        staged = json.loads((Path(self.ws.private) / "index.json").read_text())
+        self.assertEqual(staged["columns"]["T[Owner]"]["class"], "category")
+        self.assertIsNone(index_store.load(self.ws.private, "A"))
+        self.assertIsNone(Classifier(self.model, self.ws.private, {}, "A").category_values("T", "Owner"))
+        self.assertEqual(describe._index_summary(self.ws), {})
+        self.assertEqual(audit._index(self.ws), {})
+        self.assertEqual(unused._index_summary(self.ws), {})
+
+    def test_failed_reindex_keeps_previous_completed_generation(self):
+        self.run_index(self.a)
+        before = index_store.load(self.ws.private, "A")
+        with patch("pbz.checks.harden_index", side_effect=RuntimeError("interrupted")):
+            with self.assertRaises(RuntimeError):
+                self.run_index(self.b)
+        self.assertEqual(index_store.load(self.ws.private, "A"), before)
+        self.assertIsNone(index_store.load(self.ws.private, "B"))
 
 
 if __name__ == "__main__":

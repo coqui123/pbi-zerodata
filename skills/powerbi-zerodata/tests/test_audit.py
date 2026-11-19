@@ -15,7 +15,7 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 import test_parity  # noqa: E402
-from pbz import audit, common, mirror  # noqa: E402
+from pbz import audit, common, dpapi, index_store, mirror  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 
 T = "\t"
@@ -248,6 +248,11 @@ def main() -> int:
                                "columns": [{"column": "Amount Copy", "card_bucket": "10k+"}]},
                               {"table": "Customer", "rows_bucket": "1k-9k",
                                "columns": [{"column": "CustomerKey", "card_bucket": "10k+"}]}]}, f)
+    with open(os.path.join(ws.private, "index.json"), "w", encoding="utf-8") as f:
+        json.dump({"columns": {}}, f)
+    dpapi.write_protected(os.path.join(ws.private, "categories.bin"), b"{}")
+    with open(os.path.join(ws.private, "index-summary.json"), encoding="utf-8") as f:
+        index_store.publish(ws.private, project.name, json.load(f))
     r = audit.run(ws, project)
     it = find(r, "ITERATOR_MEASURE_CALL", "[Iter Call]")[0]
     check(it["severity"] == "medium" and it["evidence"] == ["rows: 10k+ (index)"], f"row bucket raises severity: {it}")

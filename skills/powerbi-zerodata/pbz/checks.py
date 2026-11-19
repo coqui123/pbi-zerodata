@@ -321,8 +321,9 @@ def _unlock_fd(fd: int) -> None:
 class _StateLock:
     """Exclusive lock file beside state.json, held across a read-modify-write."""
 
-    def __init__(self, ws):
+    def __init__(self, ws, name=None):
         self.ws = ws
+        self.name = name
         self.fd = -1
         self.path = ""
 
@@ -330,7 +331,7 @@ class _StateLock:
         if _reparse_link(self.ws.private):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         os.makedirs(self.ws.private, exist_ok=True)
-        self.path = _state_path(self.ws) + ".lock"
+        self.path = os.path.join(self.ws.private, self.name) if self.name else _state_path(self.ws) + ".lock"
         if _reparse_link(self.path):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR)
@@ -358,7 +359,7 @@ class _StateLock:
                 os.close(fd)
             except OSError:
                 pass
-        if path:
+        if path and self.name is None:
             try:
                 os.remove(path)
             except OSError:
@@ -543,7 +544,7 @@ def run_checks(ws, project, spec: dict) -> dict:
         st = _load_state(ws)
         known = model_literals(project)
         real_model = tmdl.load_model(os.path.join(project.model_dir, "definition"))
-        clf = Classifier(real_model, ws.private, pol)
+        clf = Classifier(real_model, ws.private, pol, project.name)
         from . import deps
         mdef = os.path.join(project.mirror_model, "definition")
         mmodel = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model)) if os.path.isdir(mdef) else tmdl.Model()
@@ -795,6 +796,12 @@ def _write_policy_snapshot(ws, pol: dict) -> None:
 
 
 def index(ws, project) -> dict:
+    # Keep this lock file: unlinking lets another writer lock a different inode.
+    with _StateLock(ws, "index.lock"):
+        return _index(ws, project)
+
+
+def _index(ws, project) -> dict:
     pol = policy_mod.load(ws)
     _write_policy_snapshot(ws, pol)
     port = desktop.require_port(project)
@@ -803,28 +810,19 @@ def index(ws, project) -> dict:
                                 "value_cap": 50000, "disclosure": pol.get("disclosure", "shape")}, timeout=1800)
     if not res.get("ok"):
         raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
-    summary_path = os.path.join(ws.private, "index-summary.json")
-    if _reparse_link(ws.private) or _reparse_link(summary_path):
-        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-    os.makedirs(ws.private, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix="index-summary.", dir=ws.private)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(res, handle)
-        if _reparse_link(ws.private) or _reparse_link(summary_path):
-            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-        os.replace(tmp, summary_path)
-        tmp = ""
-    finally:
-        if tmp:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
     moved = harden_index(ws, pol)
+    # Rebuild classes from the hardened index before publishing the generation.
+    idx = json.loads(read_checked(os.path.join(ws.private, "index.json"), root=ws.private))
+    for table in res.get("tables", []):
+        for col in table.get("columns", []):
+            info = idx.get("columns", {}).get(f"{table['table']}[{col['column']}]", {})
+            if "class" in info:
+                col["class"] = info["class"]
+    from . import index_store
+    index_store.publish(ws.private, project.name, res)
     cols = [c for t in res.get("tables", []) for c in t.get("columns", [])]
     return {"verb": "index", "project": project.name, "tables": len(res.get("tables", [])), "columns": len(cols),
-            "category_columns": sum(1 for c in cols if c.get("class") == "category") - moved,
+            "category_columns": sum(1 for c in cols if c.get("class") == "category"),
             "personal_or_id_columns_hashed": moved,
             "hint": "run `pbz pull --force` (or --rebase) to reclassify the mirror with the new index"}
 

@@ -19,20 +19,8 @@ _STAMP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 
 def _index_summary(ws) -> dict:
-    path = os.path.join(ws.private, "index-summary.json")
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return {}
-    except OSError:
-        raise PbzError("REFUSED", "index summary is unreadable") from None
-    try:
-        data = json.loads(read_checked(path, root=ws.private).decode("utf-8"))
-    except PbzError:
-        raise
-    except (OSError, ValueError, UnicodeError):
-        raise PbzError("REFUSED", "index summary is unreadable") from None
-    return {t.get("table"): t for t in data.get("tables", [])}
+    from .describe import _index_summary as summary
+    return summary(ws)
 
 
 def translated(project) -> set[tuple]:

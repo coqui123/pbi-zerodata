@@ -129,11 +129,12 @@ def cmd_doctor() -> dict:
 
 
 def cmd_status(ws, project, a):
+    from . import index_store
     man = mirror.load_manifest(ws, project)
     out = {"verb": "status", "workspace": ws.root, "project": project.name,
            "mirror": "present" if man else "missing (run pbz pull)",
            "classification": man.get("classification") if man else None,
-           "index": os.path.exists(os.path.join(ws.private, "index.json")),
+           "index": index_store.load(ws.private, project.name) is not None,
            "policy": os.path.exists(ws.policy_path),
            "engine": "available" if engine_call("ping", {"private_dir": ws.private}).get("ok") else "unavailable"}
     if man:

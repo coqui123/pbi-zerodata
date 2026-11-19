@@ -221,7 +221,7 @@ def run(ws, project, memory_dir: str, apply: bool = False, show: str | None = No
     if project is not None:
         try:
             clf = Classifier(tmdl.load_model(os.path.join(project.model_dir, "definition")), ws.private,
-                             policy_mod.load(ws))
+                             policy_mod.load(ws), project.name)
         except OSError:
             clf = None
     report, shown = [], None

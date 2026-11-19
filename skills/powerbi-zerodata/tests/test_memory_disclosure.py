@@ -17,7 +17,7 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 import test_parity  # noqa: E402
-from pbz import cli, common, mcp, memory, mirror, policy  # noqa: E402
+from pbz import checks, cli, common, describe, dpapi, index_store, mcp, memory, mirror, policy  # noqa: E402
 
 SENTINEL = "SECRET_ENGINE_SENTINEL_9f3a"
 
@@ -95,6 +95,74 @@ class MemoryDisclosureTests(unittest.TestCase):
         combined = buf.getvalue() + mcp_out["content"][0]["text"]
         self.assertFalse(_bands(combined))
         self.assertIn("time_part", combined)
+
+    def test_describe_reprojects_shape_index_on_all_four_paths(self):
+        pol = policy.load(self.ws)
+        pol["disclosure"] = "shape"
+        policy.save(self.ws, pol)
+
+        def index_engine(verb, payload, timeout=30):
+            dpapi.load_key(self.ws.private)
+            with open(os.path.join(self.ws.private, "index.json"), "w") as handle:
+                json.dump({"columns": {"Sales[Comment]": {"type": "string", "class": "high"}}}, handle)
+            dpapi.write_protected(os.path.join(self.ws.private, "categories.bin"), b"{}")
+            return {"ok": True, "tables": [{"table": "Sales", "rows_bucket": "10-99", "columns": [
+                {"column": "Comment", "class": "high", "card_bucket": "10-99", "blank_bucket": "0"}]}]}
+
+        with patch("pbz.checks.engine_call", index_engine), patch("pbz.checks.desktop.require_port", return_value=1):
+            checks.index(self.ws, self.project)
+        paths = (lambda: describe.overview(self.ws, self.project),
+                 lambda: describe.describe(self.ws, self.project, "Sales"),
+                 lambda: describe.describe(self.ws, self.project, "Sales[Comment]"),
+                 lambda: describe.values(self.ws, self.project, "Sales[Comment]"))
+        for read in paths:
+            self.assertIn("_bucket", json.dumps(read()))  # Shape positive control on every path.
+        pol["disclosure"] = "strict"
+        policy.save(self.ws, pol)  # Same stored generation, no reindex.
+        for read in paths:
+            self.assertNotIn("_bucket", json.dumps(read()))
+
+    def test_summary_malformed_entries_and_shared_recursive_stripper(self):
+        dpapi.load_key(self.ws.private)
+        with open(os.path.join(self.ws.private, "index.json"), "w") as handle:
+            json.dump({"columns": {}}, handle)
+        dpapi.write_protected(os.path.join(self.ws.private, "categories.bin"), b"{}")
+        for malformed in (None, [], {"tables": None}, {"tables": [None, 3, [], {}, {"table": []},
+                {"table": "Sales", "rows_bucket": "1-9", "columns": [None, 5, {},
+                 {"column": "Comment", "card_bucket": "1-9", "nested": [{"custom_bucket": "1-9"}]}]}]}):
+            with self.subTest(summary=malformed):
+                index_store.publish(self.ws.private, self.project.name, malformed)
+                out = describe._index_summary(self.ws)
+                self.assertNotIn("_bucket", json.dumps(out))
+                if "Sales" in out:
+                    self.assertEqual(len(out["Sales"]["columns"]), 1)
+        body = {"rows_bucket": "1-9", "nested": [{"custom_bucket": "1-9", "ri": "RI_OK"}]}
+        self.assertEqual(memory._strip_bands(body), {"nested": [{"ri": "RI_OK"}]})
+
+    def test_grouped_equal_cli_returns_tokens_for_the_ten_engine_groups(self):
+        pol = policy.load(self.ws)
+        pol["disclosure"] = "shape"
+        pol["reveal_columns"] = ["Sales[Comment]"]
+        policy.save(self.ws, pol)
+        hashes = [dpapi.hmac_hex(dpapi.load_key(self.ws.private), f"private-{i}") for i in range(10)]
+
+        def engine(verb, payload, timeout=30):
+            self.assertIn("Sales[Comment]", payload["reveal"])
+            return {"ok": True, "checks": [{"id": "equal", "status": "FAIL", "groups": [
+                {"Sales[Comment]": {"hmac": h}} for h in hashes]}]}
+
+        spec = {"checks": [{"id": "equal", "kind": "equal", "left": "1", "right": "0",
+                            "by": ["Sales[Comment]"]}]}
+        buf = io.StringIO()
+        with patch("pbz.checks.engine_call", engine), patch("pbz.checks.desktop.require_port", return_value=1), \
+                patch("pbz.cli.find_workspace", return_value=self.ws), redirect_stdout(buf):
+            cli.main(["--workspace", self.ws.root, "--project", self.project.name, "check", json.dumps(spec)])
+        out = json.loads(buf.getvalue())
+        self.assertIn("results", out)
+        groups = out["results"][0]["groups"]
+        self.assertEqual(len(groups), 10)
+        self.assertTrue(all("«" in g["Sales[Comment]"] for g in groups))
+        self.assertTrue(all(h not in buf.getvalue() for h in hashes))
 
     def test_unexpected_engine_class_is_closed(self):
         def bad(verb, payload, timeout=30):

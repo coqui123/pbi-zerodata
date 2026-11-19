@@ -298,7 +298,7 @@ public static class Checks
         var bad = rows.Where(r => !ValuesEqual(r[cols.Count], r[cols.Count + 1], tol)).ToList();
         res["status"] = bad.Count == 0 ? "PASS" : "FAIL";
         if (!ctx.Strict) res["mismatch"] = Buckets.Mismatch(bad.Count);
-        if (!ctx.Strict && bad.Count > 0) res["groups"] = Groups(bad, by, cols, vault, reveal, allow, privateDir);
+        if (!ctx.Strict && bad.Count > 0) res["groups"] = Groups(bad, by, cols, vault, reveal, allow, privateDir, conn);
     }
 
     static void Additive(JsonObject chk, List<string> where, JsonObject res, Conn conn)
@@ -331,12 +331,14 @@ public static class Checks
         res["status"] = NumEqual(t, sum, tol) ? "PASS" : "FAIL";
     }
 
-    static bool IndexedCategory(string privateDir, ColumnMeta col)
+    static bool IndexedCategory(JsonObject? index, ColumnMeta col, object? value)
     {
-        if (IndexFile.TryLoad(privateDir)?["columns"] is not JsonObject cols) return false;
-        if (cols[col.Key] is not JsonObject entry) return false;
-        string? cls = J.Str(entry, "class");
-        return cls == "category";
+        if (value is not string text || index?["columns"] is not JsonObject cols) return false;
+        if (cols[col.Key] is not JsonObject entry || J.Str(entry, "class") != "category") return false;
+        if (index["categories"] is not JsonObject cats || cats[col.Key] is not JsonArray values) return false;
+        // Exact membership: a newly added value stays hidden even below category_max.
+        return values.Any(v => v is JsonValue j && j.TryGetValue<string>(out var s)
+            && string.Equals(s, text, StringComparison.Ordinal));
     }
 
     static bool PolicyAllows(HashSet<string> allow, string by, ColumnMeta col)
@@ -352,8 +354,9 @@ public static class Checks
     /// an indexed category, or a policy reveal column. A direct caller cannot widen that set.
     /// </summary>
     static JsonArray Groups(List<object?[]> bad, List<string> by, List<ColumnMeta> cols, Vault vault, HashSet<string> reveal,
-        HashSet<string> allow, string privateDir)
+        HashSet<string> allow, string privateDir, Conn conn)
     {
+        var index = IndexFile.TryLoad(privateDir, conn);
         var groups = new List<JsonObject>();
         foreach (var r in bad)
         {
@@ -363,7 +366,7 @@ public static class Checks
                 object? v = r[k];
                 JsonObject key;
                 bool listed = reveal.Contains(by[k]);
-                bool permitted = cols[k].IsDate || IndexedCategory(privateDir, cols[k]) || PolicyAllows(allow, by[k], cols[k]);
+                bool permitted = cols[k].IsDate || IndexedCategory(index, cols[k], v) || PolicyAllows(allow, by[k], cols[k]);
                 if (v == null) key = new JsonObject { ["blank"] = true };
                 else if (listed && permitted) key = new JsonObject { ["reveal"] = Reveal(v) };
                 else key = new JsonObject { ["hmac"] = vault.Hmac(v) };

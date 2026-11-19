@@ -505,6 +505,139 @@ def ensure_desktop(env: Env) -> bool:
     return bool(ok)
 
 
+def publish_index(env: Env, summary: dict, project: str) -> None:
+    """Use the production hardener and publisher for live reader tests."""
+    sys.path.insert(0, str(S))
+    from types import SimpleNamespace
+    from pbz import checks, index_store
+    checks.harden_index(SimpleNamespace(private=str(env.pd)), {})
+    idx = json.loads((env.pd / "index.json").read_text("utf-8"))
+    for table in summary.get("tables", []):
+        for col in table.get("columns", []):
+            info = idx["columns"].get(f"{table['table']}[{col['column']}]", {})
+            if "class" in info:
+                col["class"] = info["class"]
+    index_store.publish(str(env.pd), project, summary)
+
+
+def test_live_index_binding(env: Env, tmp: Path) -> None:
+    """Real A/B Desktop models sharing a private store; index A LAST, then check B."""
+    global PBIP
+    sys.path.insert(0, str(S))
+    from pbz import dpapi, index_store
+    original_pbip = PBIP
+    b = Env()
+    b.pd = env.pd
+    directory = tmp / "index-project-b"
+    shutil.copytree(FIXTURE, directory, ignore=shutil.ignore_patterns(".pbi"))
+    table_file = directory / "Canary.SemanticModel" / "definition" / "tables" / "Project.tmdl"
+    table = table_file.read_text("utf-8")
+    # Keep Closed in both A and B: a raw reveal in B would pass a membership-only gate.
+    # Add enough distinct Status values to cross the policy's default category_max.
+    start = table.index("DATATABLE(")
+    table = table[:start] + ('DATATABLE("ProjectID", INTEGER, "Title", STRING, "Status", STRING, '
+        '"PlannedEnd", DATETIME, {' + ",".join(
+            '{' + str(1000 + i) + ',"fixture","' + ("Closed" if i == 0 else f"Status-{i}")
+            + '","2026-01-01"}' for i in range(60)) + '})\n')
+    table_file.write_text(table, "utf-8")
+    try:
+        PBIP = directory / "Canary.pbip"
+        if not ensure_desktop(b):
+            return
+        engine("refresh", b.req(), "binding-b-refresh")
+        rb = engine("index", b.req(), "binding-index-b")
+        publish_index(b, rb, "B")
+        expect("binding B: Status exceeds category_max", any(
+            t["table"] == "Project" and any(c["column"] == "Status" and c.get("class") == "high"
+                                             for c in t["columns"]) for t in rb["tables"]), rb)
+        ra = engine("index", env.req(), "binding-index-a-LAST")
+        publish_index(env, ra, "A")
+
+        def grouped(target, label, where=None):
+            return engine("check", target.req(reveal=["Project[Status]"], checks=[{
+                "id": "binding", "kind": "equal", "left": "1", "right": "0",
+                "by": ["Project[Status]"], "where": where or ["NOT ISBLANK(Project[Status])"]}]), label)
+
+        shared = ['Project[Status] = "Closed"']
+        raw_b = grouped(b, "binding-check-b-shared", shared)
+        groups = raw_b.get("checks", raw_b.get("results", []))[0].get("groups", [])
+        expect("B never reveals even a member of A's list", groups and all(
+            "hmac" in g["Project[Status]"] for g in groups), raw_b)
+        raw_a = grouped(env, "binding-check-a-member", shared)
+        groups = raw_a.get("checks", raw_a.get("results", []))[0].get("groups", [])
+        expect("A genuine category member still reveals", groups == [
+            {"Project[Status]": {"reveal": "Closed"}}], raw_a)
+        many = grouped(b, "binding-check-b-max-ten")
+        groups = many.get("checks", many.get("results", []))[0].get("groups", [])
+        expect("failing grouped equal returns at most ten HMAC groups", len(groups) == 10 and all(
+            "hmac" in g["Project[Status]"] for g in groups), many)
+
+        # Change only the disposable B model through TOM. Index it at low cardinality,
+        # then add a real row on the same database/port without reindexing.
+        helper = tmp / "index-row-mutation"
+        helper.mkdir()
+        import xml.etree.ElementTree as ET
+        project_xml = ET.Element("Project", Sdk="Microsoft.NET.Sdk")
+        props = ET.SubElement(project_xml, "PropertyGroup")
+        ET.SubElement(props, "OutputType").text = "Exe"
+        ET.SubElement(props, "TargetFramework").text = "net10.0"
+        refs = ET.SubElement(project_xml, "ItemGroup")
+        for dll in EXE.parent.glob("Microsoft.AnalysisServices*.dll"):
+            ref = ET.SubElement(refs, "Reference", Include=dll.stem)
+            ET.SubElement(ref, "HintPath").text = str(dll)
+        ET.ElementTree(project_xml).write(helper / "Mutation.csproj", encoding="unicode")
+        (helper / "Program.cs").write_text(r"""
+using System;
+using System.IO;
+using System.Linq;
+using Microsoft.AnalysisServices.Tabular;
+using var server = new Server();
+server.Connect("Data Source=localhost:" + args[0] + ";");
+if (server.Databases.Count != 1) throw new Exception("fixture database count");
+var database = server.Databases[0];
+if (database.ID != args[1]) throw new Exception("fixture identity mismatch");
+if (!database.Model.Tables.Select(t => t.Name).ToHashSet().SetEquals(
+    new[] { "Person", "Project", "Hours", "DimDate", "ExceptionType", "Notes" }))
+    throw new Exception("fixture table mismatch");
+var table = database.Model.Tables["Project"];
+((CalculatedPartitionSource)table.Partitions[0].Source).Expression = File.ReadAllText(args[2]);
+table.RequestRefresh(RefreshType.Full);
+database.Model.SaveChanges();
+""", "utf-8")
+        connection = engine("connect", b.req(), "row-add-identity")
+        database_id = connection["database_id"]
+
+        def change_rows(statuses):
+            expression = ('DATATABLE("ProjectID", INTEGER, "Title", STRING, "Status", STRING, '
+                '"PlannedEnd", DATETIME, {' + ",".join(
+                    '{' + str(1000 + i) + ',"fixture","' + status + '","2026-01-01"}'
+                    for i, status in enumerate(statuses)) + '})')
+            expression_file = helper / "partition.dax"
+            expression_file.write_text(expression, "utf-8")
+            proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Mutation.csproj"),
+                                   "--", str(b.port), database_id, str(expression_file)],
+                                  capture_output=True, timeout=300)
+            return expect("disposable B row mutation succeeds", proc.returncode == 0,
+                          {"exit": proc.returncode, "stderr_bytes": len(proc.stderr)})
+
+        if not change_rows(["Closed", "Active"]):
+            return
+        rb = engine("index", b.req(), "index-before-row-add")
+        publish_index(b, rb, "B")
+        if not change_rows(["Closed", "Active", "NewStatus"]):
+            return
+        stale = grouped(b, "binding-new-live-value", ['Project[Status] IN {"Closed", "NewStatus"}'])
+        groups = stale.get("checks", stale.get("results", []))[0].get("groups", [])
+        key = dpapi.load_key(str(env.pd), create=False)
+        expect("added row stays HMAC while genuine member reveals without reindex", len(groups) == 2
+            and {"Project[Status]": {"reveal": "Closed"}} in groups
+            and {"Project[Status]": {"hmac": dpapi.hmac_hex(key, "NewStatus")}} in groups, stale)
+    finally:
+        PBIP = original_pbip
+        if b.pid and b.opened_here:
+            print("INFO closing binding fixture Desktop:", close_desktop(b.pid), flush=True)
+
+
 def test_live(env: Env, key_holder: dict) -> None:
     # v1.1: the engine never refreshes M partitions (Desktop refuses external mashup refreshes)
     r = engine("refresh", env.req(), "refresh-calculate")
@@ -573,6 +706,14 @@ def test_live(env: Env, key_holder: dict) -> None:
     flat = [c for t in (r or {}).get("tables", []) for c in t["columns"]]
     expect("index strict: no buckets or years", r and r.get("ok") and all(not ({"card_bucket", "blank_bucket", "year_min", "year_max"} & set(c)) for c in flat)
            and all("rows_bucket" not in t for t in r["tables"]), r)
+
+    partial = engine("check", env.req(reveal=["Person[Name]"], checks=[{
+        "id": "partial", "kind": "equal", "left": "1", "right": "0", "by": ["Person[Name]"],
+        "where": ["NOT ISBLANK(Person[Name])"]}]), "index-unpublished-personal")
+    groups = partial.get("checks", partial.get("results", []))[0].get("groups", [])
+    expect("unpublished low-cardinality personal index is never accepted", groups and all(
+        "hmac" in g["Person[Name]"] for g in groups), partial)
+    publish_index(env, r, "Canary")
 
     # probe
     r = engine("probe", env.req(table="Hours"), "probe-hours")
@@ -882,6 +1023,7 @@ def main() -> int:
         test_offline(env, tmp)
         if not args.offline and ensure_desktop(env):
             test_live(env, key_holder)
+            test_live_index_binding(env, tmp)
         shutil.rmtree(tmp, ignore_errors=True)
         scan_all(env)
     finally:

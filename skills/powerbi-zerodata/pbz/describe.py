@@ -7,28 +7,29 @@ import re
 
 from . import lexers, pbir, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
-from .common import PbzError, _reparse_link, read_checked, read_text_checked, list_names
+from .common import PbzError, read_text_checked, list_names
 
 
 def _index_summary(ws) -> dict:
-    path = os.path.join(ws.private, "index-summary.json")
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
+    from . import index_store, memory
+    stored = index_store.load(ws.private)
+    if stored is None:
         return {}
-    except OSError:
-        raise PbzError("REFUSED", "index summary is unreadable") from None
-    if _reparse_link(path):
-        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     try:
-        data = json.loads(read_checked(path, root=ws.private).decode("utf-8"))
-    except PbzError:
-        raise
-    except (OSError, ValueError, UnicodeError):
-        raise PbzError("REFUSED", "index summary is unreadable") from None
+        data = json.loads(stored["index-summary.json"])
+    except (ValueError, UnicodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if policy_mod.load(ws).get("disclosure", "shape") != "shape":
+        data = memory._strip_bands(data)
     out = {}
-    for t in data.get("tables", []):
-        out[t.get("table")] = t
+    for table in memory._list(data.get("tables")):
+        name = memory._name(table.get("table"))
+        if name is None:
+            continue
+        out[name] = {**table, "columns": [c for c in memory._list(table.get("columns"))
+                                         if memory._name(c.get("column")) is not None]}
     return out
 
 
@@ -105,7 +106,7 @@ def overview(ws, project) -> dict:
     return {"verb": "describe", "project": project.name,
             "tables": [{"table": t.name, "columns": len(t.columns), "measures": len(t.measures),
                         "storage": sorted({k for _n, k, _e in t.partitions}) or ["none"], "hidden": t.hidden,
-                        "rows_bucket": summ.get(t.name, {}).get("rows_bucket", "unknown")}
+                        **({"rows_bucket": summ[t.name]["rows_bucket"]} if "rows_bucket" in summ.get(t.name, {}) else {})}
                        for t in model.tables.values()],
             "relationships": len(model.relationships), "roles": model.roles, "pages": pages}
 
@@ -117,7 +118,7 @@ def describe(ws, project, target: str | None) -> dict:
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
-    clf = Classifier(tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model)), ws.private, policy_mod.load(ws))
+    clf = Classifier(tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model)), ws.private, policy_mod.load(ws), project.name)
     summ = _index_summary(ws)
     usage = field_usage(project, model)
     kind, table, name = _parse_target(target)
@@ -171,7 +172,8 @@ def _table(model, clf, summ, usage, t) -> dict:
         funcs = sorted(set(re.findall(r"\b((?:[A-Z][A-Za-z]+\.)+[A-Z][A-Za-z]+)\s*\(", expr)))
         src.append({"partition": pname, "kind": pkind, "functions": funcs[:12]})
     out = {"verb": "describe", "table": t.name, "file": t.file, "hidden": t.hidden, "calculated": t.calculated,
-           "partitions": src, "rows_bucket": summ.get(t.name, {}).get("rows_bucket", "unknown (run pbz index)"),
+           "partitions": src,
+           **({"rows_bucket": summ[t.name]["rows_bucket"]} if "rows_bucket" in summ.get(t.name, {}) else {}),
            "columns": [_column(model, clf, summ, c) for c in t.columns.values()],
            "measures": [{"name": m.name, "folder": m.folder} for m in t.measures.values()],
            "hierarchies": t.hierarchies,
@@ -186,7 +188,7 @@ def values(ws, project, column: str) -> dict:
     if kind != "column":
         raise PbzError("BAD_REQUEST", "use 'Table'[Column]")
     real = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
-    clf = Classifier(real, ws.private, policy_mod.load(ws))
+    clf = Classifier(real, ws.private, policy_mod.load(ws), project.name)
     lab = f"{table}[{name}]"
     cls = clf.column_class(table, name)
     out = {"verb": "values", "column": lab, "class": cls, "classification": clf.mode}

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -161,7 +162,8 @@ public static class ValueIndex
             outTables.Add(to);
         }
 
-        var indexDoc = new JsonObject { ["version"] = 1, ["columns"] = indexCols };
+        var indexDoc = new JsonObject { ["version"] = 2, ["columns"] = indexCols,
+            ["database_id"] = conn.Meta.DatabaseId, ["port"] = conn.Port };
         Vault.WriteAtomic(Path.Combine(pd, "index.json"), indexDoc.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
         var catJson = JsonSerializer.Serialize(categories, new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
         Vault.WriteProtected(Path.Combine(pd, "categories.bin"), catJson);
@@ -279,13 +281,37 @@ public static class PolicyFile
 /// <summary>Read side of index.json (used only for internal decisions).</summary>
 public static class IndexFile
 {
-    public static JsonObject? TryLoad(string privateDir)
+    public static JsonObject? TryLoad(string privateDir, Conn conn)
     {
         try
         {
-            string p = Path.Combine(privateDir, "index.json");
-            if (LinkGuard.IsLink(p) || !File.Exists(p)) return null;
-            return JsonNode.Parse(File.ReadAllText(p, Encoding.UTF8)) as JsonObject;
+            // Only the Python publisher can mark a hardened generation complete. Legacy and
+            // staging files are never consulted. Read the manifest once to pin this generation.
+            string current = Path.Combine(privateDir, "index-current.json");
+            LinkGuard.Refuse(current);
+            var manifest = JsonNode.Parse(File.ReadAllText(current)) as JsonObject;
+            if (manifest?["complete"]?.GetValue<bool>() != true) return null;
+            string? generation = J.Str(manifest, "generation");
+            if (generation == null || !Regex.IsMatch(generation, @"^index-[0-9a-f]{32}$")) return null;
+            string directory = Path.Combine(privateDir, generation);
+            LinkGuard.Refuse(directory);
+            if (manifest["sha256"] is not JsonObject hashes) return null;
+            var blobs = new Dictionary<string, byte[]>();
+            foreach (string name in new[] { "index.json", "categories.bin", "index-summary.json" })
+            {
+                string path = Path.Combine(directory, name);
+                LinkGuard.Refuse(path);
+                byte[] raw = File.ReadAllBytes(path);
+                string hash = Convert.ToHexString(SHA256.HashData(raw)).ToLowerInvariant();
+                if (hash != J.Str(hashes, name)) return null;
+                blobs[name] = raw;
+            }
+            var index = JsonNode.Parse(Encoding.UTF8.GetString(blobs["index.json"])) as JsonObject;
+            // Compare against the actual connection, not caller-provided identity or matching stamps.
+            if (index == null || J.Str(index, "database_id") != conn.Meta.DatabaseId
+                || J.Int(index, "port") != conn.Port) return null;
+            index["categories"] = JsonNode.Parse(Encoding.UTF8.GetString(Dpapi.Unprotect(blobs["categories.bin"])));
+            return index;
         }
         catch
         {

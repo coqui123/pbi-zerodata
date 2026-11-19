@@ -343,7 +343,7 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
     model_texts = {rel[len(prefix):]: text for rel, text, _bom, _real_h in captured
                    if rel.startswith(prefix) and rel.lower().endswith(".tmdl")}
     model = tmdl.load_model(os.path.join(project.model_dir, "definition"), model_texts)
-    clf = Classifier(model, ws.private, pol)
+    clf = Classifier(model, ws.private, pol, project.name)
     tm = tokens.TokenMap(ws.private)
     new_files, lossy, counts = {}, [], {}
     keep = set(pending["changed"] + pending["added"]) if rebase else set()
