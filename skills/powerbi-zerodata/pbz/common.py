@@ -786,12 +786,13 @@ def _checked_op(op) -> tuple:
 
 
 def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = None,
-                 roots: dict | None = None) -> None:
+                 roots: dict | None = None, expected: dict | None = None) -> None:
     """Apply ('write', path, text, bom), ('write_bytes', path, data) and ('delete', path) as one edit.
 
     Unsafe paths are refused before any snapshot or content read, so a symlink is not
     opened and is not restored. `root` is the trust root for every op; `roots` overrides
     it per path. Deletes use that same containment, including while rolling back.
+    `expected` binds planned writes to current bytes; a mismatch refuses the entire edit.
     On failure, snapshots are restored through the same root checks.
     """
     checked = [_checked_op(op) for op in ops]
@@ -819,6 +820,9 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or _reparse_link(path):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         snap[path] = read_checked(path, root=trust)
+    for path, before in snap.items():
+        if expected is not None and path in expected and before != expected[path]:
+            raise PbzError("RECOVERY_REQUIRED", "file changed before apply")
     done: list[str] = []
     versions = dict(snap)
     written = {}
@@ -826,7 +830,7 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
         for op in checked:
             kind, path = op[0], op[1]
             op_root = _trust_root(path, root, roots)
-            from .mirror_txn import _raw, enlist
+            from .mirror_txn import _raw, enlist, mark_applied
             current = _raw(path, op_root)
             if current != versions[path]:
                 raise PbzError("RECOVERY_REQUIRED", "file changed before apply")
@@ -835,8 +839,6 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
             enlist(path, current, after)
             if _raw(path, op_root) != current:
                 raise PbzError("RECOVERY_REQUIRED", "file changed before apply")
-            written[path] = after
-            done.append(path)
             if kind == "write":
                 write_text(path, op[2], op[3], root=op_root)
             elif kind == "write_bytes":
@@ -848,6 +850,9 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
                         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
                     os.remove(path)
             versions[path] = after
+            written[path] = after
+            done.append(path)
+            mark_applied(path, after)
     except (OSError, PbzError, UnicodeError) as first:
         restore_fail = []
         touched = list(dict.fromkeys(reversed(done)))

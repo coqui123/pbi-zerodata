@@ -229,8 +229,11 @@ def excluded_mirror_additions(ws: Workspace, project: Project) -> list[str]:
     if _reparse_link(ws.mirror):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
-    def unreadable(_err):
-        raise PbzError("REFUSED", project.name) from None
+    def unreadable(err):
+        if err.filename is not None:
+            rel = os.path.relpath(err.filename, ws.mirror).replace("\\", "/").rstrip("/") + "/"
+            if rel.startswith(prefixes):
+                raise PbzError("REFUSED", project.name) from None
     for cur, dirs, files in os.walk(ws.mirror, followlinks=False, onerror=unreadable):
         blocked = []
         for d in dirs:
@@ -513,7 +516,13 @@ def _merge3(ws: Workspace, project: Project, rel: str, theirs: str | None,
     base = os.path.join(base_dir(ws, project), *rel.split("/"))
     if mine_text is None:
         mine_text, mine_bom = read_mirror_text(mine, root=ws.mirror)
-        base_text = read_text(base)[0] if os.path.exists(base) else theirs
+        if os.path.exists(base):
+            try:
+                base_text = read_text_checked(base, root=ws.private)[0]
+            except (OSError, UnicodeError, PbzError):
+                raise PbzError("REFUSED", rel) from None
+        else:
+            base_text = theirs
     elif base_text is None:
         base_text = theirs
     merged, clean = merge3(base_text, mine_text, theirs)
@@ -804,27 +813,74 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
     parent = _transaction_dir(ws, project)
     lock = os.path.join(parent, ".commit-lock")
     owned = False
+    claimed = None
+    guard_fd = -1
     try:
         _contained(lock, ws.private)
         os.makedirs(parent, exist_ok=True)
+        # Keep this inode: all recoverers must share the guard, including across the
+        # rename/create gap. Otherwise a delayed stale-owner read can steal a fresh lock.
+        guard = lock + ".recover"
+        preflight_regular(guard, root=ws.private)
+        guard_fd = os.open(guard, os.O_CREAT | os.O_RDWR, 0o600)
+        info = os.fstat(guard_fd)
+        current = os.lstat(guard)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or _reparse_link(guard)
+                or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        if info.st_size == 0:
+            os.write(guard_fd, b"\0")
+        os.lseek(guard_fd, 0, os.SEEK_SET)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(guard_fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(guard_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {"verb": "recover", "result": "COMMIT_BUSY"}
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            # _recover checks the existing owner. A stale lock continues to exclude writers.
-            return _recover(ws, project, transaction_id)
+            try:
+                owner = int(read_checked(lock, root=ws.private))
+                if owner <= 0:
+                    raise ValueError()
+            except ValueError:
+                return {"verb": "recover", "result": "RECOVERY_REQUIRED"}
+            if _process_alive(owner):
+                return {"verb": "recover", "result": "COMMIT_BUSY"}
+            claim = lock + ".claim-" + str(os.getpid())
+            try:
+                os.rename(lock, claim)
+            except OSError:
+                return {"verb": "recover", "result": "COMMIT_BUSY"}
+            claimed = claim
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                return {"verb": "recover", "result": "COMMIT_BUSY"}
         owned = True
         with os.fdopen(fd, "w") as handle:
             handle.write(str(os.getpid()))
         return _recover(ws, project, transaction_id, _owns_lock=True)
-    except (OSError, PbzError):
+    except OSError:
         return {"verb": "recover", "result": "RECOVERY_REQUIRED"}
     finally:
-        if owned:
-            remove_file(lock, root=ws.private)
+        try:
+            if owned:
+                remove_file(lock, root=ws.private)
+            if claimed is not None:
+                remove_file(claimed, root=ws.private)
+        finally:
+            if guard_fd >= 0:
+                os.close(guard_fd)
 
 
 def _recover(ws, project, transaction_id: str | None = None, *, _owns_lock=False) -> dict:
     """Roll back interrupted, uncommitted pushes. Never resume a half-validated commit."""
+    anchor_mirror(ws)
     if desktop.find_instance(project):
         return {"verb": "recover", "result": "DESKTOP_OPEN"}
     directory = _transaction_dir(ws, project)
@@ -1321,9 +1377,9 @@ def mirror_texts(ws: Workspace, project: Project) -> dict[str, str]:
         try:
             _contained(base, ws.mirror)
         except PbzError:
-            raise PbzError("REFUSED", os.path.basename(base)) from None
+            raise PbzError("UNSAFE_PATH", os.path.basename(base)) from None
         if _reparse_link(base):
-            raise PbzError("REFUSED", os.path.basename(base))
+            raise PbzError("UNSAFE_PATH", os.path.basename(base))
         try:
             info = os.stat(base)
         except FileNotFoundError:
@@ -1340,7 +1396,7 @@ def mirror_texts(ws: Workspace, project: Project) -> dict[str, str]:
                     continue
                 full = os.path.join(cur, d)
                 if _reparse_link(full):
-                    raise PbzError("REFUSED", os.path.relpath(full, ws.mirror).replace("\\", "/"))
+                    raise PbzError("UNSAFE_PATH", os.path.relpath(full, ws.mirror).replace("\\", "/"))
                 kept.append(d)
             dirs[:] = kept
             for f in files:

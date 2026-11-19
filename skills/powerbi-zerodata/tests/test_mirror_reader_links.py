@@ -340,14 +340,14 @@ class CurrentMirrorCollectionTests(unittest.TestCase):
         os.link(self.path, os.path.join(self.tmp.name, "alias"))
         return os.path.relpath(self.path, self.ws.mirror).replace("\\", "/")
 
-    def _refuses(self, call, *, private_unchanged=True):
+    def _refuses(self, call, *, private_unchanged=True, code="REFUSED"):
         from pbz import mirror
         from test_pull_refusal import file_map
         before = (file_map(self.ws.mirror), file_map(self.ws.private))
         history = file_map(mirror.history_dir(self.ws, self.project))
         with self.assertRaises(PbzError) as caught:
             call()
-        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(caught.exception.code, code)
         self.assertNotIn("KNOWN_INERT_HIT", str(caught.exception))
         self.assertEqual(file_map(self.ws.mirror), before[0])
         self.assertEqual(file_map(mirror.history_dir(self.ws, self.project)), history)
@@ -367,6 +367,10 @@ class CurrentMirrorCollectionTests(unittest.TestCase):
     def test_snapshot_publishes_no_blob_on_ambiguous_file(self):
         from pbz import mirror
         self._ambiguous()
+        fresh = os.path.join(os.path.dirname(self.path), "never-snapshotted.json")
+        with open(fresh, "w") as handle:
+            handle.write('{"note":"UNIQUE_UNSNAPSHOTTED_INERT"}')
+        os.link(fresh, os.path.join(self.tmp.name, "fresh-alias"))
         self._refuses(lambda: mirror.snapshot(self.ws, self.project, "unsafe"))
 
     def test_current_collector_refuses_ambiguous_file(self):
@@ -378,7 +382,9 @@ class CurrentMirrorCollectionTests(unittest.TestCase):
         from pbz import mirror
         rel = self._ambiguous()
         man = {"files": {rel: {"mirror": "old"}}}
-        self._refuses(lambda: mirror.mirror_changes(self.ws, self.project, man))
+        from unittest.mock import patch
+        with patch.object(mirror, "mirror_texts", return_value={}):
+            self._refuses(lambda: mirror.mirror_changes(self.ws, self.project, man))
 
     def test_excluded_additions_refuses_ambiguous_in_scope_file(self):
         from pbz import mirror
@@ -396,8 +402,7 @@ class CurrentMirrorCollectionTests(unittest.TestCase):
         rel = self._ambiguous()
         # Force the collection to succeed, isolating the later BOM reread.
         with patch.object(mirror, "mirror_texts", return_value={rel: "KNOWN_INERT_HIT"}):
-            self._refuses(lambda: findreplace.replace(self.ws, self.project, "KNOWN_INERT_HIT", "other", apply=True),
-                          private_unchanged=False)  # The failed edit retains its durable rollback journal.
+            self._refuses(lambda: findreplace.replace(self.ws, self.project, "KNOWN_INERT_HIT", "other", apply=True))
 
     def test_load_model_checked_root_and_real_literal_control(self):
         from pbz import checks, mirror, tmdl
@@ -423,8 +428,9 @@ class CurrentMirrorCollectionTests(unittest.TestCase):
         try:
             os.symlink(held, self.project.mirror_report, target_is_directory=True)
         except OSError:
-            self.skipTest("directory symlink is unavailable")
-        self._refuses(lambda: mirror.snapshot(self.ws, self.project, "alias"))
+            from _junction import make_junction
+            make_junction(self, self.project.mirror_report, held)
+        self._refuses(lambda: mirror.snapshot(self.ws, self.project, "alias"), code="UNSAFE_PATH")
 
     def test_collection_swap_and_walk_error_refuse(self):
         from pbz import common, mirror
@@ -437,16 +443,153 @@ class CurrentMirrorCollectionTests(unittest.TestCase):
                 with open(path, "w") as handle:
                     handle.write("SWAPPED_INERT")
         with patch.object(common, "_read_checked_hook", swap):
-            with self.assertRaises(PbzError):
+            with self.assertRaises(PbzError) as caught:
                 mirror.snapshot(self.ws, self.project, "swap")
+        self.assertEqual(caught.exception.code, "REFUSED")
         self.assertEqual(file_map(self.ws.private), before)
         def broken_walk(*args, **kwargs):
             kwargs["onerror"](PermissionError("inert"))
             return iter(())
         with patch.object(mirror.os, "walk", broken_walk):
-            with self.assertRaises(PbzError):
+            with self.assertRaises(PbzError) as caught:
                 mirror.snapshot(self.ws, self.project, "walk")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        for data in file_map(mirror.history_dir(self.ws, self.project)).values():
+            self.assertNotIn(b"SWAPPED_INERT", data)
         self.assertEqual(file_map(self.ws.private), before)
+
+    def test_invalid_utf8_refuses_without_content(self):
+        from pbz import mirror
+        with open(self.path, "wb") as handle:
+            handle.write(b'KNOWN_INERT_HIT\xff')
+        self._refuses(lambda: mirror.mirror_texts(self.ws, self.project))
+
+    def test_replace_refuses_stale_collection(self):
+        from pbz import common, findreplace, mirror
+        from unittest.mock import patch
+        rel = os.path.relpath(self.path, self.ws.mirror).replace("\\", "/")
+        newer = b'{"note":"NEWER_INERT"}'
+        common.replace_bytes(self.path, newer, root=self.ws.mirror)
+        with patch.object(mirror, "mirror_texts", return_value={rel: 'KNOWN_INERT_HIT'}):
+            self._refuses(lambda: findreplace.replace(self.ws, self.project, "KNOWN_INERT_HIT", "other", apply=True),
+                          code="RECOVERY_REQUIRED")
+        self.assertEqual(read_checked(self.path, root=self.ws.mirror), newer)
+
+    def test_replace_expected_bytes_cover_bom_and_late_change(self):
+        from pbz import common, findreplace
+        from unittest.mock import patch
+        old = b'\xef\xbb\xbf{"note":"KNOWN_INERT_HIT"}\r\n'
+        newer = b'\xef\xbb\xbf{"note":"NEWER_INERT"}\r\n'
+        common.replace_bytes(self.path, old, root=self.ws.mirror)
+        commit = common.commit_bytes
+        calls = []
+        def change_before_snapshot(ops, **kwargs):
+            self.assertEqual(kwargs["expected"][self.path], old)
+            calls.append(ops)
+            common.replace_bytes(self.path, newer, root=self.ws.mirror)
+            return commit(ops, **kwargs)
+        with patch.object(findreplace, "commit_bytes", change_before_snapshot):
+            with self.assertRaises(PbzError) as caught:
+                findreplace.replace(self.ws, self.project, "KNOWN_INERT_HIT", "other", apply=True)
+        self.assertEqual(caught.exception.code, "RECOVERY_REQUIRED")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(read_checked(self.path, root=self.ws.mirror), newer)
+
+    def test_merge3_checked_private_base_refuses(self):
+        from pbz import common, mirror
+        rel = os.path.relpath(self.path, self.ws.mirror).replace("\\", "/")
+        base = os.path.join(mirror.base_dir(self.ws, self.project), *rel.split("/"))
+        os.makedirs(os.path.dirname(base), exist_ok=True)
+        common.replace_bytes(base, b"KNOWN_INERT_HIT", root=self.ws.private)
+        os.link(base, os.path.join(self.tmp.name, "base-alias"))
+        self._refuses(lambda: mirror._merge3(self.ws, self.project, rel, "other"))
+
+    def test_expected_snapshot_refuses_all_writes_before_apply(self):
+        from pbz import common
+        other = os.path.join(os.path.dirname(self.path), "other.json")
+        common.replace_bytes(other, b"newer", root=self.ws.mirror)
+        before = read_checked(self.path, root=self.ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            common.commit_bytes([("write_bytes", self.path, b"changed"), ("write_bytes", other, b"changed")],
+                                root=self.ws.mirror, expected={self.path: before, other: b"stale"})
+        self.assertEqual(caught.exception.code, "RECOVERY_REQUIRED")
+        self.assertEqual(read_checked(self.path, root=self.ws.mirror), before)
+        self.assertEqual(read_checked(other, root=self.ws.mirror), b"newer")
+
+    def test_enumeration_errors_are_project_scoped(self):
+        from pbz import mirror
+        from unittest.mock import patch
+        def broken_walk(path, **kwargs):
+            kwargs["onerror"](PermissionError(13, "inert", path))
+            return iter(())
+        other = os.path.join(self.ws.mirror, "Other.SemanticModel", "definition")
+        own = os.path.join(self.project.mirror_model, "definition")
+        def walk_error(path):
+            return lambda *args, **kwargs: broken_walk(path, **kwargs)
+        with patch.object(mirror.os, "walk", walk_error(other)):
+            self.assertEqual(mirror.excluded_mirror_additions(self.ws, self.project), [])
+        with patch.object(mirror.os, "walk", walk_error(own)):
+            with self.assertRaises(PbzError) as caught:
+                mirror.excluded_mirror_additions(self.ws, self.project)
+        self.assertEqual(caught.exception.code, "REFUSED")
+
+    def test_model_enumeration_default_and_strict(self):
+        from pbz import tmdl
+        from unittest.mock import patch
+        missing = os.path.join(self.project.mirror_model, "missing")
+        model = tmdl.load_model(missing)
+        self.assertFalse(model.tables)
+        self.assertFalse(model.docs)
+        with self.assertRaises(PbzError) as caught:
+            tmdl.load_model(missing, root=self.ws.mirror)
+        self.assertEqual(caught.exception.code, "REFUSED")
+        def broken_walk(path, **kwargs):
+            kwargs["onerror"](PermissionError(13, "INERT_ERROR_PAYLOAD", path))
+            return iter(())
+        with patch.object(tmdl.os, "walk", broken_walk):
+            self.assertFalse(tmdl.load_model(self.project.mirror_model).docs)
+            with self.assertRaises(PbzError) as caught:
+                tmdl.load_model(self.project.mirror_model, root=self.ws.mirror)
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(caught.exception.detail, os.path.basename(self.project.mirror_model))
+
+    def test_directory_model_loads_are_rooted_or_explicitly_allowed(self):
+        import ast
+        # Real-side reads intentionally operate outside the sanitized mirror.
+        allowlist = {
+            "mirror.py": "real_model reads the real project; pull uses prepared texts",
+            "desktop.py": "Desktop compares expected tables against the real project",
+            "memscrub.py": "classifies real model literals before sanitizing memory",
+            "synth.py": "synthesis loads supplied model texts",
+            "changes.py": "change comparison loads supplied document texts",
+            "checks.py": "model_literals and validation compare the real model",
+            "consumers.py": "catalog scanning reads external consumer models",
+        }
+        # Pin functions too, so adding a mirror read to an allowed file cannot bypass the check.
+        allowed_functions = {"mirror.py": {"real_model"}, "desktop.py": {"require_port"},
+                             "memscrub.py": {"run"}, "checks.py": {"model_literals", "run_checks"},
+                             "consumers.py": {"_parse_model", "_binding_only"}}
+        found = []
+        for name in sorted(os.listdir(os.path.join(SKILL, "pbz"))):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(SKILL, "pbz", name), encoding="utf-8") as handle:
+                tree = ast.parse(handle.read())
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name) and node.func.value.id == "tmdl"
+                        and node.func.attr == "load_model"):
+                    continue
+                if len(node.args) > 1 or any(k.arg in ("root", "texts") for k in node.keywords):
+                    continue
+                functions = [f for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                             and f.lineno <= node.lineno <= f.end_lineno]
+                fn = max(functions, key=lambda f: f.lineno).name if functions else "<module>"
+                found.append((name, fn))
+                self.assertIn(name, allowlist, (name, node.lineno))
+                self.assertIn(fn, allowed_functions.get(name, set()), (name, fn, node.lineno))
+        self.assertCountEqual(found, [(name, fn) for name, functions in allowed_functions.items()
+                                      for fn in functions])
 
 
 if __name__ == "__main__":

@@ -434,12 +434,15 @@ class Model:
         return names
 
 
-def tmdl_files(definition_dir: str) -> list[str]:
+def tmdl_files(definition_dir: str, *, strict: bool = False, root: str | None = None) -> list[str]:
     if _reparse_link(definition_dir):
         raise _UNSAFE
     out = []
-    def unreadable(_err):
-        raise _UNSAFE
+    def unreadable(err):
+        if strict:
+            path = err.filename or definition_dir
+            detail = os.path.relpath(path, root) if root is not None else path
+            raise PbzError("REFUSED", detail.replace("\\", "/")) from None
     for cur, dirs, files in os.walk(definition_dir, onerror=unreadable):
         if _reparse_link(cur):
             raise _UNSAFE
@@ -461,7 +464,7 @@ def load_model(definition_dir: str, texts: dict | None = None, *, root: str | No
     model = Model()
     if texts is None:
         texts = {}
-        for p in tmdl_files(definition_dir):
+        for p in tmdl_files(definition_dir, strict=(root is not None), root=root):
             if root is not None:
                 try:
                     text = read_text_checked(p, root=root)[0]

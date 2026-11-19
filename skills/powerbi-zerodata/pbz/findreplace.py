@@ -213,15 +213,19 @@ def replace(ws, project, pattern: str, repl: str, kind: str = "any", apply: bool
         for obj_kind, old, new, table in jobs:
             rename_mod.rename(ws, project, obj_kind, old, new, table)
         ops = []
+        expected = {}
         if not name_hit:
             for rel, text in mirror.mirror_texts(ws, project).items():
                 new_text = sub_outside(text, rx, repl)
                 if new_text != text:
                     path = os.path.join(ws.mirror, *rel.split("/"))
-                    _old, bom = mirror.read_mirror_text(path, root=ws.mirror)
+                    old, bom = mirror.read_mirror_text(path, root=ws.mirror)
+                    if old != text:
+                        raise PbzError("RECOVERY_REQUIRED", rel)
+                    expected[path] = bom + text.encode("utf-8")
                     ops.append(("write", path, new_text, bom))
             if ops:
-                commit_bytes(ops, root=anchor_mirror(ws))
+                commit_bytes(ops, root=anchor_mirror(ws), expected=expected)
         return {**out, "dry_run": False, "result": "CHANGED" if planned or ops else "NOTHING_TO_CHANGE"}
 
     if jobs or outside:
