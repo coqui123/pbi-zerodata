@@ -729,9 +729,16 @@ def test_perf_baseline_workloads(env: Env) -> None:
     def call(project, check, query, action):
         result = engine("perf", env.req(project_identity=project, baseline=check,
                                         dax=query, runs=20, action=action), "perf-workload") or {}
-        blob = json.dumps(result)
-        expect("perf workload identity stays private", query not in blob and "workload" not in result
-               and "fingerprint" not in result and project not in blob, result)
+        def private(value):
+            if isinstance(value, str):
+                return query not in value and project not in value
+            if isinstance(value, dict):
+                return all("fingerprint" not in key.lower() and "workload" not in key.lower()
+                           and private(child) for key, child in value.items())
+            if isinstance(value, list):
+                return all(private(child) for child in value)
+            return True
+        expect("perf workload identity stays private", private(result), result)
         return result
 
     saved = call("project-one", "check:one", query_a, "save")
@@ -762,7 +769,7 @@ def test_perf_baseline_workloads(env: Env) -> None:
     from pbz import dpapi
     def digest(text):
         return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
-    tokens = re.findall(r'"(?:[^"]|"")*"|\'(?:[^\']|\'\')*\'|\[(?:[^\]]|\]\])*\]|[^\s]', query_a)
+    tokens = re.findall(r'"(?:[^"]|"")*"|\'(?:[^\']|\'\')*\'|\[(?:[^\]]|\]\])*\]|[^\s\"\'\[]+', query_a)
     workload = digest("\x1f".join(tokens))
     key = digest("project-one\ncheck:one\n" + workload)
     path = env.pd / "perf" / (digest(key) + ".bin")
@@ -1132,6 +1139,20 @@ class ProjectionTests(unittest.TestCase):
         sys.path.insert(0, str(S))
         from pbz import engine
         self.engine = engine
+
+    def test_check_identity_and_hard_ratio_fail_closed(self):
+        from pbz import common, perf
+        with tempfile.TemporaryDirectory() as root:
+            ws = common.Workspace(root)
+            project = common.Project(ws, "One")
+            with patch("pbz.perf.desktop.require_port", return_value=1), \
+                 patch("pbz.perf.checks.spend", return_value=True), \
+                 patch("pbz.perf.engine_call") as call:
+                for verdict, ratio, status in (("NOISY", "WITHIN_LIMIT", "PASS"),
+                                               ("NOISY", "OVER_LIMIT", "FAIL")):
+                    call.return_value = {"ok": True, "verb": "perf", "timing": "BANDED", "trace": "CAPTURED",
+                                         "verdict": verdict, "ratio_verdict": ratio}
+                    self.assertEqual(perf.expect(ws, project, "EVALUATE {1}")["status"], status)
 
     def test_probe_requires_verb(self):
         request = {"table": "Sales", "columns": ["Amount"], "disclosure": "shape"}

@@ -110,5 +110,5 @@ def expect(ws, project, query: str, expect_verdict: str = "NOT_SLOWER", check_id
         return {"status": "BUDGET", "verdict": "UNAVAILABLE"}
     verdict_ = result.get("verdict")
     status = ("FAIL" if result.get("ratio_verdict") == "OVER_LIMIT" or verdict_ == "SLOWER" else
-              "PASS" if verdict_ in ("FASTER", "SAME") and result.get("ratio_verdict") == "WITHIN_LIMIT" else "ERROR")
+              "PASS" if verdict_ in ("FASTER", "SAME", "NOISY") and result.get("ratio_verdict") == "WITHIN_LIMIT" else "ERROR")
     return {"status": status, "verdict": verdict_ or "UNAVAILABLE"}

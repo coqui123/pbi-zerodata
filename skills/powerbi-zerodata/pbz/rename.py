@@ -206,9 +206,20 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     writes = {op[1]: op[2] for op in ops if op[0] == "write"}
     for path in pbir.report_files(project.mirror_report):
         text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
-        original = pbir.walk_fields_with_path(pbir.parse_json(text), model)
-        following = dict((site, ref) for ref, site in pbir.walk_fields_with_path(
-            pbir.parse_json(writes.get(path, text)), planned))
+        try:
+            original_root = pbir.parse_json(text)
+            following_root = pbir.parse_json(writes.get(path, text))
+        except PbzError:
+            raise
+        except Exception as exc:
+            raise PbzError("REFUSED", "cannot parse report while verifying rename; nothing renamed") from exc
+        original = pbir.walk_fields_with_path(original_root, model)
+        following = dict((site, ref) for ref, site in pbir.walk_fields_with_path(following_root, planned))
+        after_strings = dict(_report_strings(following_root))
+        for site, value in _report_strings(original_root):
+            expected = _report_string_rename(site[-1], value, kind, home, old, new)
+            if after_strings.get(site) != expected:
+                raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         for ref, site in original:
             k = "column" if ref.kind == "aggregation" else ref.kind
             target = (ref.table.lower() == old.lower()) if kind == "table" else (
@@ -218,8 +229,33 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
             after_ref = following.get(site)
             table_name = new if kind == "table" else ref.table
             object_name = ref.name if kind == "table" else new
-            if after_ref is None or after_ref.table != table_name or after_ref.name != object_name:
+            if (after_ref is None or ("column" if after_ref.kind == "aggregation" else after_ref.kind) != k
+                    or after_ref.table != table_name or after_ref.name != object_name):
                 raise PbzError("REFUSED", "a report binding did not follow the rename; nothing renamed")
+
+
+def _report_strings(node, path=()):
+    """Standalone query references retain their full, index-bearing JSON paths."""
+    if isinstance(node, pbir.JObj):
+        for key, value in node.pairs:
+            here = path + (key.value,)
+            if key.value in ("queryRef", "nativeQueryRef") and isinstance(value, pbir.JStr):
+                yield here, value.value
+            yield from _report_strings(value, here)
+    elif isinstance(node, pbir.JArr):
+        for i, value in enumerate(node.items):
+            yield from _report_strings(value, path + (i,))
+
+
+def _report_string_rename(key, value, kind, home, old, new):
+    if kind == "table":
+        if key in ("queryRef", "metadata", "queryName") and value.lower().startswith(old.lower() + "."):
+            return new + value[len(old):]
+        return value
+    rewritten = re.sub(rf"(?i)(?<![\w]){re.escape(home)}\.{re.escape(old)}(?![\w])", f"{home}.{new}", value)
+    if key == "nativeQueryRef" and value.lower() == old.lower():
+        return new
+    return rewritten
 
 
 def _binding_edits(bindings, kind, home, old, new, text):
@@ -259,9 +295,7 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str) -> lis
     for key, node in pbir.string_nodes(root):
         if key in ("queryRef", "nativeQueryRef", "metadata") and old.lower() in node.value.lower():
             v = node.value
-            nv = re.sub(rf"(?i)(?<![\w]){re.escape(home)}\.{re.escape(old)}(?![\w])", f"{home}.{new}", v)
-            if key == "nativeQueryRef" and v.lower() == old.lower():
-                nv = new
+            nv = _report_string_rename(key, v, kind, home, old, new)
             if nv != v:
                 edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
     return edits
@@ -319,7 +353,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     src = os.path.join(mdef, *t.file.split("/"))
     dest = os.path.join(mdef, *t.file.split("/")[:-1], _safe_file(new) + ".tmdl")
     # Apply Windows path identity on every OS, including sanitized name collisions.
-    if old.lower() != new.lower() and ntpath.normcase(os.path.abspath(dest)) == ntpath.normcase(os.path.abspath(src)):
+    if old != new and ntpath.normcase(os.path.abspath(dest)) == ntpath.normcase(os.path.abspath(src)):
         raise PbzError("UNSUPPORTED", "table rename requires a distinct sanitized file path")
     _refuse_file_collision(mdef, t.file, new)
     res = deps.Resolver(model)
@@ -392,7 +426,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         new_text = apply_edits(text, edits) if edits else text
         path = os.path.join(mdef, *rel.split("/"))
         _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
-        if rel == t.file and os.path.basename(rel)[:-5].lower() == low and old.lower() != new.lower():
+        if rel == t.file and os.path.basename(rel)[:-5].lower() == low and old != new:
             target = "/".join(rel.split("/")[:-1] + [_safe_file(new) + ".tmdl"])
             if target != rel:
                 ops.append(("write", os.path.join(mdef, *target.split("/")), new_text, bom))

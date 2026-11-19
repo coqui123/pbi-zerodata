@@ -142,7 +142,7 @@ public static class Perf
             if (s.HasEnd && double.IsFinite(s.Ms) && s.Ms >= 0) timed.Add(s.Ms);
         timed.Sort();
 
-        captured = captured && timed.Count == samples.Count;
+        bool complete = captured && timed.Count == samples.Count;
         bool banded = timed.Count > 0;
         double median = 0;
         double spread = 0;
@@ -196,7 +196,7 @@ public static class Perf
 
         if (action == "save")
         {
-            if (captured && banded && median > 0 && baseline != null)
+            if (complete && banded && median > 0 && baseline != null)
             {
                 SaveBaseline(ctx.RequirePrivateDir(), baseline, workload, median, spread);
                 fields["baseline"] = "SAVED";
@@ -206,7 +206,7 @@ public static class Perf
         {
             if (!TryReadBaseline(ctx.RequirePrivateDir(), baseline, workload, out double old, out double oldSpread))
                 fields["baseline"] = "MISSING";
-            else if (captured && banded)
+            else if (complete && banded)
             {
                 fields["verdict"] = Verdict(old, median, oldSpread);
                 fields["ratio_verdict"] = median > old * Ratio ? "OVER_LIMIT" : "WITHIN_LIMIT";
@@ -306,10 +306,52 @@ public static class Perf
         return string.Equals(NormalizeQuery(text), needle, StringComparison.Ordinal);
     }
 
-    // Whitespace outside quoted tokens is formatting; whitespace inside literals is data.
+    // Keep literal and comment boundaries while normalizing formatting whitespace.
     static string NormalizeQuery(string text)
-        => string.Join("\u001f", Regex.Matches(text, "\"(?:[^\"]|\"\")*\"|'(?:[^']|'')*'|\\[(?:[^\\]]|\\]\\])*\\]|[^\\s]", RegexOptions.CultureInvariant)
-            .Cast<Match>().Select(m => m.Value));
+    {
+        var tokens = new List<string>();
+        int i = 0;
+        while (i < text.Length)
+        {
+            if (char.IsWhiteSpace(text[i])) { i++; continue; }
+            int start = i;
+            bool comment = false;
+            if (i + 1 < text.Length && text[i] == '/' && text[i + 1] == '/')
+            {
+                comment = true;
+                i += 2;
+                while (i < text.Length && text[i] != '\r' && text[i] != '\n') i++;
+            }
+            else if (i + 1 < text.Length && text[i] == '/' && text[i + 1] == '*')
+            {
+                comment = true;
+                i += 2;
+                while (i + 1 < text.Length && !(text[i] == '*' && text[i + 1] == '/')) i++;
+                i = Math.Min(text.Length, i + 2);
+            }
+            else if (text[i] == '"' || text[i] == '\'' || text[i] == '[')
+            {
+                char close = text[i] == '[' ? ']' : text[i];
+                i++;
+                while (i < text.Length)
+                {
+                    if (text[i++] != close) continue;
+                    if (i < text.Length && text[i] == close) { i++; continue; }
+                    break;
+                }
+            }
+            else
+            {
+                i++;
+                while (i < text.Length && !char.IsWhiteSpace(text[i])
+                    && text[i] != '"' && text[i] != '\'' && text[i] != '['
+                    && !(i + 1 < text.Length && text[i] == '/' && (text[i + 1] == '/' || text[i + 1] == '*'))) i++;
+            }
+            string token = text.Substring(start, i - start);
+            tokens.Add(comment ? Regex.Replace(token, @"\s+", " ", RegexOptions.CultureInvariant) : token);
+        }
+        return string.Join("\u001f", tokens);
+    }
 
     static string Hash(string text) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
 

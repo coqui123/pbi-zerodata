@@ -48,7 +48,7 @@ def _kill_tree(p):
             pass
 
 
-def _bounded_output(command, cwd, env, timeout):
+def _bounded_output(command, cwd, env, timeout, mid=0):
     p = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          start_new_session=os.name != "nt")
@@ -67,7 +67,7 @@ def _bounded_output(command, cwd, env, timeout):
         total = decoded_total = wire_text = pending = 0
         started = False
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        envelope = len(_encode({"jsonrpc": "2.0", "id": 0, "result": {
+        envelope = len(_encode({"jsonrpc": "2.0", "id": mid, "result": {
             "content": [{"type": "text", "text": ""}], "isError": True}}))
 
         def account(fragment):
@@ -103,7 +103,7 @@ def _bounded_output(command, cwd, env, timeout):
                     return
                 emit(chunk)
         except OSError:
-            emit(None)
+            emit("READ_ERROR")
         finally:
             p.stdout.close()
 
@@ -135,7 +135,7 @@ def _bounded_output(command, cwd, env, timeout):
         if error:
             _kill_tree(p)
         try:
-            p.wait(timeout=max(0.01, min(5, deadline - time.monotonic())))
+            p.wait(timeout=max(0.01, min(5, deadline - time.monotonic()) if error else deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             error = error or "TIMEOUT"
             _kill_tree(p)
@@ -152,6 +152,8 @@ def _bounded_output(command, cwd, env, timeout):
 
 def _operation_error(tool, code):
     body = {"ok": False, "error": code}
+    if code == "TIMEOUT":
+        body["detail"] = f"{tool.name} took longer than {tool.timeout}s"
     if not tool.read_only:
         body.update(outcome="UNKNOWN", recovery="Run the recover tool to inspect the journal before retrying.")
     return _result(body, True)
@@ -165,7 +167,7 @@ def _wire_response(response, tool=None):
     # Encoding is bounded by the raw/decoded budgets before entering this function.
     if len(_encode(response)) <= WIRE_LIMIT:
         return response
-    limited = dict(response)
+    limited = {"jsonrpc": "2.0", "id": response.get("id")}
     limited["result"] = _operation_error(tool, "OUTPUT_LIMIT") if tool else _result(
         {"ok": False, "error": "OUTPUT_LIMIT"}, True)
     # An arbitrarily large request id must not defeat the final wire budget.
@@ -783,14 +785,14 @@ def build_argv(tool: Tool, args: dict, workspace: str | None, project: str | Non
     return argv, os.path.abspath(ws)
 
 
-def call_tool(name: str, args: dict, workspace: str | None, project: str | None) -> dict:
+def call_tool(name: str, args: dict, workspace: str | None, project: str | None, mid=0) -> dict:
     tool = BY_NAME.get(name)
     if tool is None:
         raise ToolError(f"unknown tool: {name}")
     argv, cwd = build_argv(tool, args or {}, workspace, project)
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     try:
-        code, raw, error = _bounded_output([sys.executable, "-I", CLI, *argv], cwd, env, tool.timeout)
+        code, raw, error = _bounded_output([sys.executable, "-I", CLI, *argv], cwd, env, tool.timeout, mid)
     except OSError:
         return _result({"ok": False, "error": "CLI_UNAVAILABLE"}, True)
     if error:
@@ -845,7 +847,7 @@ def handle(msg, workspace: str | None, project: str | None) -> dict | None:
         if not isinstance(name, str) or not isinstance(args, dict):
             return None if notification else _error(mid, -32602, "tools/call needs name and an arguments object")
         try:
-            result = call_tool(name, args, workspace, project)
+            result = call_tool(name, args, workspace, project, mid)
         except ToolError as e:
             return None if notification else _error(mid, -32602, str(e))
     else:

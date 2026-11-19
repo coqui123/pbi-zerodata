@@ -14,6 +14,7 @@ import re
 import shutil
 import sys
 import tempfile
+from unittest.mock import patch
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
@@ -104,6 +105,30 @@ def main() -> int:
         check(notes.get("NESTED_MEASURES", {}).get("measures") == ["[C]"]
               and notes.get("DUPLICATE_MEMBERS", {}).get("pairs") == [["[A YoY 2]", "[A YoY]"]], f"family notes: {notes}")
     check(consolidate.families(um, min_bases=4) == [], "min_bases 4")
+
+    # Adjacent integers above 2^53 must remain distinct family templates.
+    decimal_text = "table T\n\tcolumn X\n"
+    for i, base in enumerate("ABCDEF"):
+        decimal_text += f"\tmeasure {base} = SUM(T[X]) + {i}\n"
+        literal = "9007199254740993" if i < 3 else "9007199254740992"
+        decimal_text += f"\tmeasure '{base} Large' = [{base}] + {literal}\n"
+    decimal_model = tmdl.load_model("", texts={"tables/T.tmdl": decimal_text})
+    decimal_families = consolidate.families(decimal_model)
+    check(len(decimal_families) == 2, f"exact decimal family groups: {decimal_families}")
+    check({f["templates"][0]["expression"] for f in decimal_families} ==
+          {"SELECTEDMEASURE() + 9007199254740993", "SELECTEDMEASURE() + 9007199254740992"},
+          "adjacent large integers preserved in templates")
+    with patch("pbz.similar._h", return_value="a" * 64):
+        collided = consolidate.families(decimal_model)
+        check(len(collided) == 2 and len({f["id"] for f in collided}) == 1, "forced family id collision")
+        try:
+            consolidate._pick_family(decimal_model, "a" * 10, None)
+        except PbzError as exc:
+            check(exc.code == "AMBIGUOUS", f"family collision refusal: {exc.code}")
+        else:
+            check(False, "family collision must refuse")
+        selected = consolidate._pick_family(decimal_model, "a" * 10, ["A Large"])
+        check(selected["bases"] == ["A", "B", "C"], "members disambiguate collided family id")
 
     # ================================================================ 1. merge 'Sales Copy' into 'Total Sales'
     tmp1, ws, project = setup("pbzcons1-")

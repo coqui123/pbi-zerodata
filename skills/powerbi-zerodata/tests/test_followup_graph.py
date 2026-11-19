@@ -323,6 +323,8 @@ class PerfDisclosureTests(unittest.TestCase):
              patch("pbz.perf.engine_call") as engine:
             engine.return_value = _perf_body(verdict="SAME", ratio_verdict="WITHIN_LIMIT")
             self.assertEqual(perf.expect(self.ws, project, "EVALUATE {1}", check_id="a:b")["status"], "PASS")
+            engine.return_value = _perf_body(verdict="NOISY", ratio_verdict="WITHIN_LIMIT")
+            self.assertEqual(perf.expect(self.ws, project, "EVALUATE {1}", check_id="a:b")["status"], "PASS")
             first = engine.call_args.args[1]
             self.assertEqual(first["baseline"], "a:b")
             for verdict in ("NOISY", "SAME"):

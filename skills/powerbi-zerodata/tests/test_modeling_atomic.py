@@ -72,9 +72,11 @@ class ModelingAtomicTests(unittest.TestCase):
 
     def test_case_only_table_rename(self):
         ws, project, mdef = self._column_project()
-        rename.rename(ws, project, "table", "Sales", "SALES")
-        self.assertIn("table SALES", Path(mdef, "tables", "Sales.tmdl").read_text())
-        self.assertIn("SUM(SALES[Amount])", Path(mdef, "tables", "Sales.tmdl").read_text())
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "SALES")
+        self.assertEqual(caught.exception.code, "UNSUPPORTED")
+        self.assertEqual(_bytes(ws.mirror), before)
 
     def _column_project(self):
         ws, project, mdef = self._project()

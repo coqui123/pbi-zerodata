@@ -359,9 +359,11 @@ and `predicates` stay (booleans are allowed in both tiers, as in `probe`). Engin
 
 ### `perf`
 
-Request `{"private_dir", "port", "dax", "runs", "baseline"?, "action"?}`. `dax` must pass the snapshot/smoke
+Request `{"private_dir", "port", "dax", "runs", "baseline"?, "action"?, "project_identity"?}`. `dax` must pass the snapshot/smoke
 guard (`DEFINE` or `EVALUATE` first; no `INFO.*`, no `EVALUATEANDLOG`). `runs` is 1 to 20. `action` is `save`,
 `compare`, or absent. `baseline` is a file name (`^[A-Za-z0-9._-]{1,64}$`) required when `action` is set.
+`project_identity` is required for save/compare and is a hash of the workspace root and project file path,
+supplied by `pbz/perf.py`.
 Each run is a cold XMLA `ClearCache` (`DatabaseID` is the catalog name) followed by the query. Result rows are
 discarded. The median and the run-to-run spread stay in the process. The baseline file is DPAPI in
 `private_dir\perf\<name>.bin` and holds only those two numbers.

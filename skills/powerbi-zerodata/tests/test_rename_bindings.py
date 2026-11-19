@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -11,7 +12,7 @@ SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.dirname(__file__))
 
-from pbz import consolidate, deps, rename, tmdl
+from pbz import consolidate, deps, rename, tmdl, pbir
 from pbz.common import PbzError
 from pbz.tokens import apply_edits
 import test_modeling_atomic as fixtures
@@ -21,6 +22,137 @@ from test_modeling_atomic import _bytes, _write
 class RenameBindingsTests(unittest.TestCase):
     _project = fixtures.ModelingAtomicTests._project
     _column_project = fixtures.ModelingAtomicTests._column_project
+
+    def test_missed_metadata_bindings_refuse_without_writes(self):
+        for seam in ("columnPermission", "baseColumn", "ref table"):
+            with self.subTest(seam=seam):
+                ws, project, _mdef = self._column_project()
+                before = _bytes(ws.mirror)
+                original = rename.apply_edits
+
+                def omit(text, edits):
+                    return original(text, [e for e in edits if not text[:e[0]].split("\n")[-1].lstrip().startswith(seam)])
+
+                with patch("pbz.rename.apply_edits", side_effect=omit):
+                    with self.assertRaises(PbzError) as caught:
+                        if seam == "ref table":
+                            rename.rename(ws, project, "table", "Sales", "Revenue")
+                        else:
+                            rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+                self.assertEqual(caught.exception.code, "REFUSED")
+                self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_role_and_base_column_crlf_bytes(self):
+        ws, project, mdef = self._column_project()
+        role = Path(mdef, "roles", "Reader.tmdl")
+        other = Path(mdef, "tables", "Other.tmdl")
+        for path in (role, other):
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        role_before, other_before = role.read_bytes(), other.read_bytes()
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(role.read_bytes(), role_before.replace(b"columnPermission Amount", b"columnPermission Value", 1))
+        self.assertEqual(other.read_bytes(), other_before.replace(b"baseColumn: Sales.Amount", b"baseColumn: Sales.Value"))
+
+    def _report_project(self, obj):
+        ws, project, mdef = self._column_project()
+        path = Path(project.mirror_report, "definition", "report.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(obj))
+        return ws, project, mdef, path
+
+    def test_report_sibling_paths_and_missed_first_binding(self):
+        field = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"}}
+        ws, project, mdef, path = self._report_project({"projections": [field, field]})
+        model = tmdl.load_model(mdef)
+        paths = [site for _ref, site in pbir.walk_fields_with_path(pbir.parse_json(path.read_text()), model)]
+        self.assertEqual(paths, [("projections", 0), ("projections", 1)])
+        before = _bytes(ws.mirror)
+        original = rename.pbir_ref_edits
+        with patch("pbz.rename.pbir_ref_edits", side_effect=lambda *a: original(*a)[1:]):
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(_bytes(ws.mirror), before)
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(path.read_text().count('"Value"'), 2)
+
+    def test_report_siblings_with_different_targets_rename_correctly(self):
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": table}}, "Property": "Amount"}}
+            for table in ("Sales", "Other")]}
+        ws, project, _mdef, path = self._report_project(obj)
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        after = json.loads(path.read_text())["projections"]
+        self.assertEqual([entry["Column"]["Property"] for entry in after], ["Value", "Amount"])
+
+    def test_unrelated_report_string_change_refuses(self):
+        ws, project, mdef, path = self._report_project({"queryRef": "Other.Amount"})
+        model = tmdl.load_model(mdef)
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            rename._verify_plan(ws, project, model, mdef,
+                                [("write", str(path), '{"queryRef":"Other.Value"}', b"")],
+                                "column", "Sales", "Absent", "New")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_malformed_planned_report_refuses(self):
+        ws, project, mdef, path = self._report_project({})
+        model = tmdl.load_model(mdef)
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            rename._verify_plan(ws, project, model, mdef, [("write", str(path), '{', b"")],
+                                "column", "Sales", "Absent", "New")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_report_kind_change_refuses(self):
+        field = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"}}
+        ws, project, mdef, path = self._report_project(field)
+        model = tmdl.load_model(mdef)
+        renamed = json.dumps(field).replace('"Amount"', '"Value"').replace('"Column"', '"Measure"')
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            rename._verify_plan(ws, project, model, mdef, [("write", str(path), renamed, b"")],
+                                "column", "Sales", "Amount", "Value")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_standalone_report_strings_verified(self):
+        for kind, old, new, strings in (
+            ("column", "Amount", "Value", ["Sales.Amount", "Other.Amount", "Amount"]),
+            ("table", "Sales", "Revenue", ["Sales.Amount", "Other.Amount", "Sales"]),
+        ):
+            for missed in (True, False):
+                with self.subTest(kind=kind, missed=missed):
+                    obj = {"refs": [{"queryRef": v, "nativeQueryRef": v} for v in strings]}
+                    ws, project, _mdef, path = self._report_project(obj)
+                    before = _bytes(ws.mirror)
+                    if missed:
+                        with patch("pbz.move.plan_pbir", return_value=[]):
+                            with self.assertRaises(PbzError) as caught:
+                                rename.rename(ws, project, kind, old, new, table="Sales")
+                        self.assertEqual(caught.exception.code, "REFUSED")
+                        self.assertEqual(_bytes(ws.mirror), before)
+                    else:
+                        rename.rename(ws, project, kind, old, new, table="Sales")
+                        after = json.loads(path.read_text())["refs"]
+                        self.assertEqual(after[0]["queryRef"], "Revenue.Amount" if kind == "table" else "Sales.Value")
+                        self.assertEqual(after[1], obj["refs"][1])
+                        self.assertEqual(after[2]["nativeQueryRef"], "Sales" if kind == "table" else "Value")
+
+    def test_verify_report_parse_failure_refuses_and_pbzerror_passes_through(self):
+        ws, project, mdef, _path = self._report_project({})
+        model = tmdl.load_model(mdef)
+        for error in (pbir.JsonError("bad json"), PbzError("UNSUPPORTED", "sentinel")):
+            before = _bytes(ws.mirror)
+            with patch("pbz.pbir.parse_json", side_effect=error):
+                with self.assertRaises(PbzError) as caught:
+                    rename._verify_plan(ws, project, model, mdef, [], "column", "Sales", "Absent", "New")
+            self.assertEqual(caught.exception.code, "UNSUPPORTED" if isinstance(error, PbzError) else "REFUSED")
+            if isinstance(error, PbzError):
+                self.assertIs(caught.exception, error)
+            self.assertEqual(_bytes(ws.mirror), before)
 
     def test_measure_rename_end_to_end_written_qualifier(self):
         ws, project, mdef = self._project()

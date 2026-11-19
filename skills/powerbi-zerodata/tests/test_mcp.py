@@ -15,6 +15,7 @@ import tempfile
 import unittest
 import time
 import tracemalloc
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -143,8 +144,8 @@ def call(mid, name, args=None) -> dict:
 
 
 class OutputBudgetTests(unittest.TestCase):
-    def run_child(self, code, timeout=5):
-        return mcp._bounded_output([sys.executable, "-c", code], os.getcwd(), os.environ.copy(), timeout)
+    def run_child(self, code, timeout=5, mid=0):
+        return mcp._bounded_output([sys.executable, "-c", code], os.getcwd(), os.environ.copy(), timeout, mid)
 
     def test_raw_exact_and_over_limit(self):
         with patch.object(mcp, "RAW_LIMIT", 1024):
@@ -172,9 +173,16 @@ class OutputBudgetTests(unittest.TestCase):
             self.assertEqual((raw, error), (b"", "OUTPUT_LIMIT"))
 
     def test_stderr_is_discarded(self):
+        try:
+            import resource
+        except ImportError:
+            resource = None
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource and sys.platform.startswith("linux") else None
         with patch.object(mcp, "RAW_LIMIT", 1024):
             code, raw, error = self.run_child("import os; os.write(2,b'x'*10000000); os.write(1,b'ok')")
             self.assertEqual((code, raw, error), (0, b"ok", None))
+        if before is not None:
+            self.assertLess(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before, 32 * 1024)
 
     def test_wire_exact_limit_and_escaping(self):
         response = {"jsonrpc": "2.0", "id": 1, "result": mcp._result({"value": "x"*1000}, False)}
@@ -212,10 +220,68 @@ class OutputBudgetTests(unittest.TestCase):
             self.assertFalse(Path(marker).exists())
 
     def test_decoded_limit(self):
-        with patch.object(mcp, "DECODED_LIMIT", 10), \
-             patch.object(mcp, "_bounded_output", return_value=(0, b"x"*11, None)):
+        with patch.object(mcp, "DECODED_LIMIT", 10):
+            self.assertEqual(self.run_child("import os; os.write(1, 'é'.encode()*10)"), (0, 'é'.encode()*10, None))
+            _code, raw, error = self.run_child("import os; os.write(1, 'é'.encode()*11)")
+            self.assertEqual((raw, error), (b"", "OUTPUT_LIMIT"))
+            for count in (10, 11):
+                with patch.object(mcp, "_bounded_output", return_value=(0, b"x"*count, None)):
+                    result = mcp.call_tool("status", {}, os.getcwd(), None)
+                self.assertEqual(result["isError"], count > 10)
+                if count > 10:
+                    self.assertEqual(json.loads(result["content"][0]["text"])["error"], "OUTPUT_LIMIT")
+                else:
+                    self.assertEqual(result["content"][0]["text"], "x" * 10)
+
+    def test_wire_fallback_discards_original_error_and_huge_id(self):
+        with patch.object(mcp, "WIRE_LIMIT", 1024):
+            response = {"jsonrpc": "2.0", "id": "i" * 10000, "error": {"message": "e" * 10000},
+                        "result": mcp._result({"value": "x" * 10000}, False)}
+            result = mcp._wire_response(response, mcp.BY_NAME["rename"])
+            self.assertLessEqual(len(mcp._encode(result)), 1024)
+            self.assertNotIn("error", result)
+            self.assertIsNone(result["id"])
+            self.assertEqual(json.loads(result["result"]["content"][0]["text"])["error"], "OUTPUT_LIMIT")
+
+    def test_timeout_detail_and_read_only_outcome(self):
+        for name, args in (("status", {}), ("rename", {"kind": "column", "old": "A", "new": "B"})):
+            with patch.object(mcp, "_bounded_output", return_value=(-9, b"", "TIMEOUT")):
+                result = mcp.call_tool(name, args, os.getcwd(), None)
+            body = json.loads(result["content"][0]["text"])
+            self.assertEqual(body["detail"], f"{name} took longer than {mcp.BY_NAME[name].timeout}s")
+            self.assertEqual("outcome" in body, name == "rename")
+            self.assertEqual("recovery" in body, name == "rename")
+
+    def test_stdout_eof_waits_until_tool_deadline(self):
+        # More than the former fixed 5 second wait, but within the tool deadline.
+        self.assertEqual(self.run_child("import os,time; os.write(1,b'ok'); os.close(1); time.sleep(5.3)", timeout=10),
+                         (0, b"ok", None))
+
+    def test_read_error_refuses_partial_output(self):
+        read = os.read
+        def broken(fd, size):
+            if threading.current_thread() is not threading.main_thread():
+                raise OSError("read failed")
+            return read(fd, size)
+        with patch.object(mcp.os, "read", side_effect=broken):
+            _code, raw, error = self.run_child("import time; time.sleep(10)")
+        self.assertEqual((raw, error), (b"", "READ_ERROR"))
+        with patch.object(mcp, "_bounded_output", return_value=(-9, b"partial", "READ_ERROR")):
             result = mcp.call_tool("status", {}, os.getcwd(), None)
-        self.assertEqual(json.loads(result["content"][0]["text"])["error"], "OUTPUT_LIMIT")
+        self.assertEqual(json.loads(result["content"][0]["text"])["error"], "READ_ERROR")
+        self.assertTrue(result["isError"])
+
+    def test_production_budget_uses_real_request_id(self):
+        mid = "id" * 100
+        envelope = {"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": "x" * 20}], "isError": True}}
+        with patch.object(mcp, "WIRE_LIMIT", len(mcp._encode(envelope))):
+            self.assertEqual(self.run_child("import os; os.write(1,b'x'*20)", mid=mid), (0, b"x"*20, None))
+            _code, raw, error = self.run_child("import os; os.write(1,b'x'*21)", mid=mid)
+            self.assertEqual((raw, error), (b"", "OUTPUT_LIMIT"))
+        with patch.object(mcp, "_bounded_output", return_value=(0, b"ok", None)) as bounded:
+            mcp.handle(rpc(mid, "tools/call", {"name": "status", "arguments": {}}), os.getcwd(), None)
+        self.assertEqual(bounded.call_args.args[-1], mid)
 
 
 class GitHookTests(unittest.TestCase):
@@ -307,19 +373,80 @@ class GitHookTests(unittest.TestCase):
             self.install()
         self.assertEqual(before, self.snapshot())
 
+    @unittest.skipIf(os.name == "nt", "direct shell hook execution is POSIX-only")
     def test_chain_bytes_args_stdin_and_status(self):
-        host = b'#!/bin/sh\nprintf "host:%s" "$*"\ncat\nexit "${HOST_STATUS:-0}"\n'
-        (self.hooks / "pre-push").write_bytes(host)
+        host = b'#!/bin/sh\nprintf "host\\n"\nprintf "%s\\n" "$@"\ncat\nexit "${HOST_STATUS:-0}"\n'
+        for name in self.inst.NAMES:
+            (self.hooks / name).write_bytes(host)
+            (self.hooks / name).chmod(0o751)
         self.install(chain=True)
-        self.assertEqual((self.hooks / "pre-push.pbz-host").read_bytes(), host)
-        for status in (0, 7):
-            out = subprocess.run(["sh", str(self.hooks / "pre-push"), "origin", "a b"], input=b"push-input\n",
-                                 capture_output=True, env={**os.environ, "HOST_STATUS": str(status)})
-            self.assertEqual(out.returncode, status)
-            self.assertEqual(out.stdout, b"host:origin a bpush-input\n" +
-                             (b"pbz:origin a bpush-input\n" if status == 0 else b""))
+        for name in self.inst.NAMES:
+            self.assertEqual((self.hooks / (name + ".pbz-host")).read_bytes(), host)
+            self.assertEqual((self.hooks / (name + ".pbz-host")).stat().st_mode & 0o777, 0o751)
+            for status in (0, 7):
+                out = subprocess.run([str(self.hooks / name), "origin", "a b"], input=b"push-input\n",
+                                     capture_output=True, env={**os.environ, "HOST_STATUS": str(status)})
+                self.assertEqual(out.returncode, status)
+                self.assertEqual(out.stdout, b"host\norigin\na b\npush-input\n" +
+                                 ((b"pbz:origin a b" + (b"push-input\n" if name == "pre-push" else b"")) if status == 0 else b""))
         self.install(chain=True)
-        self.assertEqual((self.hooks / "pre-push.pbz-host").read_bytes(), host)
+        for name in self.inst.NAMES:
+            self.assertEqual((self.hooks / (name + ".pbz-host")).read_bytes(), host)
+
+    @unittest.skipIf(os.name == "nt", "executable mode semantics require POSIX")
+    def test_non_executable_host_is_ignored(self):
+        for name in self.inst.NAMES:
+            host = self.hooks / name
+            host.write_bytes(b'#!/bin/sh\nprintf "HOST-MUST-NOT-RUN"\nexit 7\n')
+            host.chmod(0o640)
+        self.install(chain=True)
+        for name in self.inst.NAMES:
+            self.assertEqual((self.hooks / (name + ".pbz-host")).stat().st_mode & 0o777, 0o640)
+            out = subprocess.run([str(self.hooks / name), "origin", "a b"], input=b"input\n", capture_output=True)
+            self.assertEqual(out.returncode, 0)
+            self.assertEqual(out.stdout, b"pbz:origin a binput\n")
+
+    def test_chain_runs_through_git_commit_and_push(self):
+        subprocess.run(["git", "config", "user.name", "Hook Test"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.email", "hooks@example.test"], cwd=self.root, check=True)
+        for name in self.inst.NAMES:
+            host = self.hooks / name
+            host.write_bytes(b'#!/bin/sh\nprintf "host-run\\n"\nprintf "%s\\n" "$@"\ncat\n')
+            host.chmod(0o755)
+        self.install(chain=True)
+        commit = subprocess.run(["git", "commit", "--allow-empty", "-m", "hook test"], cwd=self.root, capture_output=True)
+        self.assertEqual(commit.returncode, 0, commit.stderr)
+        self.assertIn(b"host-run", commit.stderr + commit.stdout)
+        self.assertIn(b"pbz:", commit.stderr + commit.stdout)
+        remote = self.root / "local remote.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.root, check=True)
+        pushed = subprocess.run(["git", "push", "origin", "HEAD:refs/heads/main"], cwd=self.root, capture_output=True)
+        self.assertEqual(pushed.returncode, 0, pushed.stderr)
+        output = pushed.stderr + pushed.stdout
+        self.assertIn(b"host-run\norigin\n" + str(remote).encode() + b"\n", output)
+        self.assertIn(b"pbz:origin " + str(remote).encode(), output)
+        self.assertGreaterEqual(output.count(b"refs/heads/main"), 2)
+
+    def test_replace_failure_rolls_back_sidecars_and_can_retry(self):
+        host = self.hooks / "pre-commit"
+        host.write_bytes(b"#!/bin/sh\nexit 0\n")
+        host.chmod(0o640)
+        before = self.snapshot()
+        replace = self.inst.os.replace
+        calls = 0
+        def fail_once(src, dest):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError("replace failed")
+            return replace(src, dest)
+        with patch.object(self.inst.os, "replace", side_effect=fail_once):
+            with self.assertRaises(OSError):
+                self.install(chain=True)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(host.stat().st_mode & 0o777, 0o640)
+        self.install(chain=True)
 
     def test_shared_hooks_path_requires_opt_in(self):
         self.hooks = self.root / "shared-hooks"

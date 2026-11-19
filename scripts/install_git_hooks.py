@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,7 +22,9 @@ def wrapper(name: str) -> bytes:
         return b"""#!/bin/sh
 # PBZ owned chain v1
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
-"$here/pre-commit.pbz-host" "$@" || exit $?
+if [ -x "$here/pre-commit.pbz-host" ]; then
+    "$here/pre-commit.pbz-host" "$@" || exit $?
+fi
 exec "$here/pre-commit.pbz" "$@"
 """
     return (f'''#!/bin/sh
@@ -30,9 +33,11 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
 input=$(mktemp) || exit 1
 trap 'rm -f "$input"' EXIT HUP INT TERM
 cat > "$input" || exit 1
-"$here/{name}.pbz-host" "$@" < "$input"
-status=$?
-[ "$status" -eq 0 ] || exit "$status"
+if [ -x "$here/{name}.pbz-host" ]; then
+    "$here/{name}.pbz-host" "$@" < "$input"
+    status=$?
+    [ "$status" -eq 0 ] || exit "$status"
+fi
 "$here/{name}.pbz" "$@" < "$input"
 exit $?
 ''').encode("utf-8")
@@ -63,22 +68,45 @@ def install(root: str, source: str, chain: bool = False) -> list[str]:
         if current == wrapper(name):
             if host_body is None or owned_body is None or hashlib.sha256(owned_body).hexdigest() not in known:
                 raise ValueError(f"unverified PBZ chain: {dest}")
-            writes.append((owned, sources[name]))
+            writes.append((owned, sources[name], owned.stat().st_mode | stat.S_IEXEC))
         elif current is None or hashlib.sha256(current).hexdigest() in known:
             if host_body is not None or owned_body is not None:
                 raise ValueError(f"foreign hook sidecar: {dest}")
-            writes.append((dest, sources[name]))
+            writes.append((dest, sources[name], (dest.stat().st_mode if dest.exists() else 0o644) | stat.S_IEXEC))
         elif not chain:
             raise ValueError(f"foreign hook: {dest}; use --chain to preserve it")
         else:
             if host_body is not None or owned_body is not None:
                 raise ValueError(f"foreign hook sidecar: {dest}")
-            writes.extend(((host, current), (owned, sources[name]), (dest, wrapper(name))))
+            writes.extend(((host, current, dest.stat().st_mode),
+                           (owned, sources[name], 0o744), (dest, wrapper(name), 0o744)))
     hooks.mkdir(parents=True, exist_ok=True)
-    for dest, body in writes:
-        if not dest.exists() or dest.read_bytes() != body:
-            dest.write_bytes(body)
-        dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
+
+    def replace_file(dest, body, mode):
+        fd, temp = tempfile.mkstemp(prefix=dest.name + ".", suffix=".tmp", dir=hooks)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(body)
+            os.chmod(temp, stat.S_IMODE(mode))
+            os.replace(temp, dest)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
+    applied = []
+    try:
+        for dest, body, mode in writes:
+            previous = (dest.read_bytes(), dest.stat().st_mode) if dest.exists() else None
+            if previous is None or previous[0] != body or stat.S_IMODE(previous[1]) != stat.S_IMODE(mode):
+                replace_file(dest, body, mode)
+                applied.append((dest, previous))
+    except OSError:
+        for dest, previous in reversed(applied):
+            if previous is None:
+                dest.unlink()
+            else:
+                replace_file(dest, *previous)
+        raise
     return [str(hooks / name) for name in NAMES]
 
 
