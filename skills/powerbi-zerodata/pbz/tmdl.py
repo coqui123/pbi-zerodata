@@ -5,7 +5,7 @@ tokenized in place and references analysed, without re-serializing anything.
 """
 from __future__ import annotations
 
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 import heapq
 import os
 import re
@@ -117,6 +117,7 @@ class TmdlDoc:
     text: str
     nodes: list
     regions: list
+    unclosed_fence: bool = False
     _regions_by_node: dict = field(init=False, repr=False)
     lines: list = field(init=False, repr=False)
     line_offsets: list = field(init=False, repr=False)
@@ -147,11 +148,13 @@ def _indent(line: str) -> int:
 
 def parse(path: str, text: str) -> TmdlDoc:
     lines = _lines(text)
+    line_offsets = [off for off, _ in lines]
     nodes: list[Node] = []
     regions: list[Region] = []
     stack: list[Node] = []
     blocks: list[Node] = []
     pending_desc: list[tuple[int, int]] = []
+    unclosed_fence = False
     i, n = 0, len(lines)
 
     def owner_for(ind: int) -> Node | None:
@@ -168,6 +171,7 @@ def parse(path: str, text: str) -> TmdlDoc:
 
     def take_expr(line_idx: int, ind: int, rest: str, rest_offset: int, node: Node, prop: str) -> int:
         """Record an expression region starting at rest_offset; return index of next unconsumed line."""
+        nonlocal unclosed_fence
         lang = lang_for(node, prop)
         if rest.strip().startswith("```"):
             j = line_idx + 1
@@ -175,8 +179,8 @@ def parse(path: str, text: str) -> TmdlDoc:
             while j < n and lines[j][1].strip() != "```":
                 j += 1
             if j == n:
-                raise PbzError("REFUSED", "unclosed TMDL expression fence")
-            end = lines[j][0]
+                unclosed_fence = True
+            end = lines[j][0] if j < n else len(text)
             reg = Region(lang, start, end, node, prop)
             regions.append(reg)
             if prop == "expression":
@@ -234,6 +238,9 @@ def parse(path: str, text: str) -> TmdlDoc:
             while first > 0 and lines[first - 1][1].strip().startswith("///") and _indent(lines[first - 1][1]) == ind:
                 first -= 1
             node.block_start = lines[first][0]
+            if pending_desc:
+                desc_line = bisect_right(line_offsets, pending_desc[0][0]) - 1
+                node.block_start = min(node.block_start, lines[desc_line][0])
             node.block_end = len(text)
             blocks.append(node)
             nodes.append(node)
@@ -288,11 +295,13 @@ def parse(path: str, text: str) -> TmdlDoc:
             if owner is not None:
                 owner.props[stripped] = "true"
         i += 1
-    return TmdlDoc(path, text, nodes, regions)
+    return TmdlDoc(path, text, nodes, regions, unclosed_fence=unclosed_fence)
 
 
 def block_span(doc: TmdlDoc, node: Node) -> tuple[int, int]:
     """Parser-owned span, including descendants and trailing blanks, excluding sibling descriptions."""
+    if doc.unclosed_fence:
+        raise PbzError("REFUSED", "unclosed TMDL expression fence")
     return node.block_start, node.block_end
 
 

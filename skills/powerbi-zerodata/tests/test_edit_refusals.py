@@ -90,11 +90,19 @@ class EditRefusalTests(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(reopened.mirror_model, "definition", "tables")), ["Accounts.tmdl"])
         self.assertEqual(set(tmdl.load_model(mdef).tables), {"Accounts"})
 
-    def _fenced_fixture(self, eol, target_fenced=True):
+    def _fenced_fixture(self, eol, target_fenced=True, fence_style="flat", description_gap=""):
         mdef = os.path.join(self.project.mirror_model, "definition")
         def block(name, fenced):
-            expr = "```\n1\n```suffix\n\t```" if fenced else "1"
-            return (f"\t/// {name} description\n\tmeasure {name} = {expr}\n"
+            if not fenced:
+                declaration = f"\tmeasure {name} = 1\n"
+            elif fence_style == "property":
+                declaration = (f"\tmeasure {name}\n"
+                               "\t\texpression = ```\n\t\t\t1\n\t\t```\n")
+            else:
+                expr = ("```\n1\n```suffix\n\t```" if fence_style == "flat"
+                        else "```\n\t\t1\n\t\t```suffix\n\t```")
+                declaration = f"\tmeasure {name} = {expr}\n"
+            return (f"\t/// {name} description\n{description_gap}{declaration}"
                     f"\t\tformatString: {name}\n"
                     f"\t\tannotation Note = {name}\n\n").replace("\n", eol)
         before, target, after = block("Before", True), block("Target", target_fenced), block("After", True)
@@ -116,34 +124,69 @@ class EditRefusalTests(unittest.TestCase):
 
     def test_fenced_siblings_are_disjoint_for_move_delete_and_property_edit(self):
         for eol in ("\n", "\r\n"):
-            for fenced in (False, True):
-                for action in ("move", "delete", "property"):
-                    with self.subTest(eol=repr(eol), target_fenced=fenced, action=action):
-                        path, before, target, after = self._fenced_fixture(eol, fenced)
-                        original = common.read_checked(path, root=self.ws.mirror)
-                        model = tmdl.load_model(os.path.dirname(os.path.dirname(path)))
-                        doc = model.docs["tables/Sales.tmdl"]
-                        node = model.measure("Target").node
-                        self.assertEqual(doc.text[slice(*tmdl.block_span(doc, node))].encode(), target)
-                        if action == "move":
-                            move.move_measure(self.ws, self.project, "Target", "Destination")
-                            dest = os.path.join(os.path.dirname(path), "Destination.tmdl")
-                            moved = common.read_checked(dest, root=self.ws.mirror)
-                            self.assertEqual(moved.count(target), 1)
-                            self.assertEqual(moved.count(b"measure Target"), 1)
-                        elif action == "delete":
-                            result = unused.remove(self.ws, self.project, only=["measure"])
-                            self.assertEqual(result["removed"], ["measure [Target]"])
-                            # Each subcase needs its own restore-point timestamp directory.
-                            shutil.rmtree(os.path.join(self.ws.mirror, unused.TRASH))
-                        else:
-                            props.run(self.ws, self.project, "[Target]", ["formatString=Changed"])
-                        changed = common.read_checked(path, root=self.ws.mirror)
-                        self.assertEqual(changed.count(before), 1)
-                        self.assertEqual(changed.count(after), 1)
-                        expected = (original.replace(target, target.replace(b"formatString: Target", b"formatString: Changed"))
-                                    if action == "property" else original.replace(target, b""))
-                        self.assertEqual(changed, expected)
+            for fence_style in ("flat", "indented", "property"):
+                for fenced in (False, True):
+                    for action in ("move", "delete", "property"):
+                        with self.subTest(eol=repr(eol), fence_style=fence_style, target_fenced=fenced, action=action):
+                            self._check_fenced_edit(eol, fenced, action, fence_style)
+
+    def test_fenced_description_across_blank_line_moves_and_deletes_with_target(self):
+        for eol in ("\n", "\r\n"):
+            for action in ("move", "delete"):
+                with self.subTest(eol=repr(eol), action=action):
+                    self._check_fenced_edit(eol, True, action, description_gap="\n")
+
+    def _check_fenced_edit(self, eol, fenced, action, fence_style="flat", description_gap=""):
+        path, before, target, after = self._fenced_fixture(eol, fenced, fence_style, description_gap)
+        original = common.read_checked(path, root=self.ws.mirror)
+        model = tmdl.load_model(os.path.dirname(os.path.dirname(path)))
+        doc = model.docs["tables/Sales.tmdl"]
+        self.assertFalse(doc.unclosed_fence)
+        node = model.measure("Target").node
+        self.assertEqual(doc.text[slice(*tmdl.block_span(doc, node))].encode(), target)
+        if action == "move":
+            move.move_measure(self.ws, self.project, "Target", "Destination")
+            dest = os.path.join(os.path.dirname(path), "Destination.tmdl")
+            moved = common.read_checked(dest, root=self.ws.mirror)
+            # Empty destination tables get a literal LF separator before the preserved block.
+            self.assertEqual(moved, ("table Destination" + eol + eol + "\n").encode() + target)
+        elif action == "delete":
+            result = unused.remove(self.ws, self.project, only=["measure"])
+            self.assertEqual(result["removed"], ["measure [Target]"])
+            # Each subcase needs its own restore-point timestamp directory.
+            shutil.rmtree(os.path.join(self.ws.mirror, unused.TRASH))
+        else:
+            props.run(self.ws, self.project, "[Target]", ["formatString=Changed"])
+        changed = common.read_checked(path, root=self.ws.mirror)
+        self.assertEqual(changed.count(before), 1)
+        self.assertEqual(changed.count(after), 1)
+        expected = (original.replace(target, target.replace(b"formatString: Target", b"formatString: Changed"))
+                    if action == "property" else original.replace(target, b""))
+        self.assertEqual(changed, expected)
+        updated = tmdl.load_model(os.path.dirname(os.path.dirname(path)))
+        after_node = updated.measure("After").node
+        updated_doc = updated.docs[after_node.file]
+        descriptions = [updated_doc.text[r.start:r.end] for r in updated_doc.regions_for(after_node)
+                        if r.prop == "description"]
+        self.assertEqual(descriptions, [" After description"])
+
+    def test_unclosed_fence_allows_parse_and_load_but_refuses_block_span(self):
+        path, *_ = self._fenced_fixture("\r\n")
+        text = "table Sales\r\n\tmeasure Target = ```\r\n1\r\n\tmeasure After = 2\r\n"
+        _write(path, text)
+        parsed = tmdl.parse("tables/Sales.tmdl", text)
+        model = tmdl.load_model(os.path.dirname(os.path.dirname(path)))
+        loaded = model.docs["tables/Sales.tmdl"]
+        self.assertEqual(model.measure("Target").expression, "1\r\n\tmeasure After = 2\r\n")
+        for doc in (parsed, loaded):
+            with self.subTest(path=doc.path):
+                self.assertTrue(doc.unclosed_fence)
+                node = next(n for n in doc.nodes if n.kind == "measure")
+                self.assertEqual(node.expr.end, len(text))
+                with self.assertRaises(PbzError) as caught:
+                    tmdl.block_span(doc, node)
+                self.assertEqual(caught.exception.code, "REFUSED")
+                self.assertEqual(caught.exception.detail, "unclosed TMDL expression fence")
 
     def test_unclosed_fence_refuses_mutations_without_writes(self):
         path, *_ = self._fenced_fixture("\r\n")
