@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import re
 
@@ -195,6 +196,11 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         raise PbzError("AMBIGUOUS", f"a shared query is also named {old}")
     ext = _external_users(ws, project, "table", "", old)
     mdef = os.path.join(project.mirror_model, "definition")
+    src = os.path.join(mdef, *t.file.split("/"))
+    dest = os.path.join(mdef, *t.file.split("/")[:-1], _safe_file(new) + ".tmdl")
+    # Apply Windows path identity on every OS, including sanitized name collisions.
+    if old != new and ntpath.normcase(os.path.abspath(dest)) == ntpath.normcase(os.path.abspath(src)):
+        raise PbzError("UNSUPPORTED", "table rename requires a distinct sanitized file path")
     _refuse_file_collision(mdef, t.file, new)
     low = old.lower()
     changed, renamed_file = [], None

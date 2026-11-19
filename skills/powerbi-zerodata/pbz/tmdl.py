@@ -90,6 +90,8 @@ class Node:
     expr: Region | None = None
     decl_value: str = ""   # e.g. "m" / "calculated" for partitions
     file: str = ""         # document path the node was parsed from
+    block_start: int = 0
+    block_end: int = 0
 
     def __repr__(self) -> str:  # parent/children links make the default repr recursive
         return f"Node({self.kind} {self.name!r} @ {self.file}:{self.line + 1})"
@@ -133,6 +135,7 @@ def parse(path: str, text: str) -> TmdlDoc:
     nodes: list[Node] = []
     regions: list[Region] = []
     stack: list[Node] = []
+    blocks: list[Node] = []
     pending_desc: list[tuple[int, int]] = []
     i, n = 0, len(lines)
 
@@ -156,7 +159,9 @@ def parse(path: str, text: str) -> TmdlDoc:
             start = lines[j][0] if j < n else rest_offset + len(rest)
             while j < n and lines[j][1].strip() != "```":
                 j += 1
-            end = lines[j][0] if j < n else len(text)
+            if j == n:
+                raise PbzError("REFUSED", "unclosed TMDL expression fence")
+            end = lines[j][0]
             reg = Region(lang, start, end, node, prop)
             regions.append(reg)
             return j + 1
@@ -189,6 +194,10 @@ def parse(path: str, text: str) -> TmdlDoc:
             i += 1
             continue
         ind = _indent(line)
+        # Expression bodies (including their closing fences) are consumed by take_expr.
+        # Only structural lines can close a block; a sibling's description closes it too.
+        while blocks and blocks[-1].indent >= ind:
+            blocks.pop().block_end = off
         if stripped.startswith("///"):
             s = off + line.index("///") + 3
             pending_desc.append((s, off + len(line)))
@@ -202,6 +211,12 @@ def parse(path: str, text: str) -> TmdlDoc:
             parent = owner_for(ind)
             name = m.group("name") or ""
             node = Node(kw, unquote(name), ind, i, parent, file=path)
+            first = i
+            while first > 0 and lines[first - 1][1].strip().startswith("///") and _indent(lines[first - 1][1]) == ind:
+                first -= 1
+            node.block_start = lines[first][0]
+            node.block_end = len(text)
+            blocks.append(node)
             nodes.append(node)
             if parent:
                 parent.children.append(node)
@@ -258,25 +273,8 @@ def parse(path: str, text: str) -> TmdlDoc:
 
 
 def block_span(doc: TmdlDoc, node: Node) -> tuple[int, int]:
-    """Character span of a node's whole block: its /// description lines, its own line, every deeper
-    line, and the blank lines that follow it (up to the next line at the same or a lower indent)."""
-    lines = _lines(doc.text)
-    first = node.line
-    while first > 0 and lines[first - 1][1].strip().startswith("///") and _indent(lines[first - 1][1]) == node.indent:
-        first -= 1
-    j = node.line + 1
-    in_fence = False
-    while j < len(lines):
-        ln = lines[j][1]
-        if ln.strip().startswith("```"):
-            in_fence = not in_fence
-            j += 1
-            continue
-        if not in_fence and ln.strip() and _indent(ln) <= node.indent:
-            break
-        j += 1
-    end = lines[j][0] if j < len(lines) else len(doc.text)
-    return lines[first][0], end
+    """Parser-owned span, including descendants and trailing blanks, excluding sibling descriptions."""
+    return node.block_start, node.block_end
 
 
 def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tuple[int, int, str]]:

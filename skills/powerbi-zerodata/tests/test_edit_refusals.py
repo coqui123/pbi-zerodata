@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -14,7 +15,7 @@ from unittest.mock import patch
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 
-from pbz import cli, common, filters, tmdl  # noqa: E402
+from pbz import cli, common, filters, move, props, rename, tmdl, unused  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 
 SALES = "table Sales\n\n\tcolumn Region\n\t\tdataType: string\n\n\tmeasure Amount = 1\n\n"
@@ -62,6 +63,112 @@ class EditRefusalTests(unittest.TestCase):
                 fn()
         self.assertEqual(_bytes(self.ws.mirror), self.before)
         return caught.exception
+
+    def test_sanitized_table_path_identity_refuses(self):
+        mdef = os.path.join(self.project.mirror_model, "definition")
+        tables = os.path.join(mdef, "tables")
+        for old, new, filename in (("Sales", "sales", "Sales.tmdl"), ("A/B", "a?b", "A_B.tmdl")):
+            with self.subTest(old=old, new=new):
+                if old != "Sales":
+                    os.rename(os.path.join(tables, "Sales.tmdl"), os.path.join(tables, filename))
+                    _write(os.path.join(tables, filename), "table 'A/B'\n")
+                    _write(os.path.join(mdef, "model.tmdl"), "model Model\n\nref table 'A/B'\n")
+                self.before = _bytes(self.ws.mirror)
+                err = self._refuse(lambda: rename.rename(self.ws, self.project, "table", old, new))
+                self.assertEqual(err.code, "UNSUPPORTED")
+                self.assertEqual(err.detail, "table rename requires a distinct sanitized file path")
+                # Reopen the project and inspect directory entries, also on Windows.
+                reopened = common.Project(self.ws, "Mini")
+                reopened_tables = os.path.join(reopened.mirror_model, "definition", "tables")
+                self.assertEqual(os.listdir(reopened_tables), [filename])
+
+    def test_normal_table_rename_still_works(self):
+        mdef = os.path.join(self.project.mirror_model, "definition")
+        result = rename.rename(self.ws, self.project, "table", "Sales", "Accounts")
+        self.assertEqual(result["to"], "Accounts")
+        reopened = common.Project(self.ws, "Mini")
+        self.assertEqual(os.listdir(os.path.join(reopened.mirror_model, "definition", "tables")), ["Accounts.tmdl"])
+        self.assertEqual(set(tmdl.load_model(mdef).tables), {"Accounts"})
+
+    def _fenced_fixture(self, eol, target_fenced=True):
+        mdef = os.path.join(self.project.mirror_model, "definition")
+        def block(name, fenced):
+            expr = "```\n1\n```suffix\n\t```" if fenced else "1"
+            return (f"\t/// {name} description\n\tmeasure {name} = {expr}\n"
+                    f"\t\tformatString: {name}\n"
+                    f"\t\tannotation Note = {name}\n\n").replace("\n", eol)
+        before, target, after = block("Before", True), block("Target", target_fenced), block("After", True)
+        path = os.path.join(mdef, "tables", "Sales.tmdl")
+        _write(path, "table Sales" + eol + eol + before + target + after)
+        _write(os.path.join(mdef, "tables", "Destination.tmdl"), "table Destination" + eol + eol)
+        _write(os.path.join(mdef, "model.tmdl"), MODEL + "ref table Destination\n")
+        _write(os.path.join(self.project.mirror_report, "definition.pbir"),
+               json.dumps({"datasetReference": {"byPath": {"path": "../Mini.SemanticModel"}}}))
+        _write(os.path.join(self.project.mirror_report, "definition", "pages", "p1", "page.json"),
+               json.dumps({"name": "p1", "displayName": "Synthetic"}))
+        visual = {"visual": {"visualType": "card", "query": {"queryState": {"Values": {"projections": [
+            {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": name}}}
+            for name in ("Before", "After")
+        ]}}}}}
+        _write(os.path.join(self.project.mirror_report, "definition", "pages", "p1", "visuals", "v1", "visual.json"),
+               json.dumps(visual))
+        return path, before.encode(), target.encode(), after.encode()
+
+    def test_fenced_siblings_are_disjoint_for_move_delete_and_property_edit(self):
+        for eol in ("\n", "\r\n"):
+            for fenced in (False, True):
+                for action in ("move", "delete", "property"):
+                    with self.subTest(eol=repr(eol), target_fenced=fenced, action=action):
+                        path, before, target, after = self._fenced_fixture(eol, fenced)
+                        original = common.read_checked(path, root=self.ws.mirror)
+                        model = tmdl.load_model(os.path.dirname(os.path.dirname(path)))
+                        doc = model.docs["tables/Sales.tmdl"]
+                        node = model.measure("Target").node
+                        self.assertEqual(doc.text[slice(*tmdl.block_span(doc, node))].encode(), target)
+                        if action == "move":
+                            move.move_measure(self.ws, self.project, "Target", "Destination")
+                            dest = os.path.join(os.path.dirname(path), "Destination.tmdl")
+                            moved = common.read_checked(dest, root=self.ws.mirror)
+                            self.assertEqual(moved.count(target), 1)
+                            self.assertEqual(moved.count(b"measure Target"), 1)
+                        elif action == "delete":
+                            result = unused.remove(self.ws, self.project, only=["measure"])
+                            self.assertEqual(result["removed"], ["measure [Target]"])
+                            # Each subcase needs its own restore-point timestamp directory.
+                            shutil.rmtree(os.path.join(self.ws.mirror, unused.TRASH))
+                        else:
+                            props.run(self.ws, self.project, "[Target]", ["formatString=Changed"])
+                        changed = common.read_checked(path, root=self.ws.mirror)
+                        self.assertEqual(changed.count(before), 1)
+                        self.assertEqual(changed.count(after), 1)
+                        expected = (original.replace(target, target.replace(b"formatString: Target", b"formatString: Changed"))
+                                    if action == "property" else original.replace(target, b""))
+                        self.assertEqual(changed, expected)
+
+    def test_unclosed_fence_refuses_mutations_without_writes(self):
+        path, *_ = self._fenced_fixture("\r\n")
+        _write(path, "table Sales\r\n\tmeasure Target = ```\r\n1\r\n\tmeasure After = 2\r\n")
+        self.before = _bytes(self.ws.mirror)
+        for action in (
+            lambda: move.move_measure(self.ws, self.project, "Target", "Destination"),
+            lambda: props.run(self.ws, self.project, "[Target]", ["formatString=Changed"]),
+            lambda: unused.remove(self.ws, self.project, only=["measure"]),
+        ):
+            err = self._refuse(action)
+            self.assertEqual(err.code, "REFUSED")
+            self.assertEqual(err.detail, "unclosed TMDL expression fence")
+
+    def test_fenced_block_at_eof_includes_properties_and_children(self):
+        for eol in ("\n", "\r\n"):
+            text = ("table Sales\n\tmeasure Target = ```\n1\n```suffix\n\t```\n"
+                    "\t\tformatString: Target\n\t\tannotation Note = Target\n\n").replace("\n", eol)
+            doc = tmdl.parse("tables/Sales.tmdl", text)
+            node = next(n for n in doc.nodes if n.kind == "measure")
+            start, end = tmdl.block_span(doc, node)
+            self.assertEqual(start, len("table Sales" + eol))
+            self.assertEqual(end, len(text))
+            self.assertEqual(node.props["formatString"], "Target")
+            self.assertEqual([child.kind for child in node.children], ["annotation"])
 
     def test_top_n_and_ranking_refuse(self):
         err = self._refuse(lambda: filters.add(
