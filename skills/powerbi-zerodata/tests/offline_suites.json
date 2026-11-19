@@ -17,6 +17,14 @@
     "engine": true
   },
   {
+    "id": "checks",
+    "argv": [
+      "tests/test_checks.py"
+    ],
+    "windows": true,
+    "engine": true
+  },
+  {
     "id": "mirror",
     "argv": [
       "tests/test_mirror.py"
@@ -52,6 +60,14 @@
     "id": "refactor",
     "argv": [
       "tests/test_refactor.py"
+    ],
+    "windows": true,
+    "engine": true
+  },
+  {
+    "id": "rename_bindings",
+    "argv": [
+      "tests/test_rename_bindings.py"
     ],
     "windows": true,
     "engine": true
@@ -284,6 +300,14 @@
     "id": "atomic_refactor",
     "argv": [
       "tests/test_atomic_refactor.py"
+    ],
+    "windows": true,
+    "engine": true
+  },
+  {
+    "id": "usage",
+    "argv": [
+      "tests/test_usage.py"
     ],
     "windows": true,
     "engine": true
@@ -628,6 +652,14 @@
     "id": "requirements_honesty",
     "argv": [
       "tests/test_requirements_honesty.py"
+    ],
+    "windows": true,
+    "engine": true
+  },
+  {
+    "id": "evidence",
+    "argv": [
+      "tests/test_evidence.py"
     ],
     "windows": true,
     "engine": true

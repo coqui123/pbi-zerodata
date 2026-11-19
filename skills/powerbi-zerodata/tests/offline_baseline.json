@@ -15,6 +15,12 @@
       ]
     },
     {
+      "id": "checks",
+      "argv": [
+        "tests/test_checks.py"
+      ]
+    },
+    {
       "id": "mirror",
       "argv": [
         "tests/test_mirror.py"
@@ -42,6 +48,12 @@
       "id": "refactor",
       "argv": [
         "tests/test_refactor.py"
+      ]
+    },
+    {
+      "id": "rename_bindings",
+      "argv": [
+        "tests/test_rename_bindings.py"
       ]
     },
     {
@@ -216,6 +228,12 @@
       "id": "atomic_refactor",
       "argv": [
         "tests/test_atomic_refactor.py"
+      ]
+    },
+    {
+      "id": "usage",
+      "argv": [
+        "tests/test_usage.py"
       ]
     },
     {
@@ -474,6 +492,12 @@
       "id": "requirements_honesty",
       "argv": [
         "tests/test_requirements_honesty.py"
+      ]
+    },
+    {
+      "id": "evidence",
+      "argv": [
+        "tests/test_evidence.py"
       ]
     },
     {
