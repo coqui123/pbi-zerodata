@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -159,7 +160,7 @@ class MemoryDisclosureTests(unittest.TestCase):
                  lambda p: describe.values(self.ws, p, "Sales[Comment]"))
         for read in paths:
             self.assertIn("_bucket", json.dumps(read(self.project)))
-            self.assertNotIn("_bucket", json.dumps(read(other)))
+            self.assertNotIn("10-99", json.dumps(read(other)))
         for legacy in ({"tables": summary["tables"]}, {**summary, "project": "Other"}):
             index_store.publish(self.ws.private, self.project.name, legacy)
             self.assertEqual(describe._index_summary(self.ws, self.project), {})
@@ -169,16 +170,28 @@ class MemoryDisclosureTests(unittest.TestCase):
         with open(os.path.join(self.ws.private, "index.json"), "w") as handle:
             json.dump({"columns": {}}, handle)
         dpapi.write_protected(os.path.join(self.ws.private, "categories.bin"), b"{}")
-        for malformed in (None, [], {"tables": None}, {"tables": [None, 3, [], {}, {"table": []},
-                {"table": "Sales", "rows_bucket": "1-9", "columns": [None, 5, {},
-                 {"column": "Comment", "card_bucket": "1-9", "nested": [{"custom_bucket": "1-9"}]}]}]}):
+        for malformed in (None, [], {"tables": None}):
+            index_store.publish(self.ws.private, self.project.name,
+                                {**malformed, "project": self.project.name} if isinstance(malformed, dict) else malformed)
+            self.assertEqual(describe._index_summary(self.ws, self.project), {})
+        pol = policy.load(self.ws)
+        pol["disclosure"] = "shape"
+        policy.save(self.ws, pol)
+        for malformed in (None, 3, [], {}, {"table": []}):
             with self.subTest(summary=malformed):
-                index_store.publish(self.ws.private, self.project.name,
-                                    {**malformed, "project": self.project.name} if isinstance(malformed, dict) else malformed)
+                index_store.publish(self.ws.private, self.project.name, {"project": self.project.name,
+                    "tables": [malformed, {"table": "Sales", "rows_bucket": {"secret": SENTINEL},
+                        "extra": SENTINEL, "columns": [None, 5, {}, {"column": "Comment",
+                            "card_bucket": "1-9", "nested": [{"custom_bucket": "1-9"}]}]}]})
                 out = describe._index_summary(self.ws, self.project)
-                self.assertNotIn("_bucket", json.dumps(out))
-                if "Sales" in out:
-                    self.assertEqual(len(out["Sales"]["columns"]), 1)
+                self.assertIn("Sales", out)
+                self.assertEqual(out["Sales"], {"table": "Sales", "columns": [
+                    {"column": "Comment", "card_bucket": "1-9"}]})
+                self.assertNotIn("rows_bucket", out["Sales"])
+                self.assertNotIn(SENTINEL, json.dumps(out))
+        pol["disclosure"] = "strict"
+        policy.save(self.ws, pol)
+        self.assertNotIn("_bucket", json.dumps(describe._index_summary(self.ws, self.project)))
         body = {"rows_bucket": "1-9", "nested": [{"custom_bucket": "1-9", "ri": "RI_OK"}]}
         self.assertEqual(memory._strip_bands(body), {"nested": [{"ri": "RI_OK"}]})
 
@@ -192,20 +205,52 @@ class MemoryDisclosureTests(unittest.TestCase):
         def engine(verb, payload, timeout=30):
             self.assertIn("Sales[Comment]", payload["reveal"])
             return {"ok": True, "checks": [{"id": "equal", "status": "FAIL", "groups": [
-                {"Sales[Comment]": {"hmac": h}} for h in hashes]}]}
+                {"Sales[Comment]": {"hmac": h}} for h in hashes] + [
+                    {"Sales[Comment]": {"reveal": "Known member"}}]}]}
 
         spec = {"checks": [{"id": "equal", "kind": "equal", "left": "1", "right": "0",
                             "by": ["Sales[Comment]"]}]}
-        buf = io.StringIO()
-        with patch("pbz.checks.engine_call", engine), patch("pbz.checks.desktop.require_port", return_value=1), \
-                patch("pbz.cli.find_workspace", return_value=self.ws), redirect_stdout(buf):
-            cli.main(["--workspace", self.ws.root, "--project", self.project.name, "check", json.dumps(spec)])
-        out = json.loads(buf.getvalue())
-        self.assertIn("results", out)
-        groups = out["results"][0]["groups"]
-        self.assertEqual(len(groups), 10)
-        self.assertTrue(all("«" in g["Sales[Comment]"] for g in groups))
-        self.assertTrue(all(h not in buf.getvalue() for h in hashes))
+        outputs = []
+        for _ in range(2):
+            buf = io.StringIO()
+            with patch("pbz.checks.engine_call", engine), patch("pbz.checks.desktop.require_port", return_value=1), \
+                    patch("pbz.cli.find_workspace", return_value=self.ws), redirect_stdout(buf):
+                cli.main(["--workspace", self.ws.root, "--project", self.project.name, "check", json.dumps(spec)])
+            out = json.loads(buf.getvalue())
+            self.assertIn("results", out)
+            groups = out["results"][0]["groups"]
+            self.assertEqual(len(groups), 11)
+            emitted = [g["Sales[Comment]"] for g in groups[:10]]
+            self.assertTrue(all("«" in value for value in emitted))
+            self.assertEqual(len(set(emitted)), 10)
+            self.assertEqual(groups[10]["Sales[Comment]"], "Known member")
+            self.assertTrue(all(h not in buf.getvalue() for h in hashes))
+            outputs.append(emitted)
+        self.assertEqual(outputs[0], outputs[1])
+
+    def test_no_index_rows_bucket_defaults_follow_disclosure(self):
+        for mode in ("shape", "strict"):
+            pol = policy.load(self.ws)
+            pol["disclosure"] = mode
+            policy.save(self.ws, pol)
+            overview = describe.overview(self.ws, self.project)
+            detail = describe.describe(self.ws, self.project, "Sales")
+            sales = next(t for t in overview["tables"] if t["table"] == "Sales")
+            if mode == "shape":
+                self.assertEqual(sales["rows_bucket"], "unknown")
+                self.assertEqual(detail["rows_bucket"], "unknown (run pbz index)")
+            else:
+                self.assertNotIn("rows_bucket", sales)
+                self.assertNotIn("rows_bucket", detail)
+
+    def test_status_reports_linked_manifest_as_index_error(self):
+        target = Path(self.tmp.name) / "manifest.json"
+        target.write_text("{}")
+        Path(self.ws.private, "index-current.json").symlink_to(target)
+        with patch("pbz.cli.engine_call", return_value={"ok": True}):
+            out = cli.cmd_status(self.ws, self.project, None)
+        self.assertFalse(out["index"])
+        self.assertEqual(out["index_error"], "UNSAFE_PATH")
 
     def test_unexpected_engine_class_is_closed(self):
         def bad(verb, payload, timeout=30):

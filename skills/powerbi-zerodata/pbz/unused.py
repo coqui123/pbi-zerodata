@@ -18,9 +18,9 @@ TRASH = ".pbz-trash"
 _STAMP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 
-def _index_summary(ws) -> dict:
+def _index_summary(ws, project) -> dict:
     from .describe import _index_summary as summary
-    return summary(ws)
+    return summary(ws, project)
 
 
 def translated(project) -> set[tuple]:
@@ -83,7 +83,7 @@ def report(ws, project, extra_reports=(), include_all: bool = False, impact: boo
            kinds: list[str] | None = None) -> dict:
     g = usage.build(ws, project, extra_reports)
     g.translated = translated(project)
-    summ = _index_summary(ws) if impact else {}
+    summ = _index_summary(ws, project) if impact else {}
     summary: dict = {}
     objects = []
     auto_date = 0

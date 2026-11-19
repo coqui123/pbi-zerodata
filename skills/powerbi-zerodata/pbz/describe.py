@@ -5,14 +5,18 @@ import json
 import os
 import re
 
-from . import lexers, pbir, policy as policy_mod, tmdl, tokens
+from . import index_store, lexers, pbir, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
 from .common import PbzError, read_text_checked, list_names
 
 
-def _index_summary(ws, project=None) -> dict:
-    from . import index_store, memory
-    stored = index_store.load(ws.private, project.name if project else None)
+_LOAD_STORED = object()
+
+
+def _index_summary(ws, project=None, *, stored=_LOAD_STORED) -> dict:
+    from . import memory
+    if stored is _LOAD_STORED:
+        stored = index_store.load(ws.private, project.name if project else None)
     if stored is None:
         return {}
     try:
@@ -28,8 +32,19 @@ def _index_summary(ws, project=None) -> dict:
         name = memory._name(table.get("table"))
         if name is None:
             continue
-        out[name] = {**table, "columns": [c for c in memory._list(table.get("columns"))
-                                         if memory._name(c.get("column")) is not None]}
+        entry = {"table": name, "columns": []}
+        if isinstance(table.get("rows_bucket"), str):
+            entry["rows_bucket"] = table["rows_bucket"]
+        for col in memory._list(table.get("columns")):
+            cname = memory._name(col.get("column"))
+            if cname is None:
+                continue
+            column = {"column": cname}
+            for key in ("card_bucket", "class"):
+                if isinstance(col.get(key), str):
+                    column[key] = col[key]
+            entry["columns"].append(column)
+        out[name] = entry
     return out
 
 
@@ -93,6 +108,7 @@ def overview(ws, project) -> dict:
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     summ = _index_summary(ws, project)
+    shape = policy_mod.load(ws).get("disclosure", "shape") == "shape"
     pages_dir = os.path.join(project.mirror_report, "definition", "pages")
     pages = []
     if os.path.isdir(pages_dir):
@@ -106,7 +122,8 @@ def overview(ws, project) -> dict:
     return {"verb": "describe", "project": project.name,
             "tables": [{"table": t.name, "columns": len(t.columns), "measures": len(t.measures),
                         "storage": sorted({k for _n, k, _e in t.partitions}) or ["none"], "hidden": t.hidden,
-                        **({"rows_bucket": summ[t.name]["rows_bucket"]} if "rows_bucket" in summ.get(t.name, {}) else {})}
+                        **({"rows_bucket": summ.get(t.name, {}).get("rows_bucket", "unknown")}
+                           if shape else {})}
                        for t in model.tables.values()],
             "relationships": len(model.relationships), "roles": model.roles, "pages": pages}
 
@@ -118,8 +135,9 @@ def describe(ws, project, target: str | None) -> dict:
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
-    clf = Classifier(model, ws.private, policy_mod.load(ws), project.name)
-    summ = _index_summary(ws, project)
+    stored = index_store.load(ws.private, project.name)
+    clf = Classifier(model, ws.private, policy_mod.load(ws), project.name, stored=stored)
+    summ = _index_summary(ws, project, stored=stored)
     usage = field_usage(project, model)
     kind, table, name = _parse_target(target)
     if kind == "name" and name in model.tables:
@@ -142,7 +160,8 @@ def describe(ws, project, target: str | None) -> dict:
     if kind == "name":
         hits = [c for c in model.all_columns() if c.name.lower() == name.lower()]
         if len(hits) == 1:
-            return describe(ws, project, f"'{hits[0].table}'[{hits[0].name}]")
+            return {"verb": "describe", **_column(model, clf, summ, hits[0]),
+                    "used_by_visuals": usage.get(("column", hits[0].table, hits[0].name), [])}
     raise PbzError("NOT_FOUND", target)
 
 
@@ -173,7 +192,8 @@ def _table(model, clf, summ, usage, t) -> dict:
         src.append({"partition": pname, "kind": pkind, "functions": funcs[:12]})
     out = {"verb": "describe", "table": t.name, "file": t.file, "hidden": t.hidden, "calculated": t.calculated,
            "partitions": src,
-           **({"rows_bucket": summ[t.name]["rows_bucket"]} if "rows_bucket" in summ.get(t.name, {}) else {}),
+           **({"rows_bucket": summ.get(t.name, {}).get("rows_bucket", "unknown (run pbz index)")}
+              if clf.policy.get("disclosure", "shape") == "shape" else {}),
            "columns": [_column(model, clf, summ, c) for c in t.columns.values()],
            "measures": [{"name": m.name, "folder": m.folder} for m in t.measures.values()],
            "hierarchies": t.hierarchies,
@@ -188,7 +208,8 @@ def values(ws, project, column: str) -> dict:
     if kind != "column":
         raise PbzError("BAD_REQUEST", "use 'Table'[Column]")
     real = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
-    clf = Classifier(real, ws.private, policy_mod.load(ws), project.name)
+    stored = index_store.load(ws.private, project.name)
+    clf = Classifier(real, ws.private, policy_mod.load(ws), project.name, stored=stored)
     lab = f"{table}[{name}]"
     cls = clf.column_class(table, name)
     out = {"verb": "values", "column": lab, "class": cls, "classification": clf.mode}
@@ -196,7 +217,7 @@ def values(ws, project, column: str) -> dict:
     if vals is not None:
         out["values"] = vals
     else:
-        info = next((c for c in _index_summary(ws, project).get(table, {}).get("columns", []) if c.get("column") == name), {})
+        info = next((c for c in _index_summary(ws, project, stored=stored).get(table, {}).get("columns", []) if c.get("column") == name), {})
         if "card_bucket" in info:
             out["distinct_bucket"] = info["card_bucket"]
         tm = tokens.TokenMap(ws.private)

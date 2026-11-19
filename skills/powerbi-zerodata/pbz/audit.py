@@ -259,13 +259,14 @@ def _dax_text(model, node) -> str:
     return "\n".join(doc.text[r.start:r.end] for r in tmdl.node_regions(doc, node, deep=False) if r.kind == "dax")
 
 
-def _index(ws) -> dict:
+def _index(ws, project) -> dict:
     from .describe import _index_summary
     out = {}
-    for name, table in _index_summary(ws).items():
+    for name, table in _index_summary(ws, project).items():
         out[name.lower()] = {"rows": table.get("rows_bucket"),
                              "cols": {c["column"].lower(): c.get("card_bucket")
-                                      for c in table["columns"]}}
+                                      for c in (table.get("columns") or [])
+                                      if isinstance(c, dict) and isinstance(c.get("column"), str)}}
     return out
 
 
@@ -1126,7 +1127,7 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
     if min_severity and min_severity not in SEVERITY:
         raise PbzError("BAD_REQUEST", f"min severity is one of {', '.join(SEVERITY)}")
     g = usage.build(ws, project)
-    idx = _index(ws)
+    idx = _index(ws, project)
     mem_raw = _memory(ws, project)
     memory_incomplete = mem_raw is _MEMORY_INCOMPLETE
     mem = None if memory_incomplete else mem_raw

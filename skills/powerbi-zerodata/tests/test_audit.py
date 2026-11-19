@@ -244,7 +244,7 @@ def main() -> int:
     # ---------------------------------------------------------------- index buckets
     os.makedirs(ws.private, exist_ok=True)
     with open(os.path.join(ws.private, "index-summary.json"), "w", encoding="utf-8") as f:
-        json.dump({"tables": [{"table": "Sales", "rows_bucket": "10k+",
+        json.dump({"project": project.name, "tables": [{"table": "Sales", "rows_bucket": "10k+",
                                "columns": [{"column": "Amount Copy", "card_bucket": "10k+"}]},
                               {"table": "Customer", "rows_bucket": "1k-9k",
                                "columns": [{"column": "CustomerKey", "card_bucket": "10k+"}]}]}, f)

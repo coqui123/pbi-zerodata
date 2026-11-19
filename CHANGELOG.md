@@ -6,6 +6,11 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- Private indexes publish through an `index-current.json` manifest pointing to a completed,
+  hash-checked `index-<uuid>` generation directory. Publication pins the hardened artifacts
+  and prunes older generations. New engine indexes include a model stamp over sorted model
+  structure and the latest refresh time, so changes on the same endpoint invalidate reveals.
+
 - `pbz probe` and `pbz index` do not return calendar year endpoints. Probe reports blanks,
   negatives, future dates, and coarse buckets. Duplicate keys and orphans stay on `pbz check`.
 - Best-practice data rules run when `pbz audit memory` has saved a document. A missing

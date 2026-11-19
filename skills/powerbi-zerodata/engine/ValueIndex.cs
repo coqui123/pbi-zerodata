@@ -163,7 +163,8 @@ public static class ValueIndex
         }
 
         var indexDoc = new JsonObject { ["version"] = 2, ["columns"] = indexCols,
-            ["database_id"] = conn.Meta.DatabaseId, ["port"] = conn.Port };
+            ["database_id"] = conn.Meta.DatabaseId, ["port"] = conn.Port,
+            ["model_stamp"] = IndexFile.ModelStamp(conn) };
         Vault.WriteAtomic(Path.Combine(pd, "index.json"), indexDoc.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
         var catJson = JsonSerializer.Serialize(categories, new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
         Vault.WriteProtected(Path.Combine(pd, "categories.bin"), catJson);
@@ -281,6 +282,20 @@ public static class PolicyFile
 /// <summary>Read side of index.json (used only for internal decisions).</summary>
 public static class IndexFile
 {
+    public static string ModelStamp(Conn conn)
+    {
+        // Structured serialization prevents delimiter collisions in model object names.
+        var structure = conn.Meta.Tables.OrderBy(t => t.Name, StringComparer.Ordinal).Select(t => new
+        {
+            table = t.Name,
+            columns = t.Columns.OrderBy(c => c.Name, StringComparer.Ordinal)
+                .Select(c => new { column = c.Name, data_type = c.DataType }).ToArray(),
+            partition_sources = t.Partitions.Select(p => p.SourceType).OrderBy(kind => kind).ToArray()
+        }).ToArray();
+        string payload = JsonSerializer.Serialize(new { structure, refreshed = conn.LatestRefresh() });
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
+    }
+
     public static JsonObject? TryLoad(string privateDir, Conn conn)
     {
         try
@@ -307,9 +322,10 @@ public static class IndexFile
                 blobs[name] = raw;
             }
             var index = JsonNode.Parse(Encoding.UTF8.GetString(blobs["index.json"])) as JsonObject;
-            // Compare against the actual connection, not caller-provided identity or matching stamps.
+            // Bind to the actual connection identity and, for new indexes, live structure and refresh time.
             if (index == null || J.Str(index, "database_id") != conn.Meta.DatabaseId
                 || J.Int(index, "port") != conn.Port) return null;
+            if (index.ContainsKey("model_stamp") && J.Str(index, "model_stamp") != ModelStamp(conn)) return null;
             index["categories"] = JsonNode.Parse(Encoding.UTF8.GetString(Dpapi.Unprotect(blobs["categories.bin"])));
             return index;
         }

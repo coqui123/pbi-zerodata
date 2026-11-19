@@ -210,8 +210,11 @@ def is_common_word(word: str) -> bool:
     return False
 
 
+_LOAD_STORED = object()
+
+
 class Classifier:
-    def __init__(self, model, private_dir: str | None, policy: dict, project: str | None = None):
+    def __init__(self, model, private_dir: str | None, policy: dict, project: str | None = None, *, stored=_LOAD_STORED):
         self.model = model
         self.policy = policy or {}
         self.index = None
@@ -225,7 +228,8 @@ class Classifier:
             if _reparse_link(index_path):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")
             from . import index_store
-            stored = index_store.load(private_dir, project) if project is not None else None
+            if stored is _LOAD_STORED:
+                stored = index_store.load_strict(private_dir, project) if project is not None else None
             self.untrusted_index = stored is None and any(os.path.lexists(os.path.join(private_dir, name))
                                                          for name in ("index.json", "index-current.json"))
             if stored:
@@ -282,6 +286,8 @@ class Classifier:
     def column_class(self, table: str, column: str) -> str:
         """category | sensitive | numeric | date | other | unknown"""
         lab = self.label(table, column)
+        if self.index is not None and self.model is not None and self.model.column(table, column) is None:
+            return "sensitive"
         if lab.lower() in self.sensitive_cols:
             return "sensitive"
         if lab.lower() in self.category_cols:
@@ -312,6 +318,8 @@ class Classifier:
         return "category" if name_words(column) & CATEGORY_WORDS else "sensitive"
 
     def category_values(self, table: str, column: str) -> list | None:
+        if self.model is not None and self.model.column(table, column) is None:
+            return None
         if self.column_class(table, column) != "category":
             return None
         return self.categories.get(self.label(table, column))

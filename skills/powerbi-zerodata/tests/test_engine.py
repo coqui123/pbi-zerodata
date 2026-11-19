@@ -598,12 +598,7 @@ def publish_index(env: Env, summary: dict, project: str) -> None:
     from types import SimpleNamespace
     from pbz import checks, index_store
     checks.harden_index(SimpleNamespace(private=str(env.pd)), {})
-    idx = json.loads((env.pd / "index.json").read_text("utf-8"))
-    for table in summary.get("tables", []):
-        for col in table.get("columns", []):
-            info = idx["columns"].get(f"{table['table']}[{col['column']}]", {})
-            if "class" in info:
-                col["class"] = info["class"]
+    summary["tables"] = checks._rebuild_summary(str(env.pd), summary.get("tables", []))
     index_store.publish(str(env.pd), project, summary)
 
 
@@ -629,7 +624,7 @@ def test_live_index_binding(env: Env, tmp: Path) -> None:
     table_file.write_text(table, "utf-8")
     try:
         PBIP = directory / "Canary.pbip"
-        if not ensure_desktop(b):
+        if not expect("binding fixture Desktop is available", ensure_desktop(b)):
             return
         engine("refresh", b.req(), "binding-b-refresh")
         rb = engine("index", b.req(), "binding-index-b")
@@ -716,9 +711,10 @@ database.Model.SaveChanges();
         stale = grouped(b, "binding-new-live-value", ['Project[Status] IN {"Closed", "NewStatus"}'])
         groups = stale.get("checks", stale.get("results", []))[0].get("groups", [])
         key = dpapi.load_key(str(env.pd), create=False)
-        expect("added row stays HMAC while genuine member reveals without reindex", len(groups) == 2
-            and {"Project[Status]": {"reveal": "Closed"}} in groups
-            and {"Project[Status]": {"hmac": dpapi.hmac_hex(key, "NewStatus")}} in groups, stale)
+        expect("refresh invalidates all grouped reveals without reindex", len(groups) == 2
+            and all(set(g["Project[Status]"]) == {"hmac"} for g in groups)
+            and {g["Project[Status]"]["hmac"] for g in groups}
+                == {dpapi.hmac_hex(key, value) for value in ("Closed", "NewStatus")}, stale)
     finally:
         PBIP = original_pbip
         if b.pid and b.opened_here:

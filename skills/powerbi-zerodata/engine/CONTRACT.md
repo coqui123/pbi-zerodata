@@ -403,3 +403,10 @@ after `action: save`, or `MISSING` when a compare has no saved baseline. A trace
 Implementation clarifications that callers must know (response container names, the blank group
 key, optional `timeout_s`, stricter message scrubbing, query guards) are listed in
 `engine/README.md` under "Contract deviations and clarifications".
+
+Private index readers use the `index-current.json` manifest to select one completed,
+hash-checked `index-<uuid>` generation. Python publishes hardened artifacts and prunes
+older generations after the manifest write. New engine indexes record a SHA256 model
+stamp over sorted table names, column names and data types, partition source kinds,
+and the latest refresh time. The reader compares it with the live connection before
+allowing category reveals. Older indexes without a stamp retain identity-only checks.
