@@ -87,7 +87,9 @@ def _closed(value, schema, defs):
     if isinstance(value, list):
         if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", len(value)):
             raise ValueError("items")
-        return [_closed(v, schema.get("items", {}), defs) for v in value]
+        prefix = schema.get("prefixItems", [])
+        return [_closed(v, prefix[i] if i < len(prefix) else schema.get("items", {}), defs)
+                for i, v in enumerate(value)]
     return value
 
 
@@ -95,6 +97,8 @@ def _contract_project(verb, response):
     schema = json.loads((Path(__file__).resolve().parent.parent / "engine" / "contract.schema.json").read_text())
     defs = schema["$defs"]
     if response.get("ok") is False:
+        if isinstance(response.get("verb"), str) and response["verb"] != verb:
+            raise ValueError("verb")
         return _closed(response, defs["failure"], defs)
     for node in defs.values():
         if node.get("properties", {}).get("verb", {}).get("const") == verb:
@@ -108,10 +112,12 @@ _SHARES = {"none", "<1%", "1-10%", "10-50%", ">50%"}
 
 
 def _probe(response, request):
-    """Unknown fields are dropped; malformed known fields invalidate their record."""
+    """Project probe fields. The effective tier arrives in request.disclosure,
+    supplied by checks.probe from the workspace policy.
+    """
     request = request or {}
     strict = request.get("disclosure", "strict") != "shape"
-    if "verb" in response and (type(response["verb"]) is not str or response["verb"] != "probe"):
+    if response.get("verb") != "probe":
         return _fail("probe", "ENGINE_UNAVAILABLE")
     table = request.get("table")
     names = request.get("columns", [])
@@ -168,7 +174,7 @@ def _project(verb: str, response: dict, request: dict | None = None) -> dict:
         return _probe(response, request)
     try:
         return _contract_project(verb, response)
-    except (ValueError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError, OSError, KeyError):
         return _fail(verb, "ENGINE_UNAVAILABLE")
 
 

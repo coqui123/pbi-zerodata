@@ -211,13 +211,20 @@ def merge_hooks(data: dict, agent: str, uninstall: bool, owned: dict | None = No
         for addition in rec.get("additions", []):
             event, child = addition["event"], addition["child"]
             entries = hooks.get(event, [])
-            for entry in reversed(entries):
-                children = entry.get("hooks", [])
-                if child in children:
-                    children.remove(child)
-                    if not children and entry == addition["shell"]:
-                        entries.remove(entry)
-                    break
+            candidates = [i for i, entry in enumerate(entries)
+                          if entry.get("matcher") == addition["shell"].get("matcher")
+                          and child in entry.get("hooks", [])]
+            # Prefer the recorded shell after removing one matching child.
+            def shell_matches(i):
+                shell = json.loads(json.dumps(entries[i]))
+                shell["hooks"].remove(child)
+                return shell == addition["shell"]
+            if candidates:
+                index = next((i for i in candidates if shell_matches(i)), candidates[0])
+                entry = entries[index]
+                entry["hooks"].remove(child)
+                if not entry["hooks"] and entry == addition["shell"]:
+                    entries.pop(index)
             if not entries and event in rec.get("events", []):
                 hooks.pop(event, None)
         if not hooks and rec.get("container"):
@@ -230,8 +237,30 @@ def merge_hooks(data: dict, agent: str, uninstall: bool, owned: dict | None = No
     hooks = data.setdefault("hooks", {})
     for event, matcher in (("PreToolUse", ".*"), ("SessionStart", None)):
         child = {"type": "command", "command": hook_cmd(agent), "timeout": 15}
-        # Existing children, including mixed groups, belong to the host.
-        if any(child in e.get("hooks", []) for e in hooks.get(event, [])):
+        adopted = False
+        entries = hooks.get(event, [])
+        for index in range(len(entries) - 1, -1, -1):
+            entry = entries[index]
+            removed_stale = False
+            for old in list(entry.get("hooks", [])):
+                if not is_ours({"hooks": [old]}):
+                    continue
+                if old == child:
+                    if entry.get("matcher") == matcher:
+                        addition = {"event": event, "child": child,
+                                    "shell": {**entry, "hooks": []}}
+                        if not any(a["event"] == event and a["child"] == child
+                                   and a["shell"] == addition["shell"] for a in rec["additions"]):
+                            rec["additions"].append(addition)
+                        adopted = True
+                elif old.get("command") != child["command"]:
+                    entry["hooks"].remove(old)
+                    removed_stale = True
+                    rec["additions"] = [a for a in rec["additions"]
+                                        if not (a["event"] == event and a["child"] == old)]
+            if removed_stale and not entry.get("hooks") and set(entry) <= {"hooks", "matcher"}:
+                entries.pop(index)
+        if adopted:
             continue
         if event not in hooks:
             rec["events"].append(event)
@@ -468,8 +497,10 @@ def main() -> int:
     if skipped and not uninstall:
         return 1
 
-    settings_step(CLAUDE_SETTINGS, "claude", what_if, uninstall, denies=True)
-    settings_step(CODEX_HOOKS, "codex", what_if, uninstall)
+    changed = settings_step(CLAUDE_SETTINGS, "claude", what_if, uninstall, denies=True)
+    print(" ", f"hooks + deny rules -> {CLAUDE_SETTINGS}" if changed else f"ok {CLAUDE_SETTINGS}")
+    changed = settings_step(CODEX_HOOKS, "codex", what_if, uninstall)
+    print(" ", f"hooks -> {CODEX_HOOKS} (trust them once in Codex with /hooks)" if changed else f"ok {CODEX_HOOKS}")
 
     for path in RULE_FILES:
         print(" ", rule_block(path, what_if, uninstall))

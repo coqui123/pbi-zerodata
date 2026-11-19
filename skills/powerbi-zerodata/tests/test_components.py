@@ -175,7 +175,7 @@ def main() -> int:
     base = validate.report_author(st, fx, lambda s: s)
     required = "--require-validator" in sys.argv
     available = validate.validator_ran(base)
-    check(available or not required, f"required validator cannot run: {base}")
+    check(validator_gate(base, required), f"required validator cannot run: {base}")
     fdir = os.path.join(fx.mirror_report, "definition", "pages")
     src_pid = next(p for p in sorted(os.listdir(fdir)) if os.path.isdir(os.path.join(fdir, p)))
     fvis = sorted(os.listdir(os.path.join(fdir, src_pid, "visuals")))
@@ -198,7 +198,7 @@ def main() -> int:
         control.pop("displayName")
         save(control_path, control)
         invalid = validate.report_author(st, fx, lambda s: s)
-        check(validate.invalid_control_rejected(invalid), f"invalid control missing required displayName diagnostic: {invalid}")
+        check(validate.invalid_control_rejected(invalid, src_pid), f"invalid control missing required displayName diagnostic: {invalid}")
     else:
         print("note: live vendor validation unavailable (required lane fails closed)")
     comparison_checks(check)
@@ -210,6 +210,10 @@ def main() -> int:
     return 0
 
 
+def validator_gate(findings, required):
+    return not required or validate.validator_ran(findings)
+
+
 def comparison_checks(check):
     finding = {"severity": "error", "code": "SCHEMA", "where": "a/page.json", "message": "x" * 201}
     check(bool(validate.diagnostic_counts([finding, finding]) - validate.diagnostic_counts([finding])),
@@ -218,13 +222,21 @@ def comparison_checks(check):
         check(len(validate.diagnostic_counts([finding, sibling])) == 2, "full diagnostics collided")
     expected = {"severity": "error", "code": "PBIR", "where": "definition/pages/control/page.json",
                 "message": "must have required property 'displayName'"}
-    check(validate.invalid_control_rejected([expected]), "expected control diagnostic rejected")
-    check(not validate.invalid_control_rejected([{**expected, "message": "unrelated failure"}]),
+    check(validate.invalid_control_rejected([expected], "control"), "expected control diagnostic rejected")
+    check(not validate.invalid_control_rejected([{**expected, "message": "unrelated failure"}], "control"),
           "unrelated diagnostic accepted as control")
     for code in ("REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"):
         findings = [{"severity": "error", "code": code}]
         check(not validate.validator_ran(findings), f"{code} counted as a run")
-        check(not validate.invalid_control_rejected(findings + [expected]), "crash accepted as invalid control")
+        check(not validate.invalid_control_rejected(findings + [expected], "control"), "crash accepted as invalid control")
+    check(not validate.invalid_control_rejected([expected], "other"), "another page accepted as control")
+    check(not validator_gate([], True), "empty findings passed required gate")
+    for code in ("REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_SCHEMA_NOT_RUN"):
+        check(not validator_gate([{"code": code}], True), f"required gate accepted {code}")
+        check(validator_gate([{"code": code}], False), "optional gate failed")
+    check(validator_gate([{"code": "REPORT_SCHEMA_PASSED"}], True), "schema-passed gate failed")
+    check(not validator_gate([{"code": "REPORT_SCHEMA_PASSED"}, {"code": "REPORT_VALIDATOR_FAILED"}], True),
+          "failure overrode gate incorrectly")
     project = types.SimpleNamespace(name="Canary")
     with patch.object(validate.os.path, "isdir", return_value=True), patch.object(validate.os.path, "exists", return_value=False):
         check(not validate.validator_ran(validate.report_author("unused", project, lambda s: s)), "missing validator passed")
@@ -234,7 +246,8 @@ def comparison_checks(check):
                 patch.object(validate.subprocess, "run", side_effect=error) as run:
             findings = validate.report_author("unused", project, lambda s: s)
             check(not validate.validator_ran(findings), "crash or timeout passed")
-            check(run.call_count == 1, "crash or timeout retried into a green result")
+            check(run.call_count == 2, "both validator attempts must run")
+            check([f["code"] for f in findings] == ["REPORT_VALIDATOR_FAILED"], "wrong crash finding")
 
 
 if __name__ == "__main__":

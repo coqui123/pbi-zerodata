@@ -70,16 +70,18 @@ def diagnostic_counts(findings):
 
 def validator_ran(findings):
     unavailable = {"REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"}
-    return not any(f.get("code") in unavailable for f in findings)
+    return (any(f.get("code") == "REPORT_SCHEMA_PASSED" for f in findings)
+            and not any(f.get("code") in unavailable for f in findings))
 
 
-def invalid_control_rejected(findings):
+def invalid_control_rejected(findings, page_id):
     # The control removes page.displayName. Require that exact schema failure,
     # rather than treating an unavailable validator or unrelated error as rejection.
-    return validator_ran(findings) and any(
+    return not any(f.get("code") in {"REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"}
+                   for f in findings) and any(
         f.get("severity") == "error" and "displayName" in f.get("message", "")
         and "required" in f.get("message", "").lower()
-        and "page.json" in f.get("where", "") for f in findings)
+        and ("/pages/" + page_id + "/page.json") in ("/" + f.get("where", "").replace("\\", "/")) for f in findings)
 
 
 def report_author(stage: str, project, scrub) -> list[dict]:
@@ -93,7 +95,7 @@ def report_author(stage: str, project, scrub) -> list[dict]:
         try:
             p = subprocess.run(args, capture_output=True, timeout=600)
         except (subprocess.SubprocessError, OSError):
-            return [{"severity": "error", "code": "REPORT_VALIDATOR_FAILED", "where": "report", "message": "could not run"}]
+            continue
         try:
             data = json.loads(p.stdout.decode("utf-8", errors="replace") or "{}")
         except ValueError:

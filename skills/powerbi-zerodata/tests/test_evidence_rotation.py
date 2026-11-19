@@ -47,6 +47,14 @@ def _race_writer(root, private, kind, entered, release, ready, acknowledgements,
         return original_remove(path)
     evidence._workspace_lock = at_lock
     evidence.os.remove = archive_remove
+    if kind != "prune":
+        evidence._prune = lambda ws: {}  # Only the concurrent pruner may delete segments.
+    original_append = evidence._append_lines
+    written = []
+    def record_append(ws, entries):
+        original_append(ws, entries)
+        written.extend(json.loads(json.dumps(entries)))
+    evidence._append_lines = record_append
     try:
         if kind == "rotate":
             original = evidence._rotate
@@ -57,7 +65,7 @@ def _race_writer(root, private, kind, entered, release, ready, acknowledgements,
                 return original(ws)
             with patch.object(evidence, "_rotate", rotate):
                 evidence._append_lines(ws, [_entry(dt.date.today().isoformat() + "T00:00:01", 101)])
-            acknowledgements.put(("write", 101))
+            acknowledgements.put(("write", written))
         elif kind == "accept":
             with patch("pbz.cli._is_human", return_value=True), \
                     patch("pbz.evidence.mirror_rev", return_value="m" + "a" * 12), \
@@ -70,10 +78,10 @@ def _race_writer(root, private, kind, entered, release, ready, acknowledgements,
                 out = evidence.review(ws, project, accept=True)
                 if out["coverage"]["human_visual_review"] != "CURRENT":
                     raise RuntimeError("acceptance lost")
-            acknowledgements.put(("accept", True))
+            acknowledgements.put(("accept", written))
         else:
-            evidence.prune(ws)
-            acknowledgements.put(("prune", True))
+            result = evidence.prune(ws)
+            acknowledgements.put(("prune", result["pruned_segments"]))
     except Exception as err:
         acknowledgements.put(("error", type(err).__name__, str(err)))
         raise
@@ -95,6 +103,14 @@ def _hold(root, private, phase, entered, release):
             stop()
         with patch.object(evidence.os, "remove", delete_then_stop):
             evidence.prune(ws)
+
+
+def _waiting_writer(root, private, ready, completed):
+    ws = Workspace(root)
+    ws.private = private
+    ready.set()
+    evidence._append_lines(ws, [_entry(dt.date.today().isoformat() + "T00:00:01", 1)])
+    completed.set()
 
 
 class EvidenceRotationTests(unittest.TestCase):
@@ -210,8 +226,9 @@ class EvidenceRotationTests(unittest.TestCase):
         ack = ctx.Queue()
         archived = ctx.Queue()
         # A seeded old segment is the only record eligible for pruning.
+        seed = [_entry("2020-01-01T00:00:01", 0)]
         with patch.object(evidence, "_prune", return_value={}), self._cap(700):
-            evidence._append_lines(self.ws, [_entry("2020-01-01T00:00:01", 0)])
+            evidence._append_lines(self.ws, seed)
         processes = []
         for kind in ("rotate", "accept", "prune"):
             ready = ctx.Event()
@@ -228,17 +245,17 @@ class EvidenceRotationTests(unittest.TestCase):
         for proc in processes:
             proc.join(15)
             self.assertEqual(proc.exitcode, 0, results)
-        self.assertEqual(sorted(results), [("accept", True), ("prune", True), ("write", 101)])
+        self.assertEqual({r[0] for r in results}, {"accept", "prune", "write"})
+        self.assertEqual(dict(results)["prune"], 1)
         self.assertEqual(evidence.verify_chain(self.ws)["chain"], "OK")
         # Compare all acknowledged writes independently, not just the retained count.
         removed = archived.get(timeout=15)  # Capture the pruned seed, independently of retained records.
         records = [json.loads(line) for line in removed.splitlines() if line.strip()]
         records += [json.loads(line) for path in evidence._log_files(self.ws)
                    for line in evidence._read_log(self.ws, path).splitlines() if line.strip()]
-        actual = [("accept", True) if r.get("verb") == "review --accept" else
-                  ("write", r["summary"]["warnings"]) for r in records
-                  if r.get("verb") == "review --accept" or "warnings" in r["summary"]]
-        self.assertEqual(sorted(actual), sorted([("write", 0)] + [r for r in results if r[0] != "prune"]))
+        expected = seed + dict(results)["write"] + dict(results)["accept"]
+        identity = lambda r: json.dumps(r, sort_keys=True)
+        self.assertEqual(sorted(map(identity, records)), sorted(map(identity, expected)))
         entries, skipped = evidence._load_entries(self.ws, self.project)
         self.assertEqual(skipped, 0)
         self.assertTrue(any(e["stage"] == "HUMAN_ACCEPTED" for e in entries))
@@ -270,9 +287,17 @@ class EvidenceRotationTests(unittest.TestCase):
         proc.start()
         self.addCleanup(lambda: proc.terminate() if proc.is_alive() else None)
         self.assertTrue(entered.wait(15))
+        writer_ready, completed = ctx.Event(), ctx.Event()
+        writer = ctx.Process(target=_waiting_writer, args=(self.root, self.ws.private, writer_ready, completed))
+        writer.start()
+        self.addCleanup(lambda: writer.terminate() if writer.is_alive() else None)
+        self.assertTrue(writer_ready.wait(15))
+        self.assertFalse(completed.wait(0.5), "writer completed while lock was held")
         proc.terminate()
         proc.join(15)
-        evidence._append_lines(self.ws, [_entry(dt.date.today().isoformat() + "T00:00:01", 1)])
+        self.assertTrue(completed.wait(15))
+        writer.join(15)
+        self.assertEqual(writer.exitcode, 0)
         self.assertEqual(evidence.verify_chain(self.ws)["chain"], "OK")
 
     def test_corrupt_tip_refuses_append_and_io_errors_are_closed(self):

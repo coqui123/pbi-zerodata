@@ -219,14 +219,18 @@ class EvidenceTipTests(unittest.TestCase):
         self._write(self.active, '{"legacy": true}\n')
         self.assertEqual(evidence._tip(self.ws), self._mac("c"))
 
-        # Model a retained older segment following an authenticated, archived
-        # prefix. It must authenticate, but cannot supply the newest segment's tip.
+        # The older segment supplies the final authenticated tip when the
+        # newer segment and active log contain no chained records.
         self._record("e")
         self._write(self.anchor, json.dumps({"anchor": self._mac("e")}) + "\n")
         self._write(os.path.join(self.segs, "0001.jsonl"), self._record("a", self._mac("e")))
         self._write(os.path.join(self.segs, "0002.jsonl"), '{"legacy": true}\n')
         self._write(self.active, "\n")
-        self.assertEqual(evidence._tip(self.ws), self._mac("e"))
+        self.assertEqual(evidence._tip(self.ws), self._mac("a"))
+        batch = [{"fixture": "appended"}]
+        evidence._append_lines(self.ws, batch)
+        self.assertEqual(batch[0]["chain_prev"], self._mac("a"))
+        self.assertEqual(evidence._tip(self.ws), batch[0]["chain_mac"])
 
     def test_missing_active_still_uses_newest_segment(self):
         self._write(os.path.join(self.segs, "0001.jsonl"), self._record("a"))

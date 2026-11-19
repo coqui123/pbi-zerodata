@@ -744,7 +744,12 @@ def probe(ws, project, table: str, columns: list[str] | None) -> dict:
     port = desktop.require_port(project)
     req = {"private_dir": ws.private, "port": port, "table": table, "disclosure": pol.get("disclosure", "shape")}
     model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
-    known = [c.name for t in model.tables.values() if t.name == table for c in t.columns.values()]
+    matched = next((t for t in model.tables.values() if t.name == table), None)
+    if matched is None:
+        matched = next((t for t in model.tables.values() if t.name.casefold() == table.casefold()), None)
+    if not columns and matched is None:
+        raise PbzError("NOT_FOUND", "table not found in mirror")
+    known = [c.name for c in matched.columns.values()] if matched is not None else []
     req["columns"] = columns or known
     res = engine_call("probe", req, timeout=300)
     if not res.get("ok"):

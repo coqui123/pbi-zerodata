@@ -1127,6 +1127,42 @@ import unittest
 from unittest.mock import patch
 
 
+class ProjectionTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(S))
+        from pbz import engine
+        self.engine = engine
+
+    def test_probe_requires_verb(self):
+        request = {"table": "Sales", "columns": ["Amount"], "disclosure": "shape"}
+        response = {"ok": True, "table": "Sales", "columns": []}
+        for verb in (None, "health"):
+            obj = {**response, **({"verb": verb} if verb else {})}
+            self.assertEqual(self.engine._project("probe", obj, request)["class"], "ENGINE_UNAVAILABLE")
+        self.assertTrue(self.engine._project("probe", {**response, "verb": "probe"}, request)["ok"])
+
+    def test_failure_verb_must_match(self):
+        self.assertEqual(self.engine._project("deps", {"ok": False, "verb": "health", "class": "TIMEOUT"}),
+                         {"ok": False, "verb": "deps", "class": "ENGINE_UNAVAILABLE"})
+        self.assertEqual(self.engine._project("deps", {"ok": False, "verb": "deps", "class": "TIMEOUT"})["class"], "TIMEOUT")
+
+    def test_deps_positions(self):
+        edge = ["MEASURE", "Sales", "Total", "COLUMN", "Sales", "Amount"]
+        good = {"ok": True, "verb": "deps", "edges": [edge]}
+        self.assertEqual(self.engine._project("deps", good), good)
+        for i in range(6):
+            wrong = edge[:]
+            wrong[i] = 12
+            self.assertEqual(self.engine._project("deps", {**good, "edges": [wrong]})["class"], "ENGINE_UNAVAILABLE")
+
+    def test_unusable_contract(self):
+        for error in (FileNotFoundError("missing"), PermissionError("unreadable")):
+            with patch.object(Path, "read_text", side_effect=error):
+                self.assertEqual(self.engine._project("deps", {"ok": True})["class"], "ENGINE_UNAVAILABLE")
+        with patch.object(Path, "read_text", return_value='{}'):
+            self.assertEqual(self.engine._project("deps", {"ok": True})["class"], "ENGINE_UNAVAILABLE")
+
+
 class CanaryScanTests(unittest.TestCase):
     def test_clean_positive_control(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1188,7 +1224,7 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true", help="keep the temporary private_dir")
     args = ap.parse_args()
 
-    scanner_tests = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(CanaryScanTests))
+    scanner_tests = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromNames(["CanaryScanTests", "ProjectionTests"], module=sys.modules[__name__]))
     if not scanner_tests.wasSuccessful():
         return 1
     if not EXE.is_file():
@@ -1221,6 +1257,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--projection-tests" in sys.argv:
+        unittest.main(argv=[sys.argv[0]], defaultTest="ProjectionTests")
     if "--scan-tests" in sys.argv:
         unittest.main(argv=[sys.argv[0]], defaultTest="CanaryScanTests")
     sys.exit(main())

@@ -67,26 +67,58 @@ def _workspace_lock(ws):
         raise PbzError("REFUSED", UNUSABLE) from None
 
 
+def _prune_index(ws):
+    doc = json.loads(read_checked(_index_path(ws), root=_workspace_root(ws), max_bytes=256 * 1024))
+    if (not isinstance(doc, dict) or not isinstance(doc.get("anchor"), str)
+            or not _CHAIN_RE.fullmatch(doc["anchor"])):
+        raise ValueError("anchor")
+    pending = doc.get("pending", [])
+    if (not isinstance(pending, list)
+            or any(not isinstance(n, str) or not re.fullmatch(r"\d{4}\.jsonl", n) for n in pending)
+            or len(set(pending)) != len(pending) or pending != sorted(pending)):
+        raise ValueError("pending")
+    return doc
+
+
 def _recover_prune(ws):
     path = _index_path(ws)
     if not os.path.lexists(path):
         return
     try:
-        doc = json.loads(read_checked(path, root=_workspace_root(ws), max_bytes=256 * 1024))
-    except (ValueError, UnicodeError):
-        raise PbzError("REFUSED", UNUSABLE) from None
-    if (not isinstance(doc, dict) or not isinstance(doc.get("anchor"), str)
-            or not _CHAIN_RE.fullmatch(doc["anchor"])):
-        raise PbzError("REFUSED", UNUSABLE)
-    pending = doc.get("pending", [])
-    if not isinstance(pending, list) or any(not isinstance(n, str) or not re.fullmatch(r"\d{4}\.jsonl", n) for n in pending):
-        raise PbzError("REFUSED", UNUSABLE)
-    for name in pending:
-        segment = pbz_state_path(ws, "evidence.d/" + name)
+        doc = _prune_index(ws)
+        pending = doc.get("pending", [])
+        segments = []
+        prev = None
+        key = _chain_key(ws)
+        for name in pending:
+            segment = pbz_state_path(ws, "evidence.d/" + name)
+            text = _read_log(ws, segment)
+            if text is None:  # A previous recovery may have deleted a prefix.
+                if segments:
+                    return
+                continue
+            first = next((json.loads(line) for line in text.splitlines() if line.strip()), None)
+            if not isinstance(first, dict):
+                return
+            if prev is None:
+                prev = first.get("chain_prev")
+                if not isinstance(prev, str) or not _CHAIN_RE.fullmatch(prev):
+                    return
+            prev = _verified_tip(key, prev, text)
+            if prev is None:
+                return
+            segments.append(segment)
+        if segments and prev != doc["anchor"]:
+            return
+    except (ValueError, TypeError, UnicodeError, RecursionError, OSError, PbzError):
+        return
+    for segment in segments:
         try:
             os.remove(segment)
         except FileNotFoundError:
             pass
+        except OSError:
+            return
     if pending:
         write_text(path, json.dumps({"anchor": doc["anchor"]}) + "\n", root=_workspace_root(ws))
 
@@ -291,29 +323,29 @@ def _tip(ws) -> str:
     They cannot supply a tip; any invalid authenticated link refuses further writes.
     """
     key = _chain_key(ws)
-    anchor = prev = _anchor(ws)
+    if os.path.lexists(_index_path(ws)):
+        try:
+            _prune_index(ws)
+        except (ValueError, TypeError, UnicodeError, RecursionError, OSError, PbzError):
+            raise PbzError("REFUSED", UNUSABLE) from None
+    prev = _anchor(ws)
     files = _log_files(ws)
-    tips = {}
     for path in files:
-        tips[path] = None
         for line in (_read_log(ws, path) or "").split("\n"):
             if not line.strip():
                 continue
             try:
                 obj = json.loads(line)
             except (ValueError, RecursionError):
-                continue  # Preserve legacy junk; readers still mark this ledger BROKEN.
+                if path == _log_path(ws):
+                    raise PbzError("REFUSED", UNUSABLE) from None
+                continue  # Preserve legacy segment junk; readers still mark it BROKEN.
             if not isinstance(obj, dict) or "chain_mac" not in obj:
                 continue
             if not _chain_ok(key, prev, obj):
                 raise PbzError("REFUSED", UNUSABLE)
             prev = obj["chain_mac"]
-            tips[path] = prev
-    active = _log_path(ws)
-    segments = [path for path in files if path != active]
-    # Authenticate the entire history, but only the newest segment supplies a
-    # fallback when the active log has no MAC. Older segments never override it.
-    return tips.get(active) or (tips[segments[-1]] if segments else None) or anchor
+    return prev
 
 
 def _stamp(ws, entries: list[dict]) -> None:

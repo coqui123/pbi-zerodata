@@ -511,8 +511,9 @@ def installer_ownership_checks(check, tmp, inst):
     ours = {"type": "command", "command": inst.hook_cmd("claude"), "timeout": 15}
     originals = [{}, {"permissions": {}}, {"permissions": {"deny": []}},
                  {"hooks": {}}, {"hooks": {"PreToolUse": []}},
+                 {"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": []}]}},
                  {"permissions": {"deny": [inst.DENY_RULES[1], "host", inst.DENY_RULES[0]]},
-                  "hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [host, ours]}]}}]
+                  "hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [host]}]}}]
     for original in originals:
         inst.save_json(settings, original, False)
         check(inst.settings_step(settings, "claude", False, False, True), "install added nothing")
@@ -520,10 +521,14 @@ def installer_ownership_checks(check, tmp, inst):
         if original.get("hooks", {}).get("PreToolUse"):
             check(installed["hooks"]["PreToolUse"][0] == original["hooks"]["PreToolUse"][0], "mixed host hooks changed")
         before = os.stat(settings).st_mtime_ns
+        sidecar = Path(settings + ".pbz-owned.json")
+        side_before = (sidecar.stat().st_mtime_ns, sidecar.read_bytes())
         check(not inst.settings_step(settings, "claude", False, False, True), "reinstall changed settings")
+        check((sidecar.stat().st_mtime_ns, sidecar.read_bytes()) == side_before, "reinstall wrote sidecar")
         check(os.stat(settings).st_mtime_ns == before, "reinstall wrote unchanged settings")
         inst.settings_step(settings, "claude", False, True, True)
         check(inst.load_json(settings) == original, f"uninstall lost host settings: {original}")
+        check(not sidecar.exists(), "full uninstall retained sidecar")
     os.remove(settings)
     check(not inst.settings_step(settings, "claude", False, True, True) and not os.path.exists(settings),
           "uninstall created absent settings")
@@ -540,20 +545,63 @@ def installer_ownership_checks(check, tmp, inst):
     inst.save_json(settings, identical, False)
     before = os.stat(settings).st_mtime_ns
     check(not inst.settings_step(settings, "claude", False, False, True), "identical install changed settings")
-    check(os.stat(settings).st_mtime_ns == before and not os.path.exists(settings + ".pbz-owned.json"),
-          "identical install wrote files")
+    check(os.stat(settings).st_mtime_ns == before and os.path.exists(settings + ".pbz-owned.json"),
+          "pre-record guard was not adopted")
+    check(inst.load_json(settings) == identical, "adoption duplicated guard")
     inst.settings_step(settings, "claude", False, True, True)
-    check(inst.load_json(settings) == identical, "unowned identical settings removed")
+    expected = {"permissions": {"deny": inst.DENY_RULES[:]}, "hooks": {
+        "PreToolUse": [{"matcher": ".*", "hooks": [host]}], "SessionStart": []}}
+    check(inst.load_json(settings) == expected, "adopted guard not removed or host lost")
+    check(not os.path.exists(settings + ".pbz-owned.json"), "adoption uninstall retained sidecar")
+
+    narrow = {"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [ours]}]}}
+    inst.save_json(settings, narrow, False)
+    inst.settings_step(settings, "claude", False, False)
+    installed = inst.load_json(settings)
+    check(any(e.get("matcher") == ".*" and ours in e["hooks"] for e in installed["hooks"]["PreToolUse"]),
+          "narrow host guard suppressed required guard")
+    later = {"matcher": ".*", "hooks": [ours, host], "host_metadata": True}
+    installed["hooks"]["PreToolUse"].append(later)
+    inst.save_json(settings, installed, False)
+    inst.settings_step(settings, "claude", False, True)
+    check(inst.load_json(settings) == {"hooks": {"PreToolUse": narrow["hooks"]["PreToolUse"] + [later]}},
+          "uninstall chose later host group")
+    check(not os.path.exists(settings + ".pbz-owned.json"), "full uninstall retained sidecar")
+
+    stale = {**ours, "command": ours["command"] + " --old"}
+    inst.save_json(settings, {"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [stale]}]}}, False)
+    inst.settings_step(settings, "claude", False, False)
+    installed = inst.load_json(settings)
+    check(installed["hooks"]["PreToolUse"] == [{"matcher": ".*", "hooks": [ours]}], "stale guard retained")
+    inst.settings_step(settings, "claude", False, True)
+    check(not os.path.exists(settings + ".pbz-owned.json"), "stale replacement retained sidecar")
     inst.save_json(settings, {"permissions": {"deny": [inst.DENY_RULES[0]]}}, False)
     inst.settings_step(settings, "claude", False, False, True)
     os.remove(settings + ".pbz-owned.json")
     installed = inst.load_json(settings)
     inst.settings_step(settings, "claude", False, True, True)
     check(inst.load_json(settings) == installed, "missing ownership failed safe preservation")
-    inst.backup(settings, False)
-    inst.backup(settings, False)
-    check(len([n for n in os.listdir(tmp) if n.startswith("owned-settings.json.bak-pbz-")]) >= 2,
-          "backups collided")
+    backups = lambda: {n for n in os.listdir(tmp) if n.startswith("owned-settings.json.bak-pbz-")}
+    before_backups = backups()
+    with patch.object(inst, "stamp", return_value="fixed-timestamp"):
+        inst.backup(settings, False)
+        inst.backup(settings, False)
+    check(len(backups() - before_backups) == 2, "backups collided")
+
+    for uninstall in (False, True):
+        for what_if in (False, True):
+            for changed in (False, True):
+                argv = ["install.py"] + (["--uninstall"] if uninstall else []) + (["--what-if"] if what_if else [])
+                with patch.object(sys, "argv", argv), patch.object(inst, "LINKS", []), \
+                        patch.object(inst, "RULE_FILES", []), patch.object(inst, "_refuse_spaced_paths"), \
+                        patch.object(inst, "settings_step", return_value=changed), \
+                        patch.object(inst, "mcp_step", return_value=[]), patch("builtins.print") as output:
+                    inst.main()
+                lines = [str(c) for c in output.call_args_list]
+                check(any(("hooks + deny rules -> " if changed else "ok ") + inst.CLAUDE_SETTINGS in l for l in lines),
+                      "Claude settings status missing")
+                check(any(("hooks -> " if changed else "ok ") + inst.CODEX_HOOKS in l for l in lines),
+                      "Codex settings status missing")
 
 
 if __name__ == "__main__":
