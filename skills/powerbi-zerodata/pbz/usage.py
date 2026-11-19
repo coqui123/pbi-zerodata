@@ -352,7 +352,7 @@ def _dax_edges(g: Graph, src: tuple, model, res, node, home: str, via: str, row_
     for reg in tmdl.node_regions(doc, node, deep=deep):
         if reg.kind != "dax":
             continue
-        d = deps.dax(doc.text[reg.start:reg.end], home, res, row_home=row_home, function=function)
+        d = deps.dax_region(doc.text, reg, res)
         for ref in d.refs:
             k = _ref_key(ref)
             if k is None:
@@ -391,8 +391,10 @@ def _m_edges(g: Graph, src: tuple, model, res, node, own: str = "", lock_reason:
     for reg in tmdl.node_regions(doc, node, deep=True):
         if reg.kind != "m":
             continue
-        for ref in deps.m(doc.text[reg.start:reg.end], res, own):
-            k = _ref_key(ref)
+        for binding in deps.m_bindings(doc.text[reg.start:reg.end], res, own):
+            k = _ref_key(binding.ref)
+            if binding.uncertain:
+                g.lock(k, "uncertain M binding: automatic removal disabled")
             g.edge(src, k, "m")
             if lock_reason:
                 g.lock(k, lock_reason)

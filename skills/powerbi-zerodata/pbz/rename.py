@@ -6,7 +6,7 @@ import ntpath
 import os
 import re
 
-from . import lexers, mirror, pbir, tmdl
+from . import deps, lexers, mirror, pbir, tmdl
 from .common import PbzError, commit_bytes
 from .tokens import apply_edits
 
@@ -52,6 +52,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         raise PbzError("UNSUPPORTED", "rename supports measure, column and table")
     ext = _external_users(ws, project, kind, home, old)
 
+    res = deps.Resolver(model)
     changed = []
     ops = []
     # ---- TMDL (planned; nothing is written until PBIR and cultures are planned too)
@@ -72,10 +73,8 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         for reg in doc.regions:
             if reg.kind != "dax":
                 continue
-            n = reg.node
-            while n is not None and n.kind != "table":
-                n = n.parent
-            edits += dax_ref_edits(text, reg.start, reg.end, kind, home, old, new, n.name if n else None)
+            bindings = deps.dax_region(text, reg, res).bindings
+            edits += _binding_edits(bindings, kind, home, old, new)
         if kind == "column":
             for m_ in re.finditer(r"(?m)^(\t*(?:sortByColumn|column)\s*:\s*)('(?:[^']|'')*'|\S+)\s*$", text):
                 if tmdl.unquote(m_.group(2)).lower() == old.lower() and rel == model.tables[home].file:
@@ -106,25 +105,24 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             "next": "pbz diff, then pbz push", **ext}
 
 
-def dax_ref_edits(text: str, start: int, end: int, kind: str, home: str, old: str, new: str,
-                  cur: str | None = None) -> list[tuple[int, int, str]]:
-    """Edits renaming every reference to measure / column `old` of table `home` inside text[start:end] (one
-    DAX expression) to `new`: 'home'[old] and home[old], and bare [old] (for a column only when `cur`, the
-    table that holds the expression, is `home`). Offsets are in `text`."""
+def _binding_edits(bindings, kind, home, old, new):
     edits = []
-    sig = lexers.significant(lexers.lex_dax(text[start:end], start))
-    for i, t in enumerate(sig):
-        if t.kind != "bracket" or t.value.lower() != old.lower():
+    for binding in bindings:
+        ref = binding.ref
+        if ref.name.lower() != old.lower():
             continue
-        prev = sig[i - 1] if i else None
-        qualified = prev is not None and prev.end == t.start and prev.kind in ("table", "ident")
-        qtable = prev.value if qualified else None
-        if kind == "measure" and (not qualified or qtable.lower() == home.lower()):
-            edits.append((t.start, t.end, _bracket(new)))
-        elif kind == "column" and ((qualified and qtable.lower() == home.lower()) or
-                                   (not qualified and cur and cur.lower() == home.lower())):
-            edits.append((t.start, t.end, _bracket(new)))
+        if binding.uncertain:
+            raise PbzError("AMBIGUOUS", f"cannot safely bind a reference to {old}; nothing renamed")
+        if ref.kind == kind and ref.table.lower() == home.lower():
+            edits.append((binding.start, binding.end, _bracket(new)))
     return edits
+
+
+def dax_ref_edits(text: str, start: int, end: int, kind: str, home: str, old: str, new: str,
+                  cur: str | None = None, *, res, row_home: bool = False) -> list[tuple[int, int, str]]:
+    """Rename exactly the occurrences bound to the target by the shared resolver."""
+    bindings = deps.dax_bindings(text[start:end], cur or "", res, row_home, base=start).bindings
+    return _binding_edits(bindings, kind, home, old, new)
 
 
 def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str) -> list[tuple[int, int, str]]:
@@ -202,6 +200,10 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     if old != new and ntpath.normcase(os.path.abspath(dest)) == ntpath.normcase(os.path.abspath(src)):
         raise PbzError("UNSUPPORTED", "table rename requires a distinct sanitized file path")
     _refuse_file_collision(mdef, t.file, new)
+    res = deps.Resolver(model)
+    # M partitions can reference table queries as well as shared expressions.
+    mres = deps.Resolver(model)
+    mres.expressions.update({name: name for name in model.tables})
     low = old.lower()
     changed, renamed_file = [], None
     ops = []
@@ -225,22 +227,26 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         for reg in doc.regions:
             seg = text[reg.start:reg.end]
             if reg.kind == "dax":
-                sig = lexers.significant(lexers.lex_dax(seg, reg.start))
-                for i, tok in enumerate(sig):
-                    nxt = sig[i + 1] if i + 1 < len(sig) else None
-                    if tok.kind == "table" and tok.value.lower() == low:
-                        edits.append((tok.start, tok.end, _dax_table(new, True)))
-                    elif tok.kind == "ident" and tok.text.lower() == low and not (nxt is not None and nxt.text == "("):
-                        edits.append((tok.start, tok.end, _dax_table(new, False)))
+                for binding in deps.dax_region(text, reg, res).bindings:
+                    ref = binding.ref
+                    if binding.uncertain and ref.table.lower() == low:
+                        raise PbzError("AMBIGUOUS", f"cannot safely bind a reference to {old}")
+                    if ref.kind == "table" and ref.name.lower() == low:
+                        quoted = text[binding.start:binding.start + 1] == "'"
+                        edits.append((binding.start, binding.end, _dax_table(new, quoted)))
+                    elif binding.qualifier and ref.kind in {"column", "measure"}:
+                        a, b = binding.qualifier
+                        # A qualified measure can name any table; rename its actual qualifier.
+                        tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
+                        if (tok.value or tok.text).lower() == low:
+                            edits.append((a, b, _dax_table(new, tok.kind == "table")))
             elif reg.kind == "m":
-                sig = lexers.significant(lexers.lex_m(seg, reg.start))
-                steps = {(x.value or x.text) for k, x in enumerate(sig[:-1])
-                         if x.kind in ("ident", "qident") and sig[k + 1].text == "="}
-                for i, tok in enumerate(sig):
-                    name = tok.value if tok.kind == "qident" else (tok.text if tok.kind == "ident" else None)
-                    prev = sig[i - 1] if i else None
-                    if name == old and name not in steps and not (prev is not None and prev.text == "." and prev.end == tok.start):
-                        edits.append((tok.start, tok.end, _m_ident(new)))
+                for binding in deps.m_bindings(seg, mres, base=reg.start):
+                    if binding.ref.name != old:
+                        continue
+                    if binding.uncertain:
+                        raise PbzError("AMBIGUOUS", f"cannot safely bind an M reference to {old}")
+                    edits.append((binding.start, binding.end, _m_ident(new)))
             elif reg.kind == "text" and reg.node.kind == "annotation" and reg.node.name == "PBI_QueryOrder":
                 try:
                     names = json.loads(seg)

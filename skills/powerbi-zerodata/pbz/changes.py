@@ -80,7 +80,7 @@ def _model_side(texts: dict, project) -> tuple[list[Rec], object]:
                 continue
             if node.kind not in OBJECT_KINDS:
                 continue
-            table = node.name if node.kind == "table" else _table_of(node)
+            table = node.name if node.kind in {"table", "tablePermission"} else _table_of(node)
             if node.kind == "relationship":
                 pkey = ("relationship", node.props.get("fromColumn", "").strip().lower(),
                         node.props.get("toColumn", "").strip().lower())
@@ -139,8 +139,13 @@ def _ref_label(ref: deps.Ref) -> str:
     return ""
 
 
-def _refs(lang: str, text: str, home: str, res) -> set[str]:
-    refs = deps.dax(text, home, res).refs if lang == "dax" else deps.m(text, res)
+def _refs(lang: str, text: str, home: str, res, kind: str = "") -> set[str]:
+    if lang == "dax":
+        refs = deps.dax_bindings(text, home, res,
+                                 row_home=kind in {"column", "tablePermission", "calculationItem"},
+                                 function=kind == "function").refs
+    else:
+        refs = deps.m(text, res)
     return {x for x in map(_ref_label, refs) if x}
 
 
@@ -225,7 +230,7 @@ def _compare_model(a: list, b: list, ares, bres) -> list[dict]:
             if ch is None:
                 continue
             if ch["class"] in ("logic", "literal_only"):
-                ra, rb = _refs(la, ta, x.table, ares), _refs(lb, tb, y.table, bres)
+                ra, rb = _refs(la, ta, x.table, ares, x.kind), _refs(lb, tb, y.table, bres, y.kind)
                 if rb - ra:
                     ch["refs_added"] = sorted(rb - ra)
                 if ra - rb:

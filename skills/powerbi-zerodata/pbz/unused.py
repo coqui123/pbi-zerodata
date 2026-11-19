@@ -68,6 +68,8 @@ def _removal(g, k, model) -> tuple[str, str]:
         if t is not None and any(ch.kind == "refreshPolicy" for ch in (t.node.children if t.node else [])):
             return "manual", "table has an incremental refresh policy"
         return "auto", ""
+    if o.kind == "m_query" and any("uncertain M binding" in reason for reason in g.locks.get(k, ())):
+        return "manual", "uncertain M binding: automatic removal disabled"
     if o.kind == "m_query" and o.extra.get("parameter"):
         return "manual", "parameter: deployment pipelines or the service may set it"
     if o.kind == "calc_item":

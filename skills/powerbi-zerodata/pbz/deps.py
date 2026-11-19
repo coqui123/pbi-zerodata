@@ -10,8 +10,8 @@ DAX rules follow Tabular Editor 2's FormulaFixup / DaxDependencyHelper (MIT):
 - ident( is a function call (a user-defined function when the model defines one of that name);
   a bare ident is a table only when the model has a table of that name and no VAR shadows it.
 - mirror tokens «...» are opaque literals, never references.
-M rules: an identifier or #"quoted identifier" naming a shared expression (query or parameter) is a
-reference to it, unless a let step of the same name shadows it.
+M rules: identifiers name shared expressions case-sensitively, unless a lexical let, record,
+parameter or each binding shadows them. Uncertain scopes retain possible references.
 """
 from __future__ import annotations
 
@@ -44,8 +44,25 @@ class Ref:
     via: str = "dax"
 
 
+@dataclass(frozen=True)
+class Binding:
+    """One occurrence, with original spans and the context used to bind it.
+
+    start/end cover the name (the bracket for DAX columns/measures); qualifier
+    covers a DAX table prefix separately. An uncertain binding must not be edited.
+    """
+    ref: Ref
+    start: int
+    end: int
+    home: str = ""
+    row_home: bool = False
+    qualifier: tuple[int, int] | None = None
+    uncertain: bool = False
+
+
 @dataclass
 class DaxDeps:
+    bindings: list[Binding] = field(default_factory=list)
     refs: list = field(default_factory=list)            # [Ref]
     relationships: list = field(default_factory=list)   # [(fn, (table, column), (table, column))]
     unresolved: list = field(default_factory=list)      # [Ref] that matched nothing in the model
@@ -68,7 +85,7 @@ class Resolver:
             for m in t.measures:
                 self.measures.setdefault(m.lower(), (t.name, m))
         self.functions = {f.lower(): f for f in model.functions}
-        self.expressions = {e.lower(): e for e in model.expressions}
+        self.expressions = {e: e for e in model.expressions}
 
     def table(self, name: str) -> str | None:
         return self.tables.get(name.lower())
@@ -98,16 +115,18 @@ def _function_header(text: str) -> tuple[str, str]:
     return m.group("params") + ")", text[m.end():]
 
 
-def dax(expr: str, home: str, res: Resolver, row_home: bool = False, function: bool = False) -> DaxDeps:
+def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
+                 function: bool = False, base: int = 0) -> DaxDeps:
     """References made by one DAX expression whose home table is `home`.
 
     row_home: the expression has a row context on the home table (calculated column, RLS filter,
     calculation item); function: the text is a UDF definition with a parameter list.
     """
     header = ""
+    original_length = len(expr)
     if function:
         header, expr = _function_header(expr)
-    sig = lexers.significant(lexers.lex_dax(expr))
+    sig = lexers.significant(lexers.lex_dax(expr, base + original_length - len(expr)))
     local = _vars_and_params(sig, header)
     extension = {t.value.lower() for t in sig if t.kind == "str"}
     out = DaxDeps()
@@ -116,6 +135,12 @@ def dax(expr: str, home: str, res: Resolver, row_home: bool = False, function: b
     n = len(sig)
 
     def add(ref: Ref, at: int):
+        tok = sig[at]
+        qualified = at + 1 < n and sig[at + 1].kind == "bracket" and tok.kind in ("table", "ident")
+        name = sig[at + 1] if qualified else tok
+        out.bindings.append(Binding(ref, name.start, name.end, home, row_home,
+                                    (tok.start, tok.end) if qualified else None,
+                                    ref.kind == "unresolved"))
         out.refs.append(ref)
         if ref.kind == "unresolved":
             out.unresolved.append(ref)
@@ -149,7 +174,7 @@ def dax(expr: str, home: str, res: Resolver, row_home: bool = False, function: b
         elif t.kind == "op" and t.text == "," and stack:
             stack[-1]["arg"] += 1
         elif t.kind in ("table", "ident") and nxt is not None and nxt.kind == "bracket" and (
-                t.kind == "table" or t.text.lower() in local or res.table(t.text)):
+                t.kind == "table" or t.text.lower() in local or res.table(t.text) or t.end == nxt.start):
             qual = t.value if t.kind == "table" else t.text
             if t.kind == "ident" and qual.lower() in local:
                 add(Ref("extension", qual, nxt.value), i)   # VAR table column: t[Hours]
@@ -185,6 +210,26 @@ def dax(expr: str, home: str, res: Resolver, row_home: bool = False, function: b
     return out
 
 
+def dax(expr: str, home: str, res: Resolver, row_home: bool = False, function: bool = False) -> DaxDeps:
+    """Dependency projection of the shared per-occurrence DAX resolver."""
+    return dax_bindings(expr, home, res, row_home, function)
+
+
+def dax_region(text, reg, res: Resolver) -> DaxDeps:
+    """Resolve a TMDL region, including bare RLS refs and UDF header offsets."""
+    node = reg.node
+    row_home = False
+    function = False
+    while node is not None:
+        row_home |= node.kind in {"column", "tablePermission", "calculationItem"}
+        function |= node.kind == "function"
+        if node.kind in {"table", "tablePermission"}:
+            break
+        node = node.parent
+    home = node.name if node else ""
+    return dax_bindings(text[reg.start:reg.end], home, res, row_home, function, reg.start)
+
+
 def _bare(name: str, home: str, res: Resolver, row_home: bool, row_tables: list[str], extension: set[str]) -> Ref:
     if row_home and res.column(home, name):
         return Ref("column", res.table(home) or home, res.column(home, name))
@@ -204,24 +249,165 @@ def _bare(name: str, home: str, res: Resolver, row_home: bool, row_tables: list[
     return Ref("unresolved", "", name)
 
 
+def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0) -> list[Binding]:
+    """Lexical M scopes: recursive let/record bindings, lambda parameters and each's _.
+
+    Let names are visible throughout their let; record fields only inside that
+    record. Initializers exclude their own binding (exclusive M identifiers). Field selectors are not shared names. Unsupported or malformed scope
+    syntax retains every possible shared reference as uncertain, even if local.
+    M identifiers and shared names are deliberately case-sensitive.
+    """
+    sig = lexers.significant(lexers.lex_m(expr, base))
+    pairs, stack = {}, []
+    uncertain = False
+    for i, tok in enumerate(sig):
+        if tok.text in ("(", "[", "{") and tok.kind == "op":
+            stack.append(i)
+        elif tok.text in (")", "]", "}") and tok.kind == "op":
+            if not stack or sig[stack[-1]].text != {")": "(", "]": "[", "}": "{"}[tok.text]:
+                uncertain = True
+            else:
+                pairs[stack.pop()] = i
+    uncertain |= bool(stack)
+    found = []
+
+    def name(i):
+        t = sig[i]
+        return (t.value if t.kind == "qident" else t.text) if t.kind in ("ident", "qident") else None
+
+    def parts(lo, hi):
+        # Split only at this level: a nested let owns commas until its matching in.
+        result, begin, depth, i = [], lo, 0, lo
+        while i < hi:
+            if i in pairs:
+                i = pairs[i] + 1
+                continue
+            t = sig[i]
+            if t.kind == "ident" and t.text == "let":
+                depth += 1
+            elif t.kind == "ident" and t.text == "in":
+                depth -= 1
+            elif t.text == "," and depth == 0:
+                result.append((begin, i))
+                begin = i + 1
+            i += 1
+        return result + [(begin, hi)]
+
+    def definitions(ranges):
+        nonlocal uncertain
+        names, bodies = set(), []
+        for lo, hi in ranges:
+            if lo + 1 < hi and name(lo) is not None and sig[lo + 1].text == "=":
+                names.add(name(lo))
+                bodies.append((lo + 2, hi, name(lo)))
+            else:
+                uncertain = True
+                bodies.append((lo, hi, None))
+        return names, bodies
+
+    def walk(lo, hi, local):
+        nonlocal uncertain
+        i = lo
+        while i < hi:
+            t = sig[i]
+            if t.kind == "ident" and t.text == "if":
+                # Branch expressions have separate lexical boundaries: a let or
+                # lambda in the then branch cannot hide names in the else branch.
+                depth, then, j = 1, None, i + 1
+                while j < hi:
+                    if j in pairs:
+                        j = pairs[j] + 1
+                        continue
+                    word = sig[j].text if sig[j].kind == "ident" else ""
+                    if word == "if":
+                        depth += 1
+                    elif word == "then" and depth == 1 and then is None:
+                        then = j
+                    elif word == "else":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                if then is None or j == hi:
+                    uncertain = True
+                    i += 1
+                    continue
+                walk(i + 1, then, local)
+                walk(then + 1, j, local)
+                walk(j + 1, hi, local)
+                return
+            if t.kind == "ident" and t.text == "let":
+                depth, j = 1, i + 1
+                while j < hi:
+                    if j in pairs:
+                        j = pairs[j] + 1
+                        continue
+                    if sig[j].kind == "ident":
+                        if sig[j].text == "let":
+                            depth += 1
+                        elif sig[j].text == "in":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                    j += 1
+                if j == hi:
+                    uncertain = True
+                    i += 1
+                    continue
+                names, bodies = definitions(parts(i + 1, j))
+                for a, b, defined in bodies:
+                    walk(a, b, local | (names - {defined}))
+                walk(j + 1, hi, local | names)
+                return
+            if t.kind == "ident" and t.text == "each":
+                walk(i + 1, hi, local | {"_"})
+                return
+            if i in pairs:
+                end = pairs[i]
+                ranges = parts(i + 1, end)
+                if t.text == "(" and end + 1 < hi and sig[end + 1].text == "=>":
+                    params = set()
+                    for a, b in ranges:
+                        if a < b and sig[a].text == "optional":
+                            a += 1
+                        if a < b and name(a):
+                            params.add(name(a))
+                        elif a != b:
+                            uncertain = True
+                    walk(end + 2, hi, local | params)
+                    return
+                if t.text == "[":
+                    # Quoted selectors [#"Field"] have no '=' and aren't records.
+                    record = any(a + 1 < b and sig[a + 1].text == "=" for a, b in ranges)
+                    if record:
+                        names, bodies = definitions(ranges)
+                        for a, b, defined in bodies:
+                            walk(a, b, local | (names - {defined}))
+                    elif not (i + 2 == end and name(i + 1)):
+                        uncertain = True
+                else:
+                    for a, b in ranges:
+                        walk(a, b, local)
+                i = end + 1
+                continue
+            nm = name(i)
+            if t.text in ("=>", "section", "shared", "#", "try", "catch", "meta", "type", "@"):
+                uncertain = True
+            if nm in res.expressions and nm != own:
+                prev = sig[i - 1] if i else None
+                if not (prev and prev.text == "."):
+                    found.append((i, nm, nm in local))
+            i += 1
+
+    walk(0, len(sig), set())
+    if uncertain:
+        # Include tokens skipped as declarations or selectors too: uncertainty must
+        # never make the graph less conservative than a plain identifier scan.
+        found = [(i, name(i), False) for i in range(len(sig)) if name(i) in res.expressions]
+    return [Binding(Ref("m_query", "", nm, "m"), sig[i].start, sig[i].end,
+                    uncertain=uncertain) for i, nm, local in found if not local]
+
+
 def m(expr: str, res: Resolver, own: str = "") -> list[Ref]:
-    """Shared expressions (queries, parameters) referenced by an M expression."""
-    sig = lexers.significant(lexers.lex_m(expr))
-    steps = set()
-    for i, t in enumerate(sig[:-1]):
-        if t.kind in ("ident", "qident") and sig[i + 1].kind == "op" and sig[i + 1].text == "=":
-            steps.add((t.value or t.text).lower())
-    out, seen = [], set()
-    for i, t in enumerate(sig):
-        if t.kind not in ("ident", "qident"):
-            continue
-        name = t.value if t.kind == "qident" else t.text
-        low = name.lower()
-        if low in steps or low == own.lower() or low not in res.expressions or low in seen:
-            continue
-        prev = sig[i - 1] if i else None
-        if prev is not None and prev.kind == "op" and prev.text == "." and prev.end == t.start:
-            continue
-        seen.add(low)
-        out.append(Ref("m_query", "", res.expressions[low], "m"))
-    return out
+    """Dependency projection of the shared M tracker."""
+    return list(dict.fromkeys(b.ref for b in m_bindings(expr, res, own)))

@@ -64,6 +64,127 @@ def _perf_body(**over) -> dict:
     return body
 
 
+class LocatedBindingTests(unittest.TestCase):
+    def model(self, measure=False):
+        model = tmdl.load_model("", texts={
+            "tables/Sales.tmdl": "table Sales\n\tcolumn Amount\n\tcolumn OnlyHere\n",
+            "tables/Other.tmdl": "table Other\n\tcolumn Amount\n",
+            "tables/Home.tmdl": "table Home\n" + ("\tmeasure Amount = 1\n" if measure else ""),
+        })
+        return model
+
+    def test_dax_golden_occurrence_offsets(self):
+        from pbz import deps, rename, changes
+        # «...» here marks independently selected golden spans, removed before
+        # resolution. No expected offset is derived from deps or rename output.
+        fixtures = [
+            ("«[Amount]» + Sales«[Amount]»", "Sales", False, False),
+            ("SUMX(Sales, «[Amount]» + SUMX(Other, [Amount]) + «[Amount]»)", "Home", False, False),
+            ("SUMX(Other, [Amount]) + «[Amount]»", "Sales", False, False),
+            ("«[OnlyHere]»", "Home", False, False),
+            ("Sales«[Amount]» > 0 && «[Amount]» > 0", "Sales", True, False),
+            ("[Amount] + Sales«[Amount]» + Other[Amount]", "Sales", False, True),
+            ("Other[Amount] + Sales«[Amount]»", "Sales", False, False),
+            ("Home[Amount] + Sales«[Amount]»", "Sales", False, True),
+            ("Other[Amount] + «[Amount]»", "Sales", True, True),
+        ]
+        for marked, home, row, measure in fixtures:
+            with self.subTest(fixture=marked):
+                text, expected, opened = "", [], None
+                for ch in marked:
+                    if ch == "«":
+                        opened = len(text)
+                    elif ch == "»":
+                        expected.append((opened, len(text)))
+                    else:
+                        text += ch
+                res = deps.Resolver(self.model(measure))
+                old = "OnlyHere" if "OnlyHere" in text else "Amount"
+                info = deps.dax_bindings(text, home, res, row_home=row, base=7)
+                found = [(b.start - 7, b.end - 7) for b in info.bindings
+                         if b.ref == deps.Ref("column", "Sales", old)]
+                self.assertEqual(found, expected)
+                edits = rename.dax_ref_edits("prefix!" + text, 7, 7 + len(text), "column",
+                                             "Sales", old, "New", home, res=res, row_home=row)
+                self.assertEqual(edits, [(a + 7, b + 7, "[New]") for a, b in expected])
+                labels = changes._refs("dax", text, home, res, "tablePermission" if row else "measure")
+                self.assertEqual("Sales[" + old + "]" in labels, bool(expected))
+
+    def test_region_context_rls_and_function_original_offsets(self):
+        from pbz import deps, rename
+        res = deps.Resolver(self.model(True))
+        text = "role Reader\n\ttablePermission Sales = [Amount] > 0 && Sales[Amount] > 0\n"
+        doc = tmdl.parse("roles/Reader.tmdl", text)
+        reg = next(r for r in doc.regions if r.kind == "dax")
+        bindings = deps.dax_region(text, reg, res).bindings
+        self.assertEqual(rename._binding_edits(bindings, "column", "Sales", "Amount", "New"),
+                         [(text.index("[Amount]"), text.index("[Amount]") + 8, "[New]"),
+                          (text.rindex("[Amount]"), text.rindex("[Amount]") + 8, "[New]")])
+        expr = "(x: scalar) => Sales[Amount] + x"
+        binding = deps.dax_bindings(expr, "", res, function=True, base=10).bindings[0]
+        self.assertEqual((binding.start, binding.end), (30, 38))
+
+    def test_unresolved_rename_candidate_refused(self):
+        from pbz import deps, rename
+        from pbz.common import PbzError
+        for expr, home in (("[Amount]", ""), ("Missing[Amount]", "Sales")):
+            with self.subTest(expr=expr), self.assertRaises(PbzError) as caught:
+                rename.dax_ref_edits(expr, 0, len(expr), "column", "Sales", "Amount", "New",
+                                     home, res=deps.Resolver(self.model()))
+            self.assertEqual(caught.exception.code, "AMBIGUOUS")
+
+    def test_semantic_preview_preserves_rls_home_context(self):
+        from pbz import changes, deps
+        from types import SimpleNamespace
+        model = self.model(True)
+        prefix = "Mini.SemanticModel/definition/"
+        texts = {prefix + rel: doc.text for rel, doc in model.docs.items()}
+        role = prefix + "roles/Reader.tmdl"
+        texts[role] = "role Reader\n\ttablePermission Sales = [Amount] > 0\n"
+        before, ma = changes._model_side(texts, SimpleNamespace(name="Mini"))
+        texts[role] = "role Reader\n\ttablePermission Sales = Other[Amount] > 0\n"
+        after, mb = changes._model_side(texts, SimpleNamespace(name="Mini"))
+        result = changes._compare_model(before, after, deps.Resolver(ma), deps.Resolver(mb))
+        rule = next(r for r in result if r["kind"] == "tablePermission")
+        self.assertEqual(rule["expressions"][0]["refs_removed"], ["Sales[Amount]"])
+        self.assertEqual(rule["expressions"][0]["refs_added"], ["Other[Amount]"])
+
+    def test_m_tracker_scopes_and_case(self):
+        from pbz import deps
+        model = tmdl.Model()
+        model.expressions = {name: None for name in ("Sales", "Other", "Source")}
+        res = deps.Resolver(model)
+        fixtures = [
+            ("if Sales = Other then Sales else Other", ["Sales", "Other", "Sales", "Other"]),
+            ("let x = (let Sales = 1 in Sales), y = Sales in y", ["Sales"]),
+            ("let Sales = Other in Sales", ["Other"]),
+            ("let r = [Sales = 1, x = Sales], y = Sales in y", ["Sales"]),
+            ("let source = 1 in Source", ["Source"]),
+            ("let Sales = 1 in Sales", []),
+            ("let r = [Sales = 1, x = Sales] in r", []),
+            ("let Sales = Sales in Sales", ["Sales"]),
+            ("[Sales = Sales, x = Sales]", ["Sales"]),
+            ("let Sales = 1 in (let Sales = Sales in Sales)", []),
+            ("(Sales as number) => Sales + Other", ["Other"]),
+            ("each [Sales] + Sales + _", ["Sales"]),
+            ('let r = [#"Sales" = 1, x = #"Sales"] in Sales', ["Sales"]),
+            ("if true then let Sales = 1 in Sales else Sales", ["Sales"]),
+            ("let f = (Sales) => Sales, x = Sales in x", ["Sales"]),
+        ]
+        for expr, expected in fixtures:
+            with self.subTest(expr=expr):
+                bindings = deps.m_bindings(expr, res, base=5)
+                self.assertEqual([b.ref.name for b in bindings], expected)
+                self.assertFalse(any(b.uncertain for b in bindings))
+                self.assertEqual([expr[b.start-5:b.end-5].removeprefix('#"').removesuffix('"') for b in bindings], expected)
+                self.assertEqual([r.name for r in deps.m(expr, res)], list(dict.fromkeys(expected)))
+        for expr, expected in (("let Sales = 1", ["Sales"]),
+                               ("try let Sales = 1 in Sales otherwise Sales", ["Sales"] * 3)):
+            uncertain = deps.m_bindings(expr, res)
+            self.assertEqual([b.ref.name for b in uncertain], expected)
+            self.assertTrue(all(b.uncertain for b in uncertain))
+
+
 class EvidenceTipTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

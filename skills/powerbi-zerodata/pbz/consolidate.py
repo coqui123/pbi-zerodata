@@ -191,13 +191,13 @@ def _report_area(file_kind: str, path: tuple) -> str:
     return {"sort": "sorts", "formatting": "conditional_formatting"}.get(via, "other_report")
 
 
-def _retarget_dax(expr: str, d, t) -> tuple[str, int]:
+def _retarget_dax(expr: str, d, t, res) -> tuple[str, int]:
     """A DAX string with every reference to measure d pointing at measure t (requalified first when the
     tables differ). Returns (new text, references rewritten)."""
     text = expr
     if d.table.lower() != t.table.lower():
         text = apply_edits(text, move.dax_qualifier_edits(text, 0, len(text), d.name, d.table, t.table))
-    edits = rename.dax_ref_edits(text, 0, len(text), "measure", t.table, d.name, t.name)
+    edits = rename.dax_ref_edits(text, 0, len(text), "measure", d.table, d.name, t.name, res=res)
     return apply_edits(text, edits), len(edits)
 
 
@@ -238,7 +238,7 @@ def _perspective_text(rel: str, text: str, d, t, alias: bool) -> tuple[str, int]
     return text, changed
 
 
-def _report_measure_edits(root, d, t, counts: dict) -> list[tuple[int, int, str]]:
+def _report_measure_edits(root, d, t, counts: dict, res) -> list[tuple[int, int, str]]:
     """reportExtensions.json: DAX of report-level measures and their `references` entries."""
     out = []
 
@@ -263,7 +263,7 @@ def _report_measure_edits(root, d, t, counts: dict) -> list[tuple[int, int, str]
                 continue
             ex = mm.get("expression")
             if isinstance(ex, pbir.JStr):
-                new, n = _retarget_dax(ex.value, d, t)
+                new, n = _retarget_dax(ex.value, d, t, res)
                 if n:
                     counts["report_measures"] += n
                     out.append((ex.start, ex.end, json.dumps(new, ensure_ascii=False)))
@@ -349,7 +349,7 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
         for reg in doc.regions:
             if reg.kind != "dax":
                 continue
-            es = rename.dax_ref_edits(text, reg.start, reg.end, "measure", t.table, d.name, t.name)
+            es = rename.dax_ref_edits(text, reg.start, reg.end, "measure", d.table, d.name, t.name, res=res)
             if es:
                 counts[_area(reg)] = counts.get(_area(reg), 0) + len(es)
                 b += es
@@ -406,7 +406,7 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
                 c = [(n.start, n.end, json.dumps(f"{t.table}.{t.name}", ensure_ascii=False))
                      for key, n in pbir.string_nodes(root) if key not in FIELD_STRING_KEYS and n.value.lower() in olds]
                 if fkind == "extensions":
-                    c += _report_measure_edits(root, d, t, counts)
+                    c += _report_measure_edits(root, d, t, counts, res)
                 if c:
                     text = apply_edits(text, sorted(set(c)))
                 if not alias and any(f.kind == "measure" and f.name.lower() == d.name.lower() and f.table.lower() in
