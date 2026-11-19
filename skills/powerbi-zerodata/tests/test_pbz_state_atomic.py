@@ -5,6 +5,8 @@ Run: python tests/test_pbz_state_atomic.py
 from __future__ import annotations
 
 import json
+import multiprocessing
+import time
 import os
 import sys
 import tempfile
@@ -17,10 +19,38 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pbz.common import PbzError, Workspace, append_checked, read_checked  # noqa: E402
-from pbz import audit, docs, handoff, memory, mirror  # noqa: E402
+from pbz import audit, checks, docs, handoff, memory, mirror, tokens  # noqa: E402
 
 
 CANARY = b"CANARY-STATE-LINE\n"
+
+
+def allocation_pull(root, private, name, barrier=None, kill=False):
+    os.environ["PBZ_PRIVATE_ROOT"] = private
+    ws = Workspace(root)
+    original = tokens.TokenMap.__init__
+
+    def slow_load(self, directory):
+        original(self, directory)
+        time.sleep(0.3)  # Widen the old unlocked load/save race; no barrier inside the lock.
+
+    def crash_before_publication(*args, **kwargs):
+        os._exit(77)
+
+    def crash_while_locked(*args):
+        os._exit(78)
+
+    if barrier is not None:
+        barrier.wait(timeout=20)  # Both processes arrive BEFORE acquiring any lock.
+    with patch.object(tokens.TokenMap, "__init__", slow_load):
+        if kill == "locked":
+            with patch.object(tokens.TokenMap, "save", crash_while_locked):
+                mirror.pull(ws, ws.project(name))
+        elif kill:
+            with patch("pbz.mirror.write_text", crash_before_publication):
+                mirror.pull(ws, ws.project(name))
+        else:
+            mirror.pull(ws, ws.project(name))
 
 
 class StateAtomicTests(unittest.TestCase):
@@ -30,6 +60,132 @@ class StateAtomicTests(unittest.TestCase):
         self.ws = Workspace(self.tmp.name)
         open(os.path.join(self.tmp.name, "Canary.pbip"), "w", encoding="utf-8").close()
         self.project = self.ws.project()
+
+    def _allocation_projects(self):
+        private = os.path.join(self.tmp.name, "private")
+        root = os.path.join(self.tmp.name, "workspace")
+        os.makedirs(root)
+        for name in ("A", "B"):
+            open(os.path.join(root, name + ".pbip"), "w").close()
+            definition = os.path.join(root, name + ".SemanticModel", "definition")
+            os.makedirs(os.path.join(definition, "tables"))
+            for rel, text in {
+                "model.tmdl": "model Model\n\tref table T\n",
+                "tables/T.tmdl": 'table T\n\tmeasure M = "' + name + '@example.invalid"\n',
+            }.items():
+                with open(os.path.join(definition, rel), "w", encoding="utf-8") as handle:
+                    handle.write(text)
+        return root, private
+
+    def _join_process(self, process, expected=0):
+        process.join(30)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+            self.fail("allocator process deadlocked")
+        self.assertEqual(process.exitcode, expected)
+
+    def test_parallel_workspace_allocations_roundtrip_after_restart(self):
+        root, private = self._allocation_projects()
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(2)
+        processes = [ctx.Process(target=allocation_pull, args=(root, private, name, barrier))
+                     for name in ("A", "B")]
+        for process in processes:
+            process.start()
+        for process in processes:
+            self._join_process(process)
+        with patch.dict(os.environ, {"PBZ_PRIVATE_ROOT": private}):
+            ws = Workspace(root)  # Fresh map and workspace after both workers exit.
+            tm = tokens.TokenMap(ws.private)
+            allocated = []
+            for name in ("A", "B"):
+                project = ws.project(name)
+                for rel, real in mirror.project_files(project):
+                    with open(os.path.join(ws.mirror, *rel.split("/")), encoding="utf-8") as handle:
+                        text = handle.read()
+                    back, unknown = mirror._detokenize(rel, text, tm)
+                    self.assertFalse(unknown)
+                    self.assertEqual(back.encode(), Path(real).read_bytes())
+                    if rel.endswith("tables/T.tmdl"):
+                        allocated.append(tokens.TOKEN_RE.findall(text)[0])
+            self.assertNotEqual(*allocated)
+            self.assertEqual(allocated[0].rsplit("#", 1)[0], allocated[1].rsplit("#", 1)[0])
+            project = ws.project("A")
+            rel = "A.SemanticModel/definition/tables/T.tmdl"
+            real = mirror._real_path(ws, rel)
+            original = Path(real).read_bytes()
+            man = mirror.load_manifest(ws, project)
+            man["files"][rel]["mirror"] = "0" * 64  # Force a rewrite of the unchanged candidate.
+            mirror.save_manifest(ws, project, man)
+            with patch("pbz.mirror.validate.run_stage", return_value=[]), \
+                    patch("pbz.mirror.desktop.find_instance", return_value=None), \
+                    patch("pbz.mirror.write_text", wraps=mirror.write_text) as writes:
+                out = mirror.push(ws, project)
+            self.assertEqual(out["result"], "PUSHED")
+            self.assertTrue(any(call.args[0] == real for call in writes.call_args_list))
+            self.assertEqual(Path(real).read_bytes(), original)
+
+    def test_checks_reload_allocator_after_engine_and_concurrent_pull(self):
+        root, private = self._allocation_projects()
+        with patch.dict(os.environ, {"PBZ_PRIVATE_ROOT": private}):
+            ws = Workspace(root)
+            mirror.pull(ws, ws.project("A"))
+
+            def engine(*args, **kwargs):
+                # Pull must complete while the engine call is still outstanding.
+                ctx = multiprocessing.get_context("spawn")
+                process = ctx.Process(target=allocation_pull, args=(root, private, "B"))
+                process.start()
+                self._join_process(process)
+                return {"ok": True, "checks": [{"id": "c", "status": "PASS",
+                        "groups": [{"T[C]": {"hmac": "digest"}}]}]}
+
+            with patch("pbz.checks.desktop.require_port", return_value=1), \
+                    patch("pbz.checks.engine_call", engine):
+                out = checks.run_checks(ws, ws.project("A"),
+                        {"checks": [{"id": "c", "kind": "executes", "expr": "[M]"}]})
+            self.assertEqual(out["results"][0]["status"], "PASS")
+            tm = tokens.TokenMap(ws.private)
+            self.assertTrue(any(rec.get("hmac") == "digest" for rec in tm.data["tokens"].values()))
+            rel = "B.SemanticModel/definition/tables/T.tmdl"
+            text = Path(os.path.join(ws.mirror, *rel.split("/"))).read_text(encoding="utf-8")
+            back, unknown = mirror._detokenize(rel, text, tm)
+            self.assertFalse(unknown)
+            self.assertEqual(back.encode(), Path(mirror._real_path(ws, rel)).read_bytes())
+
+    def test_allocator_lock_released_on_process_death(self):
+        root, private = self._allocation_projects()
+        ctx = multiprocessing.get_context("spawn")
+        process = ctx.Process(target=allocation_pull, args=(root, private, "A", None, "locked"))
+        process.start()
+        self._join_process(process, 78)
+        process = ctx.Process(target=allocation_pull, args=(root, private, "B"))
+        process.start()
+        self._join_process(process)
+
+    def test_kill_after_map_save_before_publication(self):
+        root, private = self._allocation_projects()
+        ctx = multiprocessing.get_context("spawn")
+        process = ctx.Process(target=allocation_pull, args=(root, private, "A", None, True))
+        process.start()
+        self._join_process(process, 77)
+        with patch.dict(os.environ, {"PBZ_PRIVATE_ROOT": private}):
+            ws = Workspace(root)
+            saved = tokens.TokenMap(ws.private).data["tokens"]
+            self.assertTrue(saved)
+            self.assertFalse(os.path.exists(os.path.join(ws.mirror, "A.SemanticModel")))
+            # Recover the existing project commit lock; the allocator lock released on death.
+            mirror.recover(ws, ws.project("A"))
+            self.assertEqual(mirror.pull(ws, ws.project("B"))["result"], "PULLED")
+            self.assertEqual(mirror.pull(ws, ws.project("A"))["result"], "PULLED")
+            tm = tokens.TokenMap(ws.private)
+            for token, record in saved.items():
+                self.assertEqual(tm.get(token), record)
+            rel = "A.SemanticModel/definition/tables/T.tmdl"
+            text = Path(os.path.join(ws.mirror, *rel.split("/"))).read_text(encoding="utf-8")
+            self.assertEqual(mirror._detokenize(rel, text, tm)[0].encode(),
+                             Path(mirror._real_path(ws, rel)).read_bytes())
 
     def _junction(self, link: str, target: str) -> None:
         from _junction import make_junction

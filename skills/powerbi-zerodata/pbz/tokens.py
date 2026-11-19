@@ -10,6 +10,8 @@ import json
 import os
 import re
 import tempfile
+import stat
+import time
 
 from . import dpapi, lexers, pbir, tmdl
 from .classify import PII_IN_TEXT, looks_like_long_digits, looks_like_phone
@@ -40,6 +42,51 @@ STRUCTURAL_KEYS = {"$schema", "Entity", "Property", "Name", "Source", "visualTyp
 
 # ---------------------------------------------------------------- token map
 
+class WorkspaceLock:
+    """Process-owned allocator lock; keep its inode so waiting writers share it.
+
+    Lock order: project commit lock, then workspace allocator lock. Checks release
+    their state lock before taking this lock, and never hold it across engine calls.
+    """
+
+    def __init__(self, private_dir: str):
+        self.directory = private_dir
+        self.fd = -1
+
+    def __enter__(self):
+        path = os.path.join(self.directory, "tokens.lock")
+        if _reparse_link(self.directory) or _reparse_link(path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        os.makedirs(self.directory, exist_ok=True)
+        self.fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if _reparse_link(path) or not stat.S_ISREG(os.fstat(self.fd).st_mode):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            if os.fstat(self.fd).st_size == 0:
+                os.write(self.fd, b"\0")
+            os.lseek(self.fd, 0, os.SEEK_SET)
+            if os.name == "nt":
+                import msvcrt
+                while True:
+                    try:
+                        msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.02)
+            else:
+                import fcntl
+                fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(self.fd)
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        # Closing releases the OS lock, including on process death. Never unlink.
+        os.close(self.fd)
+        self.fd = -1
+
+
 class TokenMap:
     def __init__(self, private_dir: str):
         self.path = os.path.join(private_dir, "tokens.bin")
@@ -59,8 +106,16 @@ class TokenMap:
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(tmp, self.path)
             tmp = ""
+            if os.name != "nt":
+                dir_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         finally:
             if tmp:
                 try:

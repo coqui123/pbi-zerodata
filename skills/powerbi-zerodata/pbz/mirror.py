@@ -344,62 +344,64 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
                    if rel.startswith(prefix) and rel.lower().endswith(".tmdl")}
     model = tmdl.load_model(os.path.join(project.model_dir, "definition"), model_texts)
     clf = Classifier(model, ws.private, pol, project.name)
-    tm = tokens.TokenMap(ws.private)
-    new_files, lossy, counts = {}, [], {}
-    keep = set(pending["changed"] + pending["added"]) if rebase else set()
-    conflicts = []
-    bdir = base_dir(ws, project)
-    # Phase 1 tokenizes that capture. Nothing is written here, so a later refusal leaves the
-    # published mirror and base untouched. A malformed report file refuses the pull; it is not
-    # published and it is not reported as PULLED.
-    prepared = []
-    for rel, text, bom, real_h in captured:
-        try:
-            mtext = _tokenize(rel, text, model, clf, tm)
-        except PbzError as err:
-            if err.code == "REFUSED":
-                raise PbzError("REFUSED", rel) from None
-            raise
-        back, unknown = _detokenize(rel, mtext, tm)
-        if back != text or unknown:
-            lossy.append(rel)
-            mtext = None
-        old = man.get("files", {}).get(rel, {})
-        item = {"rel": rel, "bom": bom, "mtext": mtext, "real_h": real_h, "old": old}
-        if rel in keep and old.get("real") != real_h:
-            mine = os.path.join(ws.mirror, *rel.split("/"))
-            base = os.path.join(bdir, *rel.split("/"))
-            # Rebase inputs are checked before any content read. An aliased tracked
-            # path must not be opened as merge input.
-            if _path_outside_project(mine, rel, ws, project):
-                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-            _must_stay(mine, ws.mirror)
-            if os.path.lexists(base):
-                _must_stay(base, ws.private)
-            item["mine_text"], item["mine_bom"] = _read_mine(mine, ws.mirror)
-            item["base_text"] = _read_prepared(base, rel)[0] if os.path.exists(base) else None
-        prepared.append(item)
-    # Preflight every planned mirror/base publish and stale-delete path before the first write,
-    # so a later UNSAFE_PATH cannot leave earlier files already changed.
-    planned = {item["rel"] for item in prepared}
-    for item in prepared:
-        rel, mtext = item["rel"], item["mtext"]
-        if rel in keep:
-            continue
-        mpath = os.path.join(ws.mirror, *rel.split("/"))
-        bpath = os.path.join(bdir, *rel.split("/"))
-        if mtext is None:
-            if os.path.exists(mpath):
-                _must_stay(mpath, ws.mirror)
-            continue
-        _must_stay(mpath, ws.mirror)
-        _must_stay(bpath, ws.private)
-    for rel in man.get("files", {}):
-        if rel in planned or rel in keep:
-            continue
-        stale = os.path.join(ws.mirror, *rel.split("/"))
-        if os.path.lexists(stale):
-            _must_stay(stale, ws.mirror)
+    with tokens.WorkspaceLock(ws.private):
+        tm = tokens.TokenMap(ws.private)
+        new_files, lossy, counts = {}, [], {}
+        keep = set(pending["changed"] + pending["added"]) if rebase else set()
+        conflicts = []
+        bdir = base_dir(ws, project)
+        # Phase 1 tokenizes that capture. Nothing is written here, so a later refusal leaves the
+        # published mirror and base untouched. A malformed report file refuses the pull; it is not
+        # published and it is not reported as PULLED.
+        prepared = []
+        for rel, text, bom, real_h in captured:
+            try:
+                mtext = _tokenize(rel, text, model, clf, tm)
+            except PbzError as err:
+                if err.code == "REFUSED":
+                    raise PbzError("REFUSED", rel) from None
+                raise
+            back, unknown = _detokenize(rel, mtext, tm)
+            if back != text or unknown:
+                lossy.append(rel)
+                mtext = None
+            old = man.get("files", {}).get(rel, {})
+            item = {"rel": rel, "bom": bom, "mtext": mtext, "real_h": real_h, "old": old}
+            if rel in keep and old.get("real") != real_h:
+                mine = os.path.join(ws.mirror, *rel.split("/"))
+                base = os.path.join(bdir, *rel.split("/"))
+                # Rebase inputs are checked before any content read. An aliased tracked
+                # path must not be opened as merge input.
+                if _path_outside_project(mine, rel, ws, project):
+                    raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+                _must_stay(mine, ws.mirror)
+                if os.path.lexists(base):
+                    _must_stay(base, ws.private)
+                item["mine_text"], item["mine_bom"] = _read_mine(mine, ws.mirror)
+                item["base_text"] = _read_prepared(base, rel)[0] if os.path.exists(base) else None
+            prepared.append(item)
+        # Preflight every planned mirror/base publish and stale-delete path before the first write,
+        # so a later UNSAFE_PATH cannot leave earlier files already changed.
+        planned = {item["rel"] for item in prepared}
+        for item in prepared:
+            rel, mtext = item["rel"], item["mtext"]
+            if rel in keep:
+                continue
+            mpath = os.path.join(ws.mirror, *rel.split("/"))
+            bpath = os.path.join(bdir, *rel.split("/"))
+            if mtext is None:
+                if os.path.exists(mpath):
+                    _must_stay(mpath, ws.mirror)
+                continue
+            _must_stay(mpath, ws.mirror)
+            _must_stay(bpath, ws.private)
+        for rel in man.get("files", {}):
+            if rel in planned or rel in keep:
+                continue
+            stale = os.path.join(ws.mirror, *rel.split("/"))
+            if os.path.lexists(stale):
+                _must_stay(stale, ws.mirror)
+        tm.save()  # Persist token definitions durably before publishing any references.
     # Phase 2 reuses those strings. It does not read the same files again.
     for item in prepared:
         rel, bom, mtext = item["rel"], item["bom"], item["mtext"]
@@ -431,7 +433,6 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
             p = os.path.join(ws.mirror, *rel.split("/"))
             if os.path.exists(p):
                 remove_file(p, root=ws.mirror)
-    tm.save()
     man = {"version": 1, "project": project.name, "pulled": dt.datetime.now().isoformat(timespec="seconds"),
            "classification": clf.mode, "files": new_files}
     save_manifest(ws, project, man)
@@ -729,11 +730,12 @@ def _begin_transaction(ws, project, stamp, targets, authorized_before: dict | No
     return directory, journal
 
 
-def _restore_transaction(ws, project, directory, journal):
+def _restore_transaction(ws, project, directory, journal, *, preserve_external=False):
     if not _journal_ok(journal):
         return {"result": "RECOVERY_REQUIRED"}
     conflicts = []
-    # Check all targets before restoring any. Never overwrite a third-party change.
+    # Recovery refuses third-party changes. A live push conflict instead preserves
+    # those bytes while undoing every other push-owned write.
     for entry in journal["entries"]:
         target = _transaction_path(ws, project, entry)
         trust = ws.root if entry.get("scope") == "workspace" else ws.private
@@ -744,11 +746,13 @@ def _restore_transaction(ws, project, directory, journal):
             backup = os.path.realpath(os.path.join(directory, "before", entry["backup"]))
             if not backup.startswith(os.path.realpath(directory) + os.sep) or file_sha(backup) != entry["before"]:
                 raise PbzError("RECOVERY_BACKUP", "transaction backup is missing or invalid")
-    if conflicts:
+    if conflicts and not preserve_external:
         journal["state"] = "RECOVERY_REQUIRED"
         _journal_save(directory, journal)
         return {"result": "RECOVERY_CONFLICT", "conflicts": conflicts}
     for entry in reversed(journal["entries"]):
+        if preserve_external and entry["path"] in conflicts:
+            continue
         target = _transaction_path(ws, project, entry)
         if file_sha(target) == entry["before"]:
             continue
@@ -954,10 +958,11 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
                 "tokens": sorted(set(unknown_all))}
     # Candidate bytes and the preconditions they were read against, before validation.
     # Added paths were authorized as absent. Do not hash a file that appears later.
-    pre_real = {rel: file_sha(_real_path(ws, rel)) for rel in ch["changed"] + ch["deleted"]}
+    pre_real = {rel: files[rel]["real"] for rel in ch["changed"] + ch["deleted"]}
     pre_real.update({rel: None for rel in ch["added"]})
     pre_mirror = {rel: hashlib.sha256(bom + mtext.encode("utf-8")).hexdigest()
                   for rel, (mtext, bom) in captured_mirror.items()}
+    pre_mirror.update({rel: None for rel in ch["deleted"]})
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     # The staged copy is not the real project. Name a pbz-workspace directory so
     # definition reads trust this tree and still refuse the real model folder.
@@ -1071,6 +1076,11 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             with open(real, "rb") as f:
                 replace_bytes(dst, f.read(), root=ws.private)
+        if any(file_sha(_real_path(ws, rel)) != h for rel, h in pre_real.items()) or \
+                any(_post_mirror_hash(ws, rel) != h for rel, h in pre_mirror.items()):
+            restored = _restore_transaction(ws, project, directory, journal, preserve_external=True)
+            transaction = None
+            return {"verb": "push", **restored, "result": "CONFLICT"}
         for rel, (rtext, bom) in new_real.items():
             write_text(_real_path(ws, rel), rtext, bom, root=ws.root)
         for rel in ch["deleted"]:
@@ -1087,6 +1097,11 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
             elif os.path.lexists(target):
                 remove_file(target, root=ws.root)
                 _prune_empty(target, project.report_dir)
+        if any(file_sha(_real_path(ws, rel)) != h for rel, h in real_targets.items()) or \
+                any(_post_mirror_hash(ws, rel) != h for rel, h in pre_mirror.items()):
+            restored = _restore_transaction(ws, project, directory, journal, preserve_external=True)
+            transaction = None
+            return {"verb": "push", **restored, "result": "CONFLICT"}
         installed, img_in, img_out = sorted(pkgs), sorted(imgs_new), sorted(imgs_drop)
         for rel in ch["changed"] + ch["added"]:
             mtext, bom = captured_mirror[rel]

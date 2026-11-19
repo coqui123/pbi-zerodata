@@ -670,39 +670,42 @@ def run_checks(ws, project, spec: dict) -> dict:
                                     "reveal": sorted(set(reveal)), "checks": to_engine}, timeout=600)
         if not res.get("ok"):
             raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
-        key = dpapi.load_key(ws.private)
-        for r in res.get("checks", res.get("results", [])):
-            r = dict(r)
-            if r.get("id") in negate and r.get("status") in ("PASS", "FAIL"):
-                r["status"] = "FAIL" if r["status"] == "PASS" else "PASS"
-                r["note"] = "differs"
-            groups = []
-            for g in r.get("groups", []) or []:
-                ng = {}
-                for col, v in g.items():
-                    if isinstance(v, dict) and v.get("blank"):
-                        ng[col] = "(blank)"
-                    elif isinstance(v, dict) and "reveal" in v:
-                        ng[col] = v["reveal"]
-                    elif isinstance(v, dict) and "hmac" in v:
-                        lab = _canon_col(col)
-                        ng[col] = tm.find_by_hmac(key, lab, v["hmac"]) or tm.opaque(lab, v["hmac"])
-                if ng:
-                    groups.append(ng)
-            if groups and not strict:
-                r["groups"] = groups
-            else:
-                r.pop("groups", None)
-            if strict:
-                for k in list(r):
-                    if k.endswith("_bucket"):
-                        r.pop(k)
-            if str(r.get("id")) in rls_ids:
-                r = _rls_clean(r, rls_ids)
-            else:
-                r = _closed_engine_row(r, allowed_ids)
-            if r is not None:
-                results.append(r)
+        with tokens.WorkspaceLock(ws.private):
+            tm = tokens.TokenMap(ws.private)
+            key = dpapi.load_key(ws.private)
+            for r in res.get("checks", res.get("results", [])):
+                r = dict(r)
+                if r.get("id") in negate and r.get("status") in ("PASS", "FAIL"):
+                    r["status"] = "FAIL" if r["status"] == "PASS" else "PASS"
+                    r["note"] = "differs"
+                groups = []
+                for g in r.get("groups", []) or []:
+                    ng = {}
+                    for col, v in g.items():
+                        if isinstance(v, dict) and v.get("blank"):
+                            ng[col] = "(blank)"
+                        elif isinstance(v, dict) and "reveal" in v:
+                            ng[col] = v["reveal"]
+                        elif isinstance(v, dict) and "hmac" in v:
+                            lab = _canon_col(col)
+                            ng[col] = tm.find_by_hmac(key, lab, v["hmac"]) or tm.opaque(lab, v["hmac"])
+                    if ng:
+                        groups.append(ng)
+                if groups and not strict:
+                    r["groups"] = groups
+                else:
+                    r.pop("groups", None)
+                if strict:
+                    for k in list(r):
+                        if k.endswith("_bucket"):
+                            r.pop(k)
+                if str(r.get("id")) in rls_ids:
+                    r = _rls_clean(r, rls_ids)
+                else:
+                    r = _closed_engine_row(r, allowed_ids)
+                if r is not None:
+                    results.append(r)
+            tm.save()
     if compiles_items:
         res = engine_call("compiles", {"private_dir": ws.private, "port": port, "items": compiles_items}, timeout=300)
         if not res.get("ok"):
@@ -713,7 +716,6 @@ def run_checks(ws, project, spec: dict) -> dict:
             row = _closed_engine_row(item, allowed_ids)
             if row is not None:
                 results.append(row)
-    tm.save()
     results.extend(row for _index, row in perf_done)
     order = {str(c.get("id") or f"c{i + 1}"): i for i, c in enumerate(spec.get("checks", []))}
     results.sort(key=lambda r: order.get(str(r.get("id")), 1e9))
