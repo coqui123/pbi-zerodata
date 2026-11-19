@@ -286,7 +286,7 @@ def run(ws, project, target: str | None = None, sets: list[str] | None = None, u
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     parsed = []
     for s in sets or []:
         prop, eq, raw = s.partition("=")
@@ -362,7 +362,7 @@ def get(ws, project, target: str | None = None, kind: str | None = None, table: 
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     rows = []
     for k, label, node in _objects(model, target, kind, table, match, folder)[:500]:
         doc = model.docs[node.file]

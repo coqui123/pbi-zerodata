@@ -15,7 +15,7 @@ def _model(project):
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    return mdef, tmdl.load_model(mdef)
+    return mdef, tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
 
 
 def _insert(mdef, doc, node, block: str, root: str):
@@ -70,7 +70,7 @@ def add_calendar(ws, project, table: str, name: str, column: str, unit: str = "D
     _insert(mdef, doc, found.node, block, ws.root)
     node = None
     try:
-        again = tmdl.load_model(mdef)
+        again = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
         found_again = next((t for t in again.tables.values() if t.name.lower() == found.name.lower()), None)
         if found_again is not None and found_again.node is not None:
             node = _named_calendar(found_again.node, name)
@@ -110,7 +110,7 @@ def set_kpi(ws, project, measure: str, target: str | None, status: str | None, t
     _insert(mdef, doc, found.node, "\n".join(lines) + "\n", ws.root)
     node = None
     try:
-        again = tmdl.load_model(mdef)
+        again = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
         node = next((n for n in again.docs[found.node.file].nodes
                      if n.kind == "kpi" and n.parent is not None and n.parent.name.lower() == found.name.lower()), None)
     except Exception:

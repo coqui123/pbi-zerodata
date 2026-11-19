@@ -546,7 +546,7 @@ def run_checks(ws, project, spec: dict) -> dict:
         clf = Classifier(real_model, ws.private, pol)
         from . import deps
         mdef = os.path.join(project.mirror_model, "definition")
-        mmodel = tmdl.load_model(mdef) if os.path.isdir(mdef) else tmdl.Model()
+        mmodel = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model)) if os.path.isdir(mdef) else tmdl.Model()
         mres = deps.Resolver(mmodel)
         authored = set(st["ledger"]["authored"])
         results, to_engine, compiles_items, negate = [], [], [], set()

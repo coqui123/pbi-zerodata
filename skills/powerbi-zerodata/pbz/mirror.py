@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import uuid
 
 from . import desktop, policy as policy_mod, tmdl, tokens, validate
@@ -80,9 +81,17 @@ def _scope(base: str, kind: str) -> list[str]:
     out = []
     if _reparse_link(base):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-    if not os.path.isdir(base):
+    try:
+        info = os.stat(base)
+    except FileNotFoundError:
         return out
-    for cur, dirs, files in os.walk(base):
+    except OSError:
+        raise PbzError("REFUSED", os.path.basename(base)) from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise PbzError("REFUSED", os.path.basename(base))
+    def unreadable(_err):
+        raise PbzError("REFUSED", os.path.basename(base)) from None
+    for cur, dirs, files in os.walk(base, onerror=unreadable):
         dirs[:] = [d for d in dirs if not _path_excluded(os.path.join(cur, d), base)]
         relcur = os.path.relpath(cur, base).replace("\\", "/")
         for f in files:
@@ -160,16 +169,16 @@ def _detokenize(rel: str, text: str, tm) -> tuple[str, list[str]]:
 
 def _checked_raw(path: str, root: str) -> bytes | None:
     """Bytes of a present regular file. Missing is None. An alias or hard link is REFUSED, path only."""
-    if not os.path.lexists(path):
-        return None
     rel = os.path.relpath(path, root).replace("\\", "/")
     try:
-        preflight_regular(path, root=root)
+        _contained(path, root)
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return None
         return read_checked(path, root=root)
-    except PbzError as err:
-        if err.code == "UNSAFE_PATH":
-            raise PbzError("REFUSED", rel) from None
-        raise
+    except (OSError, PbzError):
+        raise PbzError("REFUSED", rel) from None
 
 
 def _split_bom(raw: bytes) -> tuple[str, bytes]:
@@ -187,10 +196,7 @@ def _post_mirror_hash(ws, rel: str) -> str | None:
 
 
 def mirror_changes(ws: Workspace, project: Project, man: dict, *, checked: bool = False) -> dict:
-    if checked:
-        anchor_mirror(ws)
-    elif _reparse_link(ws.mirror):
-        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    anchor_mirror(ws)
     files = man.get("files", {})
     changed, added, deleted = [], [], []
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
@@ -199,32 +205,15 @@ def mirror_changes(ws: Workspace, project: Project, man: dict, *, checked: bool 
         if _path_outside_project(p, rel, ws, project):
             changed.append(rel)
             continue
-        if checked:
-            # Missing stays deleted. Do not fall through to bare file_sha (TOCTOU / hardlink).
-            if not os.path.lexists(p):
-                h = None
-            else:
-                raw = _checked_raw(p, ws.mirror)
-                h = hashlib.sha256(raw).hexdigest() if raw is not None else None
-        else:
-            h = file_sha(p)
+        raw = _checked_raw(p, ws.mirror)
+        h = hashlib.sha256(raw).hexdigest() if raw is not None else None
         if h is None:
             deleted.append(rel)
         elif h != info.get("mirror"):
             changed.append(rel)
-    for cur, dirs, fs in os.walk(ws.mirror):
-        dirs[:] = [d for d in dirs if not _path_excluded(os.path.join(cur, d), ws.mirror)]
-        for f in fs:
-            full = os.path.join(cur, f)
-            if not _mirrored_name(f):
-                continue
-            rel = os.path.relpath(full, ws.mirror).replace("\\", "/")
-            if not rel.startswith(prefixes):
-                continue
-            if _path_outside_project(full, rel, ws, project):
-                continue
-            if rel not in files and (f.lower().endswith(".tmdl") or f.lower().endswith(JSON_EXT)):
-                added.append(rel)
+    for rel in mirror_texts(ws, project):
+        if rel not in files:
+            added.append(rel)
     return {"changed": sorted(changed), "added": sorted(added), "deleted": sorted(deleted)}
 
 
@@ -240,7 +229,9 @@ def excluded_mirror_additions(ws: Workspace, project: Project) -> list[str]:
     if _reparse_link(ws.mirror):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
-    for cur, dirs, files in os.walk(ws.mirror, followlinks=False):
+    def unreadable(_err):
+        raise PbzError("REFUSED", project.name) from None
+    for cur, dirs, files in os.walk(ws.mirror, followlinks=False, onerror=unreadable):
         blocked = []
         for d in dirs:
             full = os.path.join(cur, d)
@@ -269,7 +260,18 @@ def excluded_mirror_additions(ws: Workspace, project: Project) -> list[str]:
                 continue
             if _path_outside_project(full, rel, ws, project):
                 found.append(rel)
+            else:
+                read_mirror_text(full, root=ws.mirror)
     return sorted(set(found))
+
+
+def read_mirror_text(path: str, *, root: str) -> tuple[str, bytes]:
+    """Current mirror text, with path-only closed errors."""
+    try:
+        return read_text_checked(path, root=root)
+    except (OSError, UnicodeError, PbzError):
+        raise PbzError("UNSAFE_PATH" if _reparse_link(path) else "REFUSED",
+                       os.path.relpath(path, root).replace("\\", "/")) from None
 
 
 def _read_mine(path: str, root: str) -> tuple[str, bytes]:
@@ -509,13 +511,13 @@ def _merge3(ws: Workspace, project: Project, rel: str, theirs: str | None,
     mine = os.path.join(ws.mirror, *rel.split("/"))
     base = os.path.join(base_dir(ws, project), *rel.split("/"))
     if mine_text is None:
-        mine_text, mine_bom = read_text(mine)
+        mine_text, mine_bom = read_mirror_text(mine, root=ws.mirror)
         base_text = read_text(base)[0] if os.path.exists(base) else theirs
     elif base_text is None:
         base_text = theirs
     merged, clean = merge3(base_text, mine_text, theirs)
-    write_text(mine, merged, mine_bom or b"")
-    write_text(base, theirs, mine_bom or b"")
+    write_text(mine, merged, mine_bom or b"", root=ws.mirror)
+    write_text(base, theirs, mine_bom or b"", root=ws.private)
     return merged if clean else None
 
 
@@ -619,7 +621,7 @@ def _journal_ok(journal) -> bool:
     if not isinstance(entries, list):
         return False
     for entry in entries:
-        if not isinstance(entry, dict) or entry.get("scope") not in ("workspace", "private"):
+        if not isinstance(entry, dict) or entry.get("scope") not in (("mirror",) if journal.get("kind") == "mirror_edit" else ("workspace", "private")):
             return False
         path = entry.get("path")
         if not isinstance(path, str) or not path or ".." in path.replace("\\", "/").split("/"):
@@ -794,6 +796,30 @@ def _process_alive(pid: int) -> bool:
 
 
 def recover(ws, project, transaction_id: str | None = None) -> dict:
+    """Hold the project commit lock throughout undo, including recovery after process exit."""
+    parent = _transaction_dir(ws, project)
+    lock = os.path.join(parent, ".commit-lock")
+    owned = False
+    try:
+        _contained(lock, ws.private)
+        os.makedirs(parent, exist_ok=True)
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            # _recover checks the existing owner. A stale lock continues to exclude writers.
+            return _recover(ws, project, transaction_id)
+        owned = True
+        with os.fdopen(fd, "w") as handle:
+            handle.write(str(os.getpid()))
+        return _recover(ws, project, transaction_id, _owns_lock=True)
+    except (OSError, PbzError):
+        return {"verb": "recover", "result": "RECOVERY_REQUIRED"}
+    finally:
+        if owned:
+            remove_file(lock, root=ws.private)
+
+
+def _recover(ws, project, transaction_id: str | None = None, *, _owns_lock=False) -> dict:
     """Roll back interrupted, uncommitted pushes. Never resume a half-validated commit."""
     if desktop.find_instance(project):
         return {"verb": "recover", "result": "DESKTOP_OPEN"}
@@ -806,7 +832,7 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
         return {"verb": "recover", "result": "RECOVERY_REQUIRED",
                 "transactions": [{"id": project.name, "result": "RECOVERY_REQUIRED"}]}
     stale_lock = False
-    if os.path.exists(lock):
+    if os.path.exists(lock) and not _owns_lock:
         try:
             with open(lock) as f:
                 owner = int(f.read())
@@ -838,6 +864,9 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
                 journal = json.load(f)
             if not _journal_ok(journal):
                 result = {"result": "RECOVERY_REQUIRED"}
+            elif journal.get("kind") == "mirror_edit":
+                from .mirror_txn import restore
+                result = restore(ws, project, directory, journal)
             else:
                 result = _restore_transaction(ws, project, directory, journal)
         except (OSError, ValueError, KeyError, PbzError):
@@ -1220,8 +1249,8 @@ def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict
                     return rel, doc, n
         return None
 
-    mine = find(tmdl.load_model(mdef))
-    base = find(tmdl.load_model(bdef)) if os.path.isdir(bdef) else None
+    mine = find(tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model)))
+    base = find(tmdl.load_model(bdef, root=ws.private)) if os.path.isdir(bdef) else None
     if mine is None and base is None:
         raise PbzError("NOT_FOUND", obj)
     if base is None:  # added since the last pull: drop it
@@ -1229,7 +1258,7 @@ def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict
         new = apply_block(doc.text, tmdl.block_span(doc, n), "")
     elif mine is None:  # deleted in the mirror: put the base block back at the end of its table
         rel, bdoc, bn = base
-        mt = tmdl.load_model(mdef)
+        mt = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
         tdoc = next((d for r, d in mt.docs.items() if r == rel), None)
         if tdoc is None:
             raise PbzError("NOT_FOUND", f"table file {rel} (revert the whole file instead)")
@@ -1246,7 +1275,7 @@ def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict
         _brel, bdoc, bn = base
         new = apply_block(doc.text, tmdl.block_span(doc, n), bdoc.text[slice(*tmdl.block_span(bdoc, bn))])
     path = os.path.join(mdef, *rel.split("/"))
-    _text, bom = _read_prepared(path, f"{project.name}.SemanticModel/definition/{rel}")
+    _text, bom = read_mirror_text(path, root=ws.mirror)
     commit_bytes([("write", path, new, bom)], root=anchor_mirror(ws))
     return {"verb": "revert", "project": project.name, "object": f"{kind} {table}[{name}]",
             "result": "REVERTED", "files": [f"{project.name}.SemanticModel/definition/{rel}"]}
@@ -1269,29 +1298,50 @@ def history_dir(ws: Workspace, project: Project) -> str:
 
 def mirror_texts(ws: Workspace, project: Project) -> dict[str, str]:
     """{mirror-relative path: text} of the project's current mirror files (sanitized)."""
+    anchor_mirror(ws)
     out = {}
+    def unreadable(_err):
+        raise PbzError("REFUSED", project.name) from None
     for base in (project.mirror_model, project.mirror_report):
-        # The project tree itself must sit inside the trusted mirror; an aliased project root
-        # must not become the canonical boundary for history.
-        if _path_excluded(base, ws.mirror) or _reparse_link(base):
+        try:
+            _contained(base, ws.mirror)
+        except PbzError:
+            raise PbzError("REFUSED", os.path.basename(base)) from None
+        if _reparse_link(base):
+            raise PbzError("REFUSED", os.path.basename(base))
+        try:
+            info = os.stat(base)
+        except FileNotFoundError:
             continue
+        except OSError:
+            unreadable(None)
+        if not stat.S_ISDIR(info.st_mode):
+            unreadable(None)
         top = os.path.basename(base)
-        for cur, dirs, files in os.walk(base, followlinks=False):
-            dirs[:] = [d for d in dirs if not _path_excluded(os.path.join(cur, d), base)
-                        and not _path_excluded(os.path.join(cur, d), ws.mirror)]
-            for f in files:
-                full = os.path.join(cur, f)
-                if _path_excluded(full, base) or _path_excluded(full, ws.mirror):
+        for cur, dirs, files in os.walk(base, followlinks=False, onerror=unreadable):
+            kept = []
+            for d in dirs:
+                if d.lower() in SKIP_DIRS:
                     continue
-                low = f.lower()
-                if low.endswith(".tmdl") or low.endswith(JSON_EXT):
+                full = os.path.join(cur, d)
+                if _reparse_link(full):
+                    raise PbzError("REFUSED", os.path.relpath(full, ws.mirror).replace("\\", "/"))
+                kept.append(d)
+            dirs[:] = kept
+            for f in files:
+                if _mirrored_name(f):
+                    full = os.path.join(cur, f)
                     rel = f"{top}/" + os.path.relpath(full, base).replace("\\", "/")
-                    out[rel] = read_text(full)[0]
+                    out[rel] = read_mirror_text(full, root=ws.mirror)[0]
     return out
 
 
 def snapshot(ws: Workspace, project: Project, event: str) -> str:
-    """Record the mirror as a history snapshot (content-addressed, deduplicated, last HISTORY_KEEP kept)."""
+    """Record a checked current mirror (content-addressed, last HISTORY_KEEP kept).
+
+    This validates new snapshots only; previously stored history is not reclassified as clean.
+    """
+    texts = mirror_texts(ws, project)
     hdir = history_dir(ws, project)
     # A junction at mirror-history would make makedirs create the snapshot outside the store.
     _contained(hdir, ws.private)
@@ -1303,7 +1353,7 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         _contained(child, ws.private)
     files = {}
-    for rel, text in mirror_texts(ws, project).items():
+    for rel, text in texts.items():
         h = sha(text)
         bp = os.path.join(blobs, h + ".txt")
         if not os.path.exists(bp):

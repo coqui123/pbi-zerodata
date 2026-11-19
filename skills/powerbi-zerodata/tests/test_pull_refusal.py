@@ -48,6 +48,51 @@ class PullRefusalTests(unittest.TestCase):
         self.project = self.ws.project()
         mirror.pull(self.ws, self.project)
 
+    def _enumeration_refusal(self, root_error):
+        from unittest.mock import patch
+        from pbz import tokens
+        before = (file_map(self.ws.mirror), file_map(self.ws.private))
+        target = self.project.model_dir
+        original_walk, original_stat = os.walk, os.stat
+        if root_error:
+            def broken_stat(path, *args, **kwargs):
+                if os.fspath(path) == target:
+                    raise PermissionError("INERT-ROOT")
+                return original_stat(path, *args, **kwargs)
+            fault = patch.object(mirror.os, "stat", broken_stat)
+        else:
+            subtree = os.path.join(target, "definition", "tables")
+            self.assertTrue(file_map(subtree))
+            self.assertTrue(file_map(os.path.join(self.project.mirror_model, "definition", "tables")))
+            def broken_walk(path, *args, **kwargs):
+                if path == target:
+                    for cur, dirs, files in original_walk(path, *args, **kwargs):
+                        if cur == subtree:
+                            kwargs["onerror"](PermissionError("INERT-SUBTREE"))
+                            return
+                        yield cur, dirs, files
+                else:
+                    yield from original_walk(path, *args, **kwargs)
+            fault = patch.object(mirror.os, "walk", broken_walk)
+        with fault:
+            with self.assertRaises(common.PbzError) as caught:
+                mirror.pull(self.ws, self.project, force=True)
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertNotIn("INERT", str(caught.exception))
+        self.assertEqual((file_map(self.ws.mirror), file_map(self.ws.private)), before)
+        self.assertTrue(os.path.isfile(tokens.TokenMap(self.ws.private).path))
+
+    def test_subtree_enumeration_error_keeps_prior_capture(self):
+        self._enumeration_refusal(False)
+
+    def test_root_inspection_error_keeps_prior_capture(self):
+        self._enumeration_refusal(True)
+
+    def test_absent_optional_root_succeeds(self):
+        import shutil
+        shutil.rmtree(self.project.report_dir)
+        self.assertEqual(mirror.pull(self.ws, self.project, force=True)["result"], "PULLED")
+
     def test_bad_utf8_later_file_changes_nothing(self):
         files = mirror.project_files(self.project)
         rel, real = files[-1]

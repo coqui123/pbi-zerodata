@@ -200,7 +200,7 @@ class MirrorTransactionTests(unittest.TestCase):
     def test_base_exception_restores_and_reraises(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        root = os.path.join(tmp.name, "tree")
+        root = os.path.join(tmp.name, "pbz-workspace", "Txn.SemanticModel")
         os.makedirs(os.path.join(root, "sub"))
         kept = os.path.join(root, "sub", "kept.txt")
         prior = b"prior-bytes\n"
@@ -209,15 +209,18 @@ class MirrorTransactionTests(unittest.TestCase):
         created = os.path.join(root, "created.txt")
         boom = _Cut("stop")
 
+        from pbz.common import Workspace, Project
+        ws = Workspace(tmp.name)
+        ws.private = os.path.join(tmp.name, "private")
+        project = Project(ws, "Txn")
+
         def fn():
-            with open(kept, "wb") as handle:
-                handle.write(b"changed\n")
-            with open(created, "wb") as handle:
-                handle.write(b"new\n")
+            from pbz.common import commit_bytes
+            commit_bytes([("write_bytes", kept, b"changed\n"), ("write_bytes", created, b"new\n")], root=root)
             raise boom
 
         with self.assertRaises(_Cut) as caught:
-            mirror_txn.transaction(root, fn)
+            mirror_txn.transaction(root, fn, ws=ws, project=project)
         self.assertIs(caught.exception, boom)
         with open(kept, "rb") as handle:
             self.assertEqual(handle.read(), prior)
@@ -226,18 +229,23 @@ class MirrorTransactionTests(unittest.TestCase):
     def test_success_keeps_bytes_and_return_value(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        root = os.path.join(tmp.name, "tree")
+        root = os.path.join(tmp.name, "pbz-workspace", "Txn.SemanticModel")
         os.makedirs(root)
         kept = os.path.join(root, "kept.txt")
         with open(kept, "wb") as handle:
             handle.write(b"prior\n")
 
+        from pbz.common import Workspace, Project
+        ws = Workspace(tmp.name)
+        ws.private = os.path.join(tmp.name, "private")
+        project = Project(ws, "Txn")
+
         def fn():
-            with open(kept, "wb") as handle:
-                handle.write(b"changed\n")
+            from pbz.common import commit_bytes
+            commit_bytes([("write_bytes", kept, b"changed\n")], root=root)
             return 7
 
-        self.assertEqual(mirror_txn.transaction(root, fn), 7)
+        self.assertEqual(mirror_txn.transaction(root, fn, ws=ws, project=project), 7)
         with open(kept, "rb") as handle:
             self.assertEqual(handle.read(), b"changed\n")
 

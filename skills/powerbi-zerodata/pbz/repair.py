@@ -39,7 +39,7 @@ def _lineage(project, fix, writes) -> None:
     import re
     import uuid
     mdef = os.path.join(project.mirror_model, "definition")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     seen: set[str] = set()
     for rel in sorted(model.docs):
         doc = model.docs[rel]
@@ -74,7 +74,7 @@ def _format_conflicts(project, fix, writes) -> None:
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         return
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     for rel in sorted(model.docs):
         path = os.path.join(mdef, *rel.split("/"))
         doc = tmdl.parse(rel, writes[path][0]) if path in writes else model.docs[rel]  # after --lineage edits
@@ -107,7 +107,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
     page_ids = sorted(d for d in list_names(pdir) if os.path.isfile(os.path.join(pdir, d, "page.json"))) \
         if os.path.isdir(pdir) else []
     visuals: dict[str, set] = {}
-    model = tmdl.load_model(os.path.join(project.mirror_model, "definition")) if fields else None
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model)) if fields else None
     for pid in page_ids:
         pp = os.path.join(pdir, pid, "page.json")
         page, ptext, pbom = _load(ws, pp)

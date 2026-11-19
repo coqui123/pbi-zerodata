@@ -131,7 +131,7 @@ def move_measure(ws, project, name: str, target: str) -> dict:
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     m = model.measure(name)
     if m is None or m.node is None:
         raise PbzError("NOT_FOUND", f"measure {name}")

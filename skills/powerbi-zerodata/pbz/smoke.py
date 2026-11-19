@@ -346,7 +346,7 @@ def run(ws, project, page: str | None = None) -> dict:
         raise PbzError("NOT_FOUND", f"page {page}")
     tm = tokens.TokenMap(ws.private)
     mdef = os.path.join(project.mirror_model, "definition")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     items, rows = [], []
     stopped = False
     budget_note = "daily smoke budget reached; the user can reset it"

@@ -314,5 +314,140 @@ class MirrorReaderLinks(unittest.TestCase):
             self.assertNotIn("PBZ_CANARY_PAGE", str(caught.exception))
 
 
+class CurrentMirrorCollectionTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(__file__))
+        import test_parity
+        from pbz import common, mirror
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = os.path.join(self.tmp.name, "ws")
+        test_parity.build(root)
+        self.ws = common.Workspace(root)
+        self.ws.private = os.path.join(self.tmp.name, "private")
+        os.makedirs(self.ws.private)
+        self.project = self.ws.project()
+        mirror.pull(self.ws, self.project)
+        self.path = os.path.join(self.project.mirror_report, "definition", "inert.json")
+        with open(self.path, "w") as handle:
+            handle.write('{"note":"KNOWN_INERT_HIT"}')
+
+    def _ambiguous(self):
+        from pbz import findreplace, mirror
+        self.assertTrue(findreplace.find(self.ws, self.project, "KNOWN_INERT_HIT")["snippets"])
+        self.assertEqual(findreplace.replace(self.ws, self.project, "KNOWN_INERT_HIT", "other")["text_hits"], 1)
+        mirror.snapshot(self.ws, self.project, "safe-control")
+        os.link(self.path, os.path.join(self.tmp.name, "alias"))
+        return os.path.relpath(self.path, self.ws.mirror).replace("\\", "/")
+
+    def _refuses(self, call, *, private_unchanged=True):
+        from pbz import mirror
+        from test_pull_refusal import file_map
+        before = (file_map(self.ws.mirror), file_map(self.ws.private))
+        history = file_map(mirror.history_dir(self.ws, self.project))
+        with self.assertRaises(PbzError) as caught:
+            call()
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertNotIn("KNOWN_INERT_HIT", str(caught.exception))
+        self.assertEqual(file_map(self.ws.mirror), before[0])
+        self.assertEqual(file_map(mirror.history_dir(self.ws, self.project)), history)
+        if private_unchanged:
+            self.assertEqual(file_map(self.ws.private), before[1])
+
+    def test_find_has_no_snippets_on_ambiguous_file(self):
+        from pbz import findreplace
+        self._ambiguous()
+        self._refuses(lambda: findreplace.find(self.ws, self.project, "KNOWN_INERT_HIT"))
+
+    def test_replace_has_no_text_hits_on_ambiguous_file(self):
+        from pbz import findreplace
+        self._ambiguous()
+        self._refuses(lambda: findreplace.replace(self.ws, self.project, "KNOWN_INERT_HIT", "other"))
+
+    def test_snapshot_publishes_no_blob_on_ambiguous_file(self):
+        from pbz import mirror
+        self._ambiguous()
+        self._refuses(lambda: mirror.snapshot(self.ws, self.project, "unsafe"))
+
+    def test_current_collector_refuses_ambiguous_file(self):
+        from pbz import mirror
+        self._ambiguous()
+        self._refuses(lambda: mirror.mirror_texts(self.ws, self.project))
+
+    def test_mirror_changes_default_refuses_ambiguous_file(self):
+        from pbz import mirror
+        rel = self._ambiguous()
+        man = {"files": {rel: {"mirror": "old"}}}
+        self._refuses(lambda: mirror.mirror_changes(self.ws, self.project, man))
+
+    def test_excluded_additions_refuses_ambiguous_in_scope_file(self):
+        from pbz import mirror
+        self._ambiguous()
+        self._refuses(lambda: mirror.excluded_mirror_additions(self.ws, self.project))
+
+    def test_merge3_fallback_refuses_ambiguous_file(self):
+        from pbz import mirror
+        rel = self._ambiguous()
+        self._refuses(lambda: mirror._merge3(self.ws, self.project, rel, "other"))
+
+    def test_replace_bom_reread_refuses_ambiguous_file(self):
+        from pbz import findreplace, mirror
+        from unittest.mock import patch
+        rel = self._ambiguous()
+        # Force the collection to succeed, isolating the later BOM reread.
+        with patch.object(mirror, "mirror_texts", return_value={rel: "KNOWN_INERT_HIT"}):
+            self._refuses(lambda: findreplace.replace(self.ws, self.project, "KNOWN_INERT_HIT", "other", apply=True),
+                          private_unchanged=False)  # The failed edit retains its durable rollback journal.
+
+    def test_load_model_checked_root_and_real_literal_control(self):
+        from pbz import checks, mirror, tmdl
+        self._ambiguous()
+        model_file = os.path.join(self.project.mirror_model, "definition", "inert.tmdl")
+        os.link(self.path, model_file)
+        self._refuses(lambda: tmdl.load_model(os.path.dirname(model_file), root=self.ws.mirror))
+        self.assertTrue(mirror.real_model(self.project).tables)
+        self.assertIn("Jane Doe", checks.model_literals(self.project))
+
+    def test_aliased_base_refuses_and_policy_directory_stays_skipped(self):
+        from pbz import mirror
+        skipped = os.path.join(self.project.mirror_report, ".pbi")
+        os.makedirs(skipped)
+        external = os.path.join(self.tmp.name, "excluded-inert")
+        with open(external, "wb") as handle:
+            handle.write(b"\xff")
+        os.link(external, os.path.join(skipped, "ignored.json"))
+        # A policy exclusion remains skipped even if the excluded entry is unsafe.
+        self.assertTrue(mirror.mirror_texts(self.ws, self.project))
+        held = self.project.mirror_report + ".held"
+        os.rename(self.project.mirror_report, held)
+        try:
+            os.symlink(held, self.project.mirror_report, target_is_directory=True)
+        except OSError:
+            self.skipTest("directory symlink is unavailable")
+        self._refuses(lambda: mirror.snapshot(self.ws, self.project, "alias"))
+
+    def test_collection_swap_and_walk_error_refuse(self):
+        from pbz import common, mirror
+        from unittest.mock import patch
+        from test_pull_refusal import file_map
+        before = file_map(self.ws.private)
+        def swap(path):
+            if path == self.path:
+                os.rename(path, path + ".held")
+                with open(path, "w") as handle:
+                    handle.write("SWAPPED_INERT")
+        with patch.object(common, "_read_checked_hook", swap):
+            with self.assertRaises(PbzError):
+                mirror.snapshot(self.ws, self.project, "swap")
+        self.assertEqual(file_map(self.ws.private), before)
+        def broken_walk(*args, **kwargs):
+            kwargs["onerror"](PermissionError("inert"))
+            return iter(())
+        with patch.object(mirror.os, "walk", broken_walk):
+            with self.assertRaises(PbzError):
+                mirror.snapshot(self.ws, self.project, "walk")
+        self.assertEqual(file_map(self.ws.private), before)
+
+
 if __name__ == "__main__":
     unittest.main()

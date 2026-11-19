@@ -132,7 +132,7 @@ def _spec_queries(spec, root=None) -> list[dict]:
 
 def measure_query(project, measures: list[str], by: list[str] | None = None) -> dict:
     """A query for measures by name, optionally grouped by columns (leading key columns)."""
-    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
     names = []
     for ref in measures:
         m = _REF.match(ref)
@@ -604,7 +604,7 @@ def check(ws, project, spec) -> dict:
     failing groups, both sides of a comparison, duplicate and orphan values are shown."""
     checks = _spec_checks(spec, ws.root)
     info = synth.build_info(ws, project)  # UNSAFE unless the synthetic copy exists; no query before this
-    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
     results = []
     for i, c in enumerate(checks):
         cid = str(c.get("id") or f"c{i + 1}")

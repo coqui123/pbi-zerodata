@@ -24,7 +24,7 @@ def _model(project):
             read_text(path)
         except (OSError, UnicodeError):
             raise PbzError("REFUSED", rel) from None
-    return mdef, tmdl.load_model(mdef)
+    return mdef, tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
 
 
 def _col(model, ref: str):

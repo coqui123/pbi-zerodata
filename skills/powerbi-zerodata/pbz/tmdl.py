@@ -9,7 +9,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
-from .common import PbzError, _reparse_link
+from .common import PbzError, _reparse_link, read_text_checked
 
 _UNSAFE = PbzError("UNSAFE_PATH", "refusing to write through a link")
 
@@ -419,7 +419,9 @@ def tmdl_files(definition_dir: str) -> list[str]:
     if _reparse_link(definition_dir):
         raise _UNSAFE
     out = []
-    for cur, dirs, files in os.walk(definition_dir):
+    def unreadable(_err):
+        raise _UNSAFE
+    for cur, dirs, files in os.walk(definition_dir, onerror=unreadable):
         if _reparse_link(cur):
             raise _UNSAFE
         for d in dirs:
@@ -435,17 +437,22 @@ def tmdl_files(definition_dir: str) -> list[str]:
     return sorted(out)
 
 
-def load_model(definition_dir: str, texts: dict | None = None) -> Model:
+def load_model(definition_dir: str, texts: dict | None = None, *, root: str | None = None) -> Model:
     """Build a Model from a TMDL definition folder (or from {relpath: text})."""
     model = Model()
     if texts is None:
         texts = {}
         for p in tmdl_files(definition_dir):
-            with open(p, "rb") as f:
-                raw = f.read()
-            if raw.startswith(b"\xef\xbb\xbf"):
-                raw = raw[3:]
-            texts[os.path.relpath(p, definition_dir).replace("\\", "/")] = raw.decode("utf-8")
+            if root is not None:
+                try:
+                    text = read_text_checked(p, root=root)[0]
+                except (OSError, UnicodeError, PbzError):
+                    raise PbzError("REFUSED", os.path.relpath(p, root).replace("\\", "/")) from None
+            else:
+                with open(p, "rb") as f:
+                    raw = f.read()
+                text = raw.removeprefix(b"\xef\xbb\xbf").decode("utf-8")
+            texts[os.path.relpath(p, definition_dir).replace("\\", "/")] = text
     for relp, text in texts.items():
         if relp.lower().startswith("cultures/"):
             continue  # translations and linguistic metadata, not model objects

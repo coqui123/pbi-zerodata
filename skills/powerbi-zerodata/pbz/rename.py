@@ -5,8 +5,8 @@ import json
 import os
 import re
 
-from . import lexers, pbir, tmdl
-from .common import PbzError, commit_bytes, read_text
+from . import lexers, mirror, pbir, tmdl
+from .common import PbzError, commit_bytes
 from .tokens import apply_edits
 
 
@@ -28,7 +28,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     if kind == "measure":
         m = model.measure(old)
         if not m:
@@ -85,7 +85,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
                     edits.append((m_.start(2), m_.end(2), f"{lexers.tmdl_name(parts[0])}.{lexers.tmdl_name(new)}"))
         if edits:
             path = os.path.join(mdef, *rel.split("/"))
-            _t, bom = read_text(path)
+            _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
             ops.append(("write", path, apply_edits(text, edits), bom))
             changed.append(f"{project.name}.SemanticModel/definition/{rel}")
     from .move import plan_pbir
@@ -97,10 +97,10 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
     from .governance import culture_rename_texts
     for rel, text in culture_rename_texts(mdef, kind, home, old, new).items():
         path = os.path.join(mdef, *rel.split("/"))
-        _t, bom = read_text(path)
+        _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
         ops.append(("write", path, text, bom))
         changed.append(f"{project.name}.SemanticModel/definition/{rel}")
-    commit_bytes(ops)
+    commit_bytes(ops, root=ws.mirror)
     return {"verb": "rename", "kind": kind, "table": home, "from": old, "to": new, "files": changed,
             "next": "pbz diff, then pbz push", **ext}
 
@@ -255,7 +255,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
             continue
         new_text = apply_edits(text, edits) if edits else text
         path = os.path.join(mdef, *rel.split("/"))
-        _t, bom = read_text(path)
+        _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
         if rel == t.file and os.path.basename(rel)[:-5].lower() == low:
             target = "/".join(rel.split("/")[:-1] + [_safe_file(new) + ".tmdl"])
             if target != rel:
@@ -300,10 +300,10 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     from .governance import culture_rename_texts
     for rel, text in culture_rename_texts(mdef, "table", "", old, new).items():
         path = os.path.join(mdef, *rel.split("/"))
-        _t, bom = read_text(path)
+        _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
         ops.append(("write", path, text, bom))
         changed.append(f"{project.name}.SemanticModel/definition/{rel}")
-    commit_bytes(ops)
+    commit_bytes(ops, root=ws.mirror)
     out = {"verb": "rename", "kind": "table", "from": old, "to": new, "files": sorted(set(changed)),
            "next": "pbz diff, pbz validate, then pbz push", **ext}
     if renamed_file:

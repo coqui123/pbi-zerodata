@@ -279,7 +279,7 @@ def _summary(flt: dict) -> str:
 def add(ws, project, field: str, page: str | None = None, visual: str | None = None, report: bool = False,
         values_in=None, values_out=None, where=None, top=None, by=None, bottom=False, dry_run: bool = False) -> dict:
     _strict_docs(project)
-    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
     path, scope = _scope_file(project, page, visual, report)
     flt = build(model, field, values_in, values_out, where, top, by, bottom)
     if "Measure" in flt["field"] and not visual:

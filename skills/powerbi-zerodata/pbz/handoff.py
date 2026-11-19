@@ -184,7 +184,7 @@ def build(ws, project, include_all: bool = False) -> dict:
             if current.get("packet"):
                 out["packet"] = current["packet"]
         return out
-    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
     usage = field_usage(project, model)
     pages: dict[str, set] = {}
     model_items = []

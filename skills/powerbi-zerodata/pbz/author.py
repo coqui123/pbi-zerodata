@@ -90,7 +90,7 @@ def add_page(ws, project, name: str, width: int | None = None, height: int | Non
         page["pageBinding"] = {"name": _id(), "type": "Tooltip", "referenceScope": "Default"}
     if drillthrough:
         from . import filters
-        model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+        model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
         taken = filters._all_filter_names(project)
         flts = []
         for ref in drillthrough:
@@ -303,7 +303,7 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
     if not os.path.isdir(project.mirror_report):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     mdef = os.path.join(project.mirror_model, "definition")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     rdir = project.mirror_report
     pdir, _mp, _meta, pages = _pages(rdir)
     if _extra_pages:

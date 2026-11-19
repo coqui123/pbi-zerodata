@@ -174,7 +174,7 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
         else:
             findings.append({"severity": "error", "code": "TOM_" + str(res.get("class", "UNAVAILABLE")),
                              "where": "model", "message": "TMDL not checked by TOM"})
-        model = tmdl.load_model(mdef)
+        model = tmdl.load_model(mdef, root=stage)
         for f in lint.run(model):
             f["message"] = scrub(f["message"])
             findings.append(f)
@@ -262,7 +262,7 @@ def circular_dependencies(model) -> list[dict]:
 def run_mirror(ws, project) -> list[dict]:
     """Metadata-only checks on the mirror itself (no engine): lint + field references."""
     mdef = os.path.join(project.mirror_model, "definition")
-    model = tmdl.load_model(mdef) if os.path.isdir(mdef) else tmdl.Model()
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model)) if os.path.isdir(mdef) else tmdl.Model()
     ident = lambda s: s  # mirror text is already sanitized
     out = lint.run(model) + synthetic_marker(model)
     out += circular_dependencies(model)

@@ -120,8 +120,8 @@ class PlanPureTests(unittest.TestCase):
         def boom(ws, project, kind, old, new, table=None):
             seen["call"] = (kind, old, new, table)
             path = os.path.join(self.project.mirror_model, "definition", "tables", "Sales.tmdl")
-            with open(path, "ab") as handle:
-                handle.write(b"\nMUTATION\n")
+            data = common.read_checked(path, root=ws.mirror)
+            common.commit_bytes([("write_bytes", path, data + b"\nMUTATION\n")], root=ws.mirror)
             raise RuntimeError("rename failed")
 
         with patch("pbz.findreplace.rename_mod.rename", side_effect=boom):
@@ -274,7 +274,7 @@ class MirrorTransactionTests(unittest.TestCase):
     def test_restores_prior_bytes_when_fn_raises(self):
         tmp = tempfile.TemporaryDirectory(prefix="pbztxn-")
         self.addCleanup(tmp.cleanup)
-        root = os.path.join(tmp.name, "tree")
+        root = os.path.join(tmp.name, "pbz-workspace", "Txn.SemanticModel")
         os.makedirs(os.path.join(root, "sub"))
         kept = os.path.join(root, "sub", "kept.txt")
         prior = b"prior-bytes\n"
@@ -282,15 +282,18 @@ class MirrorTransactionTests(unittest.TestCase):
             handle.write(prior)
         created = os.path.join(root, "created.txt")
 
+        from pbz.common import Workspace, Project
+        ws = Workspace(tmp.name)
+        ws.private = os.path.join(tmp.name, "private")
+        project = Project(ws, "Txn")
+
         def fn():
-            with open(kept, "wb") as handle:
-                handle.write(b"changed\n")
-            with open(created, "wb") as handle:
-                handle.write(b"new\n")
+            from pbz.common import commit_bytes
+            commit_bytes([("write_bytes", kept, b"changed\n"), ("write_bytes", created, b"new\n")], root=root)
             raise RuntimeError("edit failed")
 
         with self.assertRaises(RuntimeError):
-            mirror_txn.transaction(root, fn)
+            mirror_txn.transaction(root, fn, ws=ws, project=project)
         with open(kept, "rb") as handle:
             self.assertEqual(handle.read(), prior)
         self.assertFalse(os.path.lexists(created))

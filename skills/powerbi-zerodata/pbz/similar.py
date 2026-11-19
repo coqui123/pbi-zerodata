@@ -191,7 +191,7 @@ def run(ws, project, threshold: float = 0.80, max_pairs: int = 100) -> dict:
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     res = deps.Resolver(model)
     ms = [m for m in model.all_measures() if m.expression.strip()]
     lab = {id(m): f"[{m.name}]" for m in ms}
@@ -305,7 +305,7 @@ def _structure(project) -> dict[str, set[str]]:
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     tables, columns, measures, rels = set(), set(), set(), set()
     for table in model.tables.values():
         if table.private:

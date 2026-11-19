@@ -23,7 +23,7 @@ def _measures(project):
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     rows = []
     for table in model.tables.values():
         for measure in table.measures.values():

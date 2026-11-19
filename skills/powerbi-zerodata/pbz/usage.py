@@ -289,7 +289,7 @@ def build(ws, project, extra_reports=(), model_dir: str | None = None) -> Graph:
     mdef = model_dir or os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=model_dir or os.path.dirname(project.mirror_model))
     g = Graph()
     g.model = model
     res = deps.Resolver(model)
