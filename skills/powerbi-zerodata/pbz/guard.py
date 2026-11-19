@@ -37,7 +37,7 @@ def _long_existing(path: str) -> str:
     """
     if os.name != "nt" or not re.search(r"~\d", path):
         return path
-    raw = os.path.normpath(path)
+    raw = re.sub(r"[\\/]+", r"\\", path)
     probe = raw
     tail: list[str] = []
     while True:
@@ -53,18 +53,19 @@ def _long_existing(path: str) -> str:
         tail.append(name)
         probe = parent
     if not re.search(r"~\d", probe):
-        return path
-    try:
-        import ctypes
-        buf = ctypes.create_unicode_buffer(32768)
-        n = ctypes.windll.kernel32.GetLongPathNameW(probe, buf, len(buf))
-    except (OSError, AttributeError):
-        return path
-    if n <= 0 or n >= len(buf):
-        return path
-    out = buf.value
-    if out.startswith("\\\\?\\"):
-        out = out[4:]
+        out = probe
+    else:
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(32768)
+            n = ctypes.windll.kernel32.GetLongPathNameW(probe, buf, len(buf))
+        except (OSError, AttributeError):
+            return path
+        if n <= 0 or n >= len(buf):
+            return path
+        out = buf.value
+        if out.startswith("\\\\?\\"):
+            out = out[4:]
     for name in reversed(tail):
         out = os.path.join(out, name)
     return out
@@ -228,9 +229,10 @@ def norm(p: str, base: str | None = None) -> str:
         p = os.path.join(base, p)
     crossed = _crosses_link(p)
     if crossed:
-        # Keep the link component visible. _long_existing calls normpath and would
-        # collapse `link/..` back into a path that still looks inside the root.
+        # Keep the link component visible.
         p = p.replace("\\", "/")
+        if "~" in p:
+            p = _long_existing(p)
     else:
         p = os.path.normpath(p)
         if "~" in p:
