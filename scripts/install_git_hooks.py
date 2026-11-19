@@ -85,10 +85,14 @@ def install(root: str, source: str, chain: bool = False) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chain", action="store_true", help="opt in to shared directories and preserve host hooks")
+    parser.add_argument("--required-ci-verified", action="store_true",
+                        help="attest that hosted offline is required on main; enable the fast staged pre-commit gate")
     args = parser.parse_args()
     try:
         for path in install(ROOT, SOURCE, args.chain):
             print(f"installed {path}")
+        if args.required_ci_verified:
+            subprocess.run(["git", "config", "pbz.requiredCI", "main-offline-required"], cwd=ROOT, check=True)
     except ValueError as error:
         parser.exit(1, str(error) + "\n")
     return 0

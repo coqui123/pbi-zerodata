@@ -51,16 +51,7 @@ BLANK = "∅blank"
 # --------------------------------------------------------------------------- canaries
 
 
-def load_canaries() -> dict[str, list[str]]:
-    text = (FIXTURE / "CANARIES.md").read_text("utf-8")
-    blocks: dict[str, list[str]] = {}
-    for m in re.finditer(r"```(canary-[a-z-]+)\r?\n(.*?)```", text, re.S):
-        blocks[m.group(1)] = [ln.strip() for ln in m.group(2).splitlines() if ln.strip()]
-    return blocks
-
-
-CAN = load_canaries()
-
+from canary_scan import CAN, scan, scan_patterns
 
 def pick(block: str, pattern: str) -> list[str]:
     rx = re.compile(pattern)
@@ -78,22 +69,6 @@ INT_CANARIES = sorted(int(n) for n in CAN["canary-numbers"] if re.fullmatch(r"\d
 DERIVED = CAN["canary-derived-numbers"]
 
 
-def scan_patterns(for_files: bool) -> list[re.Pattern]:
-    pats: list[re.Pattern] = []
-    for s in CAN["canary-strings"] + CAN["canary-blob-strings"] + CAN["canary-request-strings"] + CAN["canary-stems"]:
-        pats.append(re.compile(re.escape(s), re.I))
-    pats.append(re.compile(r"(?<![0-9a-fA-F])(?:7f3a[1-49]|5b9d[12])(?![0-9a-fA-F])"))
-    for n in CAN["canary-numbers"]:
-        core = n.lstrip("-")
-        if for_files and re.fullmatch(r"\d+", core) and int(core) == INT_CANARIES[2]:
-            continue  # bare value shared with tests/test_mirror.py synthetic data (see CANARIES.md)
-        tail = r"(?![0-9A-Za-z])" if re.fullmatch(r"\d+", core) else r"(?![0-9])"
-        pats.append(re.compile(r"(?<![0-9A-Za-z.])" + re.escape(core) + tail))
-    for n in DERIVED:
-        ip = n.split(".")[0]
-        pats.append(re.compile(r"(?<![0-9A-Za-z.])" + re.escape(ip) + r"(?![0-9])"))
-        pats.append(re.compile(re.escape(ip[:-3] + "," + ip[-3:])))
-    return pats
 
 
 OUT_PATTERNS = scan_patterns(for_files=False)
@@ -160,17 +135,22 @@ class DATA_BLOB(ctypes.Structure):
     _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
 
-_crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_crypt32.CryptUnprotectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.POINTER(DATA_BLOB),
-                                        ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(DATA_BLOB)]
-_crypt32.CryptUnprotectData.restype = wt.BOOL
-_kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-_kernel32.LocalFree.restype = ctypes.c_void_p
+def _dpapi_libraries():
+    _crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _crypt32.CryptUnprotectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.POINTER(DATA_BLOB),
+                                            ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(DATA_BLOB)]
+    _crypt32.CryptUnprotectData.restype = wt.BOOL
+    _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    _kernel32.LocalFree.restype = ctypes.c_void_p
+    return _crypt32, _kernel32
+
+
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 
 def dpapi_unprotect(blob: bytes) -> bytes:
+    _crypt32, _kernel32 = _dpapi_libraries()
     buf = ctypes.create_string_buffer(blob, len(blob))
     inp = DATA_BLOB(len(blob), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
     out = DATA_BLOB()
@@ -1121,21 +1101,8 @@ def scan_all(env: Env) -> None:
         b = p.read_bytes()
         return [b.decode("latin-1"), b.decode("utf-16-le", "ignore")]
 
-    bad = []
-    count = 0
-    fixture_root = os.path.normcase(str(FIXTURE))
-    for root, _dirs, files in os.walk(S):
-        if os.path.normcase(root).startswith(fixture_root):
-            continue
-        for f in files:
-            p = Path(root) / f
-            count += 1
-            try:
-                if any(canary_hits(t, FILE_PATTERNS) for t in file_texts(p)):
-                    bad.append(str(p.relative_to(S)))
-            except OSError:
-                pass
-    expect(f"canary scan: {count} files under the skill folder (fixture sources excluded) are clean", not bad, {"files": bad[:10]})
+    result = scan([S])
+    expect(f"canary scan: {result['files']} files read", result['ok'], result['failures'][:10])
 
     bad = []
     blobs = 0
@@ -1159,6 +1126,65 @@ def scan_all(env: Env) -> None:
     expect(f"canary scan: private_dir clean outside {blobs} DPAPI blobs", not bad, {"files": bad[:10]})
 
 
+# Scanner fixtures run without a Windows engine; no existing engine checks are skipped.
+import unittest
+from unittest.mock import patch
+
+
+class CanaryScanTests(unittest.TestCase):
+    def test_clean_positive_control(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'clean.txt').write_text('safe metadata')
+            result = scan([tmp], excluded=[])
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['files'], 1)
+
+    def test_fixture_prefix_sibling_is_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp, 'fixture')
+            sibling = Path(tmp, 'fixture-output')
+            fixture.mkdir()
+            sibling.mkdir()
+            for folder in (fixture, sibling):
+                (folder / 'value.txt').write_text(CAN['canary-strings'][0])
+            result = scan([tmp], excluded=[fixture])
+            self.assertFalse(result['ok'])
+            self.assertEqual(len(result['failures']), 1)
+            self.assertIn('fixture-output', result['failures'][0]['path'])
+
+    def test_read_error_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'blocked').touch()
+            def denied(path):
+                raise OSError('injected')
+            result = scan([tmp], read=denied)
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['files'], 0)
+            self.assertEqual(result['failures'][0]['reason'], 'read error')
+
+    def test_missing_root_and_enumeration_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(scan([Path(tmp, 'absent')])['ok'])
+            def broken(root, onerror):
+                onerror(OSError(5, 'injected', str(root)))
+                return []
+            self.assertFalse(scan([tmp], walk=broken)['ok'])
+
+    def test_canary_fails_shard_without_engine_and_aggregate(self):
+        import run_offline
+        from ci_equivalence import compare
+        with tempfile.TemporaryDirectory() as tmp, patch.object(run_offline, 'identity', return_value={}):
+            def child(argv, **kwargs):
+                Path(tmp, 'leak.txt').write_text(CAN['canary-strings'][0])
+                return subprocess.CompletedProcess(argv, 0)
+            report = run_offline.execute([{'id': 'smoke', 'argv': ['tests/smoke.py']}],
+                                         shard=0, output=tmp, run=child,
+                                         scanner=lambda roots: scan([tmp]))
+            self.assertFalse(report['ok'])
+            with self.assertRaisesRegex(ValueError, 'scan'):
+                compare(dict(report, shard='serial'), [report, dict(report, shard=1)])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--offline", action="store_true", help="skip verbs that need Power BI Desktop")
@@ -1166,6 +1192,9 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true", help="keep the temporary private_dir")
     args = ap.parse_args()
 
+    scanner_tests = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(CanaryScanTests))
+    if not scanner_tests.wasSuccessful():
+        return 1
     if not EXE.is_file():
         print("FAIL engine not built: run dotnet publish (see engine/README.md)")
         return 2
@@ -1183,7 +1212,6 @@ def main() -> int:
             test_perf_baseline_workloads(env)
             test_live(env, key_holder)
             test_live_index_binding(env, tmp)
-        shutil.rmtree(tmp, ignore_errors=True)
         scan_all(env)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1197,4 +1225,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--scan-tests" in sys.argv:
+        unittest.main(argv=[sys.argv[0]], defaultTest="CanaryScanTests")
     sys.exit(main())

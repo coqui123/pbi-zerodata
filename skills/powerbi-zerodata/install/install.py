@@ -14,6 +14,8 @@ Every settings file it edits is backed up first.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import time
 import datetime as dt
 import tempfile
 import json
@@ -101,15 +103,99 @@ def load_json(path: str) -> dict:
         return {}
 
 
-def save_json(path: str, data: dict, what_if: bool) -> None:
+class InstallConflict(ValueError):
+    """A named conflict leaves the affected file unchanged."""
+
+
+@contextmanager
+def file_lock(path: str, what_if: bool = False):
+    """Lock a persistent sidecar across read, merge, backup and replace.
+
+    Do not unlink lock files: removing one allows two different lock inodes.
+    """
+    if what_if:
+        yield
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + '.pbz-lock', 'a+b') as handle:
+        if os.name == 'nt':
+            import msvcrt
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b'0')
+                handle.flush()
+            deadline = time.monotonic() + 60
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if time.monotonic() >= deadline:
+                        raise InstallConflict(f'{path}: installer lock timeout') from error
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == 'nt':
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_content(handle, text):
+    handle.write(text)
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def atomic_text(path: str, text: str, what_if: bool = False):
     if what_if:
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp-pbz"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.tmp-pbz-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+            _write_content(handle, text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def save_json(path: str, data: dict, what_if: bool) -> None:
+    atomic_text(path, json.dumps(data, indent=2, ensure_ascii=False) + '\n', what_if)
+
+
+def update_json(path, merge, what_if=False, expected=None):
+    with file_lock(path, what_if):
+        before = load_json(path)
+        if expected is not None and before != expected:
+            raise InstallConflict(f'{path}: JSON changed since read')
+        new, how = merge(json.loads(json.dumps(before)))
+        if new != before:
+            backup(path, what_if)
+            save_json(path, new, what_if)
+        return how
+
+
+def update_toml(path, uninstall, what_if=False):
+    with file_lock(path, what_if):
+        try:
+            with open(path, encoding='utf-8') as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            text = ''
+        new, how = merge_codex_toml(text, uninstall)
+        if new != text:
+            backup(path, what_if)
+            atomic_text(path, new, what_if)
+        return how
 
 
 def is_ours(entry: dict) -> bool:
@@ -189,7 +275,7 @@ def merge_denies(data: dict, uninstall: bool, owned: dict | None = None) -> dict
     return data
 
 
-def settings_step(path: str, agent: str, what_if: bool, uninstall: bool, denies: bool = False) -> bool:
+def _settings_step(path: str, agent: str, what_if: bool, uninstall: bool, denies: bool = False) -> bool:
     """Ownership covers hook children and deny rules only; absent records remove nothing."""
     record_path = path + ".pbz-owned.json"
     existed = os.path.exists(path)
@@ -219,6 +305,11 @@ def settings_step(path: str, agent: str, what_if: bool, uninstall: bool, denies:
     return new != before
 
 
+def settings_step(path: str, agent: str, what_if: bool, uninstall: bool, denies: bool = False) -> bool:
+    with file_lock(path, what_if):
+        return _settings_step(path, agent, what_if, uninstall, denies)
+
+
 def junction(link: str, what_if: bool, uninstall: bool) -> str:
     target = os.path.realpath(SKILL)
     if os.path.lexists(link):
@@ -238,12 +329,14 @@ def junction(link: str, what_if: bool, uninstall: bool) -> str:
     return f"junction {link} -> {target}"
 
 
-def rule_block(path: str, what_if: bool, uninstall: bool) -> str:
+def _rule_block(path: str, what_if: bool, uninstall: bool) -> str:
     try:
         with open(path, encoding="utf-8") as f:
             text = f.read()
     except FileNotFoundError:
         text = ""
+    if text.count(BEGIN) != text.count(END) or text.count(BEGIN) > 1 or (END in text and text.index(END) < text.index(BEGIN)):
+        raise InstallConflict(f'{path}: conflicting rule block markers')
     if BEGIN in text and END in text:
         head, rest = text.split(BEGIN, 1)
         tail = rest.split(END, 1)[1].lstrip("\n")
@@ -255,10 +348,13 @@ def rule_block(path: str, what_if: bool, uninstall: bool) -> str:
     if new == text:
         return f"ok {path}"
     backup(path, what_if)
-    if not what_if:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(new)
+    atomic_text(path, new, what_if)
     return f"{'removed block from' if uninstall else 'rule block ->'} {path}"
+
+
+def rule_block(path: str, what_if: bool, uninstall: bool) -> str:
+    with file_lock(path, what_if):
+        return _rule_block(path, what_if, uninstall)
 
 
 def mcp_args() -> list[str]:
@@ -297,6 +393,23 @@ def _toml_str(s: str) -> str:
 
 def merge_codex_toml(text: str, uninstall: bool) -> tuple[str, str]:
     """[mcp_servers.pbz] in ~/.codex/config.toml, edited as text (stdlib has no TOML writer)."""
+    import tomllib
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        return text, f'SKIP config.toml parse conflict: {error}'
+    servers = parsed.get('mcp_servers', {})
+    if not isinstance(servers, dict):
+        return text, 'SKIP conflict mcp_servers (not a table)'
+    current = servers.get(MCP_NAME)
+    if current is not None:
+        if not isinstance(current, dict):
+            return text, 'SKIP conflict mcp_servers.pbz (not a table)'
+        if not _ours(current.get('args')):
+            return text, 'SKIP [mcp_servers.pbz] exists and is not ours'
+        extras = sorted(set(current) - {'command', 'args'})
+        if extras:
+            return text, 'SKIP conflict mcp_servers.pbz.' + extras[0] + ' (host-owned key/table)'
     import re
     header = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*(?:pbz|"pbz")\s*(?:\.[^\]]*)?\]\s*(?:#.*)?$')
     lines = text.splitlines(keepends=True)
@@ -333,27 +446,10 @@ def merge_codex_toml(text: str, uninstall: bool) -> tuple[str, str]:
 
 
 def mcp_step(what_if: bool, uninstall: bool) -> list[str]:
-    out = []
-    data = load_json(CLAUDE_JSON)
-    new, how = merge_claude_mcp(json.loads(json.dumps(data)), uninstall)
-    if new != data:
-        backup(CLAUDE_JSON, what_if)
-        save_json(CLAUDE_JSON, new, what_if)
-    out.append(f"{how} mcpServers.{MCP_NAME} -> {CLAUDE_JSON}")
-    try:
-        with open(CODEX_CONFIG, encoding="utf-8") as f:
-            text = f.read()
-    except FileNotFoundError:
-        text = ""
-    new_text, how = merge_codex_toml(text, uninstall)
-    if new_text != text:
-        backup(CODEX_CONFIG, what_if)
-        if not what_if:
-            os.makedirs(os.path.dirname(CODEX_CONFIG), exist_ok=True)
-            with open(CODEX_CONFIG, "w", encoding="utf-8", newline="\n") as f:
-                f.write(new_text)
-    out.append(f"{how} [mcp_servers.{MCP_NAME}] -> {CODEX_CONFIG}")
-    return out
+    how = update_json(CLAUDE_JSON, lambda data: merge_claude_mcp(data, uninstall), what_if)
+    codex_how = update_toml(CODEX_CONFIG, uninstall, what_if)
+    return [f"{how} mcpServers.{MCP_NAME} -> {CLAUDE_JSON}",
+            f"{codex_how} [mcp_servers.{MCP_NAME}] -> {CODEX_CONFIG}"]
 
 
 def main() -> int:

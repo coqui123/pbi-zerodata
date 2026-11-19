@@ -1,0 +1,126 @@
+# Dispatch-only shadow: isolated checkouts, no shared mutable engine payload.
+name: offline-shadow
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [serial, sharded]
+        default: sharded
+        description: Dispatch each mode on the same SHA to form a pair
+      controls:
+        type: string
+        default: ''
+        description: Optional checked-in expected-failure control JSON path
+      canary_shard:
+        type: choice
+        options: ['', '0', '1']
+        default: ''
+        description: Failure control; choose the shard without engine-offline
+      cold_cache:
+        type: boolean
+        default: false
+        description: Clear pip and NuGet caches before building
+env:
+  PBZ_CI_CANARY_SHARD: ${{ inputs.canary_shard }}
+  PBZ_CI_COLD_CACHE: ${{ inputs.cold_cache }}
+  PBZ_CI_CONTROLS: ${{ inputs.controls }}
+  PYTHONIOENCODING: utf-8
+permissions:
+  contents: read
+concurrency:
+  group: offline-shadow-${{ inputs.mode }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  reference:
+    if: inputs.mode == 'serial'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skills/powerbi-zerodata
+    concurrency:
+      group: shadow-reference-${{ github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Cold-cache control
+        if: inputs.cold_cache
+        run: |
+          python -m pip cache purge
+          dotnet nuget locals all --clear
+      - run: python -m pip install --disable-pip-version-check jsonschema
+      - run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+      - if: always()
+        run: python tests/run_offline.py --report ci-results/serial.json --output-root "${{ runner.temp }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reference
+          path: skills/powerbi-zerodata/ci-results/*.json
+          if-no-files-found: error
+  shard:
+    if: inputs.mode == 'sharded'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skills/powerbi-zerodata
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Cold-cache control
+        if: inputs.cold_cache
+        run: |
+          python -m pip cache purge
+          dotnet nuget locals all --clear
+      - run: python -m pip install --disable-pip-version-check jsonschema
+      - run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+      - if: always()
+        run: python tests/run_offline.py --shard ${{ matrix.shard }} --shards 2 --report ci-results/shard-${{ matrix.shard }}.json --output-root "${{ runner.temp }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shard-${{ matrix.shard }}
+          path: skills/powerbi-zerodata/ci-results/*.json
+          if-no-files-found: error
+  aggregate:
+    if: always()
+    needs: [reference, shard]
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          path: evidence
+      - if: inputs.mode == 'serial'
+        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --serial-only evidence
+      - if: inputs.mode == 'sharded'
+        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --shards-only evidence
+      - name: Reject unsuccessful or cancelled jobs
+        shell: pwsh
+        run: |
+          if ('${{ inputs.mode }}' -eq 'serial') {
+            if ('${{ needs.reference.result }}' -ne 'success') { throw 'reference failed or cancelled' }
+          } elseif ('${{ needs.shard.result }}' -ne 'success') { throw 'shards failed or cancelled' }

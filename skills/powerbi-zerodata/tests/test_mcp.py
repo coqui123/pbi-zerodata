@@ -28,6 +28,109 @@ from pbz import mcp  # noqa: E402
 CLI = os.path.join(SKILL, "pbz", "cli.py")
 
 
+def load_installer():
+    spec = importlib.util.spec_from_file_location('pbz_install', os.path.join(SKILL, 'install', 'install.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class InstallerTransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.inst = load_installer()
+
+    def test_host_keys_and_nested_tables_refused_on_apply_update_uninstall(self):
+        clean, _ = self.inst.merge_codex_toml('', False)
+        for host in ('extra = "host"\n', '[mcp_servers.pbz.env]\nHOST = "keep"\n',
+                     '[mcp_servers.pbz.nested.deep]\nvalue = 1\n'):
+            text = clean + host
+            for uninstall in (False, True, False):
+                with self.subTest(host=host, uninstall=uninstall):
+                    new, reason = self.inst.merge_codex_toml(text, uninstall)
+                    self.assertEqual(new, text)
+                    self.assertIn('conflict mcp_servers.pbz.', reason)
+                    with tempfile.TemporaryDirectory() as tmp:
+                        path = Path(tmp, 'config.toml')
+                        path.write_text(text, encoding='utf-8')
+                        before = path.read_bytes(), path.stat().st_mtime_ns
+                        self.inst.update_toml(str(path), uninstall)
+                        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                        self.assertEqual(path.read_text(encoding='utf-8'), text)
+
+    def test_interrupted_writers_leave_original_unchanged(self):
+        inst = self.inst
+        with tempfile.TemporaryDirectory() as tmp:
+            for writer in ('json', 'toml', 'rule'):
+                for phase in ('writing', 'replace'):
+                    with self.subTest(writer=writer, phase=phase):
+                        path = Path(tmp, writer + '-' + phase)
+                        original = '{"host": 1}\n' if writer == 'json' else 'host = "keep"\n'
+                        path.write_text(original, encoding='utf-8')
+                        def partial(handle, text):
+                            handle.write(text[:3])
+                            raise KeyboardInterrupt('injected interruption')
+                        target = patch.object(inst, '_write_content', side_effect=partial) if phase == 'writing' else patch.object(inst.os, 'replace', side_effect=KeyboardInterrupt('before replace'))
+                        with target, self.assertRaises(KeyboardInterrupt):
+                            if writer == 'json':
+                                inst.settings_step(str(path), 'codex', False, False)
+                            elif writer == 'toml':
+                                inst.update_toml(str(path), False)
+                            else:
+                                inst.rule_block(str(path), False, False)
+                        self.assertEqual(path.read_text(encoding='utf-8'), original)
+                        self.assertEqual(list(Path(tmp).glob('*.tmp-pbz-*')), [])
+
+    def test_concurrent_distinct_updates_after_both_reads(self):
+        # Two independent installers take the same snapshot before either can write.
+        # A stale writer must receive an explicit named conflict, never silently win.
+        worker = r'''
+import importlib.util, json, pathlib, sys, time
+spec = importlib.util.spec_from_file_location('installer', sys.argv[1])
+inst = importlib.util.module_from_spec(spec); spec.loader.exec_module(inst)
+path, barrier, name = sys.argv[2:]
+snapshot = inst.load_json(path)
+pathlib.Path(barrier + name).touch()
+deadline = time.monotonic() + 20
+while not pathlib.Path(barrier + 'go').exists():
+    if time.monotonic() > deadline: raise RuntimeError('barrier timeout')
+    time.sleep(.02)
+try:
+    inst.update_json(path, lambda data: ({**data, name: True}, 'updated'), expected=snapshot)
+except inst.InstallConflict as error:
+    print(str(error)); sys.exit(3)
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            path, barrier = str(Path(tmp, 'settings.json')), str(Path(tmp, 'barrier-'))
+            Path(path).write_text('{}', encoding='utf-8')
+            children = [subprocess.Popen([sys.executable, '-c', worker, self.inst.__file__, path, barrier, name],
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE) for name in ('alpha', 'beta')]
+            try:
+                deadline = time.monotonic() + 20
+                while not all(Path(barrier + n).exists() for n in ('alpha', 'beta')):
+                    if time.monotonic() > deadline:
+                        self.fail('installers did not overlap their reads')
+                    time.sleep(.02)
+                Path(barrier + 'go').touch()
+                outputs = [child.communicate(timeout=20) for child in children]
+                self.assertEqual(sorted(child.returncode for child in children), [0, 3])
+                self.assertIn(b'JSON changed since read', b''.join(out for out, err in outputs))
+                data = self.inst.load_json(path)
+                self.assertIn(data, ({'alpha': True}, {'beta': True}))
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.communicate()
+
+    def test_malformed_rule_markers_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'AGENTS.md')
+            path.write_text(self.inst.BEGIN, encoding='utf-8')
+            with self.assertRaisesRegex(self.inst.InstallConflict, 'rule block markers'):
+                self.inst.rule_block(str(path), False, False)
+            self.assertEqual(path.read_text(encoding='utf-8'), self.inst.BEGIN)
+
+
 def rpc(mid, method, params=None) -> dict:
     m = {"jsonrpc": "2.0", "id": mid, "method": method}
     if params is not None:
@@ -131,6 +234,53 @@ class GitHookTests(unittest.TestCase):
         for name in self.inst.NAMES:
             (self.source / name).write_bytes(b'#!/bin/sh\n# PBZ owned fixture\nprintf "pbz:%s" "$*"\ncat\n')
 
+    def test_split_hooks_behavior_and_staged_content(self):
+        # Use the real staged checker on a minimal repository and actual shell hooks.
+        repo = Path(SKILL).parents[1]
+        scripts = self.root / 'scripts'
+        scripts.mkdir()
+        shutil.copy2(repo / 'scripts/check_staged.py', scripts)
+        tests = self.root / 'skills/powerbi-zerodata/tests'
+        tests.mkdir(parents=True)
+        (tests / 'run_offline.py').write_text('import sys\nassert "--check" in sys.argv\n', encoding='utf-8')
+        (tests / 'test_ci_registration.py').write_text('assert True\n', encoding='utf-8')
+        (tests / 'smoke.py').write_text('assert True\n', encoding='utf-8')
+        subprocess.run(['git', 'add', '.'], cwd=self.root, check=True)
+        subprocess.run(['git', 'config', 'pbz.requiredCI', 'main-offline-required'], cwd=self.root, check=True)
+        bins = self.root / 'bin'
+        bins.mkdir()
+        record = self.root / 'dotnet-calls'
+        shim = bins / 'dotnet'
+        shim.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$PBZ_DOTNET_RECORD"\n', encoding='utf-8')
+        shim.chmod(0o755)
+        python = bins / 'python'
+        # Python path is quoted by the shell wrapper, including spaces on Windows.
+        import shlex
+        python.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable.replace(chr(92), '/')) + ' "$@"\n', encoding='utf-8')
+        python.chmod(0o755)
+        env = {**os.environ, 'PATH': str(bins) + os.pathsep + os.environ['PATH'], 'PBZ_DOTNET_RECORD': str(record)}
+        hook = repo / 'scripts/git-hooks/pre-commit'
+        def snapshot():
+            return (subprocess.check_output(['git', 'ls-files', '--stage'], cwd=self.root),
+                    {str(p.relative_to(self.root)): p.read_bytes() for p in self.root.rglob('*')
+                     if p.is_file() and '.git' not in p.relative_to(self.root).parts})
+        before = snapshot()
+        out = subprocess.run(['sh', str(hook)], cwd=self.root, env=env, capture_output=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(record.exists())
+        self.assertEqual(snapshot(), before)
+        # Working tree passes but the staged script fails.
+        (tests / 'smoke.py').write_text('broken syntax (\n', encoding='utf-8')
+        subprocess.run(['git', 'add', '.'], cwd=self.root, check=True)
+        (tests / 'smoke.py').write_text('assert True\n', encoding='utf-8')
+        before = snapshot()
+        out = subprocess.run(['sh', str(hook)], cwd=self.root, env=env, capture_output=True)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(snapshot(), before)
+        # Full pre-push publishes; a deliberately minimal runner can then refuse.
+        out = subprocess.run(['sh', str(repo / 'scripts/git-hooks/pre-push')], cwd=self.root, env=env, capture_output=True)
+        self.assertIn('publish', record.read_text(encoding='utf-8'))
+
     def install(self, chain=False):
         return self.inst.install(str(self.root), str(self.source), chain)
 
@@ -163,7 +313,7 @@ class GitHookTests(unittest.TestCase):
         self.install(chain=True)
         self.assertEqual((self.hooks / "pre-push.pbz-host").read_bytes(), host)
         for status in (0, 7):
-            out = subprocess.run([str(self.hooks / "pre-push"), "origin", "a b"], input=b"push-input\n",
+            out = subprocess.run(["sh", str(self.hooks / "pre-push"), "origin", "a b"], input=b"push-input\n",
                                  capture_output=True, env={**os.environ, "HOST_STATUS": str(status)})
             self.assertEqual(out.returncode, status)
             self.assertEqual(out.stdout, b"host:origin a bpush-input\n" +
@@ -192,7 +342,7 @@ def main() -> int:
             fails.append(msg)
 
     suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(cls)
-                                for cls in (OutputBudgetTests, GitHookTests)])
+                                for cls in (OutputBudgetTests, GitHookTests, InstallerTransactionTests)])
     check(unittest.TextTestRunner().run(suite).wasSuccessful(), "budget / git hook fixtures")
     tmp = tempfile.mkdtemp(prefix="pbzmcp-")
     root = os.path.join(tmp, "ws")
@@ -407,8 +557,10 @@ def installer_ownership_checks(check, tmp, inst):
 
 
 if __name__ == "__main__":
+    if "--installer-transactions" in sys.argv:
+        unittest.main(argv=[sys.argv[0]], defaultTest="InstallerTransactionTests")
     if "--output-budget" in sys.argv:
-        unittest.main(argv=[sys.argv[0]], defaultTest=("OutputBudgetTests", "GitHookTests"))
+        unittest.main(argv=[sys.argv[0]], defaultTest=("OutputBudgetTests", "GitHookTests", "InstallerTransactionTests"))
     if "--installer-ownership" in sys.argv:
         spec = importlib.util.spec_from_file_location("pbz_install", os.path.join(SKILL, "install", "install.py"))
         inst = importlib.util.module_from_spec(spec)

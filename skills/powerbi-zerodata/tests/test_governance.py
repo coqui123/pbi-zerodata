@@ -196,4 +196,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from ci_timing import instrument
+    instrument()
     sys.exit(main())
