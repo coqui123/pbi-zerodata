@@ -291,8 +291,11 @@ def _tip(ws) -> str:
     They cannot supply a tip; any invalid authenticated link refuses further writes.
     """
     key = _chain_key(ws)
-    prev = _anchor(ws)
-    for path in _log_files(ws):
+    anchor = prev = _anchor(ws)
+    files = _log_files(ws)
+    tips = {}
+    for path in files:
+        tips[path] = None
         for line in (_read_log(ws, path) or "").split("\n"):
             if not line.strip():
                 continue
@@ -305,7 +308,12 @@ def _tip(ws) -> str:
             if not _chain_ok(key, prev, obj):
                 raise PbzError("REFUSED", UNUSABLE)
             prev = obj["chain_mac"]
-    return prev
+            tips[path] = prev
+    active = _log_path(ws)
+    segments = [path for path in files if path != active]
+    # Authenticate the entire history, but only the newest segment supplies a
+    # fallback when the active log has no MAC. Older segments never override it.
+    return tips.get(active) or (tips[segments[-1]] if segments else None) or anchor
 
 
 def _stamp(ws, entries: list[dict]) -> None:

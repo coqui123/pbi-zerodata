@@ -20,14 +20,6 @@ from pbz import cli, evidence, governance, images, mcp, mirror_txn, perf, policy
 SENTINEL = "424242"
 
 
-def _mac(ch: str) -> str:
-    return ch * 64
-
-
-def _record(mac: str) -> str:
-    return json.dumps({"chain_mac": mac}) + "\n"
-
-
 def _model(specs: list[tuple[str, str, str]]) -> tmdl.Model:
     model = tmdl.Model()
     tables: dict[str, tmdl.Table] = {}
@@ -192,9 +184,21 @@ class EvidenceTipTests(unittest.TestCase):
         self.root = os.path.join(self.tmp.name, "ws")
         os.makedirs(self.root)
         self.ws = Workspace(self.root)
+        self.ws.private = os.path.join(self.tmp.name, "private")
+        self.key = evidence.dpapi.load_key(self.ws.private)
+        self.macs = {}
         self.active = os.path.join(self.ws.pbz_dir, "evidence.jsonl")
         self.segs = os.path.join(self.ws.pbz_dir, "evidence.d")
         self.anchor = os.path.join(self.ws.pbz_dir, "evidence.chain.json")
+
+    def _mac(self, name: str) -> str:
+        return self.macs[name]
+
+    def _record(self, name: str, prev: str = evidence.GENESIS) -> str:
+        entry = {"fixture": name, "chain_prev": prev}
+        entry["chain_mac"] = evidence._mac(self.key, prev, entry)
+        self.macs[name] = entry["chain_mac"]
+        return json.dumps(entry) + "\n"
 
     def _write(self, path: str, text: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -202,26 +206,32 @@ class EvidenceTipTests(unittest.TestCase):
             handle.write(text)
 
     def test_active_mac_wins_over_newer_segment(self):
-        self._write(os.path.join(self.segs, "0002.jsonl"), _record(_mac("a")) + _record(_mac("b")))
-        self._write(self.active, _record(_mac("c")) + '{"legacy": true}\n')
-        self.assertEqual(evidence._tip(self.ws), _mac("c"))
+        self._write(os.path.join(self.segs, "0002.jsonl"),
+                    self._record("a") + self._record("b", self._mac("a")))
+        self._write(self.active, self._record("c", self._mac("b")) + '{"legacy": true}\n')
+        self.assertEqual(evidence._tip(self.ws), self._mac("c"))
 
     def test_active_without_mac_uses_newest_segment_then_anchor(self):
-        self._write(os.path.join(self.segs, "0001.jsonl"), _record(_mac("a")))
-        self._write(os.path.join(self.segs, "0002.jsonl"), _record(_mac("b")) + _record(_mac("c")))
+        self._write(os.path.join(self.segs, "0001.jsonl"), self._record("a"))
+        self._write(os.path.join(self.segs, "0002.jsonl"),
+                    self._record("b", self._mac("a")) + self._record("c", self._mac("b")))
         self._write(self.active, '{"legacy": true}\n')
-        self.assertEqual(evidence._tip(self.ws), _mac("c"))
+        self.assertEqual(evidence._tip(self.ws), self._mac("c"))
 
-        self._write(self.anchor, json.dumps({"anchor": _mac("e")}) + "\n")
+        # Model a retained older segment following an authenticated, archived
+        # prefix. It must authenticate, but cannot supply the newest segment's tip.
+        self._record("e")
+        self._write(self.anchor, json.dumps({"anchor": self._mac("e")}) + "\n")
+        self._write(os.path.join(self.segs, "0001.jsonl"), self._record("a", self._mac("e")))
         self._write(os.path.join(self.segs, "0002.jsonl"), '{"legacy": true}\n')
         self._write(self.active, "\n")
-        self.assertEqual(evidence._tip(self.ws), _mac("e"))
+        self.assertEqual(evidence._tip(self.ws), self._mac("e"))
 
     def test_missing_active_still_uses_newest_segment(self):
-        self._write(os.path.join(self.segs, "0001.jsonl"), _record(_mac("a")))
-        self._write(os.path.join(self.segs, "0002.jsonl"), _record(_mac("d")))
+        self._write(os.path.join(self.segs, "0001.jsonl"), self._record("a"))
+        self._write(os.path.join(self.segs, "0002.jsonl"), self._record("d", self._mac("a")))
         self.assertFalse(os.path.lexists(self.active))
-        self.assertEqual(evidence._tip(self.ws), _mac("d"))
+        self.assertEqual(evidence._tip(self.ws), self._mac("d"))
 
     def test_empty_log_uses_the_anchor(self):
         self.assertEqual(evidence._tip(self.ws), evidence.GENESIS)
