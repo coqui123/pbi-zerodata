@@ -118,6 +118,23 @@ class UnusedAtomicTests(unittest.TestCase):
         self.assertNotIn("Dead", remaining)
         self.assertNotIn("UnusedSafe", remaining)
 
+    def test_shared_bracket_only_query_survives_remove(self):
+        ws, project = self._project()
+        mdef = os.path.join(project.mirror_model, "definition")
+        _write(os.path.join(mdef, "expressions.tmdl"),
+               "expression SharedOnly = 1\n\nexpression GenuinelyUnused = 1\n")
+        _write(self._sales(ws, project), SALES +
+               "\tpartition Sales = m\n\t\tsource = #shared[SharedOnly]\n")
+        graph = usage.build(ws, project)
+        self.assertEqual(graph.state[usage.key("m_query", "", "SharedOnly")], "used")
+        self.assertEqual(graph.state[usage.key("m_query", "", "GenuinelyUnused")], "unused")
+        result = unused.remove(ws, project, only=["m_query"])
+        self.assertEqual(result["result"], "REMOVED")
+        from pbz import tmdl
+        remaining = tmdl.load_model(mdef).expressions
+        self.assertIn("SharedOnly", remaining)
+        self.assertNotIn("GenuinelyUnused", remaining)
+
     def test_failed_outcome_is_exit_1(self):
         out, rc = envelope({"ok": False, "error": "FAILED",
                             "detail": "write failed; mirror rolled back, no file changed"})

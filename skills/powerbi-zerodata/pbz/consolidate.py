@@ -192,13 +192,14 @@ def _report_area(file_kind: str, path: tuple) -> str:
 
 
 def _retarget_dax(expr: str, d, t, res) -> tuple[str, int]:
-    """A DAX string with every reference to measure d pointing at measure t (requalified first when the
+    """A DAX string with every reference to measure d pointing at measure t (requalified when the
     tables differ). Returns (new text, references rewritten)."""
     text = expr
+    edits = rename.dax_ref_edits(text, 0, len(text), "measure", d.table, d.name, t.name, cur=d.table, res=res)
+    count = len(edits)
     if d.table.lower() != t.table.lower():
-        text = apply_edits(text, move.dax_qualifier_edits(text, 0, len(text), d.name, d.table, t.table))
-    edits = rename.dax_ref_edits(text, 0, len(text), "measure", d.table, d.name, t.name, res=res)
-    return apply_edits(text, edits), len(edits)
+        edits += move.dax_qualifier_edits(text, 0, len(text), d.name, d.table, t.table)
+    return apply_edits(text, edits), count
 
 
 def _alias_text(doc, node, target: str) -> str:
@@ -333,23 +334,18 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
         texts[d.node.file] = _alias_text(ddoc, d.node, t.name)
     else:
         texts[d.node.file] = apply_edits(ddoc.text, [tmdl.block_span(ddoc, d.node) + ("",)])
-    # ---- model DAX: requalify 'Src'[dup] (move planner), then [dup] -> [into] (rename planner)
+    # ---- model DAX: plan name and qualifier edits against the original bindings
     cross = d.table.lower() != t.table.lower()
     named: dict[str, int] = {}   # DAX string literals spelling the duplicate's name (never rewritten)
     for rel in list(texts):
         text = texts[rel]
         doc = model.docs[rel] if text == model.docs[rel].text else tmdl.parse(rel, text)
-        if cross:
-            a = [ed for reg in doc.regions if reg.kind == "dax"
-                 for ed in move.dax_qualifier_edits(text, reg.start, reg.end, d.name, d.table, t.table)]
-            if a:
-                text = apply_edits(text, a)
-                doc = tmdl.parse(rel, text)
-        b = []
+        b = [ed for reg in doc.regions if reg.kind == "dax"
+             for ed in move.dax_qualifier_edits(text, reg.start, reg.end, d.name, d.table, t.table)] if cross else []
         for reg in doc.regions:
             if reg.kind != "dax":
                 continue
-            es = rename.dax_ref_edits(text, reg.start, reg.end, "measure", d.table, d.name, t.name, res=res)
+            es = rename.dax_ref_edits(text, reg.start, reg.end, "measure", d.table, d.name, t.name, cur=d.table, res=res)
             if es:
                 counts[_area(reg)] = counts.get(_area(reg), 0) + len(es)
                 b += es

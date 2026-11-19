@@ -2,10 +2,10 @@
 
 DAX rules follow Tabular Editor 2's FormulaFixup / DaxDependencyHelper (MIT):
 - 'T'[x] or T[x] is a column of T, else a measure (qualified measure reference), else unresolved.
-- a bare [x] is a measure; else a column of the innermost iterator table (row context); else a column
-  of the home table; else the only column of that name in the model; else an extension column
-  (ADDCOLUMNS / SELECTCOLUMNS name) or unresolved.
-- calculated columns, RLS filters and calculation items have a row context on the home table, so a bare
+- a bare [x] resolves iterator row contexts innermost-first, then a row-context home column,
+  then a measure, then a column of the home table, then the only column of that name in the model,
+  then an extension column (ADDCOLUMNS / SELECTCOLUMNS name) or unresolved.
+- calculated columns and RLS filters have a row context on the home table, so a bare
   [x] there is a home column first.
 - ident( is a function call (a user-defined function when the model defines one of that name);
   a bare ident is a table only when the model has a table of that name and no VAR shadows it.
@@ -119,8 +119,8 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
                  function: bool = False, base: int = 0) -> DaxDeps:
     """References made by one DAX expression whose home table is `home`.
 
-    row_home: the expression has a row context on the home table (calculated column, RLS filter,
-    calculation item); function: the text is a UDF definition with a parameter list.
+    row_home: the expression has a row context on the home table (calculated column or RLS filter).
+    function: the text is a UDF definition with a parameter list.
     """
     header = ""
     original_length = len(expr)
@@ -134,13 +134,13 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
     rel_calls: list[dict] = []
     n = len(sig)
 
-    def add(ref: Ref, at: int):
+    def add(ref: Ref, at: int, uncertain: bool = False):
         tok = sig[at]
         qualified = at + 1 < n and sig[at + 1].kind == "bracket" and tok.kind in ("table", "ident")
         name = sig[at + 1] if qualified else tok
         out.bindings.append(Binding(ref, name.start, name.end, home, row_home,
                                     (tok.start, tok.end) if qualified else None,
-                                    ref.kind == "unresolved"))
+                                    ref.kind == "unresolved" or uncertain))
         out.refs.append(ref)
         if ref.kind == "unresolved":
             out.unresolved.append(ref)
@@ -174,7 +174,7 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
         elif t.kind == "op" and t.text == "," and stack:
             stack[-1]["arg"] += 1
         elif t.kind in ("table", "ident") and nxt is not None and nxt.kind == "bracket" and (
-                t.kind == "table" or t.text.lower() in local or res.table(t.text) or t.end == nxt.start):
+                t.kind == "table" or t.text.lower() in local or res.table(t.text)):
             qual = t.value if t.kind == "table" else t.text
             if t.kind == "ident" and qual.lower() in local:
                 add(Ref("extension", qual, nxt.value), i)   # VAR table column: t[Hours]
@@ -192,7 +192,10 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
             i += 2
             continue
         elif t.kind == "bracket":
-            add(_bare(t.value, home, res, row_home, row_tables(), extension), i)
+            prev = sig[i - 1] if i else None
+            uncertain = bool(prev and prev.kind == "ident" and prev.text.upper() != "VAR"
+                             and not res.table(prev.text))
+            add(_bare(t.value, home, res, row_home, row_tables(), extension), i, uncertain)
         elif t.kind == "table":
             tab = res.table(t.value)
             add(Ref("table", tab, tab) if tab else Ref("unresolved", t.value, ""), i)
@@ -221,7 +224,7 @@ def dax_region(text, reg, res: Resolver) -> DaxDeps:
     row_home = False
     function = False
     while node is not None:
-        row_home |= node.kind in {"column", "tablePermission", "calculationItem"}
+        row_home |= node.kind in {"column", "tablePermission"}
         function |= node.kind == "function"
         if node.kind in {"table", "tablePermission"}:
             break
@@ -231,14 +234,14 @@ def dax_region(text, reg, res: Resolver) -> DaxDeps:
 
 
 def _bare(name: str, home: str, res: Resolver, row_home: bool, row_tables: list[str], extension: set[str]) -> Ref:
+    for rt in row_tables:
+        if res.column(rt, name):
+            return Ref("column", rt, res.column(rt, name))
     if row_home and res.column(home, name):
         return Ref("column", res.table(home) or home, res.column(home, name))
     hit = res.measure(name)
     if hit:
         return Ref("measure", hit[0], hit[1])
-    for rt in row_tables:
-        if res.column(rt, name):
-            return Ref("column", rt, res.column(rt, name))
     if home and res.column(home, name):
         return Ref("column", res.table(home) or home, res.column(home, name))
     tabs = res.by_column.get(name.lower(), [])
@@ -249,7 +252,8 @@ def _bare(name: str, home: str, res: Resolver, row_home: bool, row_tables: list[
     return Ref("unresolved", "", name)
 
 
-def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0) -> list[Binding]:
+def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0,
+               *, _defined: set[str] | None = None) -> list[Binding]:
     """Lexical M scopes: recursive let/record bindings, lambda parameters and each's _.
 
     Let names are visible throughout their let; record fields only inside that
@@ -274,6 +278,16 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0) -> list[B
     def name(i):
         t = sig[i]
         return (t.value if t.kind == "qident" else t.text) if t.kind in ("ident", "qident") else None
+
+    def possible_name(i):
+        return sig[i].value if sig[i].kind == "bracket" else name(i)
+
+    def span(i):
+        t = sig[i]
+        if t.kind == "bracket":
+            start = t.start + 1 + len(t.text[1:]) - len(t.text[1:].lstrip())
+            return start, start + len(t.value)
+        return t.start, t.end
 
     def parts(lo, hi):
         # Split only at this level: a nested let owns commas until its matching in.
@@ -303,6 +317,8 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0) -> list[B
             else:
                 uncertain = True
                 bodies.append((lo, hi, None))
+        if _defined is not None:
+            _defined.update(names)
         return names, bodies
 
     def walk(lo, hi, local):
@@ -360,6 +376,8 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0) -> list[B
                 walk(j + 1, hi, local | names)
                 return
             if t.kind == "ident" and t.text == "each":
+                if _defined is not None:
+                    _defined.add("_")
                 walk(i + 1, hi, local | {"_"})
                 return
             if i in pairs:
@@ -372,8 +390,12 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0) -> list[B
                             a += 1
                         if a < b and name(a):
                             params.add(name(a))
+                            if any(possible_name(k) in res.expressions for k in range(a + 1, b)):
+                                uncertain = True
                         elif a != b:
                             uncertain = True
+                    if _defined is not None:
+                        _defined.update(params)
                     walk(end + 2, hi, local | params)
                     return
                 if t.text == "[":
@@ -390,8 +412,32 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0) -> list[B
                         walk(a, b, local)
                 i = end + 1
                 continue
+            if t.text == "#":
+                construct = name(i + 1) if i + 1 < hi else None
+                if construct == "shared" and i + 2 < hi and sig[i + 2].kind == "bracket":
+                    nm = sig[i + 2].value
+                    if nm in res.expressions and nm != own:
+                        found.append((i + 2, nm, False))
+                    i += 3
+                    continue
+                if construct not in {"date", "time", "datetime", "datetimezone", "duration", "table", "binary"}:
+                    uncertain = True
+                else:
+                    i += 2
+                    continue
+            if t.kind == "ident" and t.text == "type":
+                # A type ends at a delimiter at this level. Nested containers
+                # belong to the type and must also be scanned for shared names.
+                j = i + 1
+                while j < hi and sig[j].text not in {",", ")", "]", "}", "meta"}:
+                    end = pairs.get(j, j)
+                    if any(possible_name(k) in res.expressions for k in range(j, end + 1)):
+                        uncertain = True
+                    j = end + 1
+                i = j
+                continue
             nm = name(i)
-            if t.text in ("=>", "section", "shared", "#", "try", "catch", "meta", "type", "@"):
+            if t.text in ("=>", "section", "shared", "try", "catch", "meta", "@"):
                 uncertain = True
             if nm in res.expressions and nm != own:
                 prev = sig[i - 1] if i else None
@@ -403,11 +449,23 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0) -> list[B
     if uncertain:
         # Include tokens skipped as declarations or selectors too: uncertainty must
         # never make the graph less conservative than a plain identifier scan.
-        found = [(i, name(i), False) for i in range(len(sig)) if name(i) in res.expressions]
-    return [Binding(Ref("m_query", "", nm, "m"), sig[i].start, sig[i].end,
+        found = [(i, possible_name(i), False) for i in range(len(sig))
+                 if possible_name(i) in res.expressions and possible_name(i) != own]
+    return [Binding(Ref("m_query", "", nm, "m"), *span(i),
                     uncertain=uncertain) for i, nm, local in found if not local]
 
 
 def m(expr: str, res: Resolver, own: str = "") -> list[Ref]:
     """Dependency projection of the shared M tracker."""
     return list(dict.fromkeys(b.ref for b in m_bindings(expr, res, own)))
+
+
+def m_defined_names(expr: str) -> set[str]:
+    """Local declarations in an M region, using the binding tracker's scope walk."""
+    names: set[str] = set()
+    m_bindings(expr, _EmptyMResolver(), _defined=names)
+    return names
+
+
+class _EmptyMResolver:
+    expressions = {}

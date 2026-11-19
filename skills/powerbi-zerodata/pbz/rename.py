@@ -75,7 +75,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             if reg.kind != "dax":
                 continue
             bindings = deps.dax_region(text, reg, res).bindings
-            edits += _binding_edits(bindings, kind, home, old, new)
+            edits += _binding_edits(bindings, kind, home, old, new, text)
         if kind == "column":
             for m_ in re.finditer(r"(?m)^(\t*(?:sortByColumn|column)\s*:\s*)('(?:[^']|'')*'|\S+)\s*$", text):
                 if tmdl.unquote(m_.group(2)).lower() == old.lower() and rel == model.tables[home].file:
@@ -186,6 +186,10 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
         k, table, name = ref
         if k != kind or name.lower() != old.lower() or (kind != "table" and table.lower() != home.lower()):
             continue
+        if kind == "measure" and len(site) == 4 and site[1] == "dax":
+            qualifier = before.get((site[0], "qualifier", *site[2:]))
+            if qualifier and qualifier[2].lower() != home.lower():
+                continue
         dest = (moved.get(site[0], site[0]), *site[1:])
         expected = (kind, table, new)
         if after.get(dest) != expected:
@@ -218,7 +222,7 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
                 raise PbzError("REFUSED", "a report binding did not follow the rename; nothing renamed")
 
 
-def _binding_edits(bindings, kind, home, old, new):
+def _binding_edits(bindings, kind, home, old, new, text):
     edits = []
     for binding in bindings:
         ref = binding.ref
@@ -226,6 +230,11 @@ def _binding_edits(bindings, kind, home, old, new):
             continue
         if binding.uncertain:
             raise PbzError("AMBIGUOUS", f"cannot safely bind a reference to {old}; nothing renamed")
+        if kind == "measure" and binding.qualifier is not None:
+            a, b = binding.qualifier
+            tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
+            if (tok.value or tok.text).lower() != home.lower():
+                continue
         if ref.kind == kind and ref.table.lower() == home.lower():
             edits.append((binding.start, binding.end, _bracket(new)))
     return edits
@@ -235,7 +244,7 @@ def dax_ref_edits(text: str, start: int, end: int, kind: str, home: str, old: st
                   cur: str | None = None, *, res, row_home: bool = False) -> list[tuple[int, int, str]]:
     """Rename exactly the occurrences bound to the target by the shared resolver."""
     bindings = deps.dax_bindings(text[start:end], cur or "", res, row_home, base=start).bindings
-    return _binding_edits(bindings, kind, home, old, new)
+    return _binding_edits(bindings, kind, home, old, new, text)
 
 
 def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str) -> list[tuple[int, int, str]]:
@@ -359,6 +368,8 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                         continue
                     if binding.uncertain:
                         raise PbzError("AMBIGUOUS", f"cannot safely bind an M reference to {old}")
+                    if new in deps.m_defined_names(seg):
+                        raise PbzError("AMBIGUOUS", f"M local {new} would capture a reference to {old}")
                     edits.append((binding.start, binding.end, _m_ident(new)))
             elif reg.kind == "text" and reg.node.kind == "annotation" and reg.node.name == "PBI_QueryOrder":
                 try:

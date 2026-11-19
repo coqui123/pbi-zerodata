@@ -71,6 +71,7 @@ class LocatedBindingTests(unittest.TestCase):
         # resolution. No expected offset is derived from deps or rename output.
         fixtures = [
             ("«[Amount]» + Sales«[Amount]»", "Sales", False, False),
+            ("Other[Amount]", "Sales", False, False),
             ("SUMX(Sales, «[Amount]» + SUMX(Other, [Amount]) + «[Amount]»)", "Home", False, False),
             ("SUMX(Other, [Amount]) + «[Amount]»", "Sales", False, False),
             ("«[OnlyHere]»", "Home", False, False),
@@ -109,7 +110,7 @@ class LocatedBindingTests(unittest.TestCase):
         doc = tmdl.parse("roles/Reader.tmdl", text)
         reg = next(r for r in doc.regions if r.kind == "dax")
         bindings = deps.dax_region(text, reg, res).bindings
-        self.assertEqual(rename._binding_edits(bindings, "column", "Sales", "Amount", "New"),
+        self.assertEqual(rename._binding_edits(bindings, "column", "Sales", "Amount", "New", text),
                          [(text.index("[Amount]"), text.index("[Amount]") + 8, "[New]"),
                           (text.rindex("[Amount]"), text.rindex("[Amount]") + 8, "[New]")])
         expr = "(x: scalar) => Sales[Amount] + x"
@@ -144,7 +145,7 @@ class LocatedBindingTests(unittest.TestCase):
     def test_m_tracker_scopes_and_case(self):
         from pbz import deps
         model = tmdl.Model()
-        model.expressions = {name: None for name in ("Sales", "Other", "Source")}
+        model.expressions = {name: None for name in ("Sales", "Other", "Source", "_")}
         res = deps.Resolver(model)
         fixtures = [
             ("if Sales = Other then Sales else Other", ["Sales", "Other", "Sales", "Other"]),
@@ -158,7 +159,7 @@ class LocatedBindingTests(unittest.TestCase):
             ("[Sales = Sales, x = Sales]", ["Sales"]),
             ("let Sales = 1 in (let Sales = Sales in Sales)", []),
             ("(Sales as number) => Sales + Other", ["Other"]),
-            ("each [Sales] + Sales + _", ["Sales"]),
+            ("let f = each [Sales] + Sales + _, x = _ in x", ["Sales", "_"]),
             ('let r = [#"Sales" = 1, x = #"Sales"] in Sales', ["Sales"]),
             ("if true then let Sales = 1 in Sales else Sales", ["Sales"]),
             ("let f = (Sales) => Sales, x = Sales in x", ["Sales"]),

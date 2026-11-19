@@ -29,7 +29,7 @@ UNSEEN = ["service reports", "Excel / Analyze in Excel", "paginated reports", "c
 
 
 def key(kind: str, table: str, name: str, report: str = "") -> tuple:
-    base = (kind, (table or "").lower(), (name or "").lower())
+    base = (kind, (table or "").lower(), (name or "") if kind == "m_query" else (name or "").lower())
     if kind == "report_measure":
         return base + ((report or "").lower(),)
     return base
@@ -352,7 +352,7 @@ def _dax_edges(g: Graph, src: tuple, model, res, node, home: str, via: str, row_
     for reg in tmdl.node_regions(doc, node, deep=deep):
         if reg.kind != "dax":
             continue
-        d = deps.dax_region(doc.text, reg, res)
+        d = deps.dax_bindings(doc.text[reg.start:reg.end], home, res, row_home, function, base=reg.start)
         for ref in d.refs:
             k = _ref_key(ref)
             if k is None:
@@ -388,6 +388,7 @@ def _ref_key(ref: deps.Ref) -> tuple | None:
 
 def _m_edges(g: Graph, src: tuple, model, res, node, own: str = "", lock_reason: str = "") -> None:
     doc = model.docs[node.file]
+    seen = {edge.dst for edge in g.out.get(src, []) if edge.via == "m"}
     for reg in tmdl.node_regions(doc, node, deep=True):
         if reg.kind != "m":
             continue
@@ -395,7 +396,9 @@ def _m_edges(g: Graph, src: tuple, model, res, node, own: str = "", lock_reason:
             k = _ref_key(binding.ref)
             if binding.uncertain:
                 g.lock(k, "uncertain M binding: automatic removal disabled")
-            g.edge(src, k, "m")
+            if k not in seen:
+                g.edge(src, k, "m")
+                seen.add(k)
             if lock_reason:
                 g.lock(k, lock_reason)
 
