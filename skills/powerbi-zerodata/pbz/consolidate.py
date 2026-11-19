@@ -93,7 +93,7 @@ def _report_dirs(ws, project) -> list[tuple[str, str]]:
 
 def _expr_span(doc, node) -> tuple[int, int]:
     """Span from just after the declaration's `=` to the end of the node's own expression (fences included)."""
-    lines = tmdl._lines(doc.text)
+    lines = doc.lines
     off, line = lines[node.line]
     m = tmdl.DECL_RE.match(line)
     if not m or m.group("rest") is None:
@@ -104,7 +104,7 @@ def _expr_span(doc, node) -> tuple[int, int]:
         while j < len(lines) and lines[j][1].strip() != "```":
             j += 1
         return start, (lines[j][0] + len(lines[j][1]) if j < len(lines) else len(doc.text))
-    regs = [r for r in doc.regions if r.node is node and r.prop == "expression"]
+    regs = [r for r in doc.regions_for(node) if r.prop == "expression"]
     return start, max([r.end for r in regs] + [off + len(line)])
 
 
@@ -150,7 +150,7 @@ def _format_of(model, m, res) -> tuple:
     dyn: tuple = ()
     if fsd is not None:
         doc = model.docs[m.node.file]
-        text = "".join(doc.text[r.start:r.end] for r in doc.regions if r.node is fsd)
+        text = "".join(doc.text[r.start:r.end] for r in doc.regions_for(fsd))
         dyn = tuple(similar.canon(text, m.table, res).words("hash"))
     return static, dyn
 

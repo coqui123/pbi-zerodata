@@ -344,7 +344,114 @@ class Env:
         return d
 
 
+def test_grouped_streaming(tmp: Path) -> None:
+    """Offline .NET acceptance: execute the production aggregators with a lazy row source.
+
+    Requires the Windows .NET SDK; no Desktop connection or pre-materialized fixture rows.
+    """
+    import xml.etree.ElementTree as ET
+    helper = tmp / "grouped-streaming"
+    helper.mkdir()
+    project = ET.Element("Project", Sdk="Microsoft.NET.Sdk")
+    properties = ET.SubElement(project, "PropertyGroup")
+    for key, value in {"OutputType": "Exe", "TargetFramework": "net10.0",
+                       "RuntimeIdentifier": "win-x64", "ImplicitUsings": "enable", "Nullable": "enable"}.items():
+        ET.SubElement(properties, key).text = value
+    refs = ET.SubElement(project, "ItemGroup")
+    ET.SubElement(refs, "ProjectReference", Include=str(S / "engine" / "PbzEngine.csproj"))
+    ET.ElementTree(project).write(helper / "Grouped.csproj", encoding="unicode")
+    (helper / "Program.cs").write_text(r'''
+using System.Text.Json.Nodes;
+using PbzEngine;
+static void Assert(bool ok, string label) { if (!ok) throw new Exception(label); }
+static JsonObject Result(Checks.EqualAggregate a) { var r = new JsonObject(); a.Write(r); return r; }
+static IEnumerable<object?[]> Rows(int count, int bad) {
+    // All failures arrive after the passing prefix, smallest serialized keys last.
+    for (int i = 0; i < count; i++)
+        yield return new object?[] { "g" + (count - i - 1).ToString("D8"), 1, i >= count - bad ? 0 : 1 };
+}
+string directory = Path.Combine(Path.GetTempPath(), "pbz-grouped-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(directory);
+try {
+    var vault = Vault.Open(directory);
+    var table = new TableMeta { Name = "T" };
+    var columns = new List<ColumnMeta> { new() { Table = table, Name = "Key", DataType = 2 } };
+    var by = new List<string> { "T[Key]" };
+    var reveal = new HashSet<string> { "T[Key]" };
+    var allow = new HashSet<string> { "T[Key]" };
+    int loads = 0;
+    var snapshot = new Lazy<JsonObject?>(() => { loads++; return null; });
+    Func<object?[], JsonObject> Factory() => Checks.GroupFactory(() => snapshot.Value, by, columns, reveal, allow, vault);
+    foreach (var test in new[] { (0, 0, "EMPTY", "NONE"), (23, 0, "PASS", "NONE"),
+                                 (23, 1, "FAIL", "ONE"), (23, 4, "FAIL", "FEW"),
+                                 (23, 20, "FAIL", "MANY"), (1000000, 20, "FAIL", "MANY") }) {
+        var a = new Checks.EqualAggregate(1, 1e-9, Factory());
+        foreach (var row in Rows(test.Item1, test.Item2)) a.Accept(row);
+        var result = Result(a);
+        Assert((string?)result["status"] == test.Item3 && (string?)result["mismatch"] == test.Item4, "expected verdict/bucket");
+        Assert(a.RowsConsumed == test.Item1 && a.Failures == test.Item2, "actual consumed and failures");
+        Assert(a.RetainedGroups == Math.Min(10, test.Item2) && a.PeakRetainedGroups <= 10, "bounded retained objects");
+        if (test.Item2 == 0) Assert(result["groups"] == null, "no groups on pass/empty");
+        else {
+            var expected = new JsonArray();
+            for (int i = 0; i < Math.Min(10, test.Item2); i++)
+                expected.Add(new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "g" + i.ToString("D8") } });
+            Assert(JsonNode.DeepEquals(result["groups"], expected), "independently expected exact sample");
+        }
+        if (test.Item2 == 0) Assert(loads == 0, "no index load without failures");
+        else Assert(loads == 1, "one actual request snapshot load across checks");
+    }
+    // Shuffling supplements independently expected results; duplicates must survive sampling.
+    var input = Rows(23, 20).ToArray();
+    var random = new Random(7);
+    for (int iteration = 0; iteration < 4; iteration++) {
+        random.Shuffle(input);
+        var a = new Checks.EqualAggregate(1, 1e-9, Factory());
+        foreach (var row in input) a.Accept(row);
+        var expected = new JsonArray();
+        for (int i = 0; i < 10; i++) expected.Add(new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "g" + i.ToString("D8") } });
+        Assert((string?)Result(a)["status"] == "FAIL" && JsonNode.DeepEquals(Result(a)["groups"], expected), "shuffled exact sample");
+    }
+    var duplicate = new Checks.EqualAggregate(1, 1e-9, Factory());
+    for (int i = 0; i < 15; i++) duplicate.Accept(new object?[] { "same", 1, 0 });
+    Assert(((JsonArray)Result(duplicate)["groups"]!).Count == 10, "duplicate groups retained");
+    var strict = new Checks.EqualAggregate(1, 1e-9, null);
+    foreach (var row in Rows(1000000, 20)) strict.Accept(row);
+    Assert(Result(strict).ToJsonString() == "{\"status\":\"FAIL\"}" && strict.RowsConsumed == 1000000 && strict.RetainedGroups == 0, "strict traverses without groups");
+    // Permissions are snapshots per column, with exact category membership.
+    var index = JsonNode.Parse("{\"columns\":{\"T[Key]\":{\"class\":\"category\"}},\"categories\":{\"T[Key]\":[\"known\"]}}")!.AsObject();
+    int categoryLoads = 0;
+    var category = Checks.GroupFactory(() => { categoryLoads++; return index; }, by, columns, reveal, new(), vault);
+    Assert((string?)category(new object?[] { "known" })["T[Key]"]?["reveal"] == "known", "member reveals");
+    index["categories"]!["T[Key]"] = new JsonArray("new");
+    Assert(category(new object?[] { "new" })["T[Key]"]?["hmac"] != null, "new value hidden, cached permissions");
+    Assert(categoryLoads == 1, "one index load per factory");
+    Assert(category(new object?[] { null })["T[Key]"]?["blank"]?.GetValue<bool>() == true, "blank group");
+    // Additive expectations use the actual input order (floating point is order sensitive).
+    foreach (var test in new[] { (new double?[] {}, (object?)null, "EMPTY"),
+                                 (new double?[] { null, null }, (object?)null, "EMPTY"),
+                                 (new double?[] { 2, 3 }, (object?)5, "PASS"),
+                                 (new double?[] { 2, 3 }, (object?)6, "FAIL"),
+                                 (new double?[] { 1e16, 1, -1e16 }, (object?)0, "PASS"),
+                                 (new double?[] { 1e16, -1e16, 1 }, (object?)1, "PASS") }) {
+        var a = new Checks.AdditiveAggregate(0);
+        foreach (var value in test.Item1) a.Accept(new object?[] { value });
+        var result = new JsonObject(); a.Write(result, test.Item2, 1e-9);
+        Assert((string?)result["status"] == test.Item3 && a.RowsConsumed == test.Item1.Length, "additive fixed-order expectation");
+    }
+    Console.WriteLine("grouped streaming acceptance passed");
+} finally { Directory.Delete(directory, true); }
+''', "utf-8")
+    proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Grouped.csproj")],
+                          capture_output=True, timeout=300)
+    expect("offline grouped streaming: exact verdicts, samples, consumption, retention and index loads",
+           proc.returncode == 0 and b"grouped streaming acceptance passed" in proc.stdout,
+           {"exit": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace"),
+            "stderr": proc.stderr.decode("utf-8", "replace")})
+
+
 def test_offline(env: Env, tmp: Path) -> None:
+    test_grouped_streaming(tmp)
     r = engine("ping", None, "ping-empty", raw=b"")
     expect("ping without private_dir", r and r.get("ok") is True and r.get("version") == "1", r)
     r = engine("ping", {"private_dir": str(env.pd)}, "ping")

@@ -555,7 +555,7 @@ def _object_summary(rel: str, old: str, new: str) -> list[str]:
         for node in doc.nodes:
             if node.kind in ("measure", "column", "table", "partition", "relationship", "hierarchy", "expression",
                              "role", "calculationItem"):
-                regs = [text[r.start:r.end] for r in doc.regions if r.node is node]
+                regs = [text[r.start:r.end] for r in doc.regions_for(node)]
                 res[f"{node.kind} {node.name}"] = sha(json.dumps([node.props, regs], sort_keys=True))
         return res
     a, b = objs(old), objs(new)

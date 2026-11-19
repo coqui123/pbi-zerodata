@@ -5,6 +5,8 @@ tokenized in place and references analysed, without re-serializing anything.
 """
 from __future__ import annotations
 
+from bisect import bisect_left
+import heapq
 import os
 import re
 from dataclasses import dataclass, field
@@ -115,6 +117,19 @@ class TmdlDoc:
     text: str
     nodes: list
     regions: list
+    _regions_by_node: dict = field(init=False, repr=False)
+    lines: list = field(init=False, repr=False)
+    line_offsets: list = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._regions_by_node = {}
+        for ordinal, reg in enumerate(self.regions):
+            self._regions_by_node.setdefault(id(reg.node), []).append((ordinal, reg))
+        self.lines = _lines(self.text)
+        self.line_offsets = [off for off, _ in self.lines]
+
+    def regions_for(self, node: Node) -> list[Region]:
+        return [r for _, r in self._regions_by_node.get(id(node), ())]
 
 
 def _lines(text: str) -> list[tuple[int, str]]:
@@ -164,6 +179,8 @@ def parse(path: str, text: str) -> TmdlDoc:
             end = lines[j][0]
             reg = Region(lang, start, end, node, prop)
             regions.append(reg)
+            if prop == "expression":
+                node.expr = node.expr or reg
             return j + 1
         start = rest_offset
         end = rest_offset + len(rest)
@@ -185,6 +202,8 @@ def parse(path: str, text: str) -> TmdlDoc:
         reg = Region(lang, start, end, node, prop)
         if end > start:
             regions.append(reg)
+            if prop == "expression":
+                node.expr = node.expr or reg
         return last_content + 1
 
     while i < n:
@@ -281,9 +300,9 @@ def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tu
     """Edits that set `prop: value` on a node (value None: a bare flag line such as isHidden).
     Replaces an existing value in place, else inserts a line right after the declaration and its
     expression. Returns [] when the property already has that value."""
-    lines = _lines(doc.text)
+    lines = doc.lines
     s, e = block_span(doc, node)
-    for off, ln in lines:
+    for off, ln in lines[bisect_left(doc.line_offsets, s):bisect_left(doc.line_offsets, e)]:
         if off < s or off >= e or _indent(ln) != node.indent + 1:
             continue
         m = PROP_RE.match(ln)
@@ -295,7 +314,7 @@ def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tu
             return [(off + m.start("val"), off + len(ln), value)]
         if ln.strip() == prop:
             return [] if value is None else [(off + len(ln) - len(ln.lstrip("\t")), off + len(ln), f"{prop}: {value}")]
-    regs = [r for r in doc.regions if r.node is node and r.prop == "expression"]
+    regs = [r for r in doc.regions_for(node) if r.prop == "expression"]
     after = max([r.end for r in regs] + [lines[node.line][0] + len(lines[node.line][1])])
     nl = doc.text.find("\n", after)
     eol = "\r\n" if "\r\n" in doc.text else "\n"
@@ -307,8 +326,10 @@ def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tu
 
 def node_regions(doc: TmdlDoc, node: Node, deep: bool = True) -> list[Region]:
     """Expression regions owned by a node (and, with deep, by its child nodes: KPIs, format strings...)."""
-    ids = {id(node)} | ({id(d) for d in node.descendants()} if deep else set())
-    return [r for r in doc.regions if id(r.node) in ids]
+    owners = [node, *node.descendants()] if deep else [node]
+    # Merge by global ordinal: parents may have regions after a child's regions.
+    streams = [doc._regions_by_node[id(n)] for n in owners if id(n) in doc._regions_by_node]
+    return [r for _, r in heapq.merge(*streams, key=lambda item: item[0])]
 
 
 # ---------------------------------------------------------------- model index
@@ -465,19 +486,19 @@ def load_model(definition_dir: str, texts: dict | None = None, *, root: str | No
             elif node.kind == "column" and node.parent and node.parent.kind == "table":
                 t = model.tables.setdefault(node.parent.name, Table(node.parent.name, relp))
                 t.columns[node.name] = Column(
-                    t.name, node.name, node.props.get("dataType", "").strip(), node.expr is not None or any(
-                        r.node is node and r.kind == "dax" for r in doc.regions),
+                    t.name, node.name, node.props.get("dataType", "").strip(), any(r.kind == "dax" for r in doc.regions_for(node)),
                     unquote(node.props.get("sourceColumn", "").strip()), unquote(node.props.get("sortByColumn", "").strip()),
                     "isHidden" in node.props, node)
             elif node.kind == "measure" and node.parent and node.parent.kind == "table":
                 t = model.tables.setdefault(node.parent.name, Table(node.parent.name, relp))
-                reg = next((r for r in doc.regions if r.node is node and r.kind == "dax"), None)
+                reg = next((r for r in doc.regions_for(node) if r.kind == "dax"), None)
                 t.measures[node.name] = Measure(t.name, node.name, text[reg.start:reg.end] if reg else "",
                                                 node.props.get("formatString", "").strip(),
                                                 node.props.get("displayFolder", "").strip(), node)
             elif node.kind == "partition" and node.parent and node.parent.kind == "table":
                 t = model.tables.setdefault(node.parent.name, Table(node.parent.name, relp))
-                reg = next((r for r in doc.regions if r.node is node), None)
+                # Item 30a: partition descriptions are text regions, never the source expression.
+                reg = next((r for r in doc.regions_for(node) if r.prop == "source"), None)
                 kind = node.decl_value.strip().lower() or "m"
                 t.partitions.append((node.name, kind, text[reg.start:reg.end] if reg else ""))
                 t.partition_nodes.append(node)

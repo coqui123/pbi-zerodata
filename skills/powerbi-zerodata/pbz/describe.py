@@ -118,7 +118,7 @@ def describe(ws, project, target: str | None) -> dict:
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
-    clf = Classifier(tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model)), ws.private, policy_mod.load(ws), project.name)
+    clf = Classifier(model, ws.private, policy_mod.load(ws), project.name)
     summ = _index_summary(ws, project)
     usage = field_usage(project, model)
     kind, table, name = _parse_target(target)

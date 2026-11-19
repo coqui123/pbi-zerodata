@@ -27,18 +27,19 @@ public static class Checks
         var vault = Vault.Open(ctx.RequirePrivateDir());
         string privateDir = ctx.RequirePrivateDir();
         using var conn = Conn.Open(ctx, port);
+        var index = new Lazy<JsonObject?>(() => IndexFile.TryLoad(privateDir, conn));
         var results = new JsonArray();
         foreach (var node in checks)
         {
             if (node is not JsonObject chk) throw new BadRequestException("checks must be objects");
             string id = J.Id(chk);
-            results.Add(RunOne(id, chk, conn, vault, reveal, allow, privateDir, ctx));
+            results.Add(RunOne(id, chk, conn, vault, reveal, allow, index, ctx));
         }
         return Ctx.Ok("check", new JsonObject { ["checks"] = results });
     }
 
     static JsonObject RunOne(string id, JsonObject chk, Conn conn, Vault vault, HashSet<string> reveal,
-        HashSet<string> allow, string privateDir, Ctx ctx)
+        HashSet<string> allow, Lazy<JsonObject?> index, Ctx ctx)
     {
         var res = new JsonObject { ["id"] = id };
         try
@@ -71,7 +72,7 @@ public static class Checks
                     break;
                 }
                 case "equal":
-                    Equal(chk, where, res, conn, vault, reveal, allow, privateDir, ctx);
+                    Equal(chk, where, res, conn, vault, reveal, allow, index, ctx);
                     break;
                 case "additive":
                     Additive(chk, where, res, conn);
@@ -272,7 +273,7 @@ public static class Checks
     }
 
     static void Equal(JsonObject chk, List<string> where, JsonObject res, Conn conn, Vault vault, HashSet<string> reveal,
-        HashSet<string> allow, string privateDir, Ctx ctx)
+        HashSet<string> allow, Lazy<JsonObject?> index, Ctx ctx)
     {
         string left = Expr(chk, "left");
         string right = Expr(chk, "right");
@@ -288,17 +289,64 @@ public static class Checks
         string q = "EVALUATE " + Dax.CalcTable(
             "SUMMARIZECOLUMNS(" + string.Join(", ", cols.Select(c => c.Ref)) + ", \"__pbz_l\", " + left + ", \"__pbz_r\", " + right + ")",
             where);
-        var rows = conn.Rows(q, int.MaxValue);
-        if (rows.Count == 0)
+        Func<object?[], JsonObject>? group = null;
+        if (!ctx.Strict)
         {
-            res["status"] = "EMPTY";
-            if (!ctx.Strict) res["mismatch"] = Buckets.Mismatch(0);
-            return;
+            // The lazy request snapshot pins one published generation; permissions are built once per column.
+            group = GroupFactory(() => index.Value, by, cols, reveal, allow, vault);
         }
-        var bad = rows.Where(r => !ValuesEqual(r[cols.Count], r[cols.Count + 1], tol)).ToList();
-        res["status"] = bad.Count == 0 ? "PASS" : "FAIL";
-        if (!ctx.Strict) res["mismatch"] = Buckets.Mismatch(bad.Count);
-        if (!ctx.Strict && bad.Count > 0) res["groups"] = Groups(bad, by, cols, vault, reveal, allow, privateDir, conn);
+        var aggregate = new EqualAggregate(cols.Count, tol, group);
+        conn.VisitRows(q, aggregate.Accept);
+        aggregate.Write(res);
+    }
+
+    /// <summary>Streaming verdict and ordinal ten-smallest sample, including duplicate groups.</summary>
+    public sealed class EqualAggregate
+    {
+        readonly int columns;
+        readonly double tolerance;
+        readonly Func<object?[], JsonObject>? group;
+        readonly List<(string Text, JsonObject Group)> sample = new();
+        public long RowsConsumed { get; private set; }
+        public long Failures { get; private set; }
+        public int RetainedGroups => sample.Count;
+        public int PeakRetainedGroups { get; private set; }
+
+        public EqualAggregate(int columns, double tolerance, Func<object?[], JsonObject>? group)
+        {
+            this.columns = columns;
+            this.tolerance = tolerance;
+            this.group = group;
+        }
+
+        public void Accept(object?[] row)
+        {
+            RowsConsumed++;
+            if (ValuesEqual(row[columns], row[columns + 1], tolerance)) return;
+            Failures++;
+            if (group == null) return;
+            var g = group(row);
+            string text = g.ToJsonString();
+            int at = sample.FindIndex(x => StringComparer.Ordinal.Compare(text, x.Text) < 0);
+            if (at < 0) at = sample.Count;
+            if (at >= MaxGroups) return;
+            if (sample.Count == MaxGroups) sample.RemoveAt(MaxGroups - 1);
+            sample.Insert(at, (text, g));
+            PeakRetainedGroups = Math.Max(PeakRetainedGroups, sample.Count);
+        }
+
+        public void Write(JsonObject result)
+        {
+            result["status"] = RowsConsumed == 0 ? "EMPTY" : Failures == 0 ? "PASS" : "FAIL";
+            if (group == null) return;
+            result["mismatch"] = Buckets.Mismatch(Failures);
+            if (Failures > 0)
+            {
+                var groups = new JsonArray();
+                foreach (var entry in sample) groups.Add(entry.Group.DeepClone());
+                result["groups"] = groups;
+            }
+        }
     }
 
     static void Additive(JsonObject chk, List<string> where, JsonObject res, Conn conn)
@@ -309,36 +357,35 @@ public static class Checks
         if (by.Count == 0) throw new BadRequestException("additive needs by");
         var cols = by.Select(b => conn.Meta.ResolveColumn(b)).ToList();
         var total = conn.Row1("EVALUATE ROW(\"t\", " + Dax.Calc(expr, where) + ")")[0];
-        var rows = conn.Rows("EVALUATE " + Dax.CalcTable(
-            "SUMMARIZECOLUMNS(" + string.Join(", ", cols.Select(c => c.Ref)) + ", \"__pbz_v\", " + expr + ")", where), int.MaxValue);
-        double sum = 0;
-        bool any = false;
-        foreach (var r in rows)
+        var aggregate = new AdditiveAggregate(cols.Count);
+        conn.VisitRows("EVALUATE " + Dax.CalcTable(
+            "SUMMARIZECOLUMNS(" + string.Join(", ", cols.Select(c => c.Ref)) + ", \"__pbz_v\", " + expr + ")", where), aggregate.Accept);
+        aggregate.Write(res, total, tol);
+    }
+
+    public sealed class AdditiveAggregate
+    {
+        readonly int column;
+        double sum;
+        bool any;
+        public long RowsConsumed { get; private set; }
+        public AdditiveAggregate(int column) { this.column = column; }
+        public void Accept(object?[] row)
         {
-            var v = r[cols.Count];
-            if (v == null) continue;
+            RowsConsumed++;
+            var v = row[column];
+            if (v == null) return;
             if (!Norm.IsNumeric(v)) throw new EngineException(ErrorClass.TYPE_MISMATCH, "additive needs numeric values");
             sum += Norm.ToDouble(v);
             any = true;
         }
-        if (total == null && !any)
+        public void Write(JsonObject result, object? total, double tol)
         {
-            res["status"] = "EMPTY";
-            return;
+            if (total == null && !any) { result["status"] = "EMPTY"; return; }
+            if (total != null && !Norm.IsNumeric(total))
+                throw new EngineException(ErrorClass.TYPE_MISMATCH, "additive needs a numeric total");
+            result["status"] = NumEqual(total == null ? 0 : Norm.ToDouble(total), sum, tol) ? "PASS" : "FAIL";
         }
-        if (total != null && !Norm.IsNumeric(total)) throw new EngineException(ErrorClass.TYPE_MISMATCH, "additive needs a numeric total");
-        double t = total == null ? 0 : Norm.ToDouble(total);
-        res["status"] = NumEqual(t, sum, tol) ? "PASS" : "FAIL";
-    }
-
-    static bool IndexedCategory(JsonObject? index, ColumnMeta col, object? value)
-    {
-        if (value is not string text || index?["columns"] is not JsonObject cols) return false;
-        if (cols[col.Key] is not JsonObject entry || J.Str(entry, "class") != "category") return false;
-        if (index["categories"] is not JsonObject cats || cats[col.Key] is not JsonArray values) return false;
-        // Exact membership: a newly added value stays hidden even below category_max.
-        return values.Any(v => v is JsonValue j && j.TryGetValue<string>(out var s)
-            && string.Equals(s, text, StringComparison.Ordinal));
     }
 
     static bool PolicyAllows(HashSet<string> allow, string by, ColumnMeta col)
@@ -349,34 +396,44 @@ public static class Checks
         return allow.Contains(quoted);
     }
 
-    /// <summary>
-    /// Raw keys only when the exact by string is on the request list and the column is a date,
-    /// an indexed category, or a policy reveal column. A direct caller cannot widen that set.
-    /// </summary>
-    static JsonArray Groups(List<object?[]> bad, List<string> by, List<ColumnMeta> cols, Vault vault, HashSet<string> reveal,
-        HashSet<string> allow, string privateDir, Conn conn)
+    public static Func<object?[], JsonObject> GroupFactory(Func<JsonObject?> loadIndex, List<string> by,
+        List<ColumnMeta> cols, HashSet<string> reveal, HashSet<string> allow, Vault vault)
     {
-        var index = IndexFile.TryLoad(privateDir, conn);
-        var groups = new List<JsonObject>();
-        foreach (var r in bad)
+        var permissions = new Lazy<List<Func<object?, bool>>>(() => Permissions(loadIndex(), by, cols, reveal, allow));
+        return row => Group(row, by, permissions.Value, vault);
+    }
+
+    static List<Func<object?, bool>> Permissions(JsonObject? index, List<string> by, List<ColumnMeta> cols,
+        HashSet<string> reveal, HashSet<string> allow)
+    {
+        var permissions = new List<Func<object?, bool>>();
+        for (int k = 0; k < by.Count; k++)
         {
-            var g = new JsonObject();
-            for (int k = 0; k < by.Count; k++)
-            {
-                object? v = r[k];
-                JsonObject key;
-                bool listed = reveal.Contains(by[k]);
-                bool permitted = cols[k].IsDate || IndexedCategory(index, cols[k], v) || PolicyAllows(allow, by[k], cols[k]);
-                if (v == null) key = new JsonObject { ["blank"] = true };
-                else if (listed && permitted) key = new JsonObject { ["reveal"] = Reveal(v) };
-                else key = new JsonObject { ["hmac"] = vault.Hmac(v) };
-                g[by[k]] = key;
-            }
-            groups.Add(g);
+            var col = cols[k];
+            bool unconditional = reveal.Contains(by[k]) && (col.IsDate || PolicyAllows(allow, by[k], col));
+            var values = new HashSet<string>(StringComparer.Ordinal);
+            if (reveal.Contains(by[k]) && !unconditional
+                && index?["columns"] is JsonObject columns && columns[col.Key] is JsonObject entry
+                && J.Str(entry, "class") == "category" && index["categories"] is JsonObject cats
+                && cats[col.Key] is JsonArray members)
+                foreach (var member in members)
+                    if (member is JsonValue j && j.TryGetValue<string>(out var text)) values.Add(text);
+            permissions.Add(v => unconditional || (v is string text && values.Contains(text)));
         }
-        var arr = new JsonArray();
-        foreach (var g in groups.OrderBy(g => g.ToJsonString(), StringComparer.Ordinal).Take(MaxGroups)) arr.Add(g);
-        return arr;
+        return permissions;
+    }
+
+    static JsonObject Group(object?[] row, List<string> by, List<Func<object?, bool>> permissions, Vault vault)
+    {
+        var g = new JsonObject();
+        for (int k = 0; k < by.Count; k++)
+        {
+            object? v = row[k];
+            g[by[k]] = v == null ? new JsonObject { ["blank"] = true }
+                : permissions[k](v) ? new JsonObject { ["reveal"] = Reveal(v) }
+                : new JsonObject { ["hmac"] = vault.Hmac(v) };
+        }
+        return g;
     }
 
     static string Reveal(object v) => v switch
