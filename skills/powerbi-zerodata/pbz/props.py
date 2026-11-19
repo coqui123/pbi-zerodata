@@ -201,7 +201,7 @@ def _lineage_edit(doc, node) -> list[tuple[int, int, str]]:
             return [(off + m.start("val"), off + len(ln), new)]
     eol = _eol(doc.text)
     line = "\t" * (node.indent + 1) + "lineageTag: " + new + eol
-    regs = [r for r in doc.regions if r.node is node and r.prop == "expression"]
+    regs = [r for r in doc.regions_for(node) if r.prop == "expression"]
     after = max([r.end for r in regs] + [lines[node.line][0] + len(lines[node.line][1])])
     nl = doc.text.find("\n", after)
     if nl < 0:
@@ -367,7 +367,7 @@ def get(ws, project, target: str | None = None, kind: str | None = None, table: 
     for k, label, node in _objects(model, target, kind, table, match, folder)[:500]:
         doc = model.docs[node.file]
         rec = {"object": label, "kind": k}
-        desc = [doc.text[r.start:r.end].strip() for r in doc.regions if r.node is node and r.prop == "description"]
+        desc = [doc.text[r.start:r.end].strip() for r in doc.regions_for(node) if r.prop == "description"]
         if desc:
             rec["description"] = "\n".join(desc)
         for prop, (kinds, typ, _a) in PROPS.items():

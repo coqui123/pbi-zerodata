@@ -119,14 +119,15 @@ class TmdlDoc:
     regions: list
     unclosed_fence: bool = False
     _regions_by_node: dict = field(init=False, repr=False)
-    lines: list = field(init=False, repr=False)
+    lines: list | None = field(default=None, repr=False)
     line_offsets: list = field(init=False, repr=False)
 
     def __post_init__(self):
         self._regions_by_node = {}
         for ordinal, reg in enumerate(self.regions):
             self._regions_by_node.setdefault(id(reg.node), []).append((ordinal, reg))
-        self.lines = _lines(self.text)
+        if self.lines is None:
+            self.lines = _lines(self.text)
         self.line_offsets = [off for off, _ in self.lines]
 
     def regions_for(self, node: Node) -> list[Region]:
@@ -295,9 +296,10 @@ def parse(path: str, text: str) -> TmdlDoc:
             if owner is not None:
                 owner.props[stripped] = "true"
         i += 1
-    return TmdlDoc(path, text, nodes, regions, unclosed_fence=unclosed_fence)
+    return TmdlDoc(path, text, nodes, regions, unclosed_fence=unclosed_fence, lines=lines)
 
 
+# block_span and prop_edit use parser spans and the cached line table.
 def block_span(doc: TmdlDoc, node: Node) -> tuple[int, int]:
     """Parser-owned span, including descendants and trailing blanks, excluding sibling descriptions."""
     if doc.unclosed_fence:
@@ -326,7 +328,9 @@ def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tu
     regs = [r for r in doc.regions_for(node) if r.prop == "expression"]
     after = max([r.end for r in regs] + [lines[node.line][0] + len(lines[node.line][1])])
     nl = doc.text.find("\n", after)
-    eol = "\r\n" if "\r\n" in doc.text else "\n"
+    line_index = bisect_right(doc.line_offsets, after) - 1
+    line_end = doc.line_offsets[line_index] + len(lines[line_index][1])
+    eol = "\r\n" if doc.text[line_end:line_end + 2] == "\r\n" else "\n"
     line = "\t" * (node.indent + 1) + prop + (f": {value}" if value is not None else "") + eol
     if nl < 0:
         return [(len(doc.text), len(doc.text), eol + line)]

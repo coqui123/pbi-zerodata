@@ -41,7 +41,7 @@ def _function_body(model, node) -> str:
         doc = next((item for path, item in model.docs.items() if path.lower() == low), None)
     if doc is None:
         return ""
-    reg = next((r for r in doc.regions if r.node is node and r.kind == "dax"), None)
+    reg = next((r for r in doc.regions_for(node) if r.kind == "dax"), None)
     if reg is None:
         return ""
     return doc.text[reg.start:reg.end]

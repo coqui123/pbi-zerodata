@@ -223,7 +223,7 @@ def native_sql(ws, project) -> dict:
             doc = model.docs.get(part.file)
             if doc is None:
                 continue
-            reg = next((r for r in doc.regions if r.node is part and r.kind == "m"), None)
+            reg = next((r for r in doc.regions_for(part) if r.kind == "m"), None)
             if reg is None:
                 continue
             text = doc.text[reg.start:reg.end]

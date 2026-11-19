@@ -338,7 +338,10 @@ def test_grouped_streaming(tmp: Path) -> None:
                        "RuntimeIdentifier": "win-x64", "ImplicitUsings": "enable", "Nullable": "enable"}.items():
         ET.SubElement(properties, key).text = value
     refs = ET.SubElement(project, "ItemGroup")
-    ET.SubElement(refs, "ProjectReference", Include=str(S / "engine" / "PbzEngine.csproj"))
+    ET.SubElement(refs, "ProjectReference", Include=str(S / "engine" / "PbzEngine.csproj"),
+                  GlobalPropertiesToRemove="BaseIntermediateOutputPath;BaseOutputPath",
+                  AdditionalProperties=(f"BaseIntermediateOutputPath={helper / 'engine-obj'}/;"
+                                        f"BaseOutputPath={helper / 'engine-bin'}/"))
     ET.ElementTree(project).write(helper / "Grouped.csproj", encoding="unicode")
     (helper / "Program.cs").write_text(r'''
 using System.Text.Json.Nodes;
@@ -360,8 +363,14 @@ try {
     var reveal = new HashSet<string> { "T[Key]" };
     var allow = new HashSet<string> { "T[Key]" };
     int loads = 0;
-    var snapshot = new Lazy<JsonObject?>(() => { loads++; return null; });
-    Func<object?[], JsonObject> Factory() => Checks.GroupFactory(() => snapshot.Value, by, columns, reveal, allow, vault);
+    var snapshot = new Checks.RequestSnapshot(() => { loads++; return null; });
+    Func<object?[], JsonObject> Factory() => Checks.GroupFactory(snapshot, by, columns, reveal, allow, vault);
+    snapshot.Snapshot();
+    var firstFactory = Factory();
+    var secondFactory = Factory();
+    firstFactory(new object?[] { "first" });
+    secondFactory(new object?[] { "second" });
+    Assert(loads == 1, "one production holder load across two factories and group calls");
     foreach (var test in new[] { (0, 0, "EMPTY", "NONE"), (23, 0, "PASS", "NONE"),
                                  (23, 1, "FAIL", "ONE"), (23, 4, "FAIL", "FEW"),
                                  (23, 20, "FAIL", "MANY"), (1000000, 20, "FAIL", "MANY") }) {
@@ -378,8 +387,7 @@ try {
                 expected.Add(new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "g" + i.ToString("D8") } });
             Assert(JsonNode.DeepEquals(result["groups"], expected), "independently expected exact sample");
         }
-        if (test.Item2 == 0) Assert(loads == 0, "no index load without failures");
-        else Assert(loads == 1, "one actual request snapshot load across checks");
+        Assert(loads == 1, "one actual request snapshot load across checks");
     }
     // Shuffling supplements independently expected results; duplicates must survive sampling.
     var input = Rows(23, 20).ToArray();
@@ -401,12 +409,35 @@ try {
     // Permissions are snapshots per column, with exact category membership.
     var index = JsonNode.Parse("{\"columns\":{\"T[Key]\":{\"class\":\"category\"}},\"categories\":{\"T[Key]\":[\"known\"]}}")!.AsObject();
     int categoryLoads = 0;
-    var category = Checks.GroupFactory(() => { categoryLoads++; return index; }, by, columns, reveal, new(), vault);
+    var categorySnapshot = new Checks.RequestSnapshot(() => { categoryLoads++; return index; });
+    var category = Checks.GroupFactory(categorySnapshot, by, columns, reveal, new(), vault);
     Assert((string?)category(new object?[] { "known" })["T[Key]"]?["reveal"] == "known", "member reveals");
     index["categories"]!["T[Key]"] = new JsonArray("new");
     Assert(category(new object?[] { "new" })["T[Key]"]?["hmac"] != null, "new value hidden, cached permissions");
-    Assert(categoryLoads == 1, "one index load per factory");
+    var categorySecond = Checks.GroupFactory(categorySnapshot, by, columns, reveal, new(), vault);
+    Assert(categorySecond(new object?[] { "new" })["T[Key]"]?["hmac"] != null, "permissions cached across factories");
+    Assert(categoryLoads == 1, "one index load across category factories");
+    var alias = Checks.GroupFactory(categorySnapshot, new() { "'T'[Key]" }, columns, reveal, new(), vault);
+    Assert(alias(new object?[] { "known" })["'T'[Key]"]?["hmac"] != null, "cached column still requires exact reveal spelling");
     Assert(category(new object?[] { null })["T[Key]"]?["blank"]?.GetValue<bool>() == true, "blank group");
+    categorySnapshot.Invalidate();
+    var reloaded = Checks.GroupFactory(categorySnapshot, by, columns, reveal, new(), vault);
+    Assert(categoryLoads == 2 && (string?)reloaded(new object?[] { "new" })["T[Key]"]?["reveal"] == "new",
+        "invalidation reloads snapshot and permissions");
+    var multiIndex = JsonNode.Parse("{\"columns\":{\"T[Key]\":{\"class\":\"category\"},\"T[Second]\":{\"class\":\"category\"}},\"categories\":{\"T[Key]\":[\"known\"],\"T[Second]\":[\"other\"]}}")!.AsObject();
+    var multiSnapshot = new Checks.RequestSnapshot(() => multiIndex);
+    var multiBy = new List<string> { "T[Key]", "T[Second]" };
+    var multiColumns = new List<ColumnMeta> { columns[0], new() { Table = table, Name = "Second", DataType = 2 } };
+    var multiFactory = Checks.GroupFactory(multiSnapshot, multiBy, multiColumns, new(multiBy), new(), vault);
+    var multi = new Checks.EqualAggregate(2, 1e-9, multiFactory);
+    multi.Accept(new object?[] { "known", "other", 1, 1 });
+    multi.Accept(new object?[] { "known", "other", 1, 0 });
+    multi.Accept(new object?[] { "known", null, 2, 0 });
+    var multiExpected = new JsonArray(
+        new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "known" }, ["T[Second]"] = new JsonObject { ["blank"] = true } },
+        new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "known" }, ["T[Second]"] = new JsonObject { ["reveal"] = "other" } });
+    Assert(multi.RowsConsumed == 3 && multi.Failures == 2 && JsonNode.DeepEquals(Result(multi)["groups"], multiExpected),
+        "two grouping columns: exact permissions, offsets and groups");
     // Additive expectations use the actual input order (floating point is order sensitive).
     foreach (var test in new[] { (new double?[] {}, (object?)null, "EMPTY"),
                                  (new double?[] { null, null }, (object?)null, "EMPTY"),
@@ -422,10 +453,16 @@ try {
     Console.WriteLine("grouped streaming acceptance passed");
 } finally { Directory.Delete(directory, true); }
 ''', "utf-8")
-    proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Grouped.csproj")],
-                          capture_output=True, timeout=300)
-    expect("offline grouped streaming: exact verdicts, samples, consumption, retention and index loads",
-           proc.returncode == 0 and b"grouped streaming acceptance passed" in proc.stdout,
+    label = "offline grouped streaming: exact verdicts, samples, consumption, retention and index loads"
+    try:
+        proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Grouped.csproj"),
+                               f"-p:BaseIntermediateOutputPath={helper / 'obj'}/",
+                               f"-p:BaseOutputPath={helper / 'bin'}/"],
+                              capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        expect(label, False, {"reason": f"{type(exc).__name__}: {exc}"})
+        return
+    expect(label, proc.returncode == 0 and b"grouped streaming acceptance passed" in proc.stdout,
            {"exit": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace"),
             "stderr": proc.stderr.decode("utf-8", "replace")})
 
@@ -1134,6 +1171,30 @@ import unittest
 from unittest.mock import patch
 
 
+class GroupedStreamingLauncherTests(unittest.TestCase):
+    def assert_launch_failure(self, error):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(subprocess, "run", side_effect=error) as run, \
+             patch.object(sys.modules[__name__], "expect") as record:
+            test_grouped_streaming(Path(directory))
+            record.assert_called_once()
+            name, ok, detail = record.call_args.args
+            self.assertIn("offline grouped streaming", name)
+            self.assertFalse(ok)
+            self.assertIn(type(error).__name__, detail["reason"])
+            self.assertIn(str(error), detail["reason"])
+            command = run.call_args.args[0]
+            self.assertIn(f"-p:BaseIntermediateOutputPath={Path(directory) / 'grouped-streaming' / 'obj'}/", command)
+            self.assertIn(f"-p:BaseOutputPath={Path(directory) / 'grouped-streaming' / 'bin'}/", command)
+
+    def test_missing_sdk_is_recorded(self):
+        self.assert_launch_failure(FileNotFoundError("dotnet SDK missing"))
+
+    def test_timeout_is_recorded(self):
+        self.assert_launch_failure(subprocess.TimeoutExpired(["dotnet", "run"], 300))
+
+
 class ProjectionTests(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(S))
@@ -1245,7 +1306,7 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true", help="keep the temporary private_dir")
     args = ap.parse_args()
 
-    scanner_tests = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromNames(["CanaryScanTests", "ProjectionTests"], module=sys.modules[__name__]))
+    scanner_tests = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromNames(["CanaryScanTests", "ProjectionTests", "GroupedStreamingLauncherTests"], module=sys.modules[__name__]))
     if not scanner_tests.wasSuccessful():
         return 1
     if not EXE.is_file():
@@ -1278,6 +1339,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--launcher-tests" in sys.argv:
+        unittest.main(argv=[sys.argv[0]], defaultTest="GroupedStreamingLauncherTests")
     if "--projection-tests" in sys.argv:
         unittest.main(argv=[sys.argv[0]], defaultTest="ProjectionTests")
     if "--scan-tests" in sys.argv:

@@ -27,7 +27,7 @@ public static class Checks
         var vault = Vault.Open(ctx.RequirePrivateDir());
         string privateDir = ctx.RequirePrivateDir();
         using var conn = Conn.Open(ctx, port);
-        var index = new Lazy<JsonObject?>(() => IndexFile.TryLoad(privateDir, conn));
+        var index = new RequestSnapshot(() => IndexFile.TryLoad(privateDir, conn));
         var results = new JsonArray();
         foreach (var node in checks)
         {
@@ -39,7 +39,7 @@ public static class Checks
     }
 
     static JsonObject RunOne(string id, JsonObject chk, Conn conn, Vault vault, HashSet<string> reveal,
-        HashSet<string> allow, Lazy<JsonObject?> index, Ctx ctx)
+        HashSet<string> allow, RequestSnapshot index, Ctx ctx)
     {
         var res = new JsonObject { ["id"] = id };
         try
@@ -142,6 +142,7 @@ public static class Checks
             if (cls == ErrorClass.TIMEOUT)
             {
                 try { conn.Reset(); } catch { }
+                index.Invalidate();
             }
         }
         return res;
@@ -273,7 +274,7 @@ public static class Checks
     }
 
     static void Equal(JsonObject chk, List<string> where, JsonObject res, Conn conn, Vault vault, HashSet<string> reveal,
-        HashSet<string> allow, Lazy<JsonObject?> index, Ctx ctx)
+        HashSet<string> allow, RequestSnapshot index, Ctx ctx)
     {
         string left = Expr(chk, "left");
         string right = Expr(chk, "right");
@@ -292,8 +293,9 @@ public static class Checks
         Func<object?[], JsonObject>? group = null;
         if (!ctx.Strict)
         {
-            // The lazy request snapshot pins one published generation; permissions are built once per column.
-            group = GroupFactory(() => index.Value, by, cols, reveal, allow, vault);
+            // Load before opening the streaming reader, including checks without failures.
+            index.Snapshot();
+            group = GroupFactory(index, by, cols, reveal, allow, vault);
         }
         var aggregate = new EqualAggregate(cols.Count, tol, group);
         conn.VisitRows(q, aggregate.Accept);
@@ -396,31 +398,64 @@ public static class Checks
         return allow.Contains(quoted);
     }
 
-    public static Func<object?[], JsonObject> GroupFactory(Func<JsonObject?> loadIndex, List<string> by,
-        List<ColumnMeta> cols, HashSet<string> reveal, HashSet<string> allow, Vault vault)
+    public sealed class RequestSnapshot
     {
-        var permissions = new Lazy<List<Func<object?, bool>>>(() => Permissions(loadIndex(), by, cols, reveal, allow));
-        return row => Group(row, by, permissions.Value, vault);
+        readonly object gate = new();
+        readonly Func<JsonObject?> loadIndex;
+        Lazy<JsonObject?>? snapshot;
+        readonly Dictionary<string, Func<string, object?, bool>> permissions = new(StringComparer.Ordinal);
+
+        public RequestSnapshot(Func<JsonObject?> loadIndex) { this.loadIndex = loadIndex; }
+
+        public JsonObject? Snapshot()
+        {
+            lock (gate)
+            {
+                snapshot ??= new Lazy<JsonObject?>(loadIndex);
+                return snapshot.Value;
+            }
+        }
+
+        public void Invalidate()
+        {
+            lock (gate)
+            {
+                snapshot = null;
+                permissions.Clear();
+            }
+        }
+
+        public Func<object?, bool> Permission(string by, ColumnMeta col, HashSet<string> reveal, HashSet<string> allow)
+        {
+            lock (gate)
+            {
+                if (!permissions.TryGetValue(col.Key, out var predicate))
+                {
+                    var index = Snapshot();
+                    bool columnAllowed = col.IsDate || PolicyAllows(allow, col.Key, col);
+                    var values = new HashSet<string>(StringComparer.Ordinal);
+                    if (index?["columns"] is JsonObject columns && columns[col.Key] is JsonObject entry
+                        && J.Str(entry, "class") == "category" && index["categories"] is JsonObject cats
+                        && cats[col.Key] is JsonArray members)
+                        foreach (var member in members)
+                            if (member is JsonValue j && j.TryGetValue<string>(out var text)) values.Add(text);
+                    // Keep the caller's spelling for reveal and policy checks when aliases share a column key.
+                    predicate = (name, value) => reveal.Contains(name)
+                        && (columnAllowed || allow.Contains(name) || (value is string text && values.Contains(text)));
+                    permissions.Add(col.Key, predicate);
+                }
+                return value => predicate(by, value);
+            }
+        }
     }
 
-    static List<Func<object?, bool>> Permissions(JsonObject? index, List<string> by, List<ColumnMeta> cols,
-        HashSet<string> reveal, HashSet<string> allow)
+    public static Func<object?[], JsonObject> GroupFactory(RequestSnapshot index, List<string> by,
+        List<ColumnMeta> cols, HashSet<string> reveal, HashSet<string> allow, Vault vault)
     {
         var permissions = new List<Func<object?, bool>>();
         for (int k = 0; k < by.Count; k++)
-        {
-            var col = cols[k];
-            bool unconditional = reveal.Contains(by[k]) && (col.IsDate || PolicyAllows(allow, by[k], col));
-            var values = new HashSet<string>(StringComparer.Ordinal);
-            if (reveal.Contains(by[k]) && !unconditional
-                && index?["columns"] is JsonObject columns && columns[col.Key] is JsonObject entry
-                && J.Str(entry, "class") == "category" && index["categories"] is JsonObject cats
-                && cats[col.Key] is JsonArray members)
-                foreach (var member in members)
-                    if (member is JsonValue j && j.TryGetValue<string>(out var text)) values.Add(text);
-            permissions.Add(v => unconditional || (v is string text && values.Contains(text)));
-        }
-        return permissions;
+            permissions.Add(index.Permission(by[k], cols[k], reveal, allow));
+        return row => Group(row, by, permissions, vault);
     }
 
     static JsonObject Group(object?[] row, List<string> by, List<Func<object?, bool>> permissions, Vault vault)

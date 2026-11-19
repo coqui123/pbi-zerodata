@@ -75,7 +75,7 @@ def _model_side(texts: dict, project) -> tuple[list[Rec], object]:
         for node in doc.nodes:
             if node.kind == "annotation" and node.parent is None and model_rec is not None:
                 if not node.name.startswith("PBI_"):
-                    reg = next((r for r in doc.regions if r.node is node), None)
+                    reg = next(iter(doc.regions_for(node)), None)
                     model_rec.ann[node.name] = sha(doc.text[reg.start:reg.end]) if reg else ""
                 continue
             if node.kind not in OBJECT_KINDS:
@@ -101,7 +101,7 @@ def _model_side(texts: dict, project) -> tuple[list[Rec], object]:
                 pre = "" if x is node else f"{x.kind} {x.name}.".replace(" .", ".")
                 if x.kind in ("annotation", "extendedProperty"):
                     if not x.name.startswith("PBI_"):
-                        reg = next((g for g in doc.regions if g.node is x), None)
+                        reg = next(iter(doc.regions_for(x)), None)
                         r.ann[x.name] = sha(doc.text[reg.start:reg.end]) if reg else ""
                     continue
                 for p, v in x.props.items():

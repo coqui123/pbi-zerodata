@@ -35,14 +35,18 @@ def test_region_index(check):
     texts = {"mixed.tmdl": text, "expression.tmdl": "expression Query = 42\n"}
     model = tmdl.load_model("", texts)
     def snapshot(m):
-        return [(t.name, t.calculated, t.partitions,
+        tables = [(t.name, t.calculated, t.partitions,
                  [(c.name, c.calculated, c.data_type) for c in t.columns.values()],
                  [(v.name, v.expression, v.format_string) for v in t.measures.values()])
                 for t in m.tables.values()]
+        expressions = [(name, m.docs[n.file].text[n.expr.start:n.expr.end])
+                       for name, n in m.expressions.items()]
+        return tables, expressions
     # Corrected baseline: the source-property rule remains in force, with legacy full scans.
     with patch.object(tmdl.TmdlDoc, "regions_for", lambda d, n: [r for r in d.regions if r.node is n]):
         baseline = tmdl.load_model("", texts)
     check(snapshot(model) == snapshot(baseline), "indexed model equals corrected scanning baseline")
+    check(snapshot(model)[1] == [("Query", "42")], "expected shared expression source")
     t = model.tables["T"]
     check(t.partitions == [("Import", "m", "Table.FromRows({{1}})"),
                            ("Calc", "calculated", 'ROW("x", 2)')], "expected partition text")
@@ -58,15 +62,29 @@ def test_region_index(check):
         ids = {id(n), *(id(d) for d in n.descendants())}
         check(tmdl.node_regions(doc, n) == [r for r in doc.regions if id(r.node) in ids], "deep global order")
         check(tmdl.node_regions(doc, n, False) == [r for r in doc.regions if r.node is n], "own global order")
+    with patch.object(tmdl, "_lines", wraps=tmdl._lines) as line_table:
+        parsed = tmdl.parse("mixed.tmdl", text)
+        check(line_table.call_count == 1, "parse computes line table once")
+        direct = tmdl.TmdlDoc("mixed.tmdl", text, parsed.nodes, parsed.regions)
+        check(line_table.call_count == 2 and direct.lines == parsed.lines,
+              "direct document construction computes line table")
+    for ending, other in (("\n", "\r\n"), ("\r\n", "\n")):
+        mixed = "table Mixed" + other + "\tmeasure M = 7" + ending + "\tmeasure Next = 8" + other
+        mixed_doc = tmdl.parse("mixed.tmdl", mixed)
+        measure = next(n for n in mixed_doc.nodes if n.kind == "measure")
+        result = apply_edits(mixed, tmdl.prop_edit(mixed_doc, measure, "displayFolder", "KPIs"))
+        check(result == mixed.replace("\tmeasure M = 7" + ending,
+                                     "\tmeasure M = 7" + ending + "\t\tdisplayFolder: KPIs" + ending),
+              "insert uses local line ending " + repr(ending))
     # Interleaved ownership, including a parent region after a descendant's region.
     regs = [doc.regions_for(m)[0], doc.regions_for(m.children[0])[0], doc.regions_for(m)[1]]
     interleaved = tmdl.TmdlDoc("", text, doc.nodes, regs)
     check(tmdl.node_regions(interleaved, m) == regs, "deep order is global, not concatenated per owner")
 
     class NoScan(list):
-        traversals = 0
+        attempted = False
         def __iter__(self):
-            self.traversals += 1
+            self.attempted = True
             raise AssertionError("consumer rescanned all document regions")
     doc.regions = NoScan(doc.regions)
     check(len(tmdl.node_regions(doc, m)) == 3, "indexed deep lookup avoids full traversal")
@@ -82,7 +100,7 @@ def test_region_index(check):
     a, b = tmdl.block_span(doc, m)
     check(text[a:b] == "\t/// measure description\n\tmeasure M = 7\n\t\tformatStringDefinition = \"0.00\"\n", "block excludes next description")
     fmt = consolidate._format_of(model, t.measures["M"], deps.Resolver(model))
-    check(fmt[0] == "" and bool(fmt[1]), "dynamic format uses indexed regions")
+    check(fmt == ("", ("LIT:S0.00",)), "dynamic format uses indexed regions")
     check(mirror._object_summary("mixed.tmdl", text, text.replace("measure M = 7", "measure M = 6")) ==
           ["~ measure M"], "mirror object summary")
 
@@ -93,9 +111,13 @@ def test_region_index(check):
         d.regions = NoScan(d.regions)
         return d
     with patch.object(tmdl, "parse", guarded_parse):
-        check(snapshot(tmdl.load_model("", texts)) == snapshot(baseline), "zero global traversals in load_model")
+        guarded_model = tmdl.load_model("", texts)
+        check(snapshot(guarded_model) == snapshot(baseline), "zero global traversals in load_model")
         check(mirror._object_summary("mixed.tmdl", text, text.replace("measure M = 7", "measure M = 6")) ==
               ["~ measure M"], "zero global traversals in summary")
+
+    check(not doc.regions.attempted and not any(d.regions.attempted for d in guarded_model.docs.values()),
+          "no traversal attempts in indexed consumers")
 
     # Table describe must use the same parsed model for its classifier.
     from types import SimpleNamespace
@@ -125,7 +147,7 @@ def test_region_index(check):
                 loaded = tmdl.load_model("", large)
             elapsed.append(time.perf_counter() - start)
             check(len(loaded.tables["Large"].measures) == size, "benchmark member count")
-            check(loaded.docs["large.tmdl"].regions.traversals == 0, "zero global traversals per large document")
+            check(not loaded.docs["large.tmdl"].regions.attempted, "zero global traversals per large document")
         timings[size] = statistics.median(elapsed)
     ratio = timings[8000] / timings[4000]
     print(f"region benchmark: median of 5, 8k/4k = {ratio:.3f}")
@@ -175,9 +197,14 @@ def main() -> int:
         "table Sources\n\t/// M description\n\tpartition Import = m\n"
         "\t\tsource = Table.FromRows({{1}})\n"
         "\t/// Calculated description\n\tpartition Calc = calculated\n"
-        "\t\tsource = ROW(\"x\", 2)\n"}).tables["Sources"]
+        "\t\tsource = ROW(\"x\", 2)\n"
+        "\t/// Multiline description\n\tpartition Multi = m\n\t\tsource = ```\n"
+        "\t\t\tlet\n\t\t\t\tRows = Table.FromRows({{3}})\n\t\t\tin\n\t\t\t\tRows\n\t\t```\n"
+        "\tpartition Undocumented = m\n\t\tsource = Table.FromRows({{4}})\n"}).tables["Sources"]
     check(partitions.partitions == [("Import", "m", "Table.FromRows({{1}})"),
-                                    ("Calc", "calculated", 'ROW("x", 2)')],
+                                    ("Calc", "calculated", 'ROW("x", 2)'),
+                                    ("Multi", "m", "\t\t\tlet\n\t\t\t\tRows = Table.FromRows({{3}})\n\t\t\tin\n\t\t\t\tRows\n"),
+                                    ("Undocumented", "m", "Table.FromRows({{4}})")],
           f"documented partition sources: {partitions.partitions}")
     check(partitions.calculated, "calculated partition sets table flag")
 
