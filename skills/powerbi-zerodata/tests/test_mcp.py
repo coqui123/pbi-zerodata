@@ -44,7 +44,7 @@ class InstallerTransactionTests(unittest.TestCase):
         clean, _ = self.inst.merge_codex_toml('', False)
         for host in ('extra = "host"\n', '[mcp_servers.pbz.env]\nHOST = "keep"\n',
                      '[mcp_servers.pbz.nested.deep]\nvalue = 1\n'):
-            text = clean + host
+            text = clean.replace(self.inst._toml_str(self.inst.python_exe()), '"old-python"') + host
             for uninstall in (False, True, False):
                 with self.subTest(host=host, uninstall=uninstall):
                     new, reason = self.inst.merge_codex_toml(text, uninstall)
@@ -81,47 +81,143 @@ class InstallerTransactionTests(unittest.TestCase):
                         self.assertEqual(path.read_text(encoding='utf-8'), original)
                         self.assertEqual(list(Path(tmp).glob('*.tmp-pbz-*')), [])
 
-    def test_concurrent_distinct_updates_after_both_reads(self):
-        # Two independent installers take the same snapshot before either can write.
-        # A stale writer must receive an explicit named conflict, never silently win.
-        worker = r'''
-import importlib.util, json, pathlib, sys, time
-spec = importlib.util.spec_from_file_location('installer', sys.argv[1])
-inst = importlib.util.module_from_spec(spec); spec.loader.exec_module(inst)
-path, barrier, name = sys.argv[2:]
-snapshot = inst.load_json(path)
-pathlib.Path(barrier + name).touch()
-deadline = time.monotonic() + 20
-while not pathlib.Path(barrier + 'go').exists():
-    if time.monotonic() > deadline: raise RuntimeError('barrier timeout')
-    time.sleep(.02)
-try:
-    inst.update_json(path, lambda data: ({**data, name: True}, 'updated'), expected=snapshot)
-except inst.InstallConflict as error:
-    print(str(error)); sys.exit(3)
-'''
+    def test_production_settings_transactions_serialize_distinct_updates(self):
+        inst = self.inst
         with tempfile.TemporaryDirectory() as tmp:
-            path, barrier = str(Path(tmp, 'settings.json')), str(Path(tmp, 'barrier-'))
-            Path(path).write_text('{}', encoding='utf-8')
-            children = [subprocess.Popen([sys.executable, '-c', worker, self.inst.__file__, path, barrier, name],
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE) for name in ('alpha', 'beta')]
-            try:
-                deadline = time.monotonic() + 20
-                while not all(Path(barrier + n).exists() for n in ('alpha', 'beta')):
-                    if time.monotonic() > deadline:
-                        self.fail('installers did not overlap their reads')
-                    time.sleep(.02)
-                Path(barrier + 'go').touch()
-                outputs = [child.communicate(timeout=20) for child in children]
-                self.assertEqual(sorted(child.returncode for child in children), [0, 3])
-                self.assertIn(b'JSON changed since read', b''.join(out for out, err in outputs))
-                data = self.inst.load_json(path)
-                self.assertIn(data, ({'alpha': True}, {'beta': True}))
-            finally:
-                for child in children:
-                    if child.poll() is None:
-                        child.kill()
-                        child.communicate()
+            path = str(Path(tmp, 'settings.json'))
+            entered, release, second_started, finished = (threading.Event() for _ in range(4))
+            errors = []
+            original = inst.merge_claude_mcp
+            def blocked(data, uninstall):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError('merge release timeout')
+                return original(data, uninstall)
+            def worker(agent):
+                try:
+                    if agent == 'codex': second_started.set()
+                    if agent == 'claude':
+                        inst.mcp_step(False, False)
+                    else:
+                        inst.settings_step(path, 'codex', False, False, denies=True)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    if agent == 'codex': finished.set()
+            with patch.object(inst, 'merge_claude_mcp', side_effect=blocked), patch.object(inst, 'CLAUDE_JSON', path), patch.object(inst, 'CODEX_CONFIG', str(Path(tmp, 'config.toml'))):
+                first = threading.Thread(target=worker, args=('claude',))
+                second = threading.Thread(target=worker, args=('codex',))
+                first.start()
+                try:
+                    self.assertTrue(entered.wait(5))
+                    second.start()
+                    self.assertTrue(second_started.wait(5))
+                    self.assertFalse(finished.wait(.2))
+                finally:
+                    release.set()
+                    first.join(5)
+                    if second.ident is not None: second.join(5)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            data = inst.load_json(path)
+            commands = [h['command'] for entries in data['hooks'].values() for entry in entries for h in entry['hooks']]
+            self.assertEqual(data['mcpServers']['pbz']['args'], inst.mcp_args())
+            self.assertTrue(any('--agent codex' in c for c in commands))
+            self.assertTrue(all(rule in data['permissions']['deny'] for rule in inst.DENY_RULES))
+
+    def test_absent_noop_lock_cleans_only_created_sidecars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'new-parent', 'settings.json')
+            self.inst.settings_step(str(path), 'codex', False, True)
+            self.assertFalse(path.parent.exists())
+            path.parent.mkdir()
+            lock = Path(str(path) + '.pbz-lock')
+            lock.write_bytes(b'host lock')
+            with self.inst.file_lock(str(path)):
+                pass
+            self.assertEqual(lock.read_bytes(), b'host lock')
+            path.write_text('{}')
+            with self.inst.file_lock(str(path)):
+                pass
+            self.assertTrue(lock.exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX flock')
+    def test_posix_lock_timeout_is_named_conflict(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp, patch.object(fcntl, 'flock', side_effect=BlockingIOError()), patch.object(self.inst.time, 'monotonic', side_effect=[0, 61]):
+            with self.assertRaisesRegex(self.inst.InstallConflict, 'settings.json: installer lock timeout'):
+                with self.inst.file_lock(str(Path(tmp, 'settings.json'))):
+                    self.fail('lock acquired')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX modes and symlink')
+    def test_atomic_text_preserves_mode_and_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp, 'target')
+            target.write_text('original')
+            target.chmod(0o751)
+            link = Path(tmp, 'link')
+            link.symlink_to(target)
+            self.inst.atomic_text(str(link), 'updated')
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(target.read_text(), 'updated')
+            self.assertEqual(target.stat().st_mode & 0o777, 0o751)
+
+    def test_single_quoted_pbz_apply_update_uninstall(self):
+        import tomllib
+        inst = self.inst
+        clean, _ = inst.merge_codex_toml('', False)
+        quoted = clean.replace('[mcp_servers.pbz]', "[mcp_servers.'pbz']")
+        for text in ('', quoted, quoted.replace(inst._toml_str(inst.python_exe()), '"old-python"')):
+            updated, reason = inst.merge_codex_toml(text, False)
+            self.assertFalse(reason.startswith('SKIP'), reason)
+            self.assertEqual(tomllib.loads(updated)['mcp_servers']['pbz']['command'], inst.python_exe())
+            removed, reason = inst.merge_codex_toml(updated.replace('[mcp_servers.pbz]', "[mcp_servers.'pbz']"), True)
+            self.assertEqual(reason, 'removed')
+            self.assertNotIn('mcp_servers', tomllib.loads(removed))
+        for suffix in (".'nested'", '."nested]key"'):
+            text = quoted + "[mcp_servers.'pbz'" + suffix + "]\nvalue = 1\n"
+            self.assertEqual(inst.merge_codex_toml(text, False)[0], text)
+
+    def test_main_reports_conflicts_and_mcp_skips(self):
+        inst = self.inst
+        with tempfile.TemporaryDirectory() as tmp, patch.object(inst, 'LINKS', []), patch.object(inst, 'RULE_FILES', []), patch.object(inst, 'CLAUDE_SETTINGS', str(Path(tmp, 'claude-settings'))), patch.object(inst, 'CODEX_HOOKS', str(Path(tmp, 'codex-hooks'))), patch.object(inst, 'CLAUDE_JSON', str(Path(tmp, 'claude.json'))), patch.object(inst, 'CODEX_CONFIG', str(Path(tmp, 'config.toml'))), patch.object(sys, 'argv', ['install.py', '--mcp']):
+            path = Path(inst.CODEX_CONFIG)
+            path.write_text('[mcp_servers.pbz]\ncommand = "host"\n')
+            before = path.read_bytes()
+            self.assertEqual(inst.main(), 1)
+            self.assertEqual(path.read_bytes(), before)
+            for target in ('junction', 'settings_step', 'rule_block', 'mcp_step'):
+                with self.subTest(target=target), patch.object(inst, 'LINKS', ['link']), patch.object(inst, 'RULE_FILES', ['rules']), patch.object(inst, 'junction', return_value='ok'), patch.object(inst, 'settings_step', return_value=False), patch.object(inst, 'rule_block', return_value='ok'), patch.object(inst, target, side_effect=inst.InstallConflict('named-file refusal')):
+                    self.assertEqual(inst.main(), 1)
+
+    def test_interrupting_settings_file_write_preserves_original_bytes(self):
+        self._interrupt_settings_transaction(False)
+
+    def test_interrupting_ownership_record_write_preserves_original_bytes(self):
+        self._interrupt_settings_transaction(True)
+
+    def _interrupt_settings_transaction(self, ownership):
+        inst = self.inst
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'settings.json')
+            inst.settings_step(str(path), 'codex', False, False)
+            record = Path(str(path) + '.pbz-owned.json')
+            target = record if ownership else path
+            before = target.read_bytes()
+            original = inst.atomic_text
+            def interrupt(dest, text, what_if=False):
+                if str(dest) == str(target):
+                    def partial(handle, text):
+                        handle.write(text[:3])
+                        raise KeyboardInterrupt('injected write interruption')
+                    with patch.object(inst, '_write_content', side_effect=partial):
+                        original(dest, text, what_if)
+                else:
+                    original(dest, text, what_if)
+            with patch.object(inst, 'atomic_text', side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+                inst.settings_step(str(path), 'claude', False, False, denies=True)
+            self.assertEqual(target.read_bytes(), before)
 
     def test_malformed_rule_markers_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -308,8 +404,9 @@ class GitHookTests(unittest.TestCase):
         shutil.copy2(repo / 'scripts/check_staged.py', scripts)
         tests = self.root / 'skills/powerbi-zerodata/tests'
         tests.mkdir(parents=True)
-        (tests / 'run_offline.py').write_text('import sys\nassert "--check" in sys.argv\n', encoding='utf-8')
-        (tests / 'test_ci_registration.py').write_text('assert True\n', encoding='utf-8')
+        (tests / 'run_offline.py').write_text('import sys, pathlib\nif "--check" not in sys.argv: pathlib.Path("runner-called").write_text("full")\n', encoding='utf-8')
+        (tests / 'test_ci_registration.py').write_text('import smoke\n', encoding='utf-8')
+        (tests / 'test_plan_pure.py').write_text('assert True\n', encoding='utf-8')
         (tests / 'smoke.py').write_text('assert True\n', encoding='utf-8')
         subprocess.run(['git', 'add', '.'], cwd=self.root, check=True)
         subprocess.run(['git', 'config', 'pbz.requiredCI', 'main-offline-required'], cwd=self.root, check=True)
@@ -335,7 +432,41 @@ class GitHookTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertFalse(record.exists())
         self.assertEqual(snapshot(), before)
+        # An inherited attestation cannot enable fast mode.
+        global_config = self.root.parent / (self.root.name + '-gitconfig')
+        global_config.write_text('[pbz]\nrequiredCI = main-offline-required\n')
+        self.addCleanup(lambda: global_config.unlink(missing_ok=True))
+        env['GIT_CONFIG_GLOBAL'] = str(global_config)
+        # Default mode must publish and run the full gate, with no content mutation.
+        subprocess.run(['git', 'config', '--local', '--unset', 'pbz.requiredCI'], cwd=self.root, check=True)
+        runner_record = tests.parent / 'runner-called'
+        # Put instrumentation outside the snapshot while preserving fixture content.
+        original_runner = (tests / 'run_offline.py').read_text()
+        (tests / 'run_offline.py').write_text(original_runner.replace('pathlib.Path("runner-called")', 'pathlib.Path(' + repr(str(self.root.parent / (self.root.name + '-runner'))) + ')'))
+        runner_record = self.root.parent / (self.root.name + '-runner')
+        self.addCleanup(lambda: runner_record.unlink(missing_ok=True))
+        subprocess.run(['git', 'add', '.'], cwd=self.root, check=True)
+        before = snapshot()
+        out = subprocess.run(['sh', str(hook)], cwd=self.root, env=env, capture_output=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn('publish', record.read_text())
+        self.assertTrue(runner_record.exists())
+        # Remove the instrumentation output before comparing fixture bytes.
+        record.unlink()
+        self.assertEqual(snapshot(), before)
+        subprocess.run(['git', 'config', '--local', 'pbz.requiredCI', 'main-offline-required'], cwd=self.root, check=True)
+        # A tampered working-tree checker cannot hide a staged runtime failure.
+        (scripts / 'check_staged.py').write_text('raise SystemExit(0)\n')
+        (tests / 'smoke.py').write_text('raise RuntimeError("staged smoke runtime failure")\n')
+        subprocess.run(['git', 'add', 'skills'], cwd=self.root, check=True)
+        (tests / 'smoke.py').write_text('assert True\n')
+        before = snapshot()
+        out = subprocess.run(['sh', str(hook)], cwd=self.root, env=env, capture_output=True)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn(b'staged smoke runtime failure', out.stderr)
+        self.assertEqual(snapshot(), before)
         # Working tree passes but the staged script fails.
+        shutil.copy2(repo / 'scripts/check_staged.py', scripts / 'check_staged.py')
         (tests / 'smoke.py').write_text('broken syntax (\n', encoding='utf-8')
         subprocess.run(['git', 'add', '.'], cwd=self.root, check=True)
         (tests / 'smoke.py').write_text('assert True\n', encoding='utf-8')
@@ -345,7 +476,11 @@ class GitHookTests(unittest.TestCase):
         self.assertEqual(snapshot(), before)
         # Full pre-push publishes; a deliberately minimal runner can then refuse.
         out = subprocess.run(['sh', str(repo / 'scripts/git-hooks/pre-push')], cwd=self.root, env=env, capture_output=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn('publish', record.read_text(encoding='utf-8'))
+        (tests / 'run_offline.py').write_text('raise SystemExit(17)\n')
+        out = subprocess.run(['sh', str(repo / 'scripts/git-hooks/pre-push')], cwd=self.root, env=env, capture_output=True)
+        self.assertEqual(out.returncode, 17)
 
     def install(self, chain=False):
         return self.inst.install(str(self.root), str(self.source), chain)
@@ -380,6 +515,8 @@ class GitHookTests(unittest.TestCase):
             (self.hooks / name).write_bytes(host)
             (self.hooks / name).chmod(0o751)
         self.install(chain=True)
+        for name in self.inst.NAMES:
+            self.assertTrue(os.access(self.hooks / name, os.X_OK))
         for name in self.inst.NAMES:
             self.assertEqual((self.hooks / (name + ".pbz-host")).read_bytes(), host)
             self.assertEqual((self.hooks / (name + ".pbz-host")).stat().st_mode & 0o777, 0o751)

@@ -589,8 +589,8 @@
     "argv": [
       "tests/test_ci_registration.py"
     ],
-    "windows": true,
-    "engine": true
+    "windows": false,
+    "engine": false
   },
   {
     "id": "policy_atomic",

@@ -1,10 +1,31 @@
 """Explicit registration and deterministic whole-script allocation."""
 import collections
 import json
+import re
+import subprocess
+import tempfile
+import atexit
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
 MANIFEST = TESTS / 'offline_suites.json'
+ROOT = TESTS.parents[2]
+_CONTROL_DIRS = []
+
+
+def _cleanup_controls():
+    for directory in _CONTROL_DIRS:
+        directory.cleanup()
+
+
+atexit.register(_cleanup_controls)
+
+
+def control_path(path):
+    path = Path(path)
+    return path if path.is_absolute() else ROOT / path
+
+
 BASELINE = TESTS / 'offline_baseline.json'
 
 
@@ -25,12 +46,18 @@ def validate(entries, tests=TESTS):
         script = Path(argv[0])
         if script.parent != Path('tests') or not (tests / script.name).is_file():
             raise ValueError('nonexistent or extra script: ' + str(script))
+        if not script.name.startswith('test_'):
+            raise ValueError('non-test script: ' + str(script))
         if script.name == 'test_e2e.py':
             raise ValueError('e2e is live-only')
         if script.name == 'test_engine.py' and argv != ['tests/test_engine.py', '--offline']:
             raise ValueError('engine requires --offline')
         if not isinstance(e['windows'], bool) or not isinstance(e['engine'], bool):
             raise ValueError('requirements must be boolean')
+        if e['id'] == 'ci_registration' and e['engine']:
+            raise ValueError('ci_registration must be engine-free')
+        if script.name == 'test_engine.py' and not (e['engine'] and e['windows']):
+            raise ValueError('engine-offline requires engine and windows')
         if e.get('weight', 1) <= 0:
             raise ValueError('weight must be positive')
         scripts.append(script.name)
@@ -72,7 +99,7 @@ def controls(entries, path=None, check_scripts=True):
     """Explicit expected-failure experiments; the normal manifest stays frozen."""
     if not path:
         return entries, {}
-    records = path if isinstance(path, list) else json.loads(Path(path).read_text(encoding='utf-8'))
+    records = path if isinstance(path, list) else json.loads(control_path(path).read_text(encoding='utf-8'))
     result = {e['id']: dict(e) for e in entries}
     expected = {}
     for record in records:
@@ -85,8 +112,21 @@ def controls(entries, path=None, check_scripts=True):
             raise ValueError('historical control must replace a known suite')
         if record['purpose'] == 'injected' and name in result:
             raise ValueError('injected control must have a separate suite ID')
-        if check_scripts and not (TESTS.parent / record['argv'][0]).is_file():
+        argv = list(record.get('argv', [record.get('script', '')]))
+        if 'revision' in record or 'script' in record:
+            revision, script = record.get('revision', ''), Path(record.get('script', ''))
+            if (not re.fullmatch(r'[0-9a-fA-F]{40}', revision) or script.is_absolute()
+                    or '..' in script.parts or not script.parts):
+                raise ValueError('invalid historical revision/script')
+            if check_scripts:
+                data = subprocess.check_output(['git', 'show', f'{revision}:{script.as_posix()}'], cwd=ROOT)
+                directory = tempfile.TemporaryDirectory(prefix='pbz-controls-')
+                _CONTROL_DIRS.append(directory)
+                target = Path(directory.name) / script.name
+                target.write_bytes(data)
+                argv[0] = str(target)
+        elif check_scripts and not (TESTS.parent / argv[0]).is_file():
             raise ValueError('missing control script')
-        result[name] = dict(id=name, argv=record['argv'], windows=True, engine=True)
+        result[name] = dict(id=name, argv=argv, windows=True, engine=True)
         expected[name] = (record['exit_code'], record['reason'])
     return list(result.values()), expected

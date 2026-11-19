@@ -43,6 +43,8 @@ def scan(roots, excluded=(FIXTURE,), patterns=None, read=None, walk=None):
     result = {'completed': True, 'files': 0, 'failures': []}
 
     def fail(path, reason):
+        if reason in ('missing root', 'enumeration error'):
+            result['completed'] = False
         result['failures'].append({'path': str(path), 'reason': reason})
 
     def ignored(path):

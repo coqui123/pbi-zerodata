@@ -21,6 +21,7 @@ import tempfile
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -109,42 +110,62 @@ class InstallConflict(ValueError):
 
 @contextmanager
 def file_lock(path: str, what_if: bool = False):
-    """Lock a persistent sidecar across read, merge, backup and replace.
-
-    Do not unlink lock files: removing one allows two different lock inodes.
-    """
+    """Serialize a transaction, retaining sidecars except for absent no-op targets."""
     if what_if:
         yield
         return
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path + '.pbz-lock', 'a+b') as handle:
-        if os.name == 'nt':
-            import msvcrt
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b'0')
-                handle.flush()
+    path = os.path.realpath(path)
+    parent = os.path.dirname(path)
+    target_absent = not os.path.exists(path)
+    parent_created = not os.path.exists(parent)
+    os.makedirs(parent, exist_ok=True)
+    lock = path + '.pbz-lock'
+    try:
+        handle = open(lock, 'x+b')
+        lock_created = True
+    except FileExistsError:
+        handle = open(lock, 'a+b')
+        lock_created = False
+    try:
+        with handle:
             deadline = time.monotonic() + 60
+            if os.name == 'nt':
+                import msvcrt
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b'0')
+                    handle.flush()
+            else:
+                import fcntl
             while True:
                 try:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    if os.name == 'nt':
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except OSError as error:
                     if time.monotonic() >= deadline:
                         raise InstallConflict(f'{path}: installer lock timeout') from error
                     time.sleep(0.05)
-        else:
-            import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            if os.name == 'nt':
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            try:
+                yield
+            finally:
+                if os.name == 'nt':
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        if target_absent and not os.path.exists(path):
+            if lock_created:
+                os.unlink(lock)
+            if parent_created:
+                try:
+                    os.rmdir(parent)
+                except OSError:
+                    pass
 
 
 def _write_content(handle, text):
@@ -156,12 +177,15 @@ def _write_content(handle, text):
 def atomic_text(path: str, text: str, what_if: bool = False):
     if what_if:
         return
-    directory = os.path.dirname(os.path.abspath(path))
+    path = os.path.realpath(path)
+    directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.tmp-pbz-', dir=directory)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
             _write_content(handle, text)
+        if os.path.exists(path):
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -440,7 +464,7 @@ def merge_codex_toml(text: str, uninstall: bool) -> tuple[str, str]:
         if extras:
             return text, 'SKIP conflict mcp_servers.pbz.' + extras[0] + ' (host-owned key/table)'
     import re
-    header = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*(?:pbz|"pbz")\s*(?:\.[^\]]*)?\]\s*(?:#.*)?$')
+    header = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*(?:pbz|"pbz"|\'pbz\')\s*(?:\s*\.\s*(?:[A-Za-z0-9_-]+|"[^"\n]*"|\'[^\'\n]*\'))*\]\s*(?:#.*)?$')
     lines = text.splitlines(keepends=True)
     keep, section = [], []
     in_ours = False
@@ -481,7 +505,7 @@ def mcp_step(what_if: bool, uninstall: bool) -> list[str]:
             f"{codex_how} [mcp_servers.{MCP_NAME}] -> {CODEX_CONFIG}"]
 
 
-def main() -> int:
+def _main() -> int:
     what_if = "--what-if" in sys.argv
     uninstall = "--uninstall" in sys.argv
     with_mcp = "--mcp" in sys.argv
@@ -507,12 +531,24 @@ def main() -> int:
     if with_mcp or uninstall:
         for line in mcp_step(what_if, uninstall):
             print(" ", line)
+            if line.startswith("SKIP "):
+                skipped = True
+    if skipped and not uninstall:
+        return 1
     if not uninstall:
         print(f"  hook command: {hook_cmd('claude')}")
         if with_mcp:
             print(f"  mcp server: {python_exe()} {' '.join(mcp_args())}  (Claude Code alternative: "
                   f"claude mcp add --scope user {MCP_NAME} -- {python_exe()} {' '.join(mcp_args())})")
     return 0
+
+
+def main() -> int:
+    try:
+        return _main()
+    except InstallConflict as error:
+        print(f'REFUSE {error}')
+        return 1
 
 
 if __name__ == "__main__":

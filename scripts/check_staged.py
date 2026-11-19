@@ -15,7 +15,7 @@ def main():
             compile(path.read_bytes(), str(path.relative_to(tree)), 'exec')
         skill = tree / 'skills/powerbi-zerodata'
         env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}
-        for argv in (['tests/run_offline.py', '--check'], ['tests/test_ci_registration.py']):
+        for argv in (['tests/run_offline.py', '--check'], ['tests/test_ci_registration.py'], ['tests/test_plan_pure.py']):
             subprocess.run([sys.executable, *argv], cwd=skill, env=env, check=True)
     return 0
 

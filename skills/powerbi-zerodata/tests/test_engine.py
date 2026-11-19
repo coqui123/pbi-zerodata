@@ -1263,6 +1263,7 @@ class CanaryScanTests(unittest.TestCase):
                 (folder / 'value.txt').write_text(CAN['canary-strings'][0])
             result = scan([tmp], excluded=[fixture])
             self.assertFalse(result['ok'])
+            self.assertTrue(result['completed'])
             self.assertEqual(len(result['failures']), 1)
             self.assertIn('fixture-output', result['failures'][0]['path'])
 
@@ -1273,30 +1274,57 @@ class CanaryScanTests(unittest.TestCase):
                 raise OSError('injected')
             result = scan([tmp], read=denied)
             self.assertFalse(result['ok'])
+            self.assertTrue(result['completed'])
             self.assertEqual(result['files'], 0)
             self.assertEqual(result['failures'][0]['reason'], 'read error')
 
     def test_missing_root_and_enumeration_error(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertFalse(scan([Path(tmp, 'absent')])['ok'])
+            missing = scan([Path(tmp, 'absent')])
+            self.assertFalse(missing['ok'])
+            self.assertFalse(missing['completed'])
             def broken(root, onerror):
                 onerror(OSError(5, 'injected', str(root)))
                 return []
-            self.assertFalse(scan([tmp], walk=broken)['ok'])
+            result = scan([tmp], walk=broken)
+            self.assertFalse(result['ok'])
+            self.assertFalse(result['completed'])
+            def raised(root, onerror):
+                raise OSError('enumeration failed')
+            self.assertFalse(scan([tmp], walk=raised)['completed'])
 
     def test_canary_fails_shard_without_engine_and_aggregate(self):
+        import copy
+        import ci_equivalence
         import run_offline
-        from ci_equivalence import compare
-        with tempfile.TemporaryDirectory() as tmp, patch.object(run_offline, 'identity', return_value={}):
+        from ci_manifest import MANIFEST, allocate
+        entries = json.loads(MANIFEST.read_text())
+        groups = allocate(entries, 2)
+        identity = {k: 'fixture' for k in ('python', 'os', 'image', 'dotnet', 'dependencies',
+                                         'nuget', 'source', 'project', 'payload')}
+        base = dict(sha='fixture', identity=identity, ok=True, scan=dict(completed=True, ok=True))
+        def rows(entries):
+            return [dict(e, exit_code=0, skip_reasons=[], error=None, failure_reason=None) for e in entries]
+        reference = dict(copy.deepcopy(base), shard='serial', executed=rows(entries))
+        shards = [dict(copy.deepcopy(base), shard=i, executed=rows(group)) for i, group in enumerate(groups)]
+        planted_index = next(i for i, group in enumerate(groups) if all(e['id'] != 'engine-offline' for e in group))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(run_offline, 'identity', return_value=identity), patch.object(run_offline.subprocess, 'check_output', return_value='fixture'):
+            output = Path(tmp, 'output')
+            output.mkdir()
             def child(argv, **kwargs):
-                Path(tmp, 'leak.txt').write_text(CAN['canary-strings'][0])
+                (output / 'leak.txt').write_text(CAN['canary-strings'][0])
                 return subprocess.CompletedProcess(argv, 0)
-            report = run_offline.execute([{'id': 'smoke', 'argv': ['tests/smoke.py']}],
-                                         shard=0, output=tmp, run=child,
-                                         scanner=lambda roots: scan([tmp]))
+            report = run_offline.execute(groups[planted_index], shard=planted_index, output=output,
+                                         run=child, scanner=lambda roots: scan([output]))
             self.assertFalse(report['ok'])
-            with self.assertRaisesRegex(ValueError, 'scan'):
-                compare(dict(report, shard='serial'), [report, dict(report, shard=1)])
+            self.assertTrue(report['scan']['completed'])
+            shards[planted_index] = report
+            evidence = Path(tmp, 'reports')
+            evidence.mkdir()
+            for i, data in enumerate([reference, *shards]):
+                (evidence / f'{i}.json').write_text(json.dumps(data))
+            with patch.object(sys, 'argv', ['ci_equivalence.py', str(evidence)]), self.assertRaisesRegex(ValueError, 'incomplete or failed scan'):
+                ci_equivalence.main()
 
 
 def main() -> int:

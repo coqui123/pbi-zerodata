@@ -44,18 +44,27 @@ def identity():
 def execute(entries, *, shard='serial', output=None, roots=None, run=None, scanner=scan, expected_failures=None):
     output = Path(output or SKILL / 'ci-results')
     output.mkdir(parents=True, exist_ok=True)
-    report = {'schema': 1, 'shard': str(shard), 'executed': [], 'identity': identity(),
-              'sha': (os.environ.get('GITHUB_SHA') or subprocess.check_output(
-                  ['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()), 'cold_cache': os.environ.get('PBZ_CI_COLD_CACHE') == 'true', 'started': time.time()}
+    report = {'schema': 1, 'shard': str(shard), 'executed': [],
+              'cold_cache': os.environ.get('PBZ_CI_COLD_CACHE') == 'true', 'started': time.time()}
+    if os.environ.get('GITHUB_RUN_ID'):
+        report['run'] = {key: os.environ[env] for key, env in
+                         (('id', 'GITHUB_RUN_ID'), ('attempt', 'GITHUB_RUN_ATTEMPT'),
+                          ('workflow', 'GITHUB_WORKFLOW')) if env in os.environ}
     run = subprocess.run if run is None else run
+    logs = []
     try:
+        report['identity'] = identity()
+        report['sha'] = os.environ.get('GITHUB_SHA') or subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
         for entry in entries:
             started = time.monotonic()
             log = output / (entry['id'] + '.log')
-            code, skips, error, reason = -1, [], None, None
+            logs.append(log)
+            code, skips, error, reason, launched = -1, [], None, None, False
             try:
                 with log.open('wb') as handle:
                     result = run([sys.executable, str(SKILL / 'tests/ci_suite.py'), *entry['argv']], cwd=SKILL, stdout=handle, stderr=subprocess.STDOUT)
+                launched = True
                 code = result.returncode
                 text = log.read_text(encoding='utf-8', errors='replace')
                 skips = [line.strip() for line in text.splitlines() if re.match(r'^(?:PBZ_SKIP |SKIP\b)', line)]
@@ -66,15 +75,21 @@ def execute(entries, *, shard='serial', output=None, roots=None, run=None, scann
             except Exception as exc:
                 error = type(exc).__name__
             row = {'id': entry['id'], 'argv': entry['argv'], 'exit_code': code,
-                   'skip_reasons': skips, 'error': error, 'failure_reason': reason, 'seconds': time.monotonic() - started}
+                   'windows': entry.get('windows', False), 'engine': entry.get('engine', False),
+                   'launched': launched, 'skip_reasons': skips, 'error': error, 'failure_reason': reason, 'seconds': time.monotonic() - started}
             report['executed'].append(row)
             # Case counts deliberately excluded: standalone scripts have incompatible counters.
             print('PBZ_SUITE ' + redact(json.dumps(row)), flush=True)
+    except Exception as exc:
+        report['error'] = type(exc).__name__
     finally:
         report['scan'] = scanner([ROOT, output, *(roots or [])])
         report['finished'] = time.time()
         report['ok'] = (len(report['executed']) == len(entries) and
-                        all(r['exit_code'] == 0 for r in report['executed']) and report['scan']['ok'])
+                        not report.get('error') and
+                        all(r['exit_code'] == 0 and r['error'] is None for r in report['executed']) and report['scan']['ok'])
+        for log in logs:
+            log.unlink(missing_ok=True)
     return report
 
 

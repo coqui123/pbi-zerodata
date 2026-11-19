@@ -32,3 +32,5 @@ _r*.md
 pbz-r*.md
 docs/round-*-plan.md
 *Feature Research and Implementation Plan.md
+
+ci-results/
