@@ -38,6 +38,9 @@ def _long_existing(path: str) -> str:
     if os.name != "nt" or not re.search(r"~\d", path):
         return path
     raw = re.sub(r"[\\/]+", r"\\", path)
+    trailing_slash = raw.endswith("\\") and not re.fullmatch(r"[A-Za-z]:\\", raw)
+    if trailing_slash:
+        raw = raw.rstrip("\\")
     probe = raw
     tail: list[str] = []
     while True:
@@ -68,6 +71,8 @@ def _long_existing(path: str) -> str:
             out = out[4:]
     for name in reversed(tail):
         out = os.path.join(out, name)
+    if trailing_slash:
+        out = out + "\\"
     return out
 
 
