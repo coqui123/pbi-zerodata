@@ -743,8 +743,9 @@ def probe(ws, project, table: str, columns: list[str] | None) -> dict:
         return {"verb": "probe", "status": "BUDGET", "note": "daily probe budget reached; the user can reset it"}
     port = desktop.require_port(project)
     req = {"private_dir": ws.private, "port": port, "table": table, "disclosure": pol.get("disclosure", "shape")}
-    if columns:
-        req["columns"] = columns
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
+    known = [c.name for t in model.tables.values() if t.name == table for c in t.columns.values()]
+    req["columns"] = columns or known
     res = engine_call("probe", req, timeout=300)
     if not res.get("ok"):
         raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
@@ -821,6 +822,7 @@ def _index(ws, project) -> dict:
             if "class" in info:
                 col["class"] = info["class"]
     from . import index_store
+    res["project"] = project.name
     index_store.publish(ws.private, project.name, res)
     cols = [c for t in res.get("tables", []) for c in t.get("columns", [])]
     return {"verb": "index", "project": project.name, "tables": len(res.get("tables", [])), "columns": len(cols),

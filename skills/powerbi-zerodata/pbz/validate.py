@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+from collections import Counter
 
 from . import daxcatalog, deps, lint, pbir, pbircheck, tmdl
 from .classify import PII_IN_TEXT
@@ -62,6 +63,25 @@ def _diagnostics(data) -> list[dict]:
     return out
 
 
+def diagnostic_counts(findings):
+    """Full diagnostic identity, including object location, with multiplicities."""
+    return Counter(json.dumps(f, sort_keys=True, ensure_ascii=False) for f in findings)
+
+
+def validator_ran(findings):
+    unavailable = {"REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"}
+    return not any(f.get("code") in unavailable for f in findings)
+
+
+def invalid_control_rejected(findings):
+    # The control removes page.displayName. Require that exact schema failure,
+    # rather than treating an unavailable validator or unrelated error as rejection.
+    return validator_ran(findings) and any(
+        f.get("severity") == "error" and "displayName" in f.get("message", "")
+        and "required" in f.get("message", "").lower()
+        and "page.json" in f.get("where", "") for f in findings)
+
+
 def report_author(stage: str, project, scrub) -> list[dict]:
     rdir = os.path.join(stage, project.name + ".Report")
     if not os.path.isdir(rdir):
@@ -72,8 +92,8 @@ def report_author(stage: str, project, scrub) -> list[dict]:
                  [REPORT_AUTHOR, "validate", rdir, "--no-schema", "--format", "json"]):
         try:
             p = subprocess.run(args, capture_output=True, timeout=600)
-        except subprocess.SubprocessError:
-            continue
+        except (subprocess.SubprocessError, OSError):
+            return [{"severity": "error", "code": "REPORT_VALIDATOR_FAILED", "where": "report", "message": "could not run"}]
         try:
             data = json.loads(p.stdout.decode("utf-8", errors="replace") or "{}")
         except ValueError:

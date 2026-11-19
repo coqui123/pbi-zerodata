@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,7 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 import test_parity  # noqa: E402
-from pbz import checks, cli, common, describe, dpapi, index_store, mcp, memory, mirror, policy  # noqa: E402
+from pbz import checks, cli, common, describe, dpapi, engine, index_store, mcp, memory, mirror, policy  # noqa: E402
 
 SENTINEL = "SECRET_ENGINE_SENTINEL_9f3a"
 
@@ -122,6 +123,47 @@ class MemoryDisclosureTests(unittest.TestCase):
         for read in paths:
             self.assertNotIn("_bucket", json.dumps(read()))
 
+    def test_probe_defaults_to_mirror_columns_and_preserves_flags(self):
+        def probe_engine(verb, payload, timeout=30):
+            self.assertEqual(verb, "probe")
+            self.assertEqual(payload["disclosure"], "strict")
+            self.assertIn("Comment", payload["columns"])
+            return engine._project(verb, {"ok": True, "verb": "probe", "table": "Sales", "rows_bucket": "1-9",
+                "columns": [{"column": "Comment", "type": "string", "has_blanks": True, "card_bucket": "1-9"},
+                            {"column": SENTINEL, "type": "string", "has_blanks": False}]}, payload)
+        with patch("pbz.checks.engine_call", probe_engine), patch("pbz.checks.desktop.require_port", return_value=1), \
+                patch("pbz.checks.spend", return_value=True):
+            out = checks.probe(self.ws, self.project, "Sales", None)
+        self.assertEqual(out["columns"], [{"column": "Comment", "type": "string", "has_blanks": True}])
+        self.assertNotIn("_bucket", json.dumps(out))
+        self.assertNotIn(SENTINEL, json.dumps(out))
+
+    def test_summary_is_project_bound_on_every_describe_path(self):
+        pol = policy.load(self.ws)
+        pol["disclosure"] = "shape"
+        policy.save(self.ws, pol)
+        dpapi.load_key(self.ws.private)
+        with open(os.path.join(self.ws.private, "index.json"), "w") as handle:
+            json.dump({"columns": {}}, handle)
+        dpapi.write_protected(os.path.join(self.ws.private, "categories.bin"), b"{}")
+        summary = {"project": self.project.name, "tables": [{"table": "Sales", "rows_bucket": "10-99", "columns": [
+            {"column": "Comment", "card_bucket": "10-99"}]}]}
+        index_store.publish(self.ws.private, self.project.name, summary)
+        self.assertIn("Sales", describe._index_summary(self.ws, self.project))
+        other = common.Project(self.ws, "Other")
+        shutil.copytree(self.project.mirror_model, other.mirror_model)
+        shutil.copytree(self.project.mirror_report, other.mirror_report)
+        paths = (lambda p: describe.overview(self.ws, p),
+                 lambda p: describe.describe(self.ws, p, "Sales"),
+                 lambda p: describe.describe(self.ws, p, "Sales[Comment]"),
+                 lambda p: describe.values(self.ws, p, "Sales[Comment]"))
+        for read in paths:
+            self.assertIn("_bucket", json.dumps(read(self.project)))
+            self.assertNotIn("_bucket", json.dumps(read(other)))
+        for legacy in ({"tables": summary["tables"]}, {**summary, "project": "Other"}):
+            index_store.publish(self.ws.private, self.project.name, legacy)
+            self.assertEqual(describe._index_summary(self.ws, self.project), {})
+
     def test_summary_malformed_entries_and_shared_recursive_stripper(self):
         dpapi.load_key(self.ws.private)
         with open(os.path.join(self.ws.private, "index.json"), "w") as handle:
@@ -131,8 +173,9 @@ class MemoryDisclosureTests(unittest.TestCase):
                 {"table": "Sales", "rows_bucket": "1-9", "columns": [None, 5, {},
                  {"column": "Comment", "card_bucket": "1-9", "nested": [{"custom_bucket": "1-9"}]}]}]}):
             with self.subTest(summary=malformed):
-                index_store.publish(self.ws.private, self.project.name, malformed)
-                out = describe._index_summary(self.ws)
+                index_store.publish(self.ws.private, self.project.name,
+                                    {**malformed, "project": self.project.name} if isinstance(malformed, dict) else malformed)
+                out = describe._index_summary(self.ws, self.project)
                 self.assertNotIn("_bucket", json.dumps(out))
                 if "Sales" in out:
                     self.assertEqual(len(out["Sales"]["columns"]), 1)

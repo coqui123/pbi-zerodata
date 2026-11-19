@@ -15,6 +15,7 @@ Every settings file it edits is backed up first.
 from __future__ import annotations
 
 import datetime as dt
+import tempfile
 import json
 import os
 import shutil
@@ -61,7 +62,7 @@ read them only through the consent broker. Real model/report/cache/private paths
 
 
 def stamp() -> str:
-    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
 def python_exe() -> str:
@@ -87,7 +88,9 @@ def _refuse_spaced_paths() -> None:
 
 def backup(path: str, what_if: bool) -> None:
     if os.path.exists(path) and not what_if:
-        shutil.copy2(path, f"{path}.bak-pbz-{stamp()}")
+        fd, dest = tempfile.mkstemp(prefix=os.path.basename(path) + ".bak-pbz-" + stamp() + "-", dir=os.path.dirname(path))
+        os.close(fd)
+        shutil.copy2(path, dest)
 
 
 def load_json(path: str) -> dict:
@@ -114,34 +117,106 @@ def is_ours(entry: dict) -> bool:
                for h in entry.get("hooks", []))
 
 
-def merge_hooks(data: dict, agent: str, uninstall: bool) -> dict:
+def merge_hooks(data: dict, agent: str, uninstall: bool, owned: dict | None = None) -> dict:
+    owned = owned if owned is not None else {}
+    rec = owned.get("hooks", {})
+    if uninstall:
+        hooks = data.get("hooks", {})
+        for addition in rec.get("additions", []):
+            event, child = addition["event"], addition["child"]
+            entries = hooks.get(event, [])
+            for entry in reversed(entries):
+                children = entry.get("hooks", [])
+                if child in children:
+                    children.remove(child)
+                    if not children and entry == addition["shell"]:
+                        entries.remove(entry)
+                    break
+            if not entries and event in rec.get("events", []):
+                hooks.pop(event, None)
+        if not hooks and rec.get("container"):
+            data.pop("hooks", None)
+        owned.pop("hooks", None)
+        return data
+    if not rec:
+        rec = {"container": "hooks" not in data, "events": [], "additions": []}
+        owned["hooks"] = rec
     hooks = data.setdefault("hooks", {})
     for event, matcher in (("PreToolUse", ".*"), ("SessionStart", None)):
-        entries = [e for e in hooks.get(event, []) if not is_ours(e)]
-        if not uninstall:
-            entry = {"hooks": [{"type": "command", "command": hook_cmd(agent), "timeout": 15}]}
-            if matcher:
-                entry = {"matcher": matcher, **entry}
-            entries.append(entry)
-        if entries:
-            hooks[event] = entries
+        child = {"type": "command", "command": hook_cmd(agent), "timeout": 15}
+        # Existing children, including mixed groups, belong to the host.
+        if any(child in e.get("hooks", []) for e in hooks.get(event, [])):
+            continue
+        if event not in hooks:
+            rec["events"].append(event)
+        entry = {"hooks": [child]}
+        if matcher:
+            entry["matcher"] = matcher
+        hooks.setdefault(event, []).append(entry)
+        rec["additions"].append({"event": event, "child": child,
+                                  "shell": {**entry, "hooks": []}})
+    if not rec["additions"]:
+        owned.pop("hooks", None)
+    return data
+
+
+def merge_denies(data: dict, uninstall: bool, owned: dict | None = None) -> dict:
+    owned = owned if owned is not None else {}
+    rec = owned.get("denies", {})
+    if uninstall:
+        perms = data.get("permissions", {})
+        deny = perms.get("deny", [])
+        for rule in rec.get("additions", []):
+            if rule in deny:
+                deny.remove(rule)
+        if not deny and rec.get("list"):
+            perms.pop("deny", None)
+        if not perms and rec.get("container"):
+            data.pop("permissions", None)
+        owned.pop("denies", None)
+        return data
+    if not rec:
+        rec = {"container": "permissions" not in data,
+               "list": "deny" not in data.get("permissions", {}), "additions": []}
+        owned["denies"] = rec
+    deny = data.setdefault("permissions", {}).setdefault("deny", [])
+    for rule in DENY_RULES:
+        if rule not in deny:
+            deny.append(rule)
+            rec["additions"].append(rule)
+    if not rec["additions"]:
+        owned.pop("denies", None)
+    return data
+
+
+def settings_step(path: str, agent: str, what_if: bool, uninstall: bool, denies: bool = False) -> bool:
+    """Ownership covers hook children and deny rules only; absent records remove nothing."""
+    record_path = path + ".pbz-owned.json"
+    existed = os.path.exists(path)
+    before = load_json(path)
+    previous = load_json(record_path)
+    owned = json.loads(json.dumps(previous))
+    new = merge_hooks(json.loads(json.dumps(before)), agent, uninstall, owned)
+    if denies:
+        new = merge_denies(new, uninstall, owned)
+    created_file = previous.get("created_file", False)
+    if uninstall:
+        owned.pop("created_file", None)
+    elif not existed and new != before:
+        owned["created_file"] = True
+    if new != before:
+        backup(path, what_if)
+        if uninstall and created_file and not new:
+            if not what_if:
+                os.remove(path)
         else:
-            hooks.pop(event, None)
-    if not hooks:
-        data.pop("hooks", None)
-    return data
-
-
-def merge_denies(data: dict, uninstall: bool) -> dict:
-    perms = data.setdefault("permissions", {})
-    deny = [d for d in perms.get("deny", []) if d not in DENY_RULES]
-    if not uninstall:
-        deny += DENY_RULES
-    if deny:
-        perms["deny"] = deny
-    else:
-        perms.pop("deny", None)
-    return data
+            save_json(path, new, what_if)
+    if owned != previous and not what_if:
+        if owned:
+            save_json(record_path, owned, False)
+        elif os.path.exists(record_path):
+            os.remove(record_path)
+    return new != before
 
 
 def junction(link: str, what_if: bool, uninstall: bool) -> str:
@@ -297,23 +372,8 @@ def main() -> int:
     if skipped and not uninstall:
         return 1
 
-    data = load_json(CLAUDE_SETTINGS)
-    new = merge_denies(merge_hooks(json.loads(json.dumps(data)), "claude", uninstall), uninstall)
-    if new != data:
-        backup(CLAUDE_SETTINGS, what_if)
-        save_json(CLAUDE_SETTINGS, new, what_if)
-        print(f"  hooks + deny rules -> {CLAUDE_SETTINGS}")
-    else:
-        print(f"  ok {CLAUDE_SETTINGS}")
-
-    data = load_json(CODEX_HOOKS)
-    new = merge_hooks(json.loads(json.dumps(data)), "codex", uninstall)
-    if new != data:
-        backup(CODEX_HOOKS, what_if)
-        save_json(CODEX_HOOKS, new, what_if)
-        print(f"  hooks -> {CODEX_HOOKS}  (trust them once in Codex with /hooks)")
-    else:
-        print(f"  ok {CODEX_HOOKS}")
+    settings_step(CLAUDE_SETTINGS, "claude", what_if, uninstall, denies=True)
+    settings_step(CODEX_HOOKS, "codex", what_if, uninstall)
 
     for path in RULE_FILES:
         print(" ", rule_block(path, what_if, uninstall))

@@ -10,16 +10,16 @@ from .classify import Classifier
 from .common import PbzError, read_text_checked, list_names
 
 
-def _index_summary(ws) -> dict:
+def _index_summary(ws, project=None) -> dict:
     from . import index_store, memory
-    stored = index_store.load(ws.private)
+    stored = index_store.load(ws.private, project.name if project else None)
     if stored is None:
         return {}
     try:
         data = json.loads(stored["index-summary.json"])
     except (ValueError, UnicodeError):
         return {}
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or project is None or data.get("project") != project.name:
         return {}
     if policy_mod.load(ws).get("disclosure", "shape") != "shape":
         data = memory._strip_bands(data)
@@ -92,7 +92,7 @@ def overview(ws, project) -> dict:
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
-    summ = _index_summary(ws)
+    summ = _index_summary(ws, project)
     pages_dir = os.path.join(project.mirror_report, "definition", "pages")
     pages = []
     if os.path.isdir(pages_dir):
@@ -119,7 +119,7 @@ def describe(ws, project, target: str | None) -> dict:
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     clf = Classifier(tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model)), ws.private, policy_mod.load(ws), project.name)
-    summ = _index_summary(ws)
+    summ = _index_summary(ws, project)
     usage = field_usage(project, model)
     kind, table, name = _parse_target(target)
     if kind == "name" and name in model.tables:
@@ -196,7 +196,7 @@ def values(ws, project, column: str) -> dict:
     if vals is not None:
         out["values"] = vals
     else:
-        info = next((c for c in _index_summary(ws).get(table, {}).get("columns", []) if c.get("column") == name), {})
+        info = next((c for c in _index_summary(ws, project).get(table, {}).get("columns", []) if c.get("column") == name), {})
         if "card_bucket" in info:
             out["distinct_bucket"] = info["card_bucket"]
         tm = tokens.TokenMap(ws.private)

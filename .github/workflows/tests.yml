@@ -90,6 +90,34 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failed += "engine-offline" }
           if ($failed.Count) { throw "failed: $($failed -join ', ')" }
 
+  vendor-validator:
+    # Required on every PR/push. Configure this job as a required branch check.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skills/powerbi-zerodata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Build engine for mirror push validation
+        run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install locked vendor validator
+        run: npm ci --prefix tools
+      - name: Copy parity and invalid control (validator required)
+        run: |
+          python tests/test_components.py --require-validator
+          if ($LASTEXITCODE -ne 0) { throw "required vendor validator acceptance failed" }
+
   live-synth:
     if: github.event_name == 'workflow_dispatch' && inputs.live_synth
     runs-on: [self-hosted, Windows, pbz-desktop]

@@ -181,6 +181,8 @@ def main() -> int:
     text2, how = inst.merge_codex_toml(text, True)
     check(how == "removed" and "[mcp_servers.pbz]" not in text2 and "[mcp_servers.other]" in text2, f"codex remove: {how}")
     check(inst.merge_codex_toml(toml_in, True) == (toml_in, "absent"), "codex uninstall touched an absent entry")
+    installer_ownership_checks(check, tmp, inst)
+
     home = os.path.join(tmp, "home")
     os.makedirs(home)
     henv = {**os.environ, "USERPROFILE": home, "HOME": home}
@@ -197,5 +199,69 @@ def main() -> int:
     return 1 if fails else 0
 
 
+
+def installer_ownership_checks(check, tmp, inst):
+    # Hook/deny ownership is independent of MCP registration.
+    settings = os.path.join(tmp, "owned-settings.json")
+    host = {"type": "command", "command": "host-hook"}
+    ours = {"type": "command", "command": inst.hook_cmd("claude"), "timeout": 15}
+    originals = [{}, {"permissions": {}}, {"permissions": {"deny": []}},
+                 {"hooks": {}}, {"hooks": {"PreToolUse": []}},
+                 {"permissions": {"deny": [inst.DENY_RULES[1], "host", inst.DENY_RULES[0]]},
+                  "hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [host, ours]}]}}]
+    for original in originals:
+        inst.save_json(settings, original, False)
+        check(inst.settings_step(settings, "claude", False, False, True), "install added nothing")
+        installed = inst.load_json(settings)
+        if original.get("hooks", {}).get("PreToolUse"):
+            check(installed["hooks"]["PreToolUse"][0] == original["hooks"]["PreToolUse"][0], "mixed host hooks changed")
+        before = os.stat(settings).st_mtime_ns
+        check(not inst.settings_step(settings, "claude", False, False, True), "reinstall changed settings")
+        check(os.stat(settings).st_mtime_ns == before, "reinstall wrote unchanged settings")
+        inst.settings_step(settings, "claude", False, True, True)
+        check(inst.load_json(settings) == original, f"uninstall lost host settings: {original}")
+    os.remove(settings)
+    check(not inst.settings_step(settings, "claude", False, True, True) and not os.path.exists(settings),
+          "uninstall created absent settings")
+    inst.settings_step(settings, "claude", False, False, True)
+    inst.settings_step(settings, "claude", False, True, True)
+    check(not os.path.exists(settings), "installer-created settings file remained empty")
+    inst.save_json(settings, {"permissions": {"deny": inst.DENY_RULES[:]}}, False)
+    before = os.stat(settings).st_mtime_ns
+    check(not inst.settings_step(settings, "claude", False, True, True), "missing ownership removed denies")
+    check(os.stat(settings).st_mtime_ns == before, "missing ownership wrote settings")
+    identical = {"permissions": {"deny": inst.DENY_RULES[:]}, "hooks": {
+        "PreToolUse": [{"matcher": ".*", "hooks": [ours, host]}],
+        "SessionStart": [{"hooks": [ours]}]}}
+    inst.save_json(settings, identical, False)
+    before = os.stat(settings).st_mtime_ns
+    check(not inst.settings_step(settings, "claude", False, False, True), "identical install changed settings")
+    check(os.stat(settings).st_mtime_ns == before and not os.path.exists(settings + ".pbz-owned.json"),
+          "identical install wrote files")
+    inst.settings_step(settings, "claude", False, True, True)
+    check(inst.load_json(settings) == identical, "unowned identical settings removed")
+    inst.save_json(settings, {"permissions": {"deny": [inst.DENY_RULES[0]]}}, False)
+    inst.settings_step(settings, "claude", False, False, True)
+    os.remove(settings + ".pbz-owned.json")
+    installed = inst.load_json(settings)
+    inst.settings_step(settings, "claude", False, True, True)
+    check(inst.load_json(settings) == installed, "missing ownership failed safe preservation")
+    inst.backup(settings, False)
+    inst.backup(settings, False)
+    check(len([n for n in os.listdir(tmp) if n.startswith("owned-settings.json.bak-pbz-")]) >= 2,
+          "backups collided")
+
+
 if __name__ == "__main__":
+    if "--installer-ownership" in sys.argv:
+        spec = importlib.util.spec_from_file_location("pbz_install", os.path.join(SKILL, "install", "install.py"))
+        inst = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inst)
+        failures = []
+        with tempfile.TemporaryDirectory() as tmp:
+            installer_ownership_checks(lambda ok, msg: failures.append(msg) if not ok else None, tmp, inst)
+        for failure in failures:
+            print("FAIL", failure)
+        print("ok (installer ownership fixtures)" if not failures else f"{len(failures)} failure(s)")
+        sys.exit(bool(failures))
     sys.exit(main())
