@@ -26,7 +26,7 @@ import re
 import stat
 
 from . import lexers, synth, tmdl
-from .common import PbzError, commit_bytes, pbz_state_path, preflight_regular, read_checked, read_text, write_text
+from .common import PbzError, commit_bytes, pbz_state_path, preflight_regular, read_checked, read_text, write_text, list_names
 
 DIR = (".pbz", "synth-tests")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$")
@@ -653,7 +653,7 @@ def list_(ws) -> dict:
     from .common import _reparse_link
     tests = []
     d = _dir(ws)
-    names = sorted(os.listdir(d)) if os.path.isdir(d) and not _reparse_link(d) else []
+    names = sorted(list_names(d)) if os.path.isdir(d) and not _reparse_link(d) else []
     for f in names:
         if not f.endswith(".json"):
             continue

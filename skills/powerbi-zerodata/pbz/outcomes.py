@@ -15,7 +15,7 @@ def _exec_error(value) -> bool:
 
 
 def _row_failed(row: dict) -> bool:
-    return (row.get("status") in {"FAIL", "ERROR", "PROTOCOL_ERROR"} or row.get("result") in {"DIFF", "ERROR"}
+    return (row.get("status") in {"FAIL", "ERROR", "PROTOCOL_ERROR"} or row.get("result") in {"FAIL", "DIFF", "ERROR"}
             or _exec_error(row.get("result")) or _exec_error(row.get("status")))
 
 
@@ -68,10 +68,17 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
             status, code, rc = "FAILED", code if _exec_error(code) else "ASSERTION_FAILED", 1
     elif out.get("ok") is False or out.get("error"):
         status, rc = "FAILED", 2
+    elif out.get("status") == "PROTOCOL_ERROR":
+        status, code, rc = "FAILED", "ASSERTION_FAILED", 1
     elif out.get("gate") == "FAIL":
         status, code, rc = "FAILED", "GATE_FAILED", 1
     elif any(f.get("severity") == "error" for f in out.get("findings", []) if isinstance(f, dict)):
         status, code, rc = "INVALID", "VALIDATION_FAILED", 2
+    elif out.get("status") == "FAIL" or out.get("result") in {"DIFF", "FAIL"}:
+        if diagnostic:
+            status, code, rc = "FINDINGS", "DIAGNOSTIC_FINDINGS", 0
+        else:
+            status, code, rc = "FAILED", "ASSERTION_FAILED", 1
     elif assertions:
         status, code, rc = ("FINDINGS", "DIAGNOSTIC_FINDINGS", 0) if diagnostic else ("FAILED", "ASSERTION_FAILED", 1)
     elif _smoke_incomplete(out) or any(

@@ -9,7 +9,7 @@ import os
 import re
 
 from . import lexers, pbir, tmdl, usage
-from .common import PbzError, commit_bytes, file_sha, read_checked, read_text, sha
+from .common import PbzError, commit_bytes, file_sha, read_checked, read_text, sha, list_names, refuse_below
 from .usage import key
 
 KIND_ORDER = ["table", "column", "measure", "hierarchy", "calc_item", "relationship", "m_query", "function",
@@ -20,8 +20,12 @@ _STAMP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 def _index_summary(ws) -> dict:
     path = os.path.join(ws.private, "index-summary.json")
-    if not os.path.lexists(path):
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
         return {}
+    except OSError:
+        raise PbzError("REFUSED", "index summary is unreadable") from None
     try:
         data = json.loads(read_checked(path, root=ws.private).decode("utf-8"))
     except PbzError:
@@ -39,13 +43,21 @@ def translated(project) -> set[tuple]:
         return set()  # translations are pruned in the mirror together with the object
     out = set()
     cdir = os.path.join(project.model_dir, "definition", "cultures")
-    for f in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
+    # The semantic model is the trust root. A junction at definition is below it.
+    refuse_below(cdir, project.model_dir)
+    for f in sorted(list_names(cdir)) if os.path.isdir(cdir) else []:
         if not f.lower().endswith(".tmdl"):
             continue
+        path = os.path.join(cdir, f)
         try:
-            doc = tmdl.parse(f, read_text(os.path.join(cdir, f))[0])
+            raw = read_checked(path, root=project.model_dir)
+            if raw.startswith(b"\xef\xbb\xbf"):
+                raw = raw[3:]
+            doc = tmdl.parse(f, raw.decode("utf-8"))
+        except PbzError:
+            raise
         except (OSError, UnicodeDecodeError):
-            continue
+            raise PbzError("REFUSED", "a culture file could not be read") from None
         for n in doc.nodes:
             if n.kind in ("measure", "column", "hierarchy") and n.parent is not None and n.parent.kind == "table":
                 out.add(key(n.kind, n.parent.name, n.name))
@@ -683,6 +695,8 @@ def _plan_report(ws, project, g, todo, rep, out: dict) -> None:
         if what.get("bookmark"):
             ids = what["bookmark"]
             for bid in ids:
+                if not isinstance(bid, str) or not bid or bid in (".", "..") or "/" in bid or "\\" in bid or "\x00" in bid:
+                    continue
                 rel = f"bookmarks/{bid}.bookmark.json"
                 if os.path.exists(os.path.join(ddir, *rel.split("/"))):
                     out[base + rel] = None

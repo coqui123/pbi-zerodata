@@ -7,7 +7,7 @@ import json
 import os
 
 from . import pbir, tmdl
-from .common import PbzError, commit_bytes, read_definition_text
+from .common import PbzError, commit_bytes, read_definition_text, list_names
 
 
 def _rel(ws, path: str) -> str:
@@ -104,7 +104,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
         writes[path] = (_dump(data, old_text), bom)
 
     pdir = os.path.join(ddir, "pages")
-    page_ids = sorted(d for d in os.listdir(pdir) if os.path.isfile(os.path.join(pdir, d, "page.json"))) \
+    page_ids = sorted(d for d in list_names(pdir) if os.path.isfile(os.path.join(pdir, d, "page.json"))) \
         if os.path.isdir(pdir) else []
     visuals: dict[str, set] = {}
     model = tmdl.load_model(os.path.join(project.mirror_model, "definition")) if fields else None
@@ -119,7 +119,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
             changed = True
             fix("PAGE_NAME_MISMATCH", f"pages/{pid}/page.json", "name set to the folder name")
         vdir = os.path.join(pdir, pid, "visuals")
-        vids = sorted(d for d in os.listdir(vdir) if os.path.isfile(os.path.join(vdir, d, "visual.json"))) \
+        vids = sorted(d for d in list_names(vdir) if os.path.isfile(os.path.join(vdir, d, "visual.json"))) \
             if os.path.isdir(vdir) else []
         visuals[pid] = set(vids)
         groups = set()
@@ -188,7 +188,7 @@ def run(ws, project, dry_run: bool = False, fields: bool = False, lineage: bool 
             stage(mp, meta, mtext, mbom)
     bdir = os.path.join(ddir, "bookmarks")
     if os.path.isdir(bdir):
-        files = sorted(f[:-len(".bookmark.json")] for f in os.listdir(bdir) if f.endswith(".bookmark.json"))
+        files = sorted(f[:-len(".bookmark.json")] for f in list_names(bdir) if f.endswith(".bookmark.json"))
         bp = os.path.join(bdir, "bookmarks.json")
         bm, btext, bbom = _load(ws, bp)
         if isinstance(bm, dict):

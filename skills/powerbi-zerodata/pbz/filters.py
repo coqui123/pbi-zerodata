@@ -19,7 +19,7 @@ import secrets
 from datetime import datetime as _dt
 
 from . import author, tmdl
-from .common import PbzError, commit_bytes, read_text_checked
+from .common import PbzError, commit_bytes, read_text_checked, list_names, walk_tree
 from .tokens import TOKEN_RE
 
 OPS = {"=": 0, "==": 0, ">": 1, ">=": 2, "<": 3, "<=": 4}
@@ -176,7 +176,7 @@ def _strict_docs(project) -> None:
     ddir = os.path.join(project.mirror_report, "definition")
     if not os.path.isdir(ddir):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    for cur, _d, fs in os.walk(ddir):
+    for cur, _d, fs in walk_tree(ddir):
         for name in fs:
             if name not in ("report.json", "page.json", "visual.json"):
                 continue
@@ -216,7 +216,7 @@ def _scope_file(project, page: str | None, visual: str | None, report: bool) -> 
         t = targets(project, page, visual, None, False)[0]
         return t["path"], f"visual {t['id']}"
     pdir = os.path.join(ddir, "pages")
-    for pid in sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []:
+    for pid in sorted(list_names(pdir)) if os.path.isdir(pdir) else []:
         pj = os.path.join(pdir, pid, "page.json")
         if not os.path.isfile(pj):
             continue
@@ -229,7 +229,7 @@ def _scope_file(project, page: str | None, visual: str | None, report: bool) -> 
 def _all_filter_names(project) -> set:
     names = set()
     ddir = os.path.join(project.mirror_report, "definition")
-    for cur, _d, fs in os.walk(ddir):
+    for cur, _d, fs in walk_tree(ddir):
         for f in fs:
             if f in ("report.json", "page.json", "visual.json"):
                 try:
@@ -324,7 +324,7 @@ def list_(ws, project, page: str | None = None, visual: str | None = None, repor
     if not (page or visual or report):
         scopes = []
         ddir = os.path.join(project.mirror_report, "definition")
-        for cur, _d, fs in os.walk(ddir):
+        for cur, _d, fs in walk_tree(ddir):
             for f in sorted(fs):
                 if f in ("report.json", "page.json", "visual.json"):
                     p = os.path.join(cur, f)

@@ -5,6 +5,8 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from .common import walk_tree
+
 
 
 # ---------------------------------------------------------------- span-preserving JSON
@@ -487,7 +489,7 @@ def string_nodes(root) -> list[tuple[str, JStr]]:
 def report_files(report_dir: str) -> list[str]:
     out = []
     base = os.path.join(report_dir, "definition")
-    for cur, _dirs, files in os.walk(base):
+    for cur, _dirs, files in walk_tree(base):
         for f in files:
             if f.lower().endswith(".json"):
                 out.append(os.path.join(cur, f))

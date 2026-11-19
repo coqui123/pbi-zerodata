@@ -15,7 +15,7 @@ from . import desktop, policy as policy_mod, tmdl, tokens, validate
 from .classify import Classifier
 from .common import (PbzError, Project, Workspace, _contained, _reparse_link, anchor_mirror, append_checked,
                     commit_bytes, file_sha, pbz_state_path, preflight_regular, read_checked, read_text, read_text_checked, remove_file,
-                    replace_bytes, sha, write_text)
+                    replace_bytes, sha, write_text, list_names, walk_tree)
 
 SKIP_DIRS = {".pbi", "daxqueries", "tmdlscripts", "customvisuals", "node_modules"}  # cultures: mirrored, see tokens
 JSON_EXT = (".json", ".pbir", ".pbism", ".platform")
@@ -78,6 +78,8 @@ def _path_outside_project(path: str, rel: str, ws: Workspace, project: Project) 
 def _scope(base: str, kind: str) -> list[str]:
     """Relative paths (forward slashes) of mirrored files under a .SemanticModel / .Report folder."""
     out = []
+    if _reparse_link(base):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     if not os.path.isdir(base):
         return out
     for cur, dirs, files in os.walk(base):
@@ -187,6 +189,8 @@ def _post_mirror_hash(ws, rel: str) -> str | None:
 def mirror_changes(ws: Workspace, project: Project, man: dict, *, checked: bool = False) -> dict:
     if checked:
         anchor_mirror(ws)
+    elif _reparse_link(ws.mirror):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     files = man.get("files", {})
     changed, added, deleted = [], [], []
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
@@ -233,6 +237,8 @@ def excluded_mirror_additions(ws: Workspace, project: Project) -> list[str]:
     that are themselves excluded are reported. Nothing inside a blocked alias is.
     """
     found = []
+    if _reparse_link(ws.mirror):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
     for cur, dirs, files in os.walk(ws.mirror, followlinks=False):
         blocked = []
@@ -637,7 +643,7 @@ def pending_recovery(ws, project) -> list[dict]:
     directory = _transaction_dir(ws, project)
     if _reparse_link(directory):
         return [{"id": project.name, "state": "UNREADABLE"}]
-    for name in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
+    for name in sorted(list_names(directory)) if os.path.isdir(directory) else []:
         child = os.path.join(directory, name)
         if _reparse_link(child):
             out.append({"id": name, "state": "UNREADABLE"})
@@ -668,7 +674,7 @@ def _journal_save(directory, journal):
 
 def _tree_files(directory):
     return {os.path.relpath(os.path.join(cur, name), directory).replace("\\", "/")
-            for cur, _dirs, files in os.walk(directory) for name in files}
+            for cur, _dirs, files in walk_tree(directory) for name in files}
 
 
 def _must_stay(path: str, root: str | None) -> None:
@@ -796,6 +802,9 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
         return {"verb": "recover", "result": "RECOVERY_REQUIRED",
                 "transactions": [{"id": project.name, "result": "RECOVERY_REQUIRED"}]}
     lock = os.path.join(directory, ".commit-lock")
+    if _reparse_link(lock):
+        return {"verb": "recover", "result": "RECOVERY_REQUIRED",
+                "transactions": [{"id": project.name, "result": "RECOVERY_REQUIRED"}]}
     stale_lock = False
     if os.path.exists(lock):
         try:
@@ -1156,7 +1165,7 @@ def _prune_empty(path: str, stop: str) -> None:
     """Remove the folders a deleted file leaves empty (a deleted visual's folder), up to `stop`."""
     stop = os.path.normcase(os.path.abspath(stop))
     d = os.path.dirname(os.path.abspath(path))
-    while os.path.normcase(d).startswith(stop + os.sep) and os.path.isdir(d) and not os.listdir(d):
+    while os.path.normcase(d).startswith(stop + os.sep) and os.path.isdir(d) and not list_names(d):
         os.rmdir(d)
         d = os.path.dirname(d)
 
@@ -1175,6 +1184,7 @@ def revert(ws: Workspace, project: Project, paths: list[str] | None = None, obj:
     readable = []
     for rel in ch["changed"] + ch["deleted"]:
         bp = os.path.join(bdir, *rel.split("/"))
+        _must_stay(bp, ws.private)
         if not os.path.exists(bp):
             continue
         readable.append((rel, bp))
@@ -1288,6 +1298,10 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
     blobs, snaps = os.path.join(hdir, "blobs"), os.path.join(hdir, "snapshots")
     os.makedirs(blobs, exist_ok=True)
     os.makedirs(snaps, exist_ok=True)
+    for child in (blobs, snaps):
+        if _reparse_link(child):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        _contained(child, ws.private)
     files = {}
     for rel, text in mirror_texts(ws, project).items():
         h = sha(text)
@@ -1302,7 +1316,7 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{n:03d}"  # sorts after the bare stamp
     write_text(os.path.join(snaps, f"{stamp}.json"),
                json.dumps({"stamp": stamp, "event": event, "files": files}), root=ws.private)
-    names = sorted(os.listdir(snaps))
+    names = sorted(list_names(snaps))
     kept = names[-HISTORY_KEEP:]
     live, readable = set(), True
     for name in kept:
@@ -1323,7 +1337,7 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
     if readable:
         for old in names[:-HISTORY_KEEP]:
             remove_file(os.path.join(snaps, old), root=snaps)
-        for b in os.listdir(blobs):
+        for b in list_names(blobs):
             if b[:-4] not in live:
                 remove_file(os.path.join(blobs, b), root=blobs)
     return stamp
@@ -1331,8 +1345,9 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
 
 def history_list(ws: Workspace, project: Project) -> list[dict]:
     snaps = os.path.join(history_dir(ws, project), "snapshots")
+    _must_stay(snaps, ws.private)
     out = []
-    for name in sorted(os.listdir(snaps)) if os.path.isdir(snaps) else []:
+    for name in sorted(list_names(snaps)) if os.path.isdir(snaps) else []:
         try:
             snap_path = os.path.join(snaps, name)
             if _reparse_link(snap_path):

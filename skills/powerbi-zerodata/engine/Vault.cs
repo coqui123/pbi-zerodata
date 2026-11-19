@@ -78,6 +78,7 @@ public sealed class Vault
         string path = Path.Combine(privateDir, "key.bin");
         for (int attempt = 0; attempt < 10; attempt++)
         {
+            LinkGuard.Refuse(path);
             if (File.Exists(path))
             {
                 byte[] key = Dpapi.Unprotect(File.ReadAllBytes(path));

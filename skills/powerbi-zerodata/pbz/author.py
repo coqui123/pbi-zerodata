@@ -12,7 +12,7 @@ import re
 import secrets
 
 from . import images, pbir, tmdl, visuals
-from .common import PbzError, commit_bytes, read_definition_text, write_text
+from .common import PbzError, commit_bytes, read_definition_text, write_text, list_names
 from .tokens import TOKEN_RE
 
 SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition"
@@ -47,7 +47,7 @@ def _pages(rdir: str):
     meta_p = os.path.join(pdir, "pages.json")
     meta = json.loads(read_definition_text(meta_p)[0]) if os.path.exists(meta_p) else {"pageOrder": []}
     out = {}
-    for pid in sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []:
+    for pid in sorted(list_names(pdir)) if os.path.isdir(pdir) else []:
         pj = os.path.join(pdir, pid, "page.json")
         if os.path.isfile(pj):
             out[pid] = json.loads(read_definition_text(pj)[0])
@@ -148,7 +148,7 @@ LINKABLE = {"actionButton", "shape", "basicShape", "image"}
 
 def _bookmark_id(rdir: str, ref: str) -> str:
     bdir = os.path.join(rdir, "definition", "bookmarks")
-    for f in sorted(os.listdir(bdir)) if os.path.isdir(bdir) else []:
+    for f in sorted(list_names(bdir)) if os.path.isdir(bdir) else []:
         if not f.endswith(".bookmark.json"):
             continue
         bid = f[:-len(".bookmark.json")]
@@ -267,7 +267,7 @@ def _default_role(roles: list[dict], kind: str, dtype: str) -> dict | None:
         return meas[0] if meas else None
     if dtype in NUMERIC and any(r["kind"] == "measure" for r in usable) and not (grp and grp[0]["kind"] == "either"):
         return next(r for r in usable if r["kind"] == "measure")
-    return grp[0] if grp else (meas[0] if meas else None)
+    return grp[0] if grp else None
 
 
 def _free_spot(existing: list[dict], w: float, h: float, pw: float, ph: float, gap: float = 20.0):
@@ -350,7 +350,7 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
                        + " | ".join(visuals.conditions_text(contract)))
     vdir = os.path.join(pdir, pid, "visuals")
     existing = []
-    for vid in os.listdir(vdir) if os.path.isdir(vdir) else []:
+    for vid in list_names(vdir) if os.path.isdir(vdir) else []:
         try:
             existing.append(json.loads(read_definition_text(os.path.join(vdir, vid, "visual.json"))[0]).get("position") or {})
         except (OSError, ValueError):
@@ -360,7 +360,7 @@ def add_visual(ws, project, vtype: str, page: str, fields: list[str], pos: str |
         px = images.pixels(ws, project, item)
         if px:
             k = min(320 / px[0], 200 / px[1], 1.0)
-            w, h = max(40, round(px[0] * k)), max(40, round(px[1] * k))
+            w, h = round(px[0] * k), round(px[1] * k)
         else:
             w, h = 200, 200
     placed = "given"

@@ -25,7 +25,7 @@ import shutil
 import zipfile
 
 from . import pbir
-from .common import PbzError, _contained, _reparse_link, commit_bytes, read_definition_text, write_text
+from .common import PbzError, _contained, _reparse_link, commit_bytes, read_definition_text, refuse_below, write_text, list_names, walk_tree
 
 KINDS = {0: "grouping", 1: "measure", 2: "either", "grouping": "grouping", "measure": "measure",
          "groupingormeasure": "either", "either": "either"}
@@ -215,7 +215,7 @@ def _contract_path(ws, guid: str) -> str:
 def contracts(ws) -> dict[str, dict]:
     out = {}
     d = _contract_dir(ws)
-    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+    for f in sorted(list_names(d)) if os.path.isdir(d) else []:
         if f.endswith(".json"):
             try:
                 with open(os.path.join(d, f), encoding="utf-8") as h:  # pbz-allow-open: custom-visual contract store
@@ -246,7 +246,13 @@ def _package_dirs(ws, project, guid: str) -> list[str]:
         return []
     pending = _pending_dir(ws, guid)
     report = os.path.join(project.report_dir, "CustomVisuals", guid)
-    return [d for d in (pending, report) if os.path.isfile(os.path.join(d, "package.json"))]
+    found = []
+    for d, root in ((pending, ws.private), (report, project.report_dir)):
+        manifest = os.path.join(d, "package.json")
+        refuse_below(manifest, root)
+        if os.path.isfile(manifest):
+            found.append(d)
+    return found
 
 
 def package_present(ws, project, guid: str) -> bool:
@@ -305,7 +311,7 @@ def _read_file(root: str, name: str) -> bytes:
 
 def _list_dir(root: str) -> list[str]:
     out = []
-    for cur, _dirs, files in os.walk(root):
+    for cur, _dirs, files in walk_tree(root):
         for f in files:
             out.append(os.path.relpath(os.path.join(cur, f), root).replace("\\", "/"))
     return out
@@ -502,10 +508,14 @@ def import_pbiviz(ws, project, path: str, as_: str = "contract", replace: bool =
         if _reparse_link(pend):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         if os.path.lexists(pend):
-            _safe_rmtree(pending_root, pend, ignore_errors=True)
+            _safe_rmtree(pending_root, pend)
         for name, data in files.items():
             dst = os.path.join(pend, *name.split("/"))
+            refuse_below(dst, pending_root)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
+            refuse_below(dst, pending_root)
+            if _reparse_link(dst):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
             with open(dst, "wb") as f:
                 f.write(data)
         vtype, change = _register_in_mirror(project, guid, "private", info["resource_file"])
@@ -617,8 +627,14 @@ def list_visuals(ws, project) -> dict:
         if info.get("version"):
             rec["version"] = info["version"]
         if reg.get(n, {}).get("kind") == "private":
-            rec["package"] = "present" if os.path.isdir(os.path.join(project.report_dir, "CustomVisuals", n)) else \
-                ("staged" if isinstance(n, str) and GUID_RE.match(n) and os.path.isdir(_pending_dir(ws, n)) else "missing")
+            report_pkg = os.path.join(project.report_dir, "CustomVisuals", n)
+            pending_pkg = _pending_dir(ws, n) if isinstance(n, str) and GUID_RE.match(n) else ""
+            if not _reparse_link(report_pkg) and os.path.isdir(report_pkg):
+                rec["package"] = "present"
+            elif pending_pkg and not _reparse_link(pending_pkg) and os.path.isdir(pending_pkg):
+                rec["package"] = "staged"
+            else:
+                rec["package"] = "missing"
         if reg.get(n, {}).get("conflict"):
             rec["conflict"] = True
         if n in reg and not used.get(n):
@@ -674,7 +690,9 @@ def pending_for(ws, report_json_text: str) -> dict[str, str]:
     out = {}
     for g in sorted(n for n in names if isinstance(n, str) and GUID_RE.match(n)):
         pend = _pending_dir(ws, g)
-        if os.path.isfile(os.path.join(pend, "package.json")):
+        manifest = os.path.join(pend, "package.json")
+        refuse_below(manifest, ws.private)
+        if os.path.isfile(manifest):
             out[g] = pend
     return out
 
@@ -685,7 +703,7 @@ def _refuse_tree(path: str) -> None:
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     if not os.path.isdir(path):
         return
-    for cur, dirs, files in os.walk(path, followlinks=False):
+    for cur, dirs, files in walk_tree(path):
         for name in list(dirs) + list(files):
             if _reparse_link(os.path.join(cur, name)):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")

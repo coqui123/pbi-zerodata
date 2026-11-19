@@ -91,7 +91,8 @@ def set_policy(ws, project, table: str, date_col: str, store: int, store_unit: s
         raise PbzError("UNSUPPORTED", "the query is not a simple `let ... in <step>`")
     made, expr = _params(mdef, model)
     # 1) filter step in the partition query (skip when the query already filters on RangeStart)
-    if "RangeStart" in src and "RangeEnd" in src:
+    names = {(t.value or t.text) for t in lexers.significant(lexers.lex_m(src)) if t.kind in ("ident", "qident")}
+    if "RangeStart" in names and "RangeEnd" in names:
         new_src, filtered = src, "EXISTING"
     else:
         toks = lexers.significant(lexers.lex_m(src))

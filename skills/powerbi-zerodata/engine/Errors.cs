@@ -113,8 +113,10 @@ public static class EngineLog
         try
         {
             string dir = Path.Combine(privateDir, "logs");
+            LinkGuard.Refuse(dir);
             Directory.CreateDirectory(dir);
             string path = Path.Combine(dir, "engine.log");
+            LinkGuard.Refuse(path);
             string prefix = "e-" + DateTime.Now.ToString("yyyyMMdd", CultureInfo.InvariantCulture) + "-";
             string b64 = Convert.ToBase64String(Dpapi.Protect(Encoding.UTF8.GetBytes(text)));
             for (int attempt = 0; attempt < 100; attempt++)

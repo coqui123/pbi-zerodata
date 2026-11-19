@@ -24,7 +24,7 @@ import stat
 import uuid
 
 from . import desktop, deps, dpapi, lexers, pbir, tmdl
-from .common import PbzError, Project, Workspace, _reparse_link, commit_bytes, engine_call, read_text, read_text_checked, write_bytes, write_text
+from .common import PbzError, Project, Workspace, _reparse_link, commit_bytes, engine_call, read_text, read_text_checked, write_bytes, write_text, list_names, walk_tree
 from .tokens import TOKEN_RE, apply_edits
 
 MARKER = "PBZ_SYNTHETIC"
@@ -79,7 +79,7 @@ def _verified_owned(ws, root: str) -> bool:
             return False
         if not isinstance(info.get("source_project"), str) or not info["source_project"].strip():
             return False
-        models = [d for d in os.listdir(root) if d.lower().endswith(".semanticmodel") and
+        models = [d for d in list_names(root) if d.lower().endswith(".semanticmodel") and
                   os.path.isdir(os.path.join(root, d, "definition"))]
         if len(models) != 1:
             return False
@@ -410,6 +410,8 @@ def _edge(model, gen: dict, seed: int, lo: dt.date, hi: dt.date) -> tuple[dict, 
             j = cidx(ft, fc_l) if ft else None
             if j is None or (to[0].lower(), to[1].lower()) != (dt_l, dc_l):
                 continue
+            if (ft_l, fc_l) in keys or (ft_l, fc_l) in sort_cols:
+                continue
             used_any = True
             for r in out[ft][1]:
                 if r[j] in unused:
@@ -422,6 +424,8 @@ def _edge(model, gen: dict, seed: int, lo: dt.date, hi: dt.date) -> tuple[dict, 
         j = cidx(ft, fc_l) if ft else None
         if j is None or names.get(tt.lower()) is None or len(out[ft][1]) < 12:
             continue  # only keys into a faked table can be made orphans
+        if (ft_l, fc_l) in keys or (ft_l, fc_l) in sort_cols:
+            continue
         dtp = out[ft][0][j][1]
         for k, pos in enumerate((3, 7, 11)):
             out[ft][1][pos][j] = (f"{out[ft][0][j][0]} orphan edge {k}" if dtp == "string" else 8888000 + k if dtp in NUMERIC
@@ -755,7 +759,7 @@ def _inventory_source(root: str, boundary: str) -> list[tuple[str, tuple]]:
     if _reparse_link(root) or not os.path.isdir(root):
         raise _source_error()
     found = []
-    for cur, dirs, names in os.walk(root, followlinks=False):
+    for cur, dirs, names in walk_tree(root):
         _within_mirror(cur, boundary)
         kept = []
         for name in dirs:
@@ -970,7 +974,7 @@ def _write_candidate(ws, project, sp, texts, pools, rows, seed, edge, rows_by_ta
 def _publish_candidate(stage: str, dest: str, owned: bool) -> None:
     """Copy the staged file map onto `dest` in one commit, deleting obsolete destination files."""
     staged: dict[str, bytes] = {}
-    for cur, _dirs, files in os.walk(stage):
+    for cur, _dirs, files in walk_tree(stage):
         for name in files:
             path = os.path.join(cur, name)
             rel = os.path.relpath(path, stage)
@@ -980,7 +984,7 @@ def _publish_candidate(stage: str, dest: str, owned: bool) -> None:
     if os.path.isdir(dest):
         if not owned:
             raise PbzError("UNSAFE", "not a pbz synthetic folder; refusing to touch it")
-        for cur, _dirs, files in os.walk(dest):
+        for cur, _dirs, files in walk_tree(dest):
             for name in files:
                 path = os.path.join(cur, name)
                 rel = os.path.relpath(path, dest)

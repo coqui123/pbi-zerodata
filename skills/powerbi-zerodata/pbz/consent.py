@@ -23,7 +23,7 @@ import zipfile
 import zlib
 
 from . import dpapi, guard
-from .common import PbzError
+from .common import PbzError, _reparse_link
 
 PURPOSES = {"requirements", "reference", "brand-asset", "other-source"}
 TEXT_EXTS = {".txt", ".md", ".json", ".csv", ".tsv"}
@@ -258,6 +258,8 @@ def _validate(ws, receipt: dict) -> tuple[dict, bytes | None]:
 def status(ws, consent_id: str | None = None) -> dict:
     if consent_id is None:
         folder = _private(ws)
+        if _reparse_link(str(folder)):
+            raise PbzError("CONSENT_INVALID", "invalid private consent storage")
         if not folder.exists():
             return {"verb": "consent", "action": "status", "requests": []}
         files = sorted(folder.glob("*.bin"))

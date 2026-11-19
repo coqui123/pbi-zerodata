@@ -401,6 +401,7 @@ public static class Memory
     static RiMaps RunIntegrity(Conn conn, Ctx ctx, Ids ids)
     {
         var maps = new RiMaps();
+        var skippedCols = new HashSet<ColumnMeta>();
         var clock = Stopwatch.StartNew();
         double budget = Math.Clamp(ctx.TimeoutSec * 2.0, 15.0, 300.0);
         foreach (var rel in ids.Relationships.Values)
@@ -416,10 +417,13 @@ public static class Memory
                 long n = ColumnStats.L(conn.Row1(q)[0]);
                 if (n < 0) n = 0;
                 maps.Rel[rel.Id] = n;
-                maps.Col[rel.From] = AddCap(maps.Col.GetValueOrDefault(rel.From), n);
+                if (!skippedCols.Contains(rel.From))
+                    maps.Col[rel.From] = AddCap(maps.Col.GetValueOrDefault(rel.From), n);
             }
             catch (Exception ex)
             {
+                maps.Col.Remove(rel.From);
+                skippedCols.Add(rel.From);
                 ctx.LogText("memory ri omitted");
                 if (Errors.Classify(ex) == ErrorClass.TIMEOUT)
                 {

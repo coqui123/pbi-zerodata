@@ -22,9 +22,26 @@ import json
 import math
 import os
 import re
+import stat
 
-from .common import PbzError, commit_bytes, read_definition_text, write_text
+from .common import PbzError, _reparse_link, commit_bytes, read_definition_text, write_text, list_names
 from .tokens import TOKEN_RE
+
+def _mobile_file(path: str) -> bool:
+    """True for a regular mobile.json in the mirror. A symlink is not a phone layout.
+
+    A file that is present but cannot be inspected is refused. It is not treated as absent.
+    """
+    if _reparse_link(path):
+        return False
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise PbzError("REFUSED", "a phone layout could not be read") from None
+    return stat.S_ISREG(info.st_mode)
+
 
 MOBILE_SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainerMobileState"
 PHONE_WIDTH = 320
@@ -58,7 +75,7 @@ def _pages(project) -> list[tuple[str, str, dict, str]]:
         except ValueError:
             order = []
     order = [p for p in order if _page_segment(p)]
-    ids = order + [p for p in sorted(os.listdir(pdir))
+    ids = order + [p for p in sorted(list_names(pdir))
                    if _page_segment(p) and os.path.isdir(os.path.join(pdir, p)) and p not in order]
     out = []
     for pid in ids:
@@ -99,15 +116,29 @@ def _require_json(project, path: str) -> tuple[dict, str, bytes]:
     return doc, text, bom
 
 
+def _present_file(project, path: str) -> bool:
+    """False when the path is absent. A present file that cannot be inspected is refused."""
+    rel = _rel(project, path)
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", rel)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise PbzError("REFUSED", rel) from None
+    return stat.S_ISREG(info.st_mode)
+
+
 def _mutation_visuals(project, page_dir: str) -> list[dict]:
     """Every visual on the page. A present but unreadable visual or phone layout is refused, not skipped."""
     out = []
     vdir = os.path.join(page_dir, "visuals")
     if not os.path.isdir(vdir):
         return out
-    for vid in sorted(os.listdir(vdir)):
+    for vid in sorted(list_names(vdir)):
         path = os.path.join(vdir, vid, "visual.json")
-        if not os.path.isfile(path):
+        if not _present_file(project, path):
             continue
         doc, text, bom = _require_json(project, path)
         body = doc.get("visual") if isinstance(doc.get("visual"), dict) else None
@@ -115,7 +146,7 @@ def _mutation_visuals(project, page_dir: str) -> list[dict]:
         pos = doc.get("position") if isinstance(doc.get("position"), dict) else {}
         mobile = os.path.join(vdir, vid, "mobile.json")
         mobile_doc = None
-        if os.path.isfile(mobile):
+        if _present_file(project, mobile):
             mobile_doc = _require_json(project, mobile)[0]
         out.append({"id": vid, "type": vt, "doc": doc, "text": text, "bom": bom, "body": body or {}, "pos": pos,
                     "path": path, "hidden": doc.get("isHidden") is True, "group": doc.get("parentGroupName") or "",
@@ -129,7 +160,7 @@ def _mutation_page(project, page: str):
     if not os.path.isdir(root):
         raise PbzError("NO_MIRROR", "run `pbz pull` first (no report pages in the mirror)")
     hits = []
-    for pid in sorted(os.listdir(root)):
+    for pid in sorted(list_names(root)):
         pj = os.path.join(root, pid, "page.json")
         if not os.path.isfile(pj):
             continue
@@ -166,7 +197,7 @@ def _visuals(page_dir: str) -> list[dict]:
     """Every visual container on a page with its parsed JSON (groups included)."""
     out = []
     vdir = os.path.join(page_dir, "visuals")
-    for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+    for vid in sorted(list_names(vdir)) if os.path.isdir(vdir) else []:
         path = os.path.join(vdir, vid, "visual.json")
         try:
             doc = json.loads(read_definition_text(path)[0])
@@ -379,7 +410,7 @@ def audit(ws, project, page: str | None = None, min_font: float = 9.0) -> dict:
         for v in vis:
             if v["hidden"] and _num(v["pos"].get("tabOrder"), -1) >= 0:
                 add("info", "A11Y_HIDDEN_IN_TAB_ORDER", pname, v["id"], "a hidden visual keeps a tab order position")
-        if not page_hidden and vis and not any(os.path.exists(v["mobile"]) for v in vis):
+        if not page_hidden and vis and not any(_mobile_file(v["mobile"]) for v in vis):
             add("info", "A11Y_NO_MOBILE_LAYOUT", pname, "", "the page has no phone layout",
                 f'pbz mobile "{pname}" all')
     summary = dict(sorted(collections.Counter(f["code"] for f in findings).items()))
@@ -420,7 +451,7 @@ def _mobile_version(project) -> str:
     seen = collections.Counter()
     for _pid, _n, _pj, pdir in _pages(project):
         for v in _visuals(pdir):
-            if os.path.exists(v["mobile"]):
+            if _mobile_file(v["mobile"]):
                 try:
                     sch = json.loads(read_definition_text(v["mobile"])[0]).get("$schema", "")
                 except ValueError:
@@ -451,7 +482,7 @@ def mobile(ws, project, page: str, visual: str, pos: str | None = None, remove: 
     placed = _phone_pos(pos) if pos else None
     files, done = [], []
     if remove:
-        ops = [("delete", v["mobile"]) for v in pick if os.path.isfile(v["mobile"])]
+        ops = [("delete", v["mobile"]) for v in pick if _mobile_file(v["mobile"])]
         if ops:
             commit_bytes(ops)
         for kind, path in ops:

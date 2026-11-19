@@ -148,9 +148,12 @@ def expr_change(a: str, b: str, lang: str) -> dict | None:
     """Class of change between two expression texts; literal changes are counted, never shown."""
     if a == b:
         return None
-    if " ".join(a.split()) == " ".join(b.split()):
-        return {"class": "format_only"}
     lex = lexers.lex_dax if lang == "dax" else lexers.lex_m
+    if " ".join(a.split()) == " ".join(b.split()):
+        ta0, tb0 = lexers.significant(lex(a)), lexers.significant(lex(b))
+        if len(ta0) == len(tb0) and all(
+                x.kind == y.kind and (x.kind not in LIT or x.text == y.text) for x, y in zip(ta0, tb0)):
+            return {"class": "format_only"}
     ta, tb = lexers.significant(lex(a)), lexers.significant(lex(b))
     if [t.text for t in ta] == [t.text for t in tb]:
         return {"class": "comments_only"}

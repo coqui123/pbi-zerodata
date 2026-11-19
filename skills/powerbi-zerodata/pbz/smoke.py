@@ -7,7 +7,7 @@ import os
 import re
 
 from . import desktop, pbir, tmdl, tokens
-from .common import PbzError, engine_call, read_definition_text
+from .common import PbzError, engine_call, read_definition_text, list_names
 from .lexers import dax_string, dax_table_name
 
 NON_DATA = {"textbox", "image", "shape", "basicShape", "actionButton", "pageNavigator", "bookmarkNavigator",
@@ -109,15 +109,23 @@ def _in_filter(inn, aliases, model, tm) -> tuple[str | None, bool]:
     for row in vals.items:
         cells = row.items if isinstance(row, pbir.JArr) else None
         if cells is None or len(cells) != len(cols):
-            return None, True
+            partial = True
+            continue
         lits = []
+        broken = False
         for cell in cells:
             d, trunc = _cell_dax(cell, tm)
             partial = partial or trunc
             if d is None:
-                return None, True
+                broken = True
+                break
             lits.append(d)
+        if broken:
+            partial = True
+            continue
         rows.append(lits)
+    if not rows:
+        return None, True
     targets = ", ".join(col_dax(c.table, c.name) for c in cols)
     if len(cols) == 1:
         body = ", ".join(r[0] for r in rows)
@@ -239,7 +247,7 @@ def _page_has_slicers(page_dir: str) -> bool:
     mirror = page_dir
     for _ in range(4):
         mirror = os.path.dirname(mirror)
-    for vid in os.listdir(vdir):
+    for vid in list_names(vdir):
         path = os.path.join(vdir, vid, "visual.json")
         if not os.path.isfile(path):
             continue
@@ -316,7 +324,7 @@ def run(ws, project, page: str | None = None) -> dict:
     report_root = _read_pbir(report_path, _mirror_rel(mirror, report_path)) if os.path.isfile(report_path) else None
     loaded = []
     matched = page is None
-    for pid in sorted(os.listdir(pages_dir)):
+    for pid in sorted(list_names(pages_dir)):
         pdir = os.path.join(pages_dir, pid)
         pjson = os.path.join(pdir, "page.json")
         if not os.path.isfile(pjson):
@@ -328,7 +336,7 @@ def run(ws, project, page: str | None = None) -> dict:
         has_slicers = _page_has_slicers(pdir)
         visuals = []
         vdir = os.path.join(pdir, "visuals")
-        for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+        for vid in sorted(list_names(vdir)) if os.path.isdir(vdir) else []:
             vjson = os.path.join(vdir, vid, "visual.json")
             if not os.path.isfile(vjson):
                 continue

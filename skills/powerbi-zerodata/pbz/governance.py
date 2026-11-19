@@ -8,7 +8,7 @@ import os
 import re
 
 from . import deps, lexers, tmdl
-from .common import PbzError, commit_bytes, preflight_regular, read_checked, read_text, write_text
+from .common import PbzError, commit_bytes, preflight_regular, read_checked, read_text, write_text, list_names
 from .tokens import TOKEN_RE, TokenMap, apply_edits
 
 CODE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
@@ -101,10 +101,19 @@ def _ref_line(mdef: str, kind: str, name: str, add: bool):
 
 
 def culture_docs(mdef: str) -> dict:
-    """{rel: TmdlDoc} of the mirror's culture files (load_model skips them)."""
+    """{rel: TmdlDoc} of the mirror's culture files (load_model skips them).
+
+    A missing directory is an empty set. A directory that cannot be inspected is refused.
+    """
     out = {}
     cdir = os.path.join(mdef, "cultures")
-    for f in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
+    try:
+        os.lstat(cdir)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        raise PbzError("REFUSED", "culture files could not be listed") from None
+    for f in sorted(list_names(cdir)):
         if f.lower().endswith(".tmdl"):
             out[f"cultures/{f}"] = tmdl.parse(f"cultures/{f}", read_text(os.path.join(cdir, f))[0])
     return out
@@ -157,12 +166,29 @@ def _append_child(doc_text: str, doc, parent, line: str) -> str:
 # ---------------------------------------------------------------- cultures
 
 
+def _culture_names(path: str) -> list[str]:
+    """Culture filenames, or none when the directory is absent.
+
+    A directory that exists but cannot be inspected is refused. It is not an empty culture set.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raise PbzError("REFUSED", "culture files could not be listed") from None
+    try:
+        return list_names(path)
+    except OSError:
+        raise PbzError("REFUSED", "culture files could not be listed") from None
+
+
 def cultures_mirrored(project) -> bool:
     """True when every real culture file is in the mirror (older mirrors skipped cultures)."""
     real = os.path.join(project.model_dir, "definition", "cultures")
     mine = os.path.join(project.mirror_model, "definition", "cultures")
-    have = {f.lower() for f in os.listdir(mine)} if os.path.isdir(mine) else set()
-    return all(f.lower() in have for f in (os.listdir(real) if os.path.isdir(real) else []) if f.lower().endswith(".tmdl"))
+    have = {f.lower() for f in _culture_names(mine)}
+    return all(f.lower() in have for f in _culture_names(real) if f.lower().endswith(".tmdl"))
 
 
 def _culture_objects(doc, kind: str, table: str, name: str):

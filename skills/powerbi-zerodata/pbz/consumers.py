@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from . import lexers, pbir, tmdl
-from .common import PbzError, _reparse_link, commit_bytes, read_text, write_text
+from .common import PbzError, _reparse_link, commit_bytes, read_text, write_text, walk_tree
 
 REG = (".pbz", "consumers.json")
 CACHE = "consumers"
@@ -71,8 +71,12 @@ def load_registry(ws) -> dict:
     """Load .pbz/consumers.json. A missing file is an empty registry. A present file that
     cannot be read or does not match the envelope is refused before any evaluation or write."""
     path = _reg_path(ws)
-    if not os.path.lexists(path):
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
         return {"version": 1, "consumers": []}
+    except OSError:
+        raise PbzError("REFUSED", "consumer registry is unreadable") from None
     if _reparse_link(path):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     try:
@@ -203,7 +207,7 @@ def _signature(entry: dict) -> str:
             return f"f:{st.st_size}:{st.st_mtime_ns}"
         if os.path.isdir(p):
             h = hashlib.sha256()
-            for cur, dirs, files in os.walk(p):
+            for cur, dirs, files in walk_tree(p):
                 dirs[:] = sorted(d for d in dirs if d.lower() not in (".pbi", "customvisuals", "staticresources", ".git"))
                 for f in sorted(files):
                     if f.lower().endswith((".json", ".pbir", ".tmdl", ".platform")):
@@ -246,12 +250,26 @@ def _mirror_names(project) -> set[str]:
     return model_names(tmdl.load_model(mdef))
 
 
+def _object_parts(text: str) -> list[str] | None:
+    """Table and name pieces of a manual reference, lowered. None when the text names nothing."""
+    text = text.strip()
+    quoted = re.match(r"^'((?:[^']|'')+)'\s*\[(.+)\]$", text) or re.match(r"^([^\[\]']+?)\s*\[(.+)\]$", text)
+    if quoted:
+        return [quoted.group(1).replace("''", "'").lower(), quoted.group(2).lower()]
+    bracket = re.match(r"^\[(.+)\]$", text)
+    if bracket:
+        return [bracket.group(1).lower()]
+    bare = text.strip("'").lower()
+    return [bare] if bare else None
+
+
 def _keep(r: dict, names: set[str]) -> dict | None:
     """Keep a reference only when its names are this model's names; member-like parts are dropped, so
     nothing but model object names is ever cached."""
     k = r["k"]
     if k == "object":
-        return r
+        parts = _object_parts(r.get("n") or "")
+        return r if parts and all(part in names for part in parts) else None
     t, n, lv = (r.get("t") or "").lower(), (r.get("n") or "").lower(), (r.get("l") or "").lower()
     if k == "mdx":
         if t == "measures":
@@ -441,7 +459,7 @@ def _parse_pbir(entry: dict, project) -> dict:
     reports = [root] if (root.lower().rstrip("\\/").endswith(".report") or
                          os.path.exists(os.path.join(root, "definition.pbir"))) else []
     if not reports:
-        for cur, dirs, _files in os.walk(root):
+        for cur, dirs, _files in walk_tree(root):
             dirs[:] = [d for d in dirs if d.lower() not in (".git", ".pbi", "node_modules")]
             for d in list(dirs):
                 if d.lower().endswith(".report"):
@@ -1008,7 +1026,7 @@ def discover(ws, project, folder: str, add_matches: bool = False, model_names: l
     own = {os.path.normcase(os.path.abspath(p)) for p in (project.report_dir, project.model_dir, ws.mirror)}
     found, seen = [], 0
     root_depth = base.rstrip("\\/").count(os.sep)
-    for cur, dirs, files in os.walk(base):
+    for cur, dirs, files in walk_tree(base):
         if cur.count(os.sep) - root_depth >= depth:
             dirs[:] = []
         keep = []

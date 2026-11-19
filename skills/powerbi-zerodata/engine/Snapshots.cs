@@ -167,6 +167,8 @@ public static class Snapshots
         using var conn = Conn.Open(ctx, port);
         JsonObject? saved = null;
         string path = FilePath(pd, name);
+        LinkGuard.Refuse(Path.Combine(pd, "snapshots"));
+        LinkGuard.Refuse(path);
         if (File.Exists(path)) saved = JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8)) as JsonObject;
         var savedQueries = saved?["queries"] as JsonObject;
         bool stale = saved != null && !string.Equals(saved["refreshed"]?.GetValue<string>(), conn.LatestRefresh(), StringComparison.Ordinal);

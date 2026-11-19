@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 import re
 
-from .common import PbzError, commit_bytes, write_text
+from .common import PbzError, _reparse_link, anchor_mirror, commit_bytes, write_text
 
 VERSION = 1
 CONTROL_TYPES = {"actionButton", "slicer", "advancedSlicerVisual"}
@@ -281,6 +281,7 @@ def run(ws, project, page: str | None = None, spec=None) -> dict:
     `spec` is a dict or a JSON path within the mirror. The result includes synthetic SVG paths,
     approximation warnings, region/overlap findings and explicit unsupported-rendering states.
     """
+    anchor_mirror(ws)
     workspace = Path(ws.root).resolve()
     mirror = _inside(Path(ws.mirror), workspace)
     report = _inside(Path(project.mirror_report), mirror)
@@ -295,7 +296,11 @@ def run(ws, project, page: str | None = None, spec=None) -> dict:
     dirs = [p for p in sorted(pages_dir.iterdir()) if p.is_dir()]
     selected = []
     for folder in dirs:
+        if _reparse_link(str(folder)):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         p = folder / 'page.json'
+        if _reparse_link(str(p)):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         if not p.is_file():
             continue
         obj = _read(p, mirror)
@@ -313,7 +318,22 @@ def run(ws, project, page: str | None = None, spec=None) -> dict:
         if not 0 < width <= 100000 or not 0 < height <= 100000:
             raise PbzError('BAD_REQUEST', 'preview canvas dimensions are invalid')
         visuals = []
-        for file in sorted((folder / 'visuals').glob('*/visual.json')):
+        vdir = folder / 'visuals'
+        if _reparse_link(str(vdir)):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        files = []
+        if vdir.is_dir():
+            for child in vdir.iterdir():
+                if _reparse_link(str(child)):
+                    raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+                file = child / 'visual.json'
+                if _reparse_link(str(file)):
+                    raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+                if file.exists():
+                    if not file.is_file():
+                        raise PbzError("REFUSED", "a visual file could not be read")
+                    files.append(file)
+        for file in sorted(files):
             visual = _read(file, mirror)
             pos = visual.get('position', {})
             kind = visual.get('visual', {}).get('visualType', 'group' if 'visualGroup' in visual else 'unknown')

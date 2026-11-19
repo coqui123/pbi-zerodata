@@ -1315,6 +1315,9 @@ def admin(ws, a) -> dict:
     elif a.action == "log":
         n = int(a.value or 20)
         path = os.path.join(ws.private, "logs", "engine.log")
+        from .common import _reparse_link
+        if _reparse_link(os.path.dirname(path)) or _reparse_link(path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         lines = []
         try:
             with open(path, encoding="utf-8") as f:

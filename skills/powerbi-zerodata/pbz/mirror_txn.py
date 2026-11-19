@@ -8,14 +8,14 @@ from __future__ import annotations
 import os
 import stat
 
-from .common import PbzError, _reparse_link
+from .common import PbzError, _reparse_link, walk_tree
 
 
 def _files(root: str) -> list[str]:
     if not os.path.isdir(root):
         return []
     out = []
-    for dirpath, dirnames, names in os.walk(root, followlinks=False):
+    for dirpath, dirnames, names in walk_tree(root):
         kept = []
         for name in dirnames:
             path = os.path.join(dirpath, name)

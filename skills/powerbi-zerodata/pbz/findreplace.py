@@ -196,10 +196,11 @@ def replace(ws, project, pattern: str, repl: str, kind: str = "any", apply: bool
     rx = _refuse_token_syntax(pattern, repl)
     model = _model(project)
     jobs = _name_jobs(model, kind, rx, repl)
+    name_hit = any(rx.search(name) for _obj_kind, name, _table in _names(model, kind))
     planned = [{"kind": k, "from": old, "to": new, "table": table} for k, old, new, table in jobs]
     # A name hit is a rename. Text replacement runs only when no object name matched, so a
     # renamed Sales cannot be rewritten again into SalesDataData.
-    outside = 0 if jobs else _outside_count(mirror.mirror_texts(ws, project), rx)
+    outside = 0 if name_hit else _outside_count(mirror.mirror_texts(ws, project), rx)
     out = {"verb": "replace", "project": project.name, "dry_run": not apply,
            "renames": planned, "text_hits": outside}
     if not apply:
@@ -209,7 +210,7 @@ def replace(ws, project, pattern: str, repl: str, kind: str = "any", apply: bool
         for obj_kind, old, new, table in jobs:
             rename_mod.rename(ws, project, obj_kind, old, new, table)
         ops = []
-        if not jobs:
+        if not name_hit:
             for rel, text in mirror.mirror_texts(ws, project).items():
                 new_text = sub_outside(text, rx, repl)
                 if new_text != text:

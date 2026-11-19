@@ -390,8 +390,10 @@ def is_workspace_root(d: str) -> bool:
                     return True
                 if (n.endswith(".semanticmodel") or n.endswith(".report")) and e.is_dir():
                     return True
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError:
+        return True
     return False
 
 
@@ -467,11 +469,28 @@ def synthetic(path: str) -> bool:
     return _SYN[key]
 
 
+def _unreadable_dir(d: str) -> bool:
+    """True when the directory exists but cannot be listed."""
+    try:
+        with os.scandir(d) as it:
+            next(it, None)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return False
+
+
 def load_policy(root: str | None) -> dict:
     if not root:
         return {}
     if root not in _POL:
-        _POL[root] = read_policy_file(root) or {}
+        data = read_policy_file(root)
+        # An unreadable directory can be chosen as the workspace so it is not skipped.
+        # It must not inherit an empty policy and drop the denies that would have applied.
+        if data is None and _unreadable_dir(root):
+            data = _lockdown()
+        _POL[root] = data or {}
     return _POL[root]
 
 
@@ -578,7 +597,9 @@ def _private_roots() -> list[str]:
     stamp_parts, complete = _private_stamp(raws)
     stamp = (tuple(norm(raw) for raw in raws), stamp_parts)
     if complete and _PRIVATE["stamp"] == stamp:
+        _PRIVATE["unresolved"] = False
         return _PRIVATE["roots"]  # type: ignore[return-value]
+    _PRIVATE["unresolved"] = False
     found: list[str] = []
     for raw in raws:
         lexical = norm(raw)
@@ -589,7 +610,10 @@ def _private_roots() -> list[str]:
         try:
             resolved = norm(os.path.realpath(raw))
         except OSError:
-            continue
+            _PRIVATE["unresolved"] = True
+            _PRIVATE["stamp"] = None
+            _PRIVATE["roots"] = None
+            return []
         if resolved and resolved not in found:
             found.append(resolved)
     if complete:
@@ -621,6 +645,8 @@ def _global_hit(path: str) -> bool:
     for root in _private_roots():
         if _under(path, root):
             return True
+    if _PRIVATE.get("unresolved"):
+        return True
     return any(re.search(p, path) for p in GLOBAL_DENY_PATTERNS)
 
 
@@ -721,17 +747,24 @@ def classify_path(path: str) -> str | None:
 def dir_has_denied(d: str, name_filter: re.Pattern | None = None, cap_is_deny: bool = True) -> bool:
     """True if a denied file under d would be reached (optionally only files matching name_filter)."""
     count = 0
-    for cur, dirs, files in os.walk(d):
-        dirs[:] = [x for x in dirs if x.lower() != MIRROR_DIR]
-        ncur = norm(cur)
-        for name in files:
-            count += 1
-            if count > MAX_WALK_ENTRIES:
-                return cap_is_deny
-            if name_filter and not name_filter.search(name.lower()):
-                continue
-            if classify_path(ncur + "/" + name.lower()):
-                return True
+
+    def _unreadable(_err):
+        raise OSError("unreadable")
+
+    try:
+        for cur, dirs, files in os.walk(d, onerror=_unreadable):
+            dirs[:] = [x for x in dirs if x.lower() != MIRROR_DIR]
+            ncur = norm(cur)
+            for name in files:
+                count += 1
+                if count > MAX_WALK_ENTRIES:
+                    return cap_is_deny
+                if name_filter and not name_filter.search(name.lower()):
+                    continue
+                if classify_path(ncur + "/" + name.lower()):
+                    return True
+    except OSError:
+        return True
     return False
 
 
@@ -963,17 +996,44 @@ def _definition_outside_mirror(text: str) -> bool:
 
     The mirror name has to be its own component in that same path after `..` is applied.
     A file that merely contains the text pbz-workspace does not cover a separate definition reference.
+    A different definition component in the same path does not cover this one.
     """
+    breaks = set(" \t\r\n\"'`<>|()[]{};,=+")
     for match in DEFINITION_REF.finditer(text):
-        bits = _collapse_dots(re.split(r"[\\/]", _path_token(text, match.start(), match.end())))
-        covered = False
-        for index, part in enumerate(bits):
-            leaf = part.lower()
-            if leaf.endswith(".semanticmodel") or leaf.endswith(".report"):
-                if index > 0 and bits[index - 1].lower() == MIRROR_DIR:
-                    covered = True
-                    break
-        if not covered:
+        start, end = match.start(), match.end()
+        while start > 0 and text[start - 1] not in breaks:
+            start -= 1
+        while end < len(text) and text[end] not in breaks:
+            end += 1
+        token = text[start:end]
+        raw = re.split(r"[\\/]", token)
+        rel = match.start() - start
+        cursor = 0
+        origin = None
+        for index, part in enumerate(raw):
+            part_end = cursor + len(part)
+            if cursor <= rel < part_end:
+                origin = index
+                break
+            cursor = part_end + 1
+        stacked: list[tuple[str, int | None]] = []
+        for index, part in enumerate(raw):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if stacked and stacked[-1][0] != "..":
+                    stacked.pop()
+                else:
+                    stacked.append(("..", None))
+                continue
+            stacked.append((part, index))
+        landed = next((i for i, (_part, src) in enumerate(stacked) if src == origin), None)
+        if landed is None:
+            continue
+        part = stacked[landed][0]
+        parent = stacked[landed - 1][0] if landed else ""
+        leaf = part.lower()
+        if not (leaf.endswith(".semanticmodel") or leaf.endswith(".report")) or parent.lower() != MIRROR_DIR:
             return True
     return False
 
@@ -1705,7 +1765,7 @@ def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int
                     return "engine"
                 if any(s.lower() in part.lower() for s in pol.get("deny_scripts", [])):
                     return "script"
-            denied, dir_targets, has_path = None, [], False
+            denied, dir_targets, has_path, link_escape = None, [], False, False
             for t in toks[verb_index(toks) + 1:]:
                 t = strip_arg(t)
                 if t.startswith("-"):
@@ -1737,9 +1797,11 @@ def check_shell(cmd: str, cwd: str, session_root: str | None = None, _depth: int
                     why = "definition"
                 if why:
                     denied = denied or why
+                    if root and (_mirror_blocked(p, root) or _reparse_blocked(p, root)):
+                        link_escape = True
                 elif os.path.isdir(p):
                     dir_targets.append(p)
-            if denied and (v not in SAFE_PATH_VERBS or (
+            if denied and (link_escape or v not in SAFE_PATH_VERBS or (
                     v in _NEW_VERBS and any(
                         strip_arg(token).lower().strip("\"'") in _LINK_TYPES for token in toks))):
                 return denied
@@ -1941,7 +2003,10 @@ def _grep_name_filter(glob: str) -> re.Pattern | None:
     and misses denied names the glob would open. A glob that is not a simple filename
     pattern is not narrowed, so every name is checked.
     """
-    base = glob.replace("\\", "/").split("/")[-1]
+    normalized = glob.replace("\\", "/")
+    if "/" in normalized:
+        return None
+    base = normalized
     if not base or not re.fullmatch(r"[*?a-z0-9._-]+", base):
         return None
     return glob_to_regex(base)

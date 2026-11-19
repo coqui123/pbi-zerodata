@@ -7,7 +7,7 @@ import json
 import os
 
 from . import pbir
-from .common import PbzError, read_definition_text
+from .common import PbzError, read_definition_text, list_names, refuse_below
 
 
 def _load(path: str):
@@ -158,7 +158,9 @@ def run(report_dir: str, prefix: str = "", has_package=None, has_image=None) -> 
         def has_package(n: str) -> bool:  # noqa: F811
             if not _safe_custom_visual_name(n):
                 return False
-            return os.path.isfile(os.path.join(report_dir, "CustomVisuals", n, "package.json"))
+            manifest = os.path.join(report_dir, "CustomVisuals", n, "package.json")
+            refuse_below(manifest, report_dir)
+            return os.path.isfile(manifest)
     instances: dict[str, list] = {}
     formatting: list = []
     links: list = []
@@ -182,7 +184,7 @@ def run(report_dir: str, prefix: str = "", has_package=None, has_image=None) -> 
         add("warning", "PBIR_NO_VERSION", "definition/version.json", "version.json is missing")
 
     pages_dir = os.path.join(ddir, "pages")
-    page_ids = sorted(d for d in os.listdir(pages_dir) if os.path.isdir(os.path.join(pages_dir, d))) \
+    page_ids = sorted(d for d in list_names(pages_dir) if os.path.isdir(os.path.join(pages_dir, d))) \
         if os.path.isdir(pages_dir) else []
     visuals_of: dict[str, set] = {}
     bindings: dict[str, list] = {}
@@ -203,7 +205,7 @@ def run(report_dir: str, prefix: str = "", has_package=None, has_image=None) -> 
         if not page.get("displayName"):
             add("warning", "PAGE_NO_DISPLAY_NAME", rel, "page has no displayName")
         vdir = os.path.join(pages_dir, pid, "visuals")
-        vids = sorted(d for d in os.listdir(vdir) if os.path.isdir(os.path.join(vdir, d))) if os.path.isdir(vdir) else []
+        vids = sorted(d for d in list_names(vdir) if os.path.isdir(os.path.join(vdir, d))) if os.path.isdir(vdir) else []
         visuals_of[pid] = set(vids)
         groups, parents = set(), {}
         for vid in vids:
@@ -298,7 +300,7 @@ def run(report_dir: str, prefix: str = "", has_package=None, has_image=None) -> 
 
     bdir = os.path.join(ddir, "bookmarks")
     if os.path.isdir(bdir):
-        files = {f[:-len(".bookmark.json")] for f in os.listdir(bdir) if f.endswith(".bookmark.json")}
+        files = {f[:-len(".bookmark.json")] for f in list_names(bdir) if f.endswith(".bookmark.json")}
         listed = set()
         bm = _load(os.path.join(bdir, "bookmarks.json")) if os.path.exists(os.path.join(bdir, "bookmarks.json")) else None
         for it in (bm or {}).get("items") or []:
@@ -368,7 +370,7 @@ def _links(add, ddir: str, page_ids: list, links: list) -> None:
         p = _load(os.path.join(ddir, "pages", pid, "page.json")) or {}
         kinds[pid] = ((p.get("pageBinding") or {}).get("type") if isinstance(p.get("pageBinding"), dict) else None)
     bdir = os.path.join(ddir, "bookmarks")
-    marks = {f[:-len(".bookmark.json")] for f in os.listdir(bdir) if f.endswith(".bookmark.json")} if os.path.isdir(bdir) else set()
+    marks = {f[:-len(".bookmark.json")] for f in list_names(bdir) if f.endswith(".bookmark.json")} if os.path.isdir(bdir) else set()
     for vrel, props in links:
         kind = _lit_str(props.get("type"))
         if kind == "PageNavigation":

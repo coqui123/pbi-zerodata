@@ -6,7 +6,7 @@ import json
 import os
 
 from . import control
-from .common import PbzError, _reparse_link, anchor_mirror, open_mirror_file_readonly
+from .common import PbzError, _reparse_link, anchor_mirror, open_mirror_file_readonly, list_names
 
 ACTIONS = {"slicer", "navigate", "drillthrough", "back", "hover"}
 
@@ -154,7 +154,7 @@ def run(ws, project, spec, mode="static"):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     pages = {}
     if os.path.isdir(pages_dir):
-        for name in os.listdir(pages_dir):
+        for name in list_names(pages_dir):
             path = os.path.join(pages_dir, name)
             if _reparse_link(path):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")
@@ -169,7 +169,7 @@ def run(ws, project, spec, mode="static"):
             if _reparse_link(vdir):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")
             if os.path.isdir(vdir):
-                for vid in os.listdir(vdir):
+                for vid in list_names(vdir):
                     if _reparse_link(os.path.join(vdir, vid)):
                         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
                     f = os.path.join(vdir, vid, "visual.json")

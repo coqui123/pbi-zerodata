@@ -120,9 +120,13 @@ public sealed class Ctx
         {
             if (!Path.IsPathFullyQualified(pd)) throw new BadRequestException("private_dir must be an absolute path");
             pd = Path.GetFullPath(pd);
+            string logs = Path.Combine(pd, "logs");
+            string snaps = Path.Combine(pd, "snapshots");
+            LinkGuard.Refuse(logs);
+            LinkGuard.Refuse(snaps);
             Directory.CreateDirectory(pd);
-            Directory.CreateDirectory(Path.Combine(pd, "logs"));
-            Directory.CreateDirectory(Path.Combine(pd, "snapshots"));
+            Directory.CreateDirectory(logs);
+            Directory.CreateDirectory(snaps);
             PrivateDir = pd;
         }
         int? t = req.Int("timeout_s");

@@ -26,7 +26,7 @@ import shutil
 import stat
 import xml.etree.ElementTree as ET
 
-from .common import PbzError, _contained, _reparse_link, commit_bytes, read_definition_text, remove_file, replace_bytes, write_text
+from .common import PbzError, _contained, _reparse_link, commit_bytes, read_definition_text, remove_file, replace_bytes, write_text, list_names, walk_tree
 
 PACKAGE = "RegisteredResources"
 PACKAGE_TYPE = 1
@@ -318,7 +318,7 @@ def scan(report_dir: str) -> list[dict]:
     ddir = os.path.join(report_dir, "definition")
     pdir = os.path.join(ddir, "pages")
     seen_files: set[str] = set()
-    for pid in sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []:
+    for pid in sorted(list_names(pdir)) if os.path.isdir(pdir) else []:
         pj = os.path.join(pdir, pid, "page.json")
         page = _load(pj)
         seen_files.add(os.path.normcase(pj))
@@ -328,7 +328,7 @@ def scan(report_dir: str) -> list[dict]:
             out.append(_ref(rpi, f"page '{pname}' {label}" + ("" if prop == "image" else f" {prop}"),
                             f"definition/pages/{pid}/page.json", path))
         vdir = os.path.join(pdir, pid, "visuals")
-        for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+        for vid in sorted(list_names(vdir)) if os.path.isdir(vdir) else []:
             vj = os.path.join(vdir, vid, "visual.json")
             doc = _load(vj)
             seen_files.add(os.path.normcase(vj))
@@ -338,7 +338,7 @@ def scan(report_dir: str) -> list[dict]:
                 for obj, prop, path, rpi in _in_objects(body.get(section)):
                     out.append(_ref(rpi, f"page '{pname}' visual {vid} ({vt}) {pre}{obj}.{prop}",
                                     f"definition/pages/{pid}/visuals/{vid}/visual.json", path))
-    for cur, _dirs, files in os.walk(ddir):  # bookmarks, report.json, extensions: anything else
+    for cur, _dirs, files in walk_tree(ddir):  # bookmarks, report.json, extensions: anything else
         for f in sorted(files):
             p = os.path.join(cur, f)
             if not f.lower().endswith(".json") or os.path.normcase(p) in seen_files:
@@ -370,7 +370,7 @@ def _strict_definition(report_dir: str, mirror: str | None = None) -> None:
     rel_dir = os.path.relpath(ddir, root).replace("\\", "/")
     if not os.path.isdir(ddir):
         raise PbzError("REFUSED", rel_dir)
-    for cur, _dirs, files in os.walk(ddir):
+    for cur, _dirs, files in walk_tree(ddir):
         for name in files:
             if not name.lower().endswith(".json"):
                 continue
@@ -452,7 +452,7 @@ def add(ws, project, path: str, name: str | None = None) -> dict:
     pend = _pending_dir(ws, project)
     ops: list[tuple] = []
     if os.path.isdir(pend):
-        for fname in os.listdir(pend):  # staged files whose registration was reverted
+        for fname in list_names(pend):  # staged files whose registration was reverted
             if fname not in reg:
                 ops.append(("delete", os.path.join(pend, fname)))
     ops.append(("write_bytes", os.path.join(pend, item), data))
@@ -470,10 +470,15 @@ def _commit(ws, project, ops: list[tuple]) -> None:
     """Private pending files and mirror report.json each stay inside their own root."""
     roots = {}
     private = os.path.abspath(ws.private)
-    home = os.path.abspath(project.root)
+    mirror = os.path.abspath(ws.mirror)
     for op in ops:
         path = os.path.abspath(op[1])
-        roots[op[1]] = ws.private if path == private or path.startswith(private + os.sep) else home
+        if path == private or path.startswith(private + os.sep):
+            roots[op[1]] = ws.private
+        elif path == mirror or path.startswith(mirror + os.sep):
+            roots[op[1]] = ws.mirror
+        else:
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     commit_bytes(ops, private=True, roots=roots)
 
 
@@ -520,7 +525,7 @@ def remove(ws, project, item: str) -> dict:
     _unregister(doc, item)
     ops: list[tuple] = [("write", rjson, _render(text, doc), bom)]
     pend = os.path.join(_pending_dir(ws, project), item)
-    was_staged = os.path.isfile(pend)
+    was_staged = _regular_file(pend)
     if was_staged:
         ops.append(("delete", pend))
     _commit(ws, project, ops)
@@ -532,11 +537,27 @@ def remove(ws, project, item: str) -> dict:
 
 # ---------------------------------------------------------------- push support
 
+def _regular_file(path: str) -> bool:
+    """True when `path` is a regular file. A symlink or junction is not followed.
+
+    A missing file is false. A file that is present but cannot be inspected is refused.
+    """
+    if _reparse_link(path):
+        return False
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise PbzError("REFUSED", "an image file could not be read") from None
+    return stat.S_ISREG(info.st_mode)
+
+
 def staged(ws, project, report_json_text: str) -> dict[str, str]:
     """{item: staged file} for staged images that this report.json registers."""
     d = _pending_dir(ws, project)
     return {i: os.path.join(d, i) for i in sorted(registered(report_json_text))
-            if valid_item(i) and os.path.isfile(os.path.join(d, i))}
+            if valid_item(i) and _regular_file(os.path.join(d, i))}
 
 
 def dropped(old_text: str, new_text: str) -> list[str]:
@@ -627,7 +648,7 @@ def delete(items: list[str], report_dir: str, backup_dir: str | None = None, *,
 def clear_pending(ws, project, items) -> None:
     for i in items:
         p = os.path.join(_pending_dir(ws, project), i)
-        if valid_item(i) and os.path.isfile(p):
+        if valid_item(i) and _regular_file(p):
             remove_file(p, root=_pending_dir(ws, project))
 
 

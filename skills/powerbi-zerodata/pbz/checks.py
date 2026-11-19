@@ -113,9 +113,12 @@ def _class_of(value, allowed: frozenset) -> str | None:
     return value if isinstance(value, str) and value in allowed else None
 
 
-def _rls_clean(row: dict) -> dict:
+def _rls_clean(row: dict, allowed_ids: set[str]) -> dict | None:
+    ident = row.get("id")
+    if not isinstance(ident, str) or ident not in allowed_ids:
+        return None
     status = row.get("status") if row.get("status") in _CHECK_STATUS else "ERROR"
-    out = {"id": row.get("id"), "status": status}
+    out = {"id": ident, "status": status}
     klass = _class_of(row.get("class"), _ERROR_CLASS)
     if klass is not None:
         out["class"] = klass
@@ -640,7 +643,7 @@ def run_checks(ws, project, spec: dict) -> dict:
             st["checks"] += 1
             st["per_target"][th] = st["per_target"].get(th, 0) + 1
             ledger += [{"h": h, "day": st["day"]} for h in sorted({_h(x) for x in consts} - seen_consts)]
-            if c.get("_negate"):
+            if kind == "differs":
                 negate.add(cid)
             if out["kind"] == "compiles":
                 compiles_items.append({"id": cid, "table": out.get("table") or next(iter(real_model.tables), ""),
@@ -694,7 +697,7 @@ def run_checks(ws, project, spec: dict) -> dict:
                     if k.endswith("_bucket"):
                         r.pop(k)
             if str(r.get("id")) in rls_ids:
-                r = _rls_clean(r)
+                r = _rls_clean(r, rls_ids)
             else:
                 r = _closed_engine_row(r, allowed_ids)
             if r is not None:

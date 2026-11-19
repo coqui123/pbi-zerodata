@@ -21,7 +21,9 @@ public static class TmdlValidate
         ["cultureInfo"] = "cultures",
     };
 
-    static readonly Regex RefRx = new(@"^ref\s+(?<kind>[A-Za-z]+)\s+(?<name>.+?)\s*$", RegexOptions.Compiled);
+    static readonly Regex RefRx = new(
+        @"^ref\s+(?<kind>[A-Za-z]+)\s+(?<name>'(?:[^']|'')+'|[^\s]+)\s*$",
+        RegexOptions.Compiled);
     static readonly Regex DeclRx = new(
         @"^\s*(?:table|column|measure|hierarchy|level|partition|role|perspective|cultureInfo|expression|calculationItem|tablePermission)\s+(?<name>'(?:[^']|'')+'|[^\s=]+)",
         RegexOptions.Compiled);
@@ -31,6 +33,7 @@ public static class TmdlValidate
         string folder = J.ReqStr(req.Obj, "folder");
         if (!Path.IsPathFullyQualified(folder)) throw new BadRequestException("folder must be an absolute path");
         folder = Path.GetFullPath(folder);
+        LinkGuard.Refuse(folder);
         if (!Directory.Exists(folder)) throw new BadRequestException("folder not found");
 
         var scrub = new Scrubber(CollectNames(folder));
@@ -142,7 +145,7 @@ public static class TmdlValidate
     static IEnumerable<string> CollectNames(string folder)
     {
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var f in Directory.EnumerateFiles(folder, "*.tmdl", SearchOption.AllDirectories))
+        foreach (var f in TmdlFiles(folder))
         {
             foreach (var line in File.ReadLines(f))
             {
@@ -168,6 +171,7 @@ public static class TmdlValidate
         foreach (var top in new[] { "model.tmdl", "database.tmdl" })
         {
             string p = Path.Combine(folder, top);
+            LinkGuard.Refuse(p);
             if (!File.Exists(p)) continue;
             foreach (var line in File.ReadLines(p))
             {
@@ -189,9 +193,11 @@ public static class TmdlValidate
         foreach (var (kind, dir) in RefDirs)
         {
             string d = Path.Combine(folder, dir);
+            LinkGuard.Refuse(d);
             if (!Directory.Exists(d)) continue;
             foreach (var f in Directory.EnumerateFiles(d, "*.tmdl").OrderBy(x => x, StringComparer.Ordinal))
             {
+                LinkGuard.Refuse(f);
                 string objName = DecodeName(Path.GetFileNameWithoutExtension(f));
                 if (!refs[kind].Contains(objName)) orphans.Add(dir + "/" + Path.GetFileName(f));
             }
@@ -202,10 +208,31 @@ public static class TmdlValidate
     static string? FindFile(string folder, string dir, string name)
     {
         string d = Path.Combine(folder, dir);
+        LinkGuard.Refuse(d);
         if (!Directory.Exists(d)) return null;
         foreach (var f in Directory.EnumerateFiles(d, "*.tmdl"))
+        {
+            LinkGuard.Refuse(f);
             if (string.Equals(DecodeName(Path.GetFileNameWithoutExtension(f)), name, StringComparison.OrdinalIgnoreCase)) return f;
+        }
         return null;
+    }
+
+    static IEnumerable<string> TmdlFiles(string folder)
+    {
+        LinkGuard.Refuse(folder);
+        foreach (var entry in Directory.EnumerateFileSystemEntries(folder))
+        {
+            LinkGuard.Refuse(entry);
+            if (File.GetAttributes(entry).HasFlag(FileAttributes.Directory))
+            {
+                foreach (var child in TmdlFiles(entry)) yield return child;
+            }
+            else if (entry.EndsWith(".tmdl", StringComparison.OrdinalIgnoreCase))
+            {
+                yield return entry;
+            }
+        }
     }
 
     const string Reserved = "\\/:*?\"<>|%";

@@ -19,7 +19,7 @@ import os
 import re
 
 from . import pbir, tmdl
-from .common import PbzError, commit_bytes, read_definition_text, write_text
+from .common import PbzError, commit_bytes, read_definition_text, write_text, list_names
 from .tokens import TOKEN_RE
 
 _CAT: dict | None = None
@@ -175,9 +175,12 @@ def encode(code, raw: str, model, image_ref=None) -> dict:
         return _lit(_num(str(UNITS.get(raw.lower(), raw))))
     if code == "integer":
         try:
-            return _lit(f"{int(float(raw))}L")
+            n = float(raw)
         except ValueError:
             raise PbzError("BAD_REQUEST", f"{raw} is not a whole number")
+        if not n.is_integer():
+            raise PbzError("BAD_REQUEST", f"{raw} is not a whole number")
+        return _lit(f"{int(n)}L")
     if code == "color":
         return _color(raw, model)
     if code in ("text", "fontFamily", "formatString"):
@@ -230,7 +233,7 @@ def _pages(project) -> tuple[str, list[tuple[str, str]]]:
     if not os.path.isdir(pdir):
         raise PbzError("NO_MIRROR", "run `pbz pull` first (no report pages in the mirror)")
     out = []
-    for pid in sorted(os.listdir(pdir)):
+    for pid in sorted(list_names(pdir)):
         pj = os.path.join(pdir, pid, "page.json")
         if os.path.isfile(pj):
             try:
@@ -255,7 +258,7 @@ def _strict_documents(project, page: str | None, vtype: str | None, all_: bool, 
         return
     whole = page is None and bool(vtype or all_)
     chosen = []
-    for pid in sorted(os.listdir(pdir)):
+    for pid in sorted(list_names(pdir)):
         pj = os.path.join(pdir, pid, "page.json")
         if not os.path.isfile(pj):
             continue
@@ -278,7 +281,7 @@ def _strict_documents(project, page: str | None, vtype: str | None, all_: bool, 
         vdir = os.path.join(pdir, pid, "visuals")
         if not os.path.isdir(vdir):
             continue
-        for vid in sorted(os.listdir(vdir)):
+        for vid in sorted(list_names(vdir)):
             path = os.path.join(vdir, vid, "visual.json")
             if not os.path.isfile(path):
                 continue

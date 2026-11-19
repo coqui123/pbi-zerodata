@@ -177,7 +177,9 @@ def build(ws, project, include_all: bool = False) -> dict:
                 entries.append(e)
     if not entries:
         out = {"verb": "handoff", "project": project.name, "result": "NOTHING_NEW"}
-        if os.path.exists(os.path.join(ws.mirror, "HANDOFF.md")):
+        packet_path = os.path.join(ws.mirror, "HANDOFF.md")
+        preflight_regular(packet_path, root=ws.mirror)
+        if os.path.isfile(packet_path):
             out["file"] = "pbz-workspace/HANDOFF.md"
             if current.get("packet"):
                 out["packet"] = current["packet"]

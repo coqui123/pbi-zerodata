@@ -14,7 +14,7 @@ import os
 import re
 
 from . import deps, lexers, mirror, pbir, tmdl, usage
-from .common import PbzError, anchor_mirror, pbz_state_path, preflight_regular, read_checked, read_text, read_text_checked, write_text
+from .common import PbzError, anchor_mirror, pbz_state_path, preflight_regular, read_checked, read_text, read_text_checked, write_text, list_names
 
 SECTIONS = ["overview", "tables", "measures", "calculation_groups", "functions", "field_parameters",
             "relationships", "power_query", "security", "reports", "unused", "changelog"]
@@ -96,7 +96,7 @@ def _report(name: str, rdir: str, model) -> dict:
     if meta is not None and isinstance(meta.get("pageOrder"), pbir.JArr):
         order = [_s(x) for x in meta.get("pageOrder").items]
     pdir = os.path.join(ddir, "pages")
-    pids = sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []
+    pids = sorted(list_names(pdir)) if os.path.isdir(pdir) else []
     pids = [p for p in order if p in pids] + [p for p in pids if p not in order]
     for pid in pids:
         proot = load("pages", pid, "page.json")
@@ -108,7 +108,7 @@ def _report(name: str, rdir: str, model) -> dict:
                 "type": (_s(binding.get("type")) if isinstance(binding, pbir.JObj) else "") or "page",
                 "filters": _filters(proot), "visuals": []}
         vdir = os.path.join(pdir, pid, "visuals")
-        for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+        for vid in sorted(list_names(vdir)) if os.path.isdir(vdir) else []:
             vroot = load("pages", pid, "visuals", vid, "visual.json")
             if vroot is None:
                 continue
@@ -124,7 +124,7 @@ def _report(name: str, rdir: str, model) -> dict:
             page["visuals"].append({"id": vid, "type": vt, "fields": roles, "filters": _filters(vroot)})
         rep["pages"].append(page)
     bdir = os.path.join(ddir, "bookmarks")
-    for f in sorted(os.listdir(bdir)) if os.path.isdir(bdir) else []:
+    for f in sorted(list_names(bdir)) if os.path.isdir(bdir) else []:
         if f.endswith(".bookmark.json"):
             b = load("bookmarks", f)
             if b is not None:
@@ -272,7 +272,7 @@ def _changelog(ws, project) -> tuple[list[dict], int]:
     except PbzError:
         raise
     except (OSError, UnicodeError):
-        return [], 0
+        return [], 1
     kept, skipped = [], 0
     for line in lines:
         raw = line.strip()

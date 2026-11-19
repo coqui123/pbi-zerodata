@@ -8,7 +8,7 @@ import subprocess
 
 from . import daxcatalog, deps, lint, pbir, pbircheck, tmdl
 from .classify import PII_IN_TEXT
-from .common import TOOLS_BIN, definition_root, engine_call, open_mirror_file_readonly
+from .common import TOOLS_BIN, definition_root, engine_call, open_mirror_file_readonly, walk_tree
 from .tokens import ESC_TOKEN_RE, TOKEN_RE
 
 REPORT_AUTHOR = os.path.join(TOOLS_BIN, "powerbi-report-author.cmd")
@@ -189,7 +189,7 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
         findings += [dict(f, message=scrub(f["message"]))
                      for f in pbircheck.run(rdir, has_package=staged_pkg, has_image=staged_img)]
     findings += field_refs(stage, project, model, scrub)
-    for cur, _dirs, files in os.walk(stage):
+    for cur, _dirs, files in walk_tree(stage):
         for name in files:
             if name.lower().endswith((".tmdl", ".json", ".pbir", ".pbism")):
                 p = os.path.join(cur, name)

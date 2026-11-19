@@ -24,7 +24,7 @@ import json
 import os
 
 from . import author, filters
-from .common import PbzError, anchor_mirror, commit_bytes, read_definition_text
+from .common import PbzError, anchor_mirror, commit_bytes, read_definition_text, list_names, refuse_below, walk_tree
 from .layout import LABELS
 from .tokens import TOKEN_RE
 
@@ -55,13 +55,16 @@ def _json_text(doc: dict) -> str:
 def _require_pages(ws, rdir: str) -> None:
     """Parse pages.json and every page.json before a helper can raise a raw parser error."""
     pdir = os.path.join(rdir, "definition", "pages")
+    refuse_below(pdir, rdir)
     meta_p = os.path.join(pdir, "pages.json")
+    refuse_below(meta_p, rdir)
     if os.path.isfile(meta_p):
         _load(ws, meta_p)
     if not os.path.isdir(pdir):
         return
-    for pid in os.listdir(pdir):
+    for pid in list_names(pdir):
         pj = os.path.join(pdir, pid, "page.json")
+        refuse_below(pj, rdir)
         if os.path.isfile(pj):
             _load(ws, pj)
 
@@ -71,11 +74,14 @@ def _rel(ws, path: str) -> str:
 
 
 def _visual_names(pdir: str) -> set:
+    root = os.path.dirname(os.path.dirname(pdir))
+    refuse_below(pdir, root)
     names = set()
-    for pid in os.listdir(pdir):
+    for pid in list_names(pdir):
         vdir = os.path.join(pdir, pid, "visuals")
         if os.path.isdir(vdir):
-            names |= set(os.listdir(vdir))
+            refuse_below(vdir, root)
+            names |= set(list_names(vdir))
     return names
 
 
@@ -124,7 +130,7 @@ def _page_visuals(pdir: str, pid: str) -> list[tuple[str, str]]:
     """[(visual name, path)] in the order `pbz layout` labels them."""
     vdir = os.path.join(pdir, pid, "visuals")
     out = []
-    for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+    for vid in sorted(list_names(vdir)) if os.path.isdir(vdir) else []:
         p = os.path.join(vdir, vid, "visual.json")
         if os.path.isfile(p):
             out.append((vid, p))
@@ -134,7 +140,7 @@ def _page_visuals(pdir: str, pid: str) -> list[tuple[str, str]]:
 def _bookmarks_on(rdir: str, pid: str) -> int:
     bdir = os.path.join(rdir, "definition", "bookmarks")
     n = 0
-    for f in os.listdir(bdir) if os.path.isdir(bdir) else []:
+    for f in list_names(bdir) if os.path.isdir(bdir) else []:
         if f.endswith(".bookmark.json"):
             try:
                 es = json.loads(read_definition_text(os.path.join(bdir, f))[0]).get("explorationState") or {}
@@ -158,7 +164,7 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
     if any(str(p.get("displayName", "")).lower() == new_name.strip().lower() for p in pages.values()):
         raise PbzError("NAME_TAKEN", f"page {new_name}")
     anchor = author._find_page(pages, after) if after else src
-    new_pid = _fresh(set(pages) | set(os.listdir(pdir)))
+    new_pid = _fresh(set(pages) | set(list_names(pdir)))
     taken_filters = filters._all_filter_names(project)
     taken_visuals = _visual_names(pdir)
     src_dir = os.path.join(pdir, src)
@@ -203,7 +209,7 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
         files.append(path)
 
     plan(os.path.join(dst_dir, "page.json"), _json_text(pdoc), pbom)
-    for cur, dirs, fs in os.walk(src_dir):  # other page-level files (not page.json, not visuals) as they are
+    for cur, dirs, fs in walk_tree(src_dir):  # other page-level files (not page.json, not visuals) as they are
         rel = os.path.relpath(cur, src_dir)
         if rel.split(os.sep)[0] == "visuals":
             dirs[:] = []
@@ -219,7 +225,7 @@ def copy_page(ws, project, page: str, new_name: str, after: str | None = None,
     for vid, path in vis:
         vsrc = os.path.dirname(path)
         vdst = os.path.join(dst_dir, "visuals", vmap[vid])
-        for cur, _dirs, fs in os.walk(vsrc):
+        for cur, _dirs, fs in walk_tree(vsrc):
             rel = os.path.relpath(cur, vsrc)
             for f in fs:
                 s_f = os.path.join(cur, f)
@@ -316,7 +322,7 @@ def copy_visual(ws, project, page: str, visual: str, to_page: str | None = None,
             raise PbzError("BAD_REQUEST", "--pos is x,y or x,y,width,height")
         nx, ny = parts[0], parts[1]
         if len(parts) == 4:
-            if len(members) > 1:
+            if "visualGroup" in docs[top][0]:
                 raise PbzError("BAD_REQUEST", "a group copy takes --pos x,y (its children keep their sizes)")
             w, h = parts[2], parts[3]
     else:
@@ -330,7 +336,7 @@ def copy_visual(ws, project, page: str, visual: str, to_page: str | None = None,
     extras: dict[str, list[tuple[str, str, bytes]]] = {}
     for vid in members:
         root = os.path.join(pdir, src_pid, "visuals", vid)
-        for cur, _dirs, fs in os.walk(root):  # mobile.json and friends, read before any write
+        for cur, _dirs, fs in walk_tree(root):  # mobile.json and friends, read before any write
             rel = os.path.relpath(cur, root)
             for f in fs:
                 if rel == "." and f == "visual.json":

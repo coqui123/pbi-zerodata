@@ -12,7 +12,7 @@ import math
 import os
 
 from . import perf
-from .common import PbzError, _reparse_link
+from .common import PbzError, _reparse_link, walk_tree
 
 _UNSAFE = PbzError("UNSAFE_PATH", "refusing to write through a link")
 
@@ -48,7 +48,7 @@ def _visuals(project) -> dict[str, str]:
         return found
     if _reparse_link(report):
         raise _UNSAFE
-    for dirpath, dirs, names in os.walk(report):
+    for dirpath, dirs, names in walk_tree(report):
         if _reparse_link(dirpath):
             raise _UNSAFE
         for d in dirs:

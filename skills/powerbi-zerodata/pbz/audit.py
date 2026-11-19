@@ -261,8 +261,12 @@ def _dax_text(model, node) -> str:
 
 def _index(ws) -> dict:
     path = os.path.join(ws.private, "index-summary.json")
-    if not os.path.lexists(path):
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
         return {}
+    except OSError:
+        raise PbzError("REFUSED", "index summary is unreadable") from None
     try:
         data = json.loads(read_checked(path, root=ws.private).decode("utf-8"))
     except PbzError:
@@ -1188,11 +1192,22 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
         for f in active:
             f["status"] = "persistent" if f["id"] in old else "new"
         now = {f["id"] for f in out_f}
+        resolved, unchecked = [], []
+        for i, r in old.items():
+            if i in now:
+                continue
+            item = {"id": i, "rule": r["rule"], "object": r["object"]}
+            # This finding exists only when the index bucket is 10k+. A missing index did not recheck it.
+            if r.get("rule") == "HIGH_CARDINALITY_BIDIRECTIONAL" and not idx:
+                unchecked.append(item)
+            else:
+                resolved.append(item)
         result["baseline"] = {"name": since, "saved": base.get("saved"),
                               "new": sum(1 for f in active if f["status"] == "new"),
                               "persistent": sum(1 for f in active if f["status"] == "persistent"),
-                              "resolved": [{"id": i, "rule": r["rule"], "object": r["object"]}
-                                           for i, r in old.items() if i not in now][:100]}
+                              "resolved": resolved[:100]}
+        if unchecked:
+            result["baseline"]["not_rechecked"] = unchecked[:100]
     result["findings"] = active[:max_findings]
     if len(active) > max_findings:
         result["more"] = len(active) - max_findings

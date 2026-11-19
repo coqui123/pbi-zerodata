@@ -22,8 +22,7 @@ import unicodedata
 from . import dpapi
 from .common import (
     PbzError, SIZE_CAP, append_checked, pbz_state_path, read_checked, write_text, _reparse_link,
-    _workspace_root,
-)
+    _workspace_root, list_names)
 
 STAGES = ("PARSED", "BOUND", "LOADED", "EXECUTED", "STATIC_CONTRACT", "SYNTHETIC", "HANDOFF", "HUMAN_ACCEPTED")
 LOG = "evidence.jsonl"
@@ -108,7 +107,7 @@ def _segment_paths(ws) -> list[str]:
     directory = pbz_state_path(ws, "evidence.d")
     out = []
     try:
-        names = sorted(os.listdir(directory))
+        names = sorted(list_names(directory))
     except OSError:
         raise PbzError("REFUSED", UNUSABLE) from None
     for name in names:
@@ -206,6 +205,21 @@ def _anchor(ws) -> str:
     return anchor if isinstance(anchor, str) and _CHAIN_RE.fullmatch(anchor) else GENESIS
 
 
+def _verified_tip(key, prev: str, text: str) -> str | None:
+    """Last MAC when every line chains from prev. A broken or unauthenticated line returns None."""
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, RecursionError):
+            return None
+        if not isinstance(obj, dict) or not _chain_ok(key, prev, obj):
+            return None
+        prev = obj["chain_mac"]
+    return prev
+
+
 def _last_mac(text: str | None) -> str | None:
     last = None
     for line in (text or "").split("\n"):
@@ -263,7 +277,7 @@ def _rotate(ws) -> str:
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     nums = []
     try:
-        names = os.listdir(directory)
+        names = list_names(directory)
     except OSError:
         raise PbzError("REFUSED", UNUSABLE) from None
     for name in names:
@@ -306,6 +320,7 @@ def prune(ws, today: dt.date | None = None) -> dict:
     from .checks import LEDGER_DAYS
     cutoff = ((today or dt.date.today()) - dt.timedelta(days=LEDGER_DAYS)).isoformat()
     anchor = _anchor(ws)
+    key = _chain_key(ws)
     doomed = []
     for path in _segment_paths(ws):
         text = _read_log(ws, path)
@@ -314,9 +329,10 @@ def prune(ws, today: dt.date | None = None) -> dict:
         newest = _newest_day(text)
         if newest is None or newest >= cutoff:
             break
-        mac = _last_mac(text)
-        if mac:
-            anchor = mac
+        verified = _verified_tip(key, anchor, text)
+        if verified is None:
+            break
+        anchor = verified
         doomed.append(path)
     if doomed:
         write_text(_index_path(ws), json.dumps({"anchor": anchor}) + "\n", root=_workspace_root(ws))
@@ -794,6 +810,8 @@ def summarize(verb: str, action: str | None, out: dict) -> tuple[str, dict] | No
     if out.get("ok") is False:
         return None
     if verb == "health":
+        if out.get("status") in ("ERROR", "FAIL"):
+            return "EXECUTED", {"outcome": "FAIL", "status": out["status"], "executed": False}
         bad = out.get("errors") or out.get("objects_in_error") or []
         unprocessed = out.get("unprocessed_tables") or []
         count = len(bad) if isinstance(bad, list) else bad
@@ -962,7 +980,7 @@ def _state_names(ws, dirname: str) -> tuple[str, list[str]]:
     if _reparse_link(path) or not os.path.isdir(path):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     names = []
-    for name in sorted(os.listdir(path)):
+    for name in sorted(list_names(path)):
         full = os.path.join(path, name)
         if _reparse_link(full):
             continue
@@ -1138,7 +1156,8 @@ def review(ws, project, accept: bool = False, current_spec_digest: str | None = 
                 "runtime_from_static": static_view["runtime_satisfied"],
                 "human_from_static": static_view["human_accepted"]}
     out = {"verb": "review", "project": project.name, "revision": {"mirror": cur_m, "real": cur_r},
-           "pending_edits": pending, "classes": {c: by_class[c] for c in CLASS_ORDER if c in by_class},
+           "pending_edits": pending, "edits_unknown": edits_unknown,
+           "classes": {c: by_class[c] for c in CLASS_ORDER if c in by_class},
            "changes": rows[:300], "evidence": evidence, "coverage": coverage,
            "next": [f"{c}: {NEXT[c]}" for c in CLASS_ORDER if c in by_class],
            "suggested_tests": suggested}
@@ -1154,7 +1173,7 @@ def review(ws, project, accept: bool = False, current_spec_digest: str | None = 
 def _markdown(out: dict, ws, project, rows: list[dict]) -> str:
     L = [f"# Review packet: {project.name}", "",
          f"Revision: mirror `{out['revision']['mirror']}`, real files `{out['revision']['real']}`. "
-         f"Pending edits: {'yes' if out['pending_edits'] else 'no'}.", ""]
+         f"Pending edits: {'unknown' if out.get('edits_unknown') else 'yes' if out['pending_edits'] else 'no'}.", ""]
     if rows:
         L += ["## Changes by release class", "", "| Class | Kind | Object | Change | Impact |", "|---|---|---|---|---|"]
         for r in rows:
@@ -1164,7 +1183,10 @@ def _markdown(out: dict, ws, project, rows: list[dict]) -> str:
             L.append(f"| {r['class']} | {r['kind']} | {r['object']} | {r['status']}: {detail} | {impact} |")
         L += ["", "## Next steps", ""] + [f"- {n}" for n in out["next"]] + [""]
     else:
-        L += ["No pending edits since the last pull or push.", ""]
+        if out.get("edits_unknown"):
+            L += ["Pending edits could not be determined.", ""]
+        else:
+            L += ["No pending edits since the last pull or push.", ""]
     if out["suggested_tests"]:
         L += ["## Suggested verification", ""] + [f"- `{t}`" if t.startswith("pbz ") else f"- {t}" for t in out["suggested_tests"]] + [""]
     L += ["## Evidence", "", "| Stage | Status | Verb | When | Summary |", "|---|---|---|---|---|"]

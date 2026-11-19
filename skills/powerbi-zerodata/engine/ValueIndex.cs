@@ -284,7 +284,7 @@ public static class IndexFile
         try
         {
             string p = Path.Combine(privateDir, "index.json");
-            if (!File.Exists(p)) return null;
+            if (LinkGuard.IsLink(p) || !File.Exists(p)) return null;
             return JsonNode.Parse(File.ReadAllText(p, Encoding.UTF8)) as JsonObject;
         }
         catch

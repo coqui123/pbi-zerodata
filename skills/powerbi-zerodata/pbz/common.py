@@ -244,6 +244,66 @@ def _reparse_link(path: str) -> bool:
     return getattr(info, "st_reparse_tag", None) in _LINK_TAGS
 
 
+def refuse_below(path: str, root: str) -> None:
+    """Refuse a symlink or junction on `path` or on a parent strictly below `root`.
+
+    `root` itself may be a junction. That directory is the store.
+    """
+    _refuse_dotdot_through_link(path)
+    path = os.path.abspath(path)
+    root = os.path.abspath(root)
+    try:
+        if os.path.normcase(os.path.commonpath([path, root])) != os.path.normcase(root):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    except ValueError:
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
+    cur = path
+    while os.path.normcase(cur) != os.path.normcase(root):
+        if _reparse_link(cur):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+
+def list_names(path: str) -> list[str]:
+    """Names in one directory. A symlink or junction is refused before it is listed."""
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    return os.listdir(path)
+
+
+def walk_tree(root: str):
+    """Walk `root`. The start, every directory, and every file that is a link is refused.
+
+    A missing start yields nothing. A start or a child that exists but cannot be listed is refused.
+    The refusal happens in the parent before that link is opened, so a junction is not listed.
+    """
+    if _reparse_link(root):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise PbzError("REFUSED", "a directory could not be listed") from None
+
+    def _unreadable(_err):
+        raise PbzError("REFUSED", "a directory could not be listed") from None
+
+    for cur, dirs, files in os.walk(root, onerror=_unreadable):
+        if _reparse_link(cur):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        for name in dirs:
+            if _reparse_link(os.path.join(cur, name)):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        for name in files:
+            if _reparse_link(os.path.join(cur, name)):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        yield cur, dirs, files
+
+
 def _still_owned(tmp: str, dev: int, ino: int) -> bool:
     """True when `tmp` is still the file this call created. A link or a replacement is not."""
     try:

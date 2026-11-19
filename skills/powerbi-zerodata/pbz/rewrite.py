@@ -85,6 +85,7 @@ def _return_without_var(sig) -> bool:
     A comma inside a table constructor does not end that block.
     """
     counts = [0]
+    brace_at = [0]
     depth = 0
     braces = 0
     prev = None
@@ -93,8 +94,10 @@ def _return_without_var(sig) -> bool:
             depth += 1
             if len(counts) <= depth:
                 counts.append(0)
+                brace_at.append(braces)
             else:
                 counts[depth] = 0
+                brace_at[depth] = braces
             prev = tok
             continue
         if tok.kind == "op" and tok.text == ")":
@@ -112,18 +115,20 @@ def _return_without_var(sig) -> bool:
             braces = max(0, braces - 1)
             prev = tok
             continue
-        if tok.kind == "op" and tok.text == "," and braces == 0:
+        if tok.kind == "op" and tok.text == "," and (braces == 0 or (depth > 0 and braces == brace_at[depth])):
             counts[depth] = 0
             prev = tok
             continue
         if tok.kind == "ident" and tok.text.upper() == "VAR":
             starts = prev is None or prev.text.upper() == "RETURN" or (
-                prev.kind == "op" and prev.text not in (")", "}"))
+                prev.kind == "op" and prev.text != ")")
             if starts:
                 counts[depth] += 1
             prev = tok
             continue
         if tok.kind == "ident" and tok.text.upper() == "RETURN":
+            if prev is not None and prev.kind == "ident" and prev.text.upper() == "RETURN":
+                return True
             if counts[depth] == 0:
                 return True
             counts[depth] -= 1

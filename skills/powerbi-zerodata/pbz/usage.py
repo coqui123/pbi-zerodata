@@ -21,7 +21,7 @@ import os
 from dataclasses import dataclass, field
 
 from . import deps, pbir, tmdl
-from .common import PbzError, read_definition_text, read_text
+from .common import PbzError, read_definition_text, read_text, list_names
 
 STATES = ("used", "used_external", "locked", "used_by_unused", "unused", "unknown")
 UNSEEN = ["service reports", "Excel / Analyze in Excel", "paginated reports", "composite models",
@@ -250,7 +250,7 @@ def bound_reports(ws, project, graph: Graph | None = None) -> list[tuple[str, st
     if not os.path.isdir(ws.mirror):
         return out
     want = (project.name + ".SemanticModel").lower()
-    for name in sorted(os.listdir(ws.mirror)):
+    for name in sorted(list_names(ws.mirror)):
         rdir = os.path.join(ws.mirror, name)
         if not (name.lower().endswith(".report") and os.path.isdir(rdir)):
             continue
@@ -264,8 +264,23 @@ def bound_reports(ws, project, graph: Graph | None = None) -> list[tuple[str, st
                 graph.warnings.append({"code": "UNREADABLE_REPORT_FILE", "report": name[:-7],
                                        "where": "definition.pbir"})
             continue
-        path = ((ref.get("datasetReference") or {}).get("byPath") or {}).get("path", "")
-        if path and os.path.basename(os.path.normpath(path.replace("\\", "/"))).lower() == want:
+        raw_dataset = ref.get("datasetReference")
+        if "datasetReference" in ref and not isinstance(raw_dataset, dict):
+            if graph is not None:
+                graph.incomplete = True
+                graph.warnings.append({"code": "UNREADABLE_REPORT_FILE", "report": name[:-7],
+                                       "where": "definition.pbir"})
+            continue
+        dataset = raw_dataset if isinstance(raw_dataset, dict) else {}
+        by_path = dataset.get("byPath")
+        path = by_path.get("path", "") if isinstance(by_path, dict) else ""
+        if "byPath" in dataset and (not isinstance(by_path, dict) or not isinstance(path, str) or not path.strip()):
+            if graph is not None:
+                graph.incomplete = True
+                graph.warnings.append({"code": "UNREADABLE_REPORT_FILE", "report": name[:-7],
+                                       "where": "definition.pbir"})
+            continue
+        if isinstance(path, str) and path and os.path.basename(os.path.normpath(path.replace("\\", "/"))).lower() == want:
             out.append((name[:-7], rdir))
     return out
 

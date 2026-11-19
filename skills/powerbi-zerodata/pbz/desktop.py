@@ -44,7 +44,7 @@ def _json_list(text: str) -> list:
 
 def processes() -> list[dict]:
     """PBIDesktop.exe processes with their command lines (file paths are metadata)."""
-    out = _ps("Get-CimInstance Win32_Process -Filter \"Name='PBIDesktop.exe'\" | "
+    out = _ps("$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process -Filter \"Name='PBIDesktop.exe'\" | "
               "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress")
     if out is None:
         raise PbzError("ENGINE_UNAVAILABLE", "Desktop process probe failed")
@@ -191,12 +191,14 @@ def close(project: Project, wait: int = 60) -> dict:
     _ps(f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ [void]$p.CloseMainWindow() }}")
     deadline = time.monotonic() + max(0, wait)
     while True:
-        alive = _ps(f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'alive' }}")
+        alive = _ps(
+            f"$errs = $null; $p = Get-Process -Id {pid} -ErrorAction SilentlyContinue -ErrorVariable errs; "
+            f"if ($p) {{ 'alive' }} elseif ($errs | Where-Object {{ $_.FullyQualifiedErrorId -notlike 'NoProcessFoundForGivenId*' }}) {{ exit 1 }}")
         if alive is None:
             return {"verb": "desktop", "project": project.name, "open": True, "pid": pid,
                     "action": "unknown", "result": "UNKNOWN",
                     "hint": "Desktop close could not be confirmed. It may still be open."}
-        if not alive.strip():
+        if not alive:
             return {"verb": "desktop", "project": project.name, "open": False,
                     "action": "closed", "result": "CLOSED"}
         remaining = deadline - time.monotonic()

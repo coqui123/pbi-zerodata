@@ -270,7 +270,7 @@ def _num(text: str) -> float | None:
 
 def _one_minus(sig: list) -> bool:
     for i in range(len(sig) - 2):
-        if sig[i].kind == "num" and _num(sig[i].text) == 1.0 and sig[i + 1].kind == "op" and sig[i + 1].text in "-+" \
+        if sig[i].kind == "num" and _num(sig[i].text) == 1.0 and sig[i + 1].kind == "op" and sig[i + 1].text == "-" \
                 and sig[i + 2].kind == "op" and sig[i + 2].text == "(":
             depth = 0
             for t in sig[i + 2:]:
@@ -363,8 +363,7 @@ def _canon(sig: list, res) -> str:
         elif t.kind == "bracket":
             parts.append("b:" + t.value.lower())
         elif t.kind == "num":
-            v = _num(t.text)
-            parts.append("n:" + (repr(v) if v is not None else t.text))
+            parts.append("n:" + t.text)
         elif t.kind in ("str", "pbztok"):
             parts.append("s:" + (t.value or t.text))
         else:

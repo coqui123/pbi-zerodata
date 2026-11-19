@@ -9,7 +9,7 @@ import stat
 from . import policy as policy_mod, tmdl
 from .classify import Classifier
 from . import guard
-from .common import PbzError, _reparse_link, commit_bytes
+from .common import PbzError, _reparse_link, commit_bytes, list_names
 
 RULES = [
     (re.compile(r"\b\d+(?:[.,]\d+)?\s?(?:→|->)\s?\d+(?:[.,]\d+)?[KMB%]?"), "[changed value]"),
@@ -56,7 +56,7 @@ def approved_memory_roots(ws) -> list[str]:
     projects = os.path.join(home, ".claude", "projects")
     if os.path.isdir(projects):
         try:
-            names = os.listdir(projects)
+            names = list_names(projects)
         except OSError:
             names = []
         for name in names:
@@ -103,7 +103,17 @@ def _links_within(path: str, boundary: str) -> None:
         except OSError:
             here = current
         below = os.path.normcase(here) != os.path.normcase(root_real)
-        if below and _reparse_link(current):
+        child = False
+        for root in (root_abs, root_real):
+            try:
+                if (os.path.normcase(os.path.commonpath([current, root])) == os.path.normcase(root)
+                        and os.path.normcase(current) != os.path.normcase(root)):
+                    child = True
+                    break
+            except ValueError:
+                continue
+        # A junction whose target is the boundary is still a component below it.
+        if child and _reparse_link(current):
             raise PbzError("UNSAFE_PATH", "memory folder is outside approved roots")
         try:
             real = os.path.realpath(current)
@@ -194,7 +204,7 @@ def run(ws, project, memory_dir: str, apply: bool = False, show: str | None = No
     if show:
         _stat_approved(os.path.join(memory_dir, show), directory)
     try:
-        names = os.listdir(memory_dir)
+        names = list_names(memory_dir)
     except OSError:
         raise PbzError("UNSAFE_PATH", "memory folder is outside approved roots") from None
     files = sorted(f for f in names if f.lower().endswith(".md") and os.path.basename(f) == f)

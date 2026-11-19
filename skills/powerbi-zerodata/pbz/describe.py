@@ -7,15 +7,25 @@ import re
 
 from . import lexers, pbir, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
-from .common import PbzError, read_text_checked
+from .common import PbzError, _reparse_link, read_checked, read_text_checked, list_names
 
 
 def _index_summary(ws) -> dict:
+    path = os.path.join(ws.private, "index-summary.json")
     try:
-        with open(os.path.join(ws.private, "index-summary.json"), encoding="utf-8") as f:  # pbz-allow-open: private index
-            data = json.load(f)
-    except (OSError, ValueError):
+        os.lstat(path)
+    except FileNotFoundError:
         return {}
+    except OSError:
+        raise PbzError("REFUSED", "index summary is unreadable") from None
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    try:
+        data = json.loads(read_checked(path, root=ws.private).decode("utf-8"))
+    except PbzError:
+        raise
+    except (OSError, ValueError, UnicodeError):
+        raise PbzError("REFUSED", "index summary is unreadable") from None
     out = {}
     for t in data.get("tables", []):
         out[t.get("table")] = t
@@ -28,7 +38,7 @@ def field_usage(project, model) -> dict:
     pages_dir = os.path.join(project.mirror_report, "definition", "pages")
     if not os.path.isdir(pages_dir):
         return use
-    for pid in sorted(os.listdir(pages_dir)):
+    for pid in sorted(list_names(pages_dir)):
         pjson = os.path.join(pages_dir, pid, "page.json")
         if not os.path.isfile(pjson):
             continue
@@ -37,7 +47,7 @@ def field_usage(project, model) -> dict:
         for ref in pbir.walk_fields(proot, model):
             use.setdefault((ref.kind, ref.table, ref.name), set()).add(f"{pname} | (page filter)")
         vdir = os.path.join(pages_dir, pid, "visuals")
-        for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+        for vid in sorted(list_names(vdir)) if os.path.isdir(vdir) else []:
             vjson = os.path.join(vdir, vid, "visual.json")
             if not os.path.isfile(vjson):
                 continue
@@ -85,13 +95,13 @@ def overview(ws, project) -> dict:
     pages_dir = os.path.join(project.mirror_report, "definition", "pages")
     pages = []
     if os.path.isdir(pages_dir):
-        for pid in sorted(os.listdir(pages_dir)):
+        for pid in sorted(list_names(pages_dir)):
             pj = os.path.join(pages_dir, pid, "page.json")
             if os.path.isfile(pj):
                 root = pbir.parse_json(read_text_checked(pj, root=os.path.dirname(project.mirror_report))[0])
                 name = root.get("displayName").value if isinstance(root.get("displayName"), pbir.JStr) else pid
                 vdir = os.path.join(pages_dir, pid, "visuals")
-                pages.append({"id": pid, "name": name, "visuals": len(os.listdir(vdir)) if os.path.isdir(vdir) else 0})
+                pages.append({"id": pid, "name": name, "visuals": len(list_names(vdir)) if os.path.isdir(vdir) else 0})
     return {"verb": "describe", "project": project.name,
             "tables": [{"table": t.name, "columns": len(t.columns), "measures": len(t.measures),
                         "storage": sorted({k for _n, k, _e in t.partitions}) or ["none"], "hidden": t.hidden,

@@ -71,6 +71,7 @@ public static class Perf
             trace = EngineTrace.TryStart(server, Events, ctx);
 
             var samples = new List<Sample>(runs);
+            bool collected = trace != null && trace.Started;
             for (int i = 0; i < runs; i++)
             {
                 ctx.Guard(() => { ClearCache(server, databaseId); return 0; });
@@ -86,12 +87,22 @@ public static class Perf
                 catch (Exception ex)
                 {
                     ctx.LogText("trace collect failed " + Errors.Classify(ex));
+                    collected = false;
                     hits = new List<EngineTrace.Hit>();
                 }
+                bool sawEnd = false;
+                foreach (var h in hits)
+                    if (h.Class == "QueryEnd" && h.Duration >= 0)
+                    {
+                        sawEnd = true;
+                        break;
+                    }
+                if (trace != null && !sawEnd)
+                    collected = false;
                 samples.Add(Interpret(hits, dax));
                 foreach (var h in hits) h.Text = "";
             }
-            return Finish(ctx, samples, trace != null && trace.Started, action, baseline);
+            return Finish(ctx, samples, collected, action, baseline);
         }
         finally
         {
@@ -178,7 +189,7 @@ public static class Perf
 
         if (action == "save")
         {
-            if (banded && baseline != null)
+            if (captured && banded && baseline != null)
             {
                 SaveBaseline(ctx.RequirePrivateDir(), baseline, median, spread);
                 fields["baseline"] = "SAVED";
@@ -188,7 +199,7 @@ public static class Perf
         {
             if (!TryReadBaseline(ctx.RequirePrivateDir(), baseline, out double old, out double oldSpread))
                 fields["baseline"] = "MISSING";
-            else if (banded)
+            else if (captured && banded)
                 fields["verdict"] = Verdict(old, median, Math.Max(oldSpread, spread));
         }
         return Ctx.Ok("perf", fields);

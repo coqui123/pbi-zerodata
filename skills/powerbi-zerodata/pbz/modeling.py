@@ -56,7 +56,9 @@ def require_compat(mdef: str, feature: str, upgrade: bool, offer: bool = True) -
     raise the level (one way: older Desktop builds cannot open it) and return a note."""
     need = COMPAT[feature]
     cur, _path = compat_level(mdef)
-    if cur is None or cur >= need:
+    if cur is None:
+        raise PbzError("COMPAT_LEVEL", f"{feature} needs compatibility level {need}; the model does not state one")
+    if cur >= need:
         return None
     if not upgrade:
         hint = (" Pass --upgrade-compat to raise it (one way: older Desktop builds cannot open it)"

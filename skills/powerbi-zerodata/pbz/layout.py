@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 
 from . import pbir
-from .common import PbzError, read_definition_text
+from .common import PbzError, read_definition_text, list_names
 
 COLS, ROWS = 96, 30
 LABELS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -37,7 +37,7 @@ def _s(node) -> str:
 def _visuals(page_dir: str) -> list[dict]:
     out = []
     vdir = os.path.join(page_dir, "visuals")
-    for vid in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+    for vid in sorted(list_names(vdir)) if os.path.isdir(vdir) else []:
         root = _load(os.path.join(vdir, vid, "visual.json"))
         if root is None:
             continue
@@ -127,7 +127,7 @@ def run(ws, project, page: str | None = None, show_map: bool = True) -> dict:
     meta = _load(os.path.join(pages_dir, "pages.json"))
     order = [_s(x) for x in meta.get("pageOrder").items] if isinstance(meta, pbir.JObj) and isinstance(meta.get("pageOrder"), pbir.JArr) else []
     order = [p for p in order if _page_segment(p)]
-    ids = order + [p for p in sorted(os.listdir(pages_dir))
+    ids = order + [p for p in sorted(list_names(pages_dir))
                    if _page_segment(p) and os.path.isdir(os.path.join(pages_dir, p)) and p not in order]
     out_pages, findings = [], []
     for pid in ids:
