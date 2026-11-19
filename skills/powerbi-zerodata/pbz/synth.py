@@ -7,9 +7,9 @@ mostly match (a few orphans on purpose), dates inside the model's calendar, seed
 strings drawn from the literals and mirror tokens the DAX and report filters compare each column to, so
 filtered measures and visuals return rows. Measures, calculated columns, calculation groups, field
 parameters, hierarchies, relationships and roles are kept. Every object gets a new lineageTag and the
-model carries `annotation PBZ_SYNTHETIC = <hmac>`, an HMAC (private workspace key) of its table lineage
-tags: the engine's `synth-query` verb returns rows only when that marker verifies and every partition is
-calculated, so real data can never come back through it.
+model carries `annotation PBZ_SYNTHETIC = <hmac>`, an ownership token. The broker stores a signed
+full-definition manifest in private_dir during validation and binds it to the Desktop catalog on open. `synth-query` verifies that manifest before
+and after execution, and releases buffered rows only when both checks agree.
 """
 from __future__ import annotations
 
@@ -616,7 +616,7 @@ def _new_lineage(texts: dict[str, str]) -> dict[str, str]:
 
 
 def marker_value(key: bytes, table_tags: list[str]) -> str:
-    """HMAC the engine recomputes from the loaded model's non-private table lineage tags."""
+    """Legacy folder ownership token; row authorization requires the broker's signed manifest."""
     return dpapi.hmac_hex(key, "pbz-synthetic:" + ",".join(sorted(t.strip().lower() for t in table_tags)))
 
 
@@ -896,7 +896,8 @@ def build(ws, project, rows: int = 200, seed: int = 7, edge: bool = False) -> di
         _write_candidate(ws, project, staged, texts, pools, rows, seed, edge, rows_by_table,
                          model_bytes, report_bytes)
         res = engine_call("tmdl-validate", {"private_dir": ws.private,
-                                            "folder": os.path.join(staged.model_dir, "definition")}, timeout=300)
+                                            "folder": os.path.join(staged.model_dir, "definition"),
+                                            "synthetic_marker": marker}, timeout=300)
         if not isinstance(res, dict):
             raise PbzError("ENGINE_UNAVAILABLE",
                            "synthetic validation is unavailable; the destination was not replaced")
@@ -1040,6 +1041,12 @@ def open_(ws, project, wait: int = 480) -> dict:
     port = desktop.engine_port(int(inst["pid"])) if inst and inst.get("pid") else None
     if port:  # calculated tables are computed on open; recalculate in case Desktop deferred it
         engine_call("refresh", {"private_dir": sp.ws.private, "port": port}, timeout=1800)
+        mt = read_text_checked(os.path.join(sp.model_dir, "definition", "model.tmdl"), root=sp.ws.root)[0]
+        marker = re.search(r"(?m)^annotation PBZ_SYNTHETIC = (\w+)", mt)
+        bound = engine_call("synth-bind", {"private_dir": ws.private, "port": port,
+                                          "marker": marker.group(1) if marker else ""}, timeout=300)
+        if not isinstance(bound, dict) or bound.get("ok") is not True or bound.get("verified") is not True:
+            raise PbzError("ENGINE_UNAVAILABLE", "synthetic catalog verification failed; row output disabled")
     return {**res, "verb": "synth-open", "project": sp.name}
 
 
@@ -1082,9 +1089,16 @@ def query(ws, project, dax: str, max_rows: int = 500) -> dict:
     if not res.get("ok"):
         kind = res.get("class")
         code = kind if isinstance(kind, str) and kind in _VALIDATION_CLASSES else "OTHER"
-        raise PbzError(code, "refused or failed (synthetic marker, calculated partitions and DAX are checked)")
-    return {"verb": "synth-query", "project": sp.name, "columns": res.get("columns", []), "rows": res.get("rows", []),
-            "truncated": res.get("truncated", False), "data": "synthetic"}
+        reasons = {"SYNTH_DATA_PARTITION", "SYNTH_NO_MARKER", "SYNTH_MANIFEST_SIGNATURE",
+                   "SYNTH_VERIFICATION_UNAVAILABLE", "SYNTH_DEFINITION_CHANGED", "SYNTH_CATALOG_MISMATCH",
+                   "SYNTH_MARKER_MISMATCH", "SYNTH_MODEL_CHANGED_DURING_QUERY"}
+        reason = res.get("reason")
+        raise PbzError(code, reason if isinstance(reason, str) and reason in reasons else "synthetic query refused or failed")
+    if (res.get("verified") is not True or not isinstance(res.get("columns"), list)
+            or not isinstance(res.get("rows"), list) or not isinstance(res.get("truncated"), bool)):
+        raise PbzError("ENGINE_UNAVAILABLE", "synthetic verification unavailable; row output disabled")
+    return {"verb": "synth-query", "project": sp.name, "columns": res["columns"], "rows": res["rows"],
+            "truncated": res["truncated"], "data": "synthetic"}
 
 
 def run(ws, project, a) -> dict:

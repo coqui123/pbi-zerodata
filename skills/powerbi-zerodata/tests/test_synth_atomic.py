@@ -55,6 +55,89 @@ class SynthAtomicTests(unittest.TestCase):
     def _tmps(self):
         return list(Path(self.tmp.name).rglob("*.pbz-tmp"))
 
+    def test_build_requests_trusted_manifest(self):
+        calls = []
+        def broker(verb, request, timeout=120):
+            calls.append((verb, request))
+            return _ok(verb, request, timeout)
+        with patch("pbz.synth.engine_call", broker):
+            synth.build(self.ws, self.project, rows=20, seed=1)
+        validation = [r for v, r in calls if v == "tmdl-validate"]
+        self.assertEqual(len(validation), 1)
+        self.assertRegex(validation[0]["synthetic_marker"], r"^[a-f0-9]{64}$")
+        self.assertEqual(validation[0]["private_dir"], self.ws.private)
+
+    def test_rows_require_explicit_verification_and_complete_envelope(self):
+        os.makedirs(os.path.join(self.dest, ".pbz"))
+        common.write_text(os.path.join(self.dest, ".pbz", "policy.json"), '{"synthetic":true}')
+        common.write_text(os.path.join(self.dest, ".pbz", "synth.json"), '{}')
+        good = {"ok": True, "verified": True, "columns": ["x"], "rows": [[7]], "truncated": False}
+        cases = [dict(good, verified=False), dict(good, verified=None),
+                 {k: v for k, v in good.items() if k != "verified"},
+                 {"ok": True, "verified": True}, dict(good, rows=None)]
+        for response in cases + [good]:
+            with self.subTest(response=response), patch("pbz.synth.desktop.find_instance", return_value={"pid": 1}), \
+                    patch("pbz.synth.desktop.engine_port", return_value=1234), \
+                    patch("pbz.synth.engine_call", return_value=response):
+                if response == good:
+                    self.assertEqual(synth.query(self.ws, self.project, 'EVALUATE ROW("x", 7)')["rows"], [[7]])
+                else:
+                    with self.assertRaises(PbzError) as caught:
+                        synth.query(self.ws, self.project, 'EVALUATE ROW("x", 7)')
+                    self.assertEqual(caught.exception.code, "ENGINE_UNAVAILABLE")
+
+    def test_engine_wrapper_preserves_verification_and_reason(self):
+        from pbz import engine
+        result = engine._project("synth-query", {"ok": False, "reason": "SYNTH_DEFINITION_CHANGED"})
+        self.assertEqual(result["reason"], "SYNTH_DEFINITION_CHANGED")
+        result = engine._project("synth-bind", {"ok": True, "verified": True, "rows": [[1]]})
+        self.assertIs(result["verified"], True)
+        self.assertNotIn("rows", result)
+
+    def test_open_binds_only_the_owned_build_and_requires_verification(self):
+        with patch("pbz.synth.engine_call", _ok):
+            synth.build(self.ws, self.project, rows=20, seed=1)
+        marker_text = common.read_text(os.path.join(synth.synth_project(self.ws, self.project).model_dir,
+                                                  "definition", "model.tmdl"))[0]
+        responses = [None, {"ok": False}, {"ok": True}, {"ok": True, "verified": False},
+                     {"ok": True, "verified": True}]
+        for response in responses:
+            calls = []
+            def broker(verb, request, timeout=120):
+                calls.append((verb, request))
+                return response if verb == "synth-bind" else {"ok": True}
+            with self.subTest(response=response), patch("pbz.synth.engine_call", broker), \
+                    patch("pbz.synth.desktop.open_", return_value={"open": True, "engine": "READY"}), \
+                    patch("pbz.synth.desktop.find_instance", return_value={"pid": 1}), \
+                    patch("pbz.synth.desktop.engine_port", return_value=1234):
+                if response and response.get("verified") is True:
+                    self.assertTrue(synth.open_(self.ws, self.project)["open"])
+                else:
+                    with self.assertRaises(PbzError) as caught:
+                        synth.open_(self.ws, self.project)
+                    self.assertEqual(caught.exception.code, "ENGINE_UNAVAILABLE")
+            self.assertEqual([verb for verb, _ in calls], ["refresh", "synth-bind"])
+            request = calls[-1][1]
+            self.assertEqual(request["private_dir"], self.ws.private)
+            self.assertEqual(request["port"], 1234)
+            self.assertIn("annotation PBZ_SYNTHETIC = " + request["marker"], marker_text)
+
+    def test_query_reports_only_closed_refusal_reasons(self):
+        os.makedirs(os.path.join(self.dest, ".pbz"))
+        common.write_text(os.path.join(self.dest, ".pbz", "policy.json"), '{"synthetic":true}')
+        common.write_text(os.path.join(self.dest, ".pbz", "synth.json"), '{}')
+        for reason in ("SYNTH_DEFINITION_CHANGED", "SYNTH_VERIFICATION_UNAVAILABLE", "raw secret"):
+            with self.subTest(reason=reason), patch("pbz.synth.desktop.find_instance", return_value={"pid": 1}), \
+                    patch("pbz.synth.desktop.engine_port", return_value=1234), \
+                    patch("pbz.synth.engine_call", return_value={"ok": False, "class": "BAD_REQUEST", "reason": reason}):
+                with self.assertRaises(PbzError) as caught:
+                    synth.query(self.ws, self.project, 'EVALUATE ROW("x", 7)')
+                self.assertEqual(caught.exception.code, "BAD_REQUEST")
+                if reason.startswith("SYNTH_"):
+                    self.assertIn(reason, str(caught.exception))
+                else:
+                    self.assertNotIn(reason, str(caught.exception))
+
     def test_mid_build_failure_restores_previous_tree(self):
         with patch("pbz.synth.engine_call", _ok):
             built = synth.build(self.ws, self.project, rows=20, seed=1)

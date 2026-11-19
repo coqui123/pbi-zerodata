@@ -64,6 +64,7 @@ public static class Program
         "snapshot-compare" => Snapshots.Compare(req, ctx),
         "smoke" => Smoke.Run(req, ctx),
         "deps" => Deps.Run(req, ctx),
+        "synth-bind" => SyntheticProvenance.Bind(req, ctx),
         "synth-query" => SynthQuery.Run(req, ctx),
         "memory" => Memory.Run(req, ctx),
         "perf" => Perf.Run(req, ctx),
@@ -157,11 +158,13 @@ public sealed class Ctx
         return o;
     }
 
-    /// <summary>Error envelope: class + log id only. Raw text goes to the DPAPI log.</summary>
+    /// <summary>Error envelope: class, log id and optional closed synth reason. Raw text goes to the DPAPI log.</summary>
     public JsonObject Fail(Exception ex)
     {
         var cls = Errors.Classify(ex);
         var o = new JsonObject { ["ok"] = false, ["verb"] = Verb, ["class"] = cls.ToString() };
+        if (ex is BadRequestException && SyntheticProvenance.Reasons.Contains(ex.Message.Split(':')[0]))
+            o["reason"] = ex.Message.Split(':')[0];
         string? id = Log(ex, null);
         if (id != null) o["log_id"] = id;
         return o;

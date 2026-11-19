@@ -41,7 +41,7 @@ def _fail(verb: str, cls: str) -> dict:
 #   deps: edges
 #   snapshot / probe pass-through: queries, name, table, rows_bucket
 _RESPONSE_FIELDS = frozenset({
-    "ok", "class", "verb",
+    "ok", "class", "verb", "verified", "reason",
     "checks", "results", "errors", "status", "tables", "objects", "unprocessed_tables",
     "objects_in_error", "missing_refs", "orphan_files", "items",
     "model", "relationships", "other", "auto_datetime", "coverage", "predicates",

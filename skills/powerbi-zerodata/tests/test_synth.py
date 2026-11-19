@@ -3,6 +3,7 @@ push-time refusal of that marker in real models.
 
 Run: python tests/test_synth.py           (offline: build, TOM validation, keys, marker, refusals)
      python tests/test_synth.py --live    (also opens the synthetic model in Desktop and queries it)
+     python tests/test_synth.py --provenance (Windows C# manifest and query-buffer acceptance fixtures)
 """
 from __future__ import annotations
 
@@ -186,7 +187,155 @@ def live(fails: list) -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+# These fixtures compile and execute the production C# manifest and buffering code on Windows.
+# They are deliberately opt-in and fail if the SDK is unavailable; Linux cannot run DPAPI/TOM.
+PROVENANCE_FIXTURES = r'''
+using System;
+using System.IO;
+using System.Text.Json.Nodes;
+using Microsoft.AnalysisServices.Tabular;
+using PbzEngine;
+using P = PbzEngine.SyntheticProvenance;
+
+class Fixtures
+{
+    static Model Build()
+    {
+        var database = new Database { Name = "Fixture", CompatibilityLevel = 1600 };
+        var model = new Model();
+        database.Model = model;
+        foreach (var name in new[] { "T", "Other", "Private", "LocalDateTable_existing" })
+        {
+            var table = new Table { Name = name, LineageTag = "tag-" + name };
+            if (name == "Private") { table.IsPrivate = true; table.LineageTag = null; }
+            table.Columns.Add(new CalculatedTableColumn { Name = "X", SourceColumn = "[X]", DataType = DataType.Int64 });
+            table.Partitions.Add(new Partition { Name = "P", Source = new CalculatedPartitionSource {
+                Expression = "DATATABLE(\"X\", INTEGER, {{1}})" } });
+            model.Tables.Add(table);
+        }
+        model.Tables["T"].Measures.Add(new Measure { Name = "M", Expression = "SUM('T'[X])", FormatString = "0" });
+        model.Tables["T"].Columns.Add(new CalculatedColumn { Name = "C", Expression = "[X] + 1", DataType = DataType.Int64 });
+        var group = new Table { Name = "CG", CalculationGroup = new CalculationGroup() };
+        group.Partitions.Add(new Partition { Name = "CG", Source = new CalculationGroupSource() });
+        group.CalculationGroup.CalculationItems.Add(new CalculationItem { Name = "Item", Expression = "SELECTEDMEASURE()" });
+        model.Tables.Add(group);
+        return model;
+    }
+
+    static void Main(string[] args)
+    {
+        var ctx = new Ctx("synth-query");
+        ctx.Init(Req.Parse(new JsonObject { ["private_dir"] = args[0] }.ToJsonString()));
+        var marker = new string('a', 64);
+        var definition = P.Definition(Build());
+        P.Save(ctx, marker, definition, "catalog-A");
+        var good = new P.Snapshot(marker, "catalog-A", definition, "v1");
+        int passed = 0;
+        void Check(string name, Action action, bool refused)
+        {
+            try { action(); if (refused) throw new Exception(name + ": accepted"); }
+            catch (BadRequestException) { if (!refused) throw; }
+            passed++;
+            Console.WriteLine("PASS " + name);
+        }
+        Check("passing manifest", () => P.Verify(ctx, good), false);
+        void Mutation(string name, Action<Model> mutate)
+        {
+            var model = Build(); mutate(model);
+            Check(name, () => P.Buffered<int>(
+                () => good with { DefinitionValue = P.Definition(model) }, s => P.Verify(ctx, s),
+                () => throw new Exception("query ran on changed model")), true);
+        }
+        Mutation("changed measure", m => m.Tables["T"].Measures["M"].Expression = "42");
+        Mutation("changed calculated table", m => ((CalculatedPartitionSource)m.Tables["T"].Partitions[0].Source).Expression = "ROW(\"X\", 1)");
+        Mutation("edited DATATABLE row", m => ((CalculatedPartitionSource)m.Tables["T"].Partitions[0].Source).Expression = "DATATABLE(\"X\", INTEGER, {{123456}})");
+        Mutation("added column", m => m.Tables["T"].Columns.Add(new CalculatedColumn { Name = "Added", Expression = "1", DataType = DataType.Int64 }));
+        Table Extra(string name, bool data = false) {
+            var t = new Table { Name = name };
+            t.Partitions.Add(new Partition { Name = "P", Source = data ? new MPartitionSource { Expression = "secret" } : new CalculatedPartitionSource { Expression = "ROW(\"X\", 1)" } });
+            return t;
+        }
+        Mutation("added untagged table", m => m.Tables.Add(Extra("U")));
+        Mutation("private-prefixed table", m => m.Tables.Add(Extra("LocalDateTable_secret")));
+        Mutation("private table with data partition", m => m.Tables["Private"].Partitions[0].Source = new MPartitionSource { Expression = "secret" });
+        // Verify private and untagged tables present at signing remain covered, not just additions.
+        var privateModel = Build(); var hidden = Extra("LocalDateTable_signed"); hidden.IsPrivate = true;
+        privateModel.Tables.Add(hidden);
+        var privateDefinition = P.Definition(privateModel);
+        if (!privateDefinition.Contains("LocalDateTable_signed")) throw new Exception("private table omitted");
+        Mutation("removed table", m => m.Tables.Remove("Other"));
+        Mutation("calculated column expression", m => ((CalculatedColumn)m.Tables["T"].Columns["C"]).Expression = "42");
+        Mutation("calculation item expression", m => m.Tables["CG"].CalculationGroup.CalculationItems["Item"].Expression = "42");
+        Mutation("private table expression", m => ((CalculatedPartitionSource)m.Tables["Private"].Partitions[0].Source).Expression = "ROW(\"X\", 42)");
+        Mutation("private-prefixed table expression", m => ((CalculatedPartitionSource)m.Tables["LocalDateTable_existing"].Partitions[0].Source).Expression = "ROW(\"X\", 42)");
+        Mutation("format string", m => m.Tables["T"].Measures["M"].FormatString = "secret");
+        Check("marker replay different catalog", () => P.Verify(ctx, good with { Catalog = "catalog-B" }), true);
+        Check("missing marker", () => P.Verify(ctx, good with { MarkerValue = "" }), true);
+        var manifestPath = Path.Combine(args[0], "synth-manifest-" + marker + ".bin");
+        var signed = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(Dpapi.Unprotect(File.ReadAllBytes(manifestPath))))!.AsObject();
+        signed["definition"] = "tampered";
+        Vault.WriteProtected(manifestPath, signed.ToJsonString());
+        Check("invalid manifest signature", () => P.Verify(ctx, good), true);
+        P.Save(ctx, marker, definition, "catalog-A");
+        int queries = 0;
+        Check("verification unavailable", () => P.Buffered(
+            () => good with { MarkerValue = new string('b', 64) }, s => P.Verify(ctx, s), () => ++queries), true);
+        if (queries != 0) throw new Exception("query ran without verification");
+        Check("live verification unavailable before query", () => P.Buffered<int>(
+            () => throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: live definition unavailable"),
+            s => P.Verify(ctx, s), () => ++queries), true);
+        if (queries != 0) throw new Exception("query ran without live verification");
+        int captures = 0;
+        Check("edit between verification and execution", () => P.Buffered(
+            () => ++captures == 1 ? good : good with { DefinitionValue = "edited" },
+            s => P.Verify(ctx, s), () => ++queries), true);
+        if (queries != 1 || captures != 2) throw new Exception("race fixture did not execute both checks");
+        captures = 0;
+        Check("version changed while definition restored", () => P.Buffered(
+            () => ++captures == 1 ? good : good with { Version = "v2" },
+            s => P.Verify(ctx, s), () => ++queries), true);
+        captures = 0;
+        Check("live verification unavailable after query", () => P.Buffered(
+            () => ++captures == 1 ? good : throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: live definition unavailable"),
+            s => P.Verify(ctx, s), () => ++queries), true);
+        Check("verified rows released", () => {
+            if (P.Buffered(() => good, s => P.Verify(ctx, s), () => 7) != 7) throw new Exception("lost rows");
+        }, false);
+        Console.WriteLine($"{passed} passed, 0 failed");
+    }
+}
+'''
+
+
+def provenance_fixtures() -> int:
+    if os.name != "nt" or not shutil.which("dotnet"):
+        print("FAIL provenance fixtures require Windows DPAPI, TOM and the .NET 10 SDK")
+        return 2
+    from xml.sax.saxutils import escape
+    with tempfile.TemporaryDirectory(prefix="pbz-provenance-") as tmp:
+        with open(os.path.join(tmp, "Fixtures.csproj"), "w", encoding="utf-8") as f:
+            f.write('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType>'
+                    '<TargetFramework>net10.0</TargetFramework><RuntimeIdentifier>win-x64</RuntimeIdentifier>'
+                    '</PropertyGroup><ItemGroup><ProjectReference Include="'
+                    + escape(os.path.join(SKILL, "engine", "PbzEngine.csproj"))
+                    + '" /></ItemGroup></Project>')
+        with open(os.path.join(tmp, "Program.cs"), "w", encoding="utf-8") as f:
+            f.write(PROVENANCE_FIXTURES)
+        return subprocess.run(["dotnet", "run", "--project", os.path.join(tmp, "Fixtures.csproj"),
+                               "--", os.path.join(tmp, "private")], timeout=300).returncode
+
+
+def require_live() -> None:
+    from pbz.engine import ENGINE_EXE
+    if os.name != "nt" or not ENGINE_EXE.is_file():
+        raise RuntimeError("live tests require Windows, a built broker, and Power BI Desktop; refusing to skip")
+
+
 def main() -> int:
+    if "--provenance" in sys.argv:
+        return provenance_fixtures()
+    if "--live" in sys.argv:
+        require_live()
     fails: list[str] = []
     offline(fails)
     if "--live" in sys.argv:

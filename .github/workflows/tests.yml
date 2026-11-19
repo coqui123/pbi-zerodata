@@ -1,7 +1,8 @@
 # Offline test suites on every push and pull request. Power BI Desktop is not available on hosted
 # runners, so the Desktop suites (test_e2e.py, test_engine.py live mode, test_synth.py --live,
 # test_synthtest.py --live, test_synthedge.py --live, test_memory.py --live, test_consolidate.py --live)
-# stay local. The engine is built so TOM validation runs in push tests.
+# run locally or in the opt-in live-synth job on a dedicated Desktop runner.
+# The engine is built so TOM validation and provenance fixtures run in push tests.
 name: tests
 
 on:
@@ -9,6 +10,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      live_synth:
+        description: Run synth acceptance on the dedicated Windows Desktop runner
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -41,6 +47,9 @@ jobs:
 
       - name: Build the engine
         run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+
+      - name: Synthetic provenance fixtures (no skips)
+        run: python tests/test_synth.py --provenance
 
       - name: Offline suites
         env:
@@ -80,3 +89,32 @@ jobs:
           python tests/test_engine.py --offline
           if ($LASTEXITCODE -ne 0) { $failed += "engine-offline" }
           if ($failed.Count) { throw "failed: $($failed -join ', ')" }
+
+  live-synth:
+    if: github.event_name == 'workflow_dispatch' && inputs.live_synth
+    runs-on: [self-hosted, Windows, pbz-desktop]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skills/powerbi-zerodata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - run: python -m pip install --disable-pip-version-check jsonschema
+      - run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+      - name: Provenance and live synth acceptance (no skips)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python tests/test_synth.py --provenance
+          if ($LASTEXITCODE -ne 0) { throw "provenance fixtures failed" }
+          foreach ($suite in @("synth", "synthedge", "synthtest")) {
+            python "tests/test_$suite.py" --live
+            if ($LASTEXITCODE -ne 0) { throw "live $suite failed" }
+          }

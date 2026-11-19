@@ -78,6 +78,13 @@ public static class TmdlValidate
         foreach (var m in missing) missingArr.Add(m);
         var orphanArr = new JsonArray();
         foreach (var o in orphans) orphanArr.Add(o);
+        if (errors.Count == 0 && missing.Count == 0 && req.Str("synthetic_marker") is string marker)
+        {
+            var db = ctx.Guard(() => TmdlSerializer.DeserializeDatabaseFromFolder(folder));
+            if (db.Model.Annotations.Find("PBZ_SYNTHETIC")?.Value != marker)
+                throw new BadRequestException("SYNTH_MARKER_MISMATCH: candidate marker differs");
+            SyntheticProvenance.Save(ctx, marker, SyntheticProvenance.Definition(db.Model));
+        }
         return Ctx.Ok("tmdl-validate", new JsonObject
         {
             ["valid"] = errors.Count == 0 && missing.Count == 0,

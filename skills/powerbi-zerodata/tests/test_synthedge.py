@@ -6,7 +6,7 @@ and every check kind against a stubbed query runner (counterexamples, shrinking,
 
 Run: python tests/test_synthedge.py
      python tests/test_synthedge.py --live   (builds the edge profile of the fixture, opens it in Desktop
-                                              and runs real checks; skipped while another Desktop runs)
+                                              and runs real checks; fails while another Desktop runs)
 """
 from __future__ import annotations
 
@@ -232,8 +232,7 @@ def live(fails: list) -> None:
             fails.append(msg)
 
     if _desktop_running():
-        print("SKIP live: another Power BI Desktop is running")
-        return
+        raise RuntimeError("live tests require an idle Desktop session; refusing to skip")
     tmp = tempfile.mkdtemp(prefix="pbzsynthedgelive-")
     os.environ["PBZ_SYNTH_ROOT"] = os.path.join(tmp, "synth")
     ws_dir = os.path.join(tmp, "ws")
@@ -276,6 +275,9 @@ def live(fails: list) -> None:
 
 
 def main() -> int:
+    if "--live" in sys.argv:
+        from test_synth import require_live
+        require_live()
     fails: list[str] = []
     offline(fails)
     if "--live" in sys.argv:

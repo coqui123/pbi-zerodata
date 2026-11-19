@@ -238,6 +238,9 @@ def live(fails: list) -> None:
 
 
 def main() -> int:
+    if "--live" in sys.argv:
+        from test_synth import require_live
+        require_live()
     fails: list[str] = []
     offline(fails)
     if "--live" in sys.argv:
