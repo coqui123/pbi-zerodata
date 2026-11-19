@@ -638,6 +638,57 @@ database.Model.SaveChanges();
             print("INFO closing binding fixture Desktop:", close_desktop(b.pid), flush=True)
 
 
+def test_perf_baseline_workloads(env: Env) -> None:
+    """Windows/Desktop acceptance: actual protected baseline save/read, never a mocked save."""
+    query_a = 'EVALUATE ROW("workload", "a b", "probe", SUMX(GENERATESERIES(1, 1000000), SIN([Value])))'
+    query_b = query_a.replace('"a b"', '"ab"')
+
+    def call(project, check, query, action):
+        result = engine("perf", env.req(project_identity=project, baseline=check,
+                                        dax=query, runs=20, action=action), "perf-workload") or {}
+        blob = json.dumps(result)
+        expect("perf workload identity stays private", query not in blob and "workload" not in result
+               and "fingerprint" not in result and project not in blob, result)
+        return result
+
+    saved = call("project-one", "check:one", query_a, "save")
+    expect("perf same-query control save succeeded", saved.get("baseline") == "SAVED", saved)
+    control = call("project-one", "check:one", query_a, "compare")
+    expect("perf same-query PASS control", control.get("verdict") in ("SAME", "FASTER")
+           and control.get("ratio_verdict") == "WITHIN_LIMIT", control)
+    mismatch = call("project-one", "check:one", query_b, "compare")
+    expect("perf literal-only different query has no comparable baseline",
+           mismatch.get("baseline") == "MISSING" and "verdict" not in mismatch, mismatch)
+    for project, check, query in (("project-one", "check:two", query_b),
+                                  ("project-two", "check:one", query_b),
+                                  ("project-two", "check:two", query_a)):
+        result = call(project, check, query, "save")
+        expect("perf interleaved save succeeds", result.get("baseline") == "SAVED", result)
+    for project, check, query in (("project-one", "check:one", query_a),
+                                  ("project-one", "check:two", query_b),
+                                  ("project-two", "check:one", query_b),
+                                  ("project-two", "check:two", query_a)):
+        result = call(project, check, query, "compare")
+        expect("perf project/check baseline remains comparable", "verdict" in result, result)
+        other = query_b if query == query_a else query_a
+        result = call(project, check, other, "compare")
+        expect("perf project/check isolation", result.get("baseline") == "MISSING" and "verdict" not in result, result)
+    # Replace the matching file with a protected legacy body, to prove version and
+    # workload checks reject it even if a legacy file reaches the new storage path.
+    sys.path.insert(0, str(S))
+    from pbz import dpapi
+    def digest(text):
+        return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
+    tokens = re.findall(r'"(?:[^"]|"")*"|\'(?:[^\']|\'\')*\'|\[(?:[^\]]|\]\])*\]|[^\s]', query_a)
+    workload = digest("\x1f".join(tokens))
+    key = digest("project-one\ncheck:one\n" + workload)
+    path = env.pd / "perf" / (digest(key) + ".bin")
+    expect("perf legacy test reaches saved baseline", path.exists())
+    path.write_bytes(dpapi.protect(json.dumps({"median": 1, "spread": 0}).encode("utf-8")))
+    result = call("project-one", "check:one", query_a, "compare")
+    expect("perf legacy unbound baseline ignored", result.get("baseline") == "MISSING" and "verdict" not in result, result)
+
+
 def test_live(env: Env, key_holder: dict) -> None:
     # v1.1: the engine never refreshes M partitions (Desktop refuses external mashup refreshes)
     r = engine("refresh", env.req(), "refresh-calculate")
@@ -1022,6 +1073,7 @@ def main() -> int:
         test_norm_reference()
         test_offline(env, tmp)
         if not args.offline and ensure_desktop(env):
+            test_perf_baseline_workloads(env)
             test_live(env, key_holder)
             test_live_index_binding(env, tmp)
         shutil.rmtree(tmp, ignore_errors=True)

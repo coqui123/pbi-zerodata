@@ -537,7 +537,7 @@ def families(model, min_bases: int = 3) -> list[dict]:
             if similar.discovery(c).words("hash") == TRIVIAL or any(
                     r.split("[", 1)[0].lower() in cg_tables for r in c.refs()):
                 continue  # an alias, or already a wrapper that applies a calculation group
-            key = similar._h(" ".join(c.words("hash")))
+            key = tuple(c.words("hash"))
             grp = groups.setdefault(key, {"bases": {}, "text": {}, "dups": []})
             if base in grp["bases"]:
                 grp["dups"].append((m.name, grp["bases"][base]))
@@ -571,7 +571,7 @@ def families(model, min_bases: int = 3) -> list[dict]:
             if len(mem) < min_bases:
                 continue  # its members already belong to a wider template of this family
             assigned |= {mb.lower() for mb in mem.values()}
-            templates.append({"key": k, "expression": groups[k]["text"][next(iter(mem))], "members": mem})
+            templates.append({"key": similar._h(repr(k)), "expression": groups[k]["text"][next(iter(mem))], "members": mem})
         if not templates:
             continue
         used: set[str] = set()

@@ -34,7 +34,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         m = model.measure(old)
         if not m:
             raise PbzError("NOT_FOUND", f"measure {old}")
-        if model.measure(new) or model.column(m.table, new):
+        if (model.measure(new) or model.column(m.table, new)) and new.lower() != old.lower():
             raise PbzError("NAME_TAKEN", new)
         if any(c.name.lower() == old.lower() for c in model.all_columns()):
             raise PbzError("AMBIGUOUS", f"a column is also named {old}; rename it in Desktop")
@@ -44,7 +44,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         if len(hits) != 1:
             raise PbzError("AMBIGUOUS" if hits else "NOT_FOUND", f"column {old}; pass --table")
         home = hits[0].table
-        if model.column(home, new) or model.measure(new):
+        if (model.column(home, new) or model.measure(new)) and new.lower() != old.lower():
             raise PbzError("NAME_TAKEN", new)
     elif kind == "table":
         return rename_table(ws, project, model, old, new)
@@ -65,9 +65,10 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
                 e = _decl_edit(text, node, kind, new)
                 if e:
                     edits.append(e)
-            elif node.kind == pkind and node.name.lower() == old.lower() and node.parent is not None \
-                    and node.parent.name.lower() == home.lower():  # perspective membership follows the rename
-                e = _decl_edit(text, node, pkind, new)
+            elif node.kind in ((pkind, "columnPermission") if kind == "column" else (pkind,)) and node.name.lower() == old.lower() and node.parent is not None \
+                    and node.parent.name.lower() == home.lower() and node.parent.kind in ("perspectiveTable", "tablePermission"):
+                # Perspective membership and object-level security follow the rename.
+                e = _decl_edit(text, node, node.kind, new)
                 if e:
                     edits.append(e)
         for reg in doc.regions:
@@ -79,7 +80,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             for m_ in re.finditer(r"(?m)^(\t*(?:sortByColumn|column)\s*:\s*)('(?:[^']|'')*'|\S+)\s*$", text):
                 if tmdl.unquote(m_.group(2)).lower() == old.lower() and rel == model.tables[home].file:
                     edits.append((m_.start(2), m_.end(2), lexers.tmdl_name(new)))
-            for m_ in re.finditer(r"(?m)^(\t*(?:fromColumn|toColumn)\s*:\s*)(.+?)\s*$", text):
+            for m_ in re.finditer(r"(?m)^(\t*(?:fromColumn|toColumn|baseColumn)\s*:\s*)(.+?)\s*$", text):
                 parts = tmdl.split_dotted(m_.group(2))
                 if len(parts) == 2 and parts[0].lower() == home.lower() and parts[1].lower() == old.lower():
                     edits.append((m_.start(2), m_.end(2), f"{lexers.tmdl_name(parts[0])}.{lexers.tmdl_name(new)}"))
@@ -100,9 +101,121 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
         ops.append(("write", path, text, bom))
         changed.append(f"{project.name}.SemanticModel/definition/{rel}")
+    _verify_plan(ws, project, model, mdef, ops, kind, home, old, new)
     commit_bytes(ops, root=ws.mirror)
     return {"verb": "rename", "kind": kind, "table": home, "from": old, "to": new, "files": changed,
             "next": "pbz diff, then pbz push", **ext}
+
+
+def _inventory(model):
+    """Stable binding sites, including names that no longer resolve after an edit.
+
+    Node/region ordinals survive a name-only edit; retaining unresolved sites is
+    essential: a stale name must not disappear from the post-edit check.
+    """
+    out = {}
+    res = deps.Resolver(model)
+    for rel, doc in model.docs.items():
+        for i, node in enumerate(doc.nodes):
+            parent = node.parent
+            if node.kind in ("column", "measure", "perspectiveColumn", "perspectiveMeasure", "columnPermission") and parent:
+                kind = "measure" if node.kind in ("measure", "perspectiveMeasure") else "column"
+                out[rel, "node", i] = (kind, parent.name, node.name)
+            elif node.kind in ("table", "perspectiveTable", "tablePermission"):
+                out[rel, "node", i] = ("table", "", node.name)
+        for i, reg in enumerate(doc.regions):
+            if reg.kind == "m":
+                mres = deps.Resolver(model)
+                mres.expressions.update({name: name for name in model.tables})
+                for j, binding in enumerate(deps.m_bindings(doc.text[reg.start:reg.end], mres)):
+                    out[rel, "m", i, j] = ("table", "", binding.ref.name)
+            if reg.kind == "text" and reg.node.kind == "annotation" and reg.node.name == "PBI_QueryOrder":
+                try:
+                    names = json.loads(doc.text[reg.start:reg.end])
+                except ValueError:
+                    names = None
+                if isinstance(names, list):
+                    for j, name in enumerate(names):
+                        out[rel, "query-order", i, j] = ("table", "", name)
+            if reg.kind != "dax":
+                continue
+            for j, binding in enumerate(deps.dax_region(doc.text, reg, res).bindings):
+                ref = binding.ref
+                out[rel, "dax", i, j] = (ref.kind, "" if ref.kind == "table" else ref.table, ref.name)
+                if binding.qualifier:
+                    a, b = binding.qualifier
+                    tok = lexers.significant(lexers.lex_dax(doc.text[a:b]))[0]
+                    out[rel, "qualifier", i, j] = ("table", "", tok.value or tok.text)
+        for i, line in enumerate(doc.text.splitlines()):
+            ref = re.match(r"^ref table (.+?)\s*$", line)
+            if ref:
+                out[rel, "ref", i] = ("table", "", tmdl.unquote(ref[1]))
+            prop = re.match(r"^\t*(fromColumn|toColumn|baseColumn|baseTable|defaultHierarchy|sortByColumn|column)\s*:\s*(.+?)\s*$", line)
+            if not prop:
+                continue
+            parts = tmdl.split_dotted(prop[2])
+            if prop[1] in ("sortByColumn", "column"):
+                tables = [t.name for t in model.tables.values() if t.file == rel]
+                if len(tables) == 1:
+                    out[rel, "prop", i] = ("column", tables[0], tmdl.unquote(prop[2]))
+            elif prop[1] in ("baseTable", "defaultHierarchy") and parts:
+                out[rel, "prop-table", i] = ("table", "", parts[0])
+            elif len(parts) == 2:
+                out[rel, "prop", i] = ("column", parts[0], parts[1])
+                out[rel, "prop-table", i] = ("table", "", parts[0])
+    return out
+
+
+def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
+    before = _inventory(model)
+    texts = {rel: doc.text for rel, doc in model.docs.items()}
+    moved = {}
+    for op in ops:
+        rel = os.path.relpath(op[1], mdef).replace("\\", "/")
+        if rel.startswith("../"):
+            continue
+        if op[0] == "delete":
+            texts.pop(rel, None)
+            if kind == "table":
+                moved[rel] = "/".join(rel.split("/")[:-1] + [_safe_file(new) + ".tmdl"])
+        else:
+            texts[rel] = op[2]
+    planned = tmdl.load_model(mdef, texts=texts)
+    after = _inventory(planned)
+    for site, ref in before.items():
+        k, table, name = ref
+        if k != kind or name.lower() != old.lower() or (kind != "table" and table.lower() != home.lower()):
+            continue
+        dest = (moved.get(site[0], site[0]), *site[1:])
+        expected = (kind, table, new)
+        if after.get(dest) != expected:
+            raise PbzError("REFUSED", "a binding did not follow the rename; nothing renamed")
+        if kind == "column" and planned.column(home, new) is None:
+            raise PbzError("REFUSED", "renamed binding has no target; nothing renamed")
+        if kind == "measure" and planned.measure(new) is None:
+            raise PbzError("REFUSED", "renamed binding has no target; nothing renamed")
+        if kind == "table" and planned.table(new) is None:
+            raise PbzError("REFUSED", "renamed binding has no target; nothing renamed")
+
+    # Inventory report field sites before editing too, even when a missed rewrite
+    # produced no write operation for the containing file.
+    writes = {op[1]: op[2] for op in ops if op[0] == "write"}
+    for path in pbir.report_files(project.mirror_report):
+        text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
+        original = pbir.walk_fields_with_path(pbir.parse_json(text), model)
+        following = dict((site, ref) for ref, site in pbir.walk_fields_with_path(
+            pbir.parse_json(writes.get(path, text)), planned))
+        for ref, site in original:
+            k = "column" if ref.kind == "aggregation" else ref.kind
+            target = (ref.table.lower() == old.lower()) if kind == "table" else (
+                k == kind and ref.table.lower() == home.lower() and ref.name.lower() == old.lower())
+            if not target:
+                continue
+            after_ref = following.get(site)
+            table_name = new if kind == "table" else ref.table
+            object_name = ref.name if kind == "table" else new
+            if after_ref is None or after_ref.table != table_name or after_ref.name != object_name:
+                raise PbzError("REFUSED", "a report binding did not follow the rename; nothing renamed")
 
 
 def _binding_edits(bindings, kind, home, old, new):
@@ -197,7 +310,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     src = os.path.join(mdef, *t.file.split("/"))
     dest = os.path.join(mdef, *t.file.split("/")[:-1], _safe_file(new) + ".tmdl")
     # Apply Windows path identity on every OS, including sanitized name collisions.
-    if old != new and ntpath.normcase(os.path.abspath(dest)) == ntpath.normcase(os.path.abspath(src)):
+    if old.lower() != new.lower() and ntpath.normcase(os.path.abspath(dest)) == ntpath.normcase(os.path.abspath(src)):
         raise PbzError("UNSUPPORTED", "table rename requires a distinct sanitized file path")
     _refuse_file_collision(mdef, t.file, new)
     res = deps.Resolver(model)
@@ -260,7 +373,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
             if parts and parts[0].lower() == low:
                 edits.append((m_.start(2), m_.end(2), ".".join([lexers.tmdl_name(new)] + [lexers.tmdl_name(p) for p in parts[1:]])))
         if rel == "model.tmdl":
-            for m_ in re.finditer(r"(?m)^ref table ('(?:[^']|'')*'|\S+)[ \t]*$", text):
+            for m_ in re.finditer(r"(?m)^ref table ('(?:[^']|'')*'|[^\s]+)[ \t]*\r?$", text):
                 if tmdl.unquote(m_.group(1)).lower() == low:
                     edits.append((m_.start(1), m_.end(1), lexers.tmdl_name(new)))
         if not edits and rel != t.file:
@@ -268,7 +381,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         new_text = apply_edits(text, edits) if edits else text
         path = os.path.join(mdef, *rel.split("/"))
         _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
-        if rel == t.file and os.path.basename(rel)[:-5].lower() == low:
+        if rel == t.file and os.path.basename(rel)[:-5].lower() == low and old.lower() != new.lower():
             target = "/".join(rel.split("/")[:-1] + [_safe_file(new) + ".tmdl"])
             if target != rel:
                 ops.append(("write", os.path.join(mdef, *target.split("/")), new_text, bom))
@@ -315,6 +428,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
         ops.append(("write", path, text, bom))
         changed.append(f"{project.name}.SemanticModel/definition/{rel}")
+    _verify_plan(ws, project, model, mdef, ops, "table", "", old, new)
     commit_bytes(ops, root=ws.mirror)
     out = {"verb": "rename", "kind": "table", "from": old, "to": new, "files": sorted(set(changed)),
            "next": "pbz diff, pbz validate, then pbz push", **ext}

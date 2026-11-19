@@ -12,12 +12,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
+import time
+import tracemalloc
+from pathlib import Path
+from unittest.mock import patch
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 import test_parity  # noqa: E402
+from pbz import mcp  # noqa: E402
 
 CLI = os.path.join(SKILL, "pbz", "cli.py")
 
@@ -33,6 +39,151 @@ def call(mid, name, args=None) -> dict:
     return rpc(mid, "tools/call", {"name": name, "arguments": args or {}})
 
 
+class OutputBudgetTests(unittest.TestCase):
+    def run_child(self, code, timeout=5):
+        return mcp._bounded_output([sys.executable, "-c", code], os.getcwd(), os.environ.copy(), timeout)
+
+    def test_raw_exact_and_over_limit(self):
+        with patch.object(mcp, "RAW_LIMIT", 1024):
+            code, raw, error = self.run_child("import os; os.write(1, b'x'*1024)")
+            self.assertEqual((code, len(raw), error), (0, 1024, None))
+            tracemalloc.start()
+            try:
+                code, raw, error = self.run_child("import os; os.write(1, b'x'*10000000)")
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            self.assertEqual((raw, error), (b"", "OUTPUT_LIMIT"))
+            self.assertLess(peak, 1024*1024)
+
+    def test_exact_wire_limit_during_production(self):
+        response = {"jsonrpc": "2.0", "id": 0, "result": {
+            "content": [{"type": "text", "text": "x"*1024}], "isError": False}}
+        with patch.object(mcp, "WIRE_LIMIT", len(mcp._encode(response))):
+            code, raw, error = self.run_child("import os; os.write(1,b'x'*1024)")
+            self.assertEqual((code, raw, error), (0, b"x"*1024, None))
+
+    def test_wire_expansion_is_stopped_during_production(self):
+        with patch.object(mcp, "WIRE_LIMIT", 1024), patch.object(mcp, "RAW_LIMIT", 10000):
+            _code, raw, error = self.run_child("import os,time; os.write(1,bytes([92])*2000); time.sleep(20)")
+            self.assertEqual((raw, error), (b"", "OUTPUT_LIMIT"))
+
+    def test_stderr_is_discarded(self):
+        with patch.object(mcp, "RAW_LIMIT", 1024):
+            code, raw, error = self.run_child("import os; os.write(2,b'x'*10000000); os.write(1,b'ok')")
+            self.assertEqual((code, raw, error), (0, b"ok", None))
+
+    def test_wire_exact_limit_and_escaping(self):
+        response = {"jsonrpc": "2.0", "id": 1, "result": mcp._result({"value": "x"*1000}, False)}
+        size = len(mcp._encode(response))
+        with patch.object(mcp, "WIRE_LIMIT", size):
+            self.assertEqual(mcp._wire_response(response), response)
+            escaped = {**response, "result": {"content": [{"type": "text", "text": "\\"*1000}], "isError": False}}
+            out = mcp._wire_response(escaped, mcp.BY_NAME["rename"])
+            body = json.loads(out["result"]["content"][0]["text"])
+            self.assertEqual(body["error"], "OUTPUT_LIMIT")
+            self.assertEqual(body["outcome"], "UNKNOWN")
+            self.assertIn("recover", body["recovery"])
+            self.assertLessEqual(len(mcp._encode(out)), size)
+
+    def test_timed_out_writer_and_size_limit_have_recovery(self):
+        code, raw, error = self.run_child("import time; time.sleep(20)", timeout=0.1)
+        self.assertEqual((raw, error), (b"", "TIMEOUT"))
+        for error in ("TIMEOUT", "OUTPUT_LIMIT"):
+            with patch.object(mcp, "_bounded_output", return_value=(-9, b"", error)):
+                result = mcp.call_tool("rename", {"kind": "column", "old": "A", "new": "B"}, os.getcwd(), None)
+            body = json.loads(result["content"][0]["text"])
+            self.assertTrue(result["isError"])
+            self.assertEqual(body["error"], error)
+            self.assertEqual(body["outcome"], "UNKNOWN")
+            self.assertIn("recover", body["recovery"])
+
+    def test_timeout_kills_descendant_with_inherited_stdout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = str(Path(tmp, "child-survived"))
+            child = f"import time; from pathlib import Path; time.sleep(0.4); Path({marker!r}).write_text('survived')"
+            parent = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(20)"
+            _code, raw, error = self.run_child(parent, timeout=0.15)
+            self.assertEqual((raw, error), (b"", "TIMEOUT"))
+            time.sleep(0.5)
+            self.assertFalse(Path(marker).exists())
+
+    def test_decoded_limit(self):
+        with patch.object(mcp, "DECODED_LIMIT", 10), \
+             patch.object(mcp, "_bounded_output", return_value=(0, b"x"*11, None)):
+            result = mcp.call_tool("status", {}, os.getcwd(), None)
+        self.assertEqual(json.loads(result["content"][0]["text"])["error"], "OUTPUT_LIMIT")
+
+
+class GitHookTests(unittest.TestCase):
+    def setUp(self):
+        path = Path(SKILL).parents[1] / "scripts" / "install_git_hooks.py"
+        spec = importlib.util.spec_from_file_location("git_hooks_installer", path)
+        self.inst = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.inst)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.hooks = self.root / ".git" / "hooks"
+        self.source = self.root / "source"
+        self.source.mkdir()
+        for name in self.inst.NAMES:
+            (self.source / name).write_bytes(b'#!/bin/sh\n# PBZ owned fixture\nprintf "pbz:%s" "$*"\ncat\n')
+
+    def install(self, chain=False):
+        return self.inst.install(str(self.root), str(self.source), chain)
+
+    def snapshot(self):
+        return {str(p.relative_to(self.hooks)): p.read_bytes() for p in self.hooks.iterdir() if p.is_file()}
+
+    def test_preflight_second_foreign_hook(self):
+        (self.hooks / "pre-push").write_bytes(b"foreign")
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            self.install()
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse((self.hooks / "pre-commit").exists())
+
+    def test_idempotent_and_user_edit_refused(self):
+        self.install()
+        before = self.snapshot()
+        self.install()
+        self.assertEqual(before, self.snapshot())
+        with (self.hooks / "pre-push").open("ab") as f:
+            f.write(b"# user edit\n")
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            self.install()
+        self.assertEqual(before, self.snapshot())
+
+    def test_chain_bytes_args_stdin_and_status(self):
+        host = b'#!/bin/sh\nprintf "host:%s" "$*"\ncat\nexit "${HOST_STATUS:-0}"\n'
+        (self.hooks / "pre-push").write_bytes(host)
+        self.install(chain=True)
+        self.assertEqual((self.hooks / "pre-push.pbz-host").read_bytes(), host)
+        for status in (0, 7):
+            out = subprocess.run([str(self.hooks / "pre-push"), "origin", "a b"], input=b"push-input\n",
+                                 capture_output=True, env={**os.environ, "HOST_STATUS": str(status)})
+            self.assertEqual(out.returncode, status)
+            self.assertEqual(out.stdout, b"host:origin a bpush-input\n" +
+                             (b"pbz:origin a bpush-input\n" if status == 0 else b""))
+        self.install(chain=True)
+        self.assertEqual((self.hooks / "pre-push.pbz-host").read_bytes(), host)
+
+    def test_shared_hooks_path_requires_opt_in(self):
+        self.hooks = self.root / "shared-hooks"
+        subprocess.run(["git", "-C", str(self.root), "config", "core.hooksPath", str(self.hooks)], check=True)
+        with self.assertRaises(ValueError):
+            self.install()
+        self.assertFalse(self.hooks.exists())
+        self.install(chain=True)
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            self.install()
+        self.assertEqual(before, self.snapshot())
+
+
 def main() -> int:
     fails: list[str] = []
 
@@ -40,6 +191,9 @@ def main() -> int:
         if not cond:
             fails.append(msg)
 
+    suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(cls)
+                                for cls in (OutputBudgetTests, GitHookTests)])
+    check(unittest.TextTestRunner().run(suite).wasSuccessful(), "budget / git hook fixtures")
     tmp = tempfile.mkdtemp(prefix="pbzmcp-")
     root = os.path.join(tmp, "ws")
     test_parity.build(root)
@@ -253,6 +407,8 @@ def installer_ownership_checks(check, tmp, inst):
 
 
 if __name__ == "__main__":
+    if "--output-budget" in sys.argv:
+        unittest.main(argv=[sys.argv[0]], defaultTest=("OutputBudgetTests", "GitHookTests"))
     if "--installer-ownership" in sys.argv:
         spec = importlib.util.spec_from_file_location("pbz_install", os.path.join(SKILL, "install", "install.py"))
         inst = importlib.util.module_from_spec(spec)

@@ -1,4 +1,5 @@
 #!/bin/sh
+# PBZ owned offline checks v1
 # Refuse the git command unless the offline suites in .github/workflows/tests.yml pass.
 set -e
 root=$(git rev-parse --show-toplevel) || exit 1

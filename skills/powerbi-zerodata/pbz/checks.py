@@ -90,7 +90,7 @@ def _perf_check(ws, project, raw: dict, cid: str) -> dict:
     from . import perf
     query = raw.get("query") if isinstance(raw.get("query"), str) else ""
     try:
-        got = perf.expect(ws, project, query)
+        got = perf.expect(ws, project, query, check_id=cid)
     except PbzError as err:
         return {"id": cid, "status": "ERROR", "class": _class_of(err.code, _PY_CLASS) or "OTHER"}
     status = got.get("status") if got.get("status") in _CHECK_STATUS else "ERROR"

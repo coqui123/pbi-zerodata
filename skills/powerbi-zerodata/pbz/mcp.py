@@ -7,9 +7,14 @@ never echoes tool arguments or outputs. `pbz admin` and `memscrub --apply` are n
 """
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import subprocess
+import signal
+import queue
+import threading
+import time
 import sys
 from dataclasses import dataclass, field
 
@@ -21,6 +26,153 @@ INSTRUCTIONS = ("pbz edits Power BI PBIP projects without exposing company rows:
                 "fixed buckets, and low-cardinality category labels. They do not return rows, totals, or query "
                 "grids. synth query returns rows from the fake copy only. Never try to read data files or query "
                 "an engine another way.")
+
+# Raw stdout: 4 MiB; decoded text: 4 Mi characters. The binding budget is
+# 8 MiB of UTF-8 JSON-RPC wire bytes, including escaping, envelope and newline.
+RAW_LIMIT = 4 * 1024 * 1024
+DECODED_LIMIT = 4 * 1024 * 1024
+WIRE_LIMIT = 8 * 1024 * 1024
+
+
+def _kill_tree(p):
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=True)
+        else:
+            os.killpg(p.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
+def _bounded_output(command, cwd, env, timeout):
+    p = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         start_new_session=os.name != "nt")
+    chunks = queue.Queue(maxsize=2)
+    stop = threading.Event()
+
+    def emit(value):
+        while not stop.is_set():
+            try:
+                chunks.put(value, timeout=0.05)
+                return
+            except queue.Full:
+                pass
+
+    def read():
+        total = decoded_total = wire_text = pending = 0
+        started = False
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        envelope = len(_encode({"jsonrpc": "2.0", "id": 0, "result": {
+            "content": [{"type": "text", "text": ""}], "isError": True}}))
+
+        def account(fragment):
+            nonlocal decoded_total, wire_text, pending, started
+            decoded_total += len(fragment)
+            if not started:
+                fragment = fragment.lstrip()
+            body = fragment.rstrip()
+            # Defer trailing whitespace because call_tool strips its final text.
+            escaped = lambda value: len(json.dumps(value, ensure_ascii=False)[1:-1].encode("utf-8"))
+            if body:
+                wire_text += pending + escaped(body)
+                pending = escaped(fragment[len(body):])
+                started = True
+            elif started:
+                pending += escaped(fragment)
+            return decoded_total <= DECODED_LIMIT and envelope + wire_text <= WIRE_LIMIT
+
+        try:
+            while not stop.is_set():
+                chunk = os.read(p.stdout.fileno(), min(65536, RAW_LIMIT + 1 - total))
+                if not chunk:
+                    if not account(decoder.decode(b"", final=True)):
+                        _kill_tree(p)
+                        emit("OUTPUT_LIMIT")
+                    else:
+                        emit(None)
+                    return
+                total += len(chunk)
+                if total > RAW_LIMIT or not account(decoder.decode(chunk)):
+                    _kill_tree(p)
+                    emit("OUTPUT_LIMIT")
+                    return
+                emit(chunk)
+        except OSError:
+            emit(None)
+        finally:
+            p.stdout.close()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    data = bytearray()
+    deadline = time.monotonic() + timeout
+    error = None
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                error = "TIMEOUT"
+                break
+            try:
+                chunk = chunks.get(timeout=remaining)
+            except queue.Empty:
+                error = "TIMEOUT"
+                break
+            if chunk is None:
+                break
+            if isinstance(chunk, str):
+                error = chunk
+                break
+            if len(data) + len(chunk) > RAW_LIMIT:
+                error = "OUTPUT_LIMIT"
+                break
+            data.extend(chunk)
+        if error:
+            _kill_tree(p)
+        try:
+            p.wait(timeout=max(0.01, min(5, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            error = error or "TIMEOUT"
+            _kill_tree(p)
+            # Never communicate()/re-drain inherited Windows pipe handles here.
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        stop.set()
+        reader.join(timeout=0.1)
+    return p.returncode, data if not error else b"", error
+
+
+def _operation_error(tool, code):
+    body = {"ok": False, "error": code}
+    if not tool.read_only:
+        body.update(outcome="UNKNOWN", recovery="Run the recover tool to inspect the journal before retrying.")
+    return _result(body, True)
+
+
+def _encode(response):
+    return json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def _wire_response(response, tool=None):
+    # Encoding is bounded by the raw/decoded budgets before entering this function.
+    if len(_encode(response)) <= WIRE_LIMIT:
+        return response
+    limited = dict(response)
+    limited["result"] = _operation_error(tool, "OUTPUT_LIMIT") if tool else _result(
+        {"ok": False, "error": "OUTPUT_LIMIT"}, True)
+    # An arbitrarily large request id must not defeat the final wire budget.
+    if len(_encode(limited)) > WIRE_LIMIT:
+        limited["id"] = None
+    return limited
+
 
 S, B, I, N, O = {"type": "string"}, {"type": "boolean"}, {"type": "integer"}, {"type": "number"}, {"type": "object"}
 L = {"type": "array", "items": {"type": "string"}}
@@ -638,17 +790,20 @@ def call_tool(name: str, args: dict, workspace: str | None, project: str | None)
     argv, cwd = build_argv(tool, args or {}, workspace, project)
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     try:
-        p = subprocess.run([sys.executable, "-I", CLI, *argv], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                           capture_output=True, timeout=tool.timeout)
-    except subprocess.TimeoutExpired:
-        return _result({"ok": False, "error": "TIMEOUT", "detail": f"{name} took longer than {tool.timeout}s"}, True)
+        code, raw, error = _bounded_output([sys.executable, "-I", CLI, *argv], cwd, env, tool.timeout)
     except OSError:
         return _result({"ok": False, "error": "CLI_UNAVAILABLE"}, True)
-    text = p.stdout.decode("utf-8", errors="replace").strip()
-    if not text:  # argparse errors and crashes write only to stderr, which can echo inputs: never forward it
-        err = "BAD_ARGUMENTS" if p.returncode == 2 else "INTERNAL_ERROR"
+    if error:
+        return _operation_error(tool, error)
+    text = raw.decode("utf-8", errors="replace")
+    if len(text) > DECODED_LIMIT:
+        return _operation_error(tool, "OUTPUT_LIMIT")
+    text = text.strip()
+    if not text:  # stderr can echo inputs: never forward it
+        err = "BAD_ARGUMENTS" if code == 2 else "INTERNAL_ERROR"
         return _result({"ok": False, "error": err, "detail": f"see the {name} tool's input schema"}, True)
-    return {"content": [{"type": "text", "text": text}], "isError": p.returncode != 0}
+    result = {"content": [{"type": "text", "text": text}], "isError": code != 0}
+    return _wire_response({"jsonrpc": "2.0", "id": 0, "result": result}, tool)["result"]
 
 
 def _result(obj: dict, is_error: bool) -> dict:
@@ -695,7 +850,9 @@ def handle(msg, workspace: str | None, project: str | None) -> dict | None:
             return None if notification else _error(mid, -32602, str(e))
     else:
         return None if notification else _error(mid, -32601, f"method not found: {method}")
-    return None if notification else {"jsonrpc": "2.0", "id": mid, "result": result}
+    return None if notification else _wire_response(
+        {"jsonrpc": "2.0", "id": mid, "result": result},
+        BY_NAME.get(params.get("name")) if method == "tools/call" else None)
 
 
 def serve(workspace: str | None = None, project: str | None = None) -> int:
@@ -717,7 +874,7 @@ def serve(workspace: str | None = None, project: str | None = None) -> int:
             except Exception:  # never let one bad message kill the server or leak a traceback
                 resp = _error(msg.get("id") if isinstance(msg, dict) else None, -32603, "internal error")
         if resp is not None:
-            out.write(json.dumps(resp, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
+            out.write(_encode(_wire_response(resp)))
             out.flush()
     sys.stderr.write("pbz mcp: stdin closed\n")
     return 0

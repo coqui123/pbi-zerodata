@@ -1,10 +1,10 @@
 """`pbz similar`: duplicate and near-duplicate measures from normalized DAX. Names and scores only.
 
 canon(): significant tokens with functions uppercased, names casefolded, bare [x] resolved to T[x] or
-the measure, numbers as floats, strings and mirror tokens as opaque literal slots, VAR names renamed
+the measure, numbers as exact decimals, strings and mirror tokens as opaque literal slots, VAR names renamed
 $v1.., outer parentheses and a trivial `VAR x = E RETURN x` stripped. A filterless top-level
 CALCULATE(E) is stripped for candidate discovery only (it performs context transition), never for
-"identical". Groups: identical (same canon, literals compared by hash), alias (the body is one other
+"identical". Groups: identical (same canon, literals compared exactly), alias (the body is one other
 measure), same_shape (same canon once literals, columns and measures become slots: a calculation
 group candidate). Fuzzy pairs (difflib) are blocked by shared token 3-grams. Literal values are never
 shown, only that a literal differs.
@@ -12,6 +12,7 @@ shown, only that a literal differs.
 from __future__ import annotations
 
 import difflib
+from decimal import Decimal, InvalidOperation
 import hashlib
 import os
 from dataclasses import dataclass, field
@@ -30,7 +31,7 @@ class Canon:
     toks: list = field(default_factory=list)   # [(token, kind, value)]; kind "" | lit | col | meas
 
     def words(self, literals: str = "hash") -> list[str]:
-        """Token strings. literals: "hash" (exact compare), "slot" (any literal), "shape" (all slots)."""
+        """Token strings. literals: "hash" (private exact compare), "slot" (any literal), "shape" (all slots)."""
         out = []
         for tok, kind, val in self.toks:
             if kind == "lit":
@@ -54,9 +55,16 @@ def _h(s: str) -> str:
 
 def _num(text: str) -> str:
     try:
-        return repr(float(text))
-    except ValueError:
-        return text
+        sign, digits, exponent = Decimal(text).as_tuple()
+        digits = list(digits)
+        while digits and digits[-1] == 0:
+            digits.pop()
+            exponent += 1
+        if not digits:
+            return "N0"
+        return "N" + ("-" if sign else "") + "".join(map(str, digits)) + "e" + str(exponent)
+    except InvalidOperation:
+        return "N" + text
 
 
 def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
@@ -73,7 +81,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         nxt = sig[i + 1] if i + 1 < n else None
         if t.kind in LIT_KINDS:
             val = _num(t.text) if t.kind == "num" else ("T" + t.text if t.kind == "pbztok" else "S" + t.value)
-            toks.append(("LIT", "lit", _h(val)))
+            toks.append(("LIT", "lit", val))
         elif t.kind in ("table", "ident") and nxt is not None and nxt.kind == "bracket" and (
                 t.kind == "table" or t.text.lower() in var_names or res.table(t.text)):
             if t.kind == "ident" and t.text.lower() in var_names:
@@ -199,9 +207,9 @@ def run(ws, project, threshold: float = 0.80, max_pairs: int = 100) -> dict:
     disc = {i: discovery(c) for i, c in canons.items()}
 
     # identical
-    by_key: dict[str, list] = {}
+    by_key: dict[tuple, list] = {}
     for m in ms:
-        by_key.setdefault(_h(" ".join(canons[id(m)].words("hash"))), []).append(m)
+        by_key.setdefault(tuple(canons[id(m)].words("hash")), []).append(m)
     identical = [grp for grp in by_key.values() if len(grp) > 1]
     group_of = {id(m): gi for gi, grp in enumerate(identical) for m in grp}
     # aliases
@@ -213,11 +221,11 @@ def run(ws, project, threshold: float = 0.80, max_pairs: int = 100) -> dict:
             aliases.append({"measure": lab[id(m)], "table": m.table, "alias_of": d.toks[0][2]})
             alias_pairs.add(frozenset((lab[id(m)].lower(), d.toks[0][2].lower())))
     # same shape (slots: literals, columns, measures)
-    shapes: dict[str, list] = {}
+    shapes: dict[tuple, list] = {}
     for m in ms:
         w = canons[id(m)].words("shape")
         if len(w) >= MIN_SHAPE_TOKENS:
-            shapes.setdefault(_h(" ".join(w)), []).append(m)
+            shapes.setdefault(tuple(w), []).append(m)
     same_shape = []
     shape_of: dict[int, int] = {}
     for grp in shapes.values():

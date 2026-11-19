@@ -300,6 +300,29 @@ class PerfDisclosureTests(unittest.TestCase):
         self.assertNotIn("NO_BASELINE", json.dumps(out))
         self.assertNotIn("status", out)
 
+    def test_check_identity_and_hard_ratio_fail_closed(self):
+        from pbz import common
+        project = common.Project(self.ws, "One")
+        with patch("pbz.perf.desktop.require_port", return_value=1), \
+             patch("pbz.perf.checks.spend", return_value=True), \
+             patch("pbz.perf.engine_call") as engine:
+            engine.return_value = _perf_body(verdict="SAME", ratio_verdict="WITHIN_LIMIT")
+            self.assertEqual(perf.expect(self.ws, project, "EVALUATE {1}", check_id="a:b")["status"], "PASS")
+            first = engine.call_args.args[1]
+            self.assertEqual(first["baseline"], "a:b")
+            for verdict in ("NOISY", "SAME"):
+                engine.return_value = _perf_body(verdict=verdict, ratio_verdict="OVER_LIMIT")
+                self.assertEqual(perf.expect(self.ws, project, "EVALUATE {1}", check_id="other")["status"], "FAIL")
+            engine.return_value = _perf_body(verdict="SAME")
+            self.assertEqual(perf.expect(self.ws, project, "EVALUATE {1}")["status"], "ERROR")
+            engine.return_value = {"ok": True, "baseline": "MISSING", "query": "secret", "workload": "private-fingerprint"}
+            self.assertEqual(perf.expect(self.ws, project, "EVALUATE {2}")["status"], "ERROR")
+            out = perf.run(self.ws, common.Project(self.ws, "Two"), "EVALUATE {1}", baseline="a:b", action="save")
+            self.assertNotEqual(first["project_identity"], engine.call_args.args[1]["project_identity"])
+            self.assertNotIn("query", out)
+            self.assertNotIn("workload", out)
+            self.assertNotIn("fingerprint", str(out))
+
     def test_run_uses_workspace_policy(self):
         self._strict()
         with patch("pbz.perf.engine_call", return_value=_perf_body(verdict="SLOWER", baseline="SAVED")), \

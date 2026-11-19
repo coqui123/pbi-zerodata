@@ -578,6 +578,7 @@
         "trace": { "enum": ["CAPTURED", "UNAVAILABLE"] },
         "verdict": { "enum": ["FASTER", "SAME", "SLOWER", "NOISY"] },
         "baseline": { "enum": ["SAVED", "MISSING"] },
+        "ratio_verdict": { "enum": ["WITHIN_LIMIT", "OVER_LIMIT"] },
         "plan": {
           "type": "object",
           "additionalProperties": false,
