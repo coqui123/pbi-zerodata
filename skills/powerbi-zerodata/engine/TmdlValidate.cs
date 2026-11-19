@@ -38,9 +38,10 @@ public static class TmdlValidate
 
         var scrub = new Scrubber(CollectNames(folder));
         var errors = new JsonArray();
+        Database? db = null;
         try
         {
-            ctx.Guard(() => TmdlSerializer.DeserializeDatabaseFromFolder(folder));
+            db = ctx.Guard(() => TmdlSerializer.DeserializeDatabaseFromFolder(folder));
         }
         catch (TmdlFormatException fe)
         {
@@ -80,8 +81,7 @@ public static class TmdlValidate
         foreach (var o in orphans) orphanArr.Add(o);
         if (errors.Count == 0 && missing.Count == 0 && req.Str("synthetic_marker") is string marker)
         {
-            var db = ctx.Guard(() => TmdlSerializer.DeserializeDatabaseFromFolder(folder));
-            if (db.Model.Annotations.Find("PBZ_SYNTHETIC")?.Value != marker)
+            if (db!.Model.Annotations.Find("PBZ_SYNTHETIC")?.Value != marker)
                 throw new BadRequestException("SYNTH_MARKER_MISMATCH: candidate marker differs");
             SyntheticProvenance.Save(ctx, marker, SyntheticProvenance.Definition(db.Model));
         }

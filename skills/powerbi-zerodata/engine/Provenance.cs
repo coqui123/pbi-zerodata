@@ -93,6 +93,13 @@ public static class SyntheticProvenance
         var definition = new JsonObject { ["version"] = 2 };
         foreach (var name in new[] { "tables", "relationships", "roles", "expressions", "functions", "cultures", "perspectives" })
             definition[name] = Canonical(json[name]);
+        // RowNumber identities are engine-maintained and stripped above, but every column
+        // must still be covered. Count them from TOM, even if JSON omits inferred columns.
+        var rowNumberCounts = new JsonObject();
+        foreach (var table in model.Tables.OrderBy(t => t.Name, StringComparer.Ordinal))
+            rowNumberCounts[table.Name] = table.Columns.Count(c =>
+                c.Type == Microsoft.AnalysisServices.Tabular.ColumnType.RowNumber);
+        definition["rowNumberCounts"] = rowNumberCounts;
         return definition.ToJsonString();
     }
 
@@ -188,7 +195,24 @@ public static class SyntheticProvenance
     public static void Verify(Ctx ctx, Snapshot snapshot, bool requireCatalog = true)
     {
         var trusted = Load(ctx, snapshot.MarkerValue);
-        if (trusted["definition"]!.GetValue<string>() != snapshot.DefinitionValue)
+        var definition = trusted["definition"]!.GetValue<string>();
+        var liveDefinition = snapshot.DefinitionValue;
+        // Legacy signatures cover definitions without counts. Only that signed format may
+        // omit the new field; new manifests always compare the per-table counts as well.
+        if (definition != liveDefinition && JsonNode.Parse(definition) is JsonObject oldDefinition
+            && !oldDefinition.ContainsKey("rowNumberCounts"))
+        {
+            try
+            {
+                if (JsonNode.Parse(liveDefinition) is JsonObject live)
+                {
+                    live.Remove("rowNumberCounts");
+                    liveDefinition = live.ToJsonString();
+                }
+            }
+            catch (System.Text.Json.JsonException) { }
+        }
+        if (definition != liveDefinition)
             throw new BadRequestException("SYNTH_DEFINITION_CHANGED: live model differs from signed build");
         if (requireCatalog && trusted["catalog"]?.GetValue<string>() != snapshot.Catalog)
             throw new BadRequestException("SYNTH_CATALOG_MISMATCH: model is not the registered Desktop catalog");

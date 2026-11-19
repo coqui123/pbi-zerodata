@@ -1039,14 +1039,25 @@ def open_(ws, project, wait: int = 480) -> dict:
     res = desktop.open_(sp, wait)
     inst = desktop.find_instance(sp)
     port = desktop.engine_port(int(inst["pid"])) if inst and inst.get("pid") else None
-    if port:  # calculated tables are computed on open; recalculate in case Desktop deferred it
-        engine_call("refresh", {"private_dir": sp.ws.private, "port": port}, timeout=1800)
-        mt = read_text_checked(os.path.join(sp.model_dir, "definition", "model.tmdl"), root=sp.ws.root)[0]
-        marker = re.search(r"(?m)^annotation PBZ_SYNTHETIC = (\w+)", mt)
-        bound = engine_call("synth-bind", {"private_dir": ws.private, "port": port,
-                                          "marker": marker.group(1) if marker else ""}, timeout=300)
-        if not isinstance(bound, dict) or bound.get("ok") is not True or bound.get("verified") is not True:
-            raise PbzError("ENGINE_UNAVAILABLE", "synthetic catalog verification failed; row output disabled")
+    if not port:
+        raise PbzError("ENGINE_UNAVAILABLE", "the synthetic model's engine is not ready yet")
+    # Calculated tables are computed on open; recalculate in case Desktop deferred it.
+    engine_call("refresh", {"private_dir": sp.ws.private, "port": port}, timeout=1800)
+    mt = read_text_checked(os.path.join(sp.model_dir, "definition", "model.tmdl"), root=sp.ws.root)[0]
+    marker = re.search(r"(?m)^annotation PBZ_SYNTHETIC = (\w+)", mt)
+    bound = engine_call("synth-bind", {"private_dir": ws.private, "port": port,
+                                      "marker": marker.group(1) if marker else ""}, timeout=300)
+    if isinstance(bound, dict) and bound.get("ok") is False:
+        kind = bound.get("class")
+        code = kind if isinstance(kind, str) and kind in _VALIDATION_CLASSES else "OTHER"
+        reasons = {"SYNTH_DATA_PARTITION", "SYNTH_NO_MARKER", "SYNTH_MANIFEST_SIGNATURE",
+                   "SYNTH_VERIFICATION_UNAVAILABLE", "SYNTH_DEFINITION_CHANGED", "SYNTH_CATALOG_MISMATCH",
+                   "SYNTH_MARKER_MISMATCH", "SYNTH_MODEL_CHANGED_DURING_QUERY"}
+        reason = bound.get("reason")
+        raise PbzError(code, reason if isinstance(reason, str) and reason in reasons
+                       else "synthetic catalog verification failed; row output disabled")
+    if not isinstance(bound, dict) or bound.get("ok") is not True or bound.get("verified") is not True:
+        raise PbzError("ENGINE_UNAVAILABLE", "synthetic catalog verification failed; row output disabled")
     return {**res, "verb": "synth-open", "project": sp.name}
 
 

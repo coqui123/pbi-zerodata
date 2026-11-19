@@ -99,7 +99,10 @@ class SynthAtomicTests(unittest.TestCase):
             synth.build(self.ws, self.project, rows=20, seed=1)
         marker_text = common.read_text(os.path.join(synth.synth_project(self.ws, self.project).model_dir,
                                                   "definition", "model.tmdl"))[0]
-        responses = [None, {"ok": False}, {"ok": True}, {"ok": True, "verified": False},
+        responses = [None, {"ok": False},
+                     {"ok": False, "class": "BAD_REQUEST", "reason": "SYNTH_DEFINITION_CHANGED"},
+                     {"ok": False, "class": "CANARY-CLASS", "reason": "raw secret"},
+                     {"ok": True}, {"ok": True, "verified": False},
                      {"ok": True, "verified": True}]
         for response in responses:
             calls = []
@@ -115,12 +118,31 @@ class SynthAtomicTests(unittest.TestCase):
                 else:
                     with self.assertRaises(PbzError) as caught:
                         synth.open_(self.ws, self.project)
-                    self.assertEqual(caught.exception.code, "ENGINE_UNAVAILABLE")
+                    if response and response.get("ok") is False:
+                        self.assertEqual(caught.exception.code,
+                                         "BAD_REQUEST" if response.get("class") == "BAD_REQUEST" else "OTHER")
+                        if response.get("reason") == "SYNTH_DEFINITION_CHANGED":
+                            self.assertIn("SYNTH_DEFINITION_CHANGED", str(caught.exception))
+                        else:
+                            self.assertNotIn("raw secret", str(caught.exception))
+                        self.assertNotIn("CANARY-CLASS", str(caught.exception))
+                    else:
+                        self.assertEqual(caught.exception.code, "ENGINE_UNAVAILABLE")
             self.assertEqual([verb for verb, _ in calls], ["refresh", "synth-bind"])
             request = calls[-1][1]
             self.assertEqual(request["private_dir"], self.ws.private)
             self.assertEqual(request["port"], 1234)
             self.assertIn("annotation PBZ_SYNTHETIC = " + request["marker"], marker_text)
+
+        for instance in (None, {"pid": 1}):
+            with self.subTest(instance=instance), patch("pbz.synth.engine_call") as broker, \
+                    patch("pbz.synth.desktop.open_", return_value={"open": True}), \
+                    patch("pbz.synth.desktop.find_instance", return_value=instance), \
+                    patch("pbz.synth.desktop.engine_port", return_value=None):
+                with self.assertRaises(PbzError) as caught:
+                    synth.open_(self.ws, self.project)
+                self.assertEqual(caught.exception.code, "ENGINE_UNAVAILABLE")
+                broker.assert_not_called()
 
     def test_query_reports_only_closed_refusal_reasons(self):
         os.makedirs(os.path.join(self.dest, ".pbz"))

@@ -213,6 +213,7 @@ class Fixtures
                 Expression = "DATATABLE(\"X\", INTEGER, {{1}})" } });
             model.Tables.Add(table);
         }
+        model.Tables["T"].Columns.Add(new RowNumberColumn { Name = "RowNumber" });
         model.Tables["T"].Measures.Add(new Measure { Name = "M", Expression = "SUM('T'[X])", FormatString = "0" });
         model.Tables["T"].Columns.Add(new CalculatedColumn { Name = "C", Expression = "[X] + 1", DataType = DataType.Int64 });
         var group = new Table { Name = "CG", CalculationGroup = new CalculationGroup() };
@@ -231,25 +232,49 @@ class Fixtures
         P.Save(ctx, marker, definition, "catalog-A");
         var good = new P.Snapshot(marker, "catalog-A", definition, "v1");
         int passed = 0;
-        void Check(string name, Action action, bool refused)
+        void Check(string name, Action action, string? expectedReason)
         {
-            try { action(); if (refused) throw new Exception(name + ": accepted"); }
-            catch (BadRequestException) { if (!refused) throw; }
+            try { action(); if (expectedReason != null) throw new Exception(name + ": accepted"); }
+            catch (BadRequestException ex)
+            {
+                if (expectedReason == null || !ex.Message.StartsWith(expectedReason + ":", StringComparison.Ordinal))
+                    throw new Exception(name + ": unexpected refusal reason", ex);
+            }
             passed++;
             Console.WriteLine("PASS " + name);
         }
-        Check("passing manifest", () => P.Verify(ctx, good), false);
-        void Mutation(string name, Action<Model> mutate)
+        Check("passing manifest", () => P.Verify(ctx, good), null);
+        var legacyDefinition = JsonNode.Parse(definition)!.AsObject();
+        var counts = legacyDefinition["rowNumberCounts"]!.AsObject();
+        if (counts.Count != Build().Tables.Count || counts["T"]!.GetValue<int>() != 1
+            || counts["Other"]!.GetValue<int>() != 0) throw new Exception("incomplete RowNumber counts");
+        legacyDefinition.Remove("rowNumberCounts");
+        var legacyText = legacyDefinition.ToJsonString();
+        Check("new manifest requires counts", () => P.Verify(ctx,
+            good with { DefinitionValue = legacyText }), "SYNTH_DEFINITION_CHANGED");
+        // Simulate a manifest signed by the previous build, without changing the main fixture.
+        var legacyMarker = new string('c', 64);
+        P.Save(ctx, legacyMarker, legacyText, "catalog-A");
+        Check("legacy manifest remains readable", () => P.Verify(ctx,
+            good with { MarkerValue = legacyMarker }), null);
+        Check("legacy manifest still covers definitions", () => P.Verify(ctx,
+            good with { MarkerValue = legacyMarker, DefinitionValue = "edited" }), "SYNTH_DEFINITION_CHANGED");
+        void Mutation(string name, Action<Model> mutate, string expectedReason = "SYNTH_DEFINITION_CHANGED")
         {
-            var model = Build(); mutate(model);
+            var model = Build();
+            var baseline = good with { DefinitionValue = P.Definition(model) };
+            Check(name + " baseline", () => P.Verify(ctx, baseline), null);
+            mutate(model);
             Check(name, () => P.Buffered<int>(
-                () => good with { DefinitionValue = P.Definition(model) }, s => P.Verify(ctx, s),
-                () => throw new Exception("query ran on changed model")), true);
+                () => baseline with { DefinitionValue = P.Definition(model) }, s => P.Verify(ctx, s),
+                () => throw new Exception("query ran on changed model")), expectedReason);
         }
         Mutation("changed measure", m => m.Tables["T"].Measures["M"].Expression = "42");
         Mutation("changed calculated table", m => ((CalculatedPartitionSource)m.Tables["T"].Partitions[0].Source).Expression = "ROW(\"X\", 1)");
         Mutation("edited DATATABLE row", m => ((CalculatedPartitionSource)m.Tables["T"].Partitions[0].Source).Expression = "DATATABLE(\"X\", INTEGER, {{123456}})");
         Mutation("added column", m => m.Tables["T"].Columns.Add(new CalculatedColumn { Name = "Added", Expression = "1", DataType = DataType.Int64 }));
+        Mutation("removed RowNumber column", m => m.Tables["T"].Columns.Remove("RowNumber"));
+        Mutation("added RowNumber column", m => m.Tables["Other"].Columns.Add(new RowNumberColumn { Name = "RowNumber" }));
         Table Extra(string name, bool data = false) {
             var t = new Table { Name = name };
             t.Partitions.Add(new Partition { Name = "P", Source = data ? new MPartitionSource { Expression = "secret" } : new CalculatedPartitionSource { Expression = "ROW(\"X\", 1)" } });
@@ -257,7 +282,7 @@ class Fixtures
         }
         Mutation("added untagged table", m => m.Tables.Add(Extra("U")));
         Mutation("private-prefixed table", m => m.Tables.Add(Extra("LocalDateTable_secret")));
-        Mutation("private table with data partition", m => m.Tables["Private"].Partitions[0].Source = new MPartitionSource { Expression = "secret" });
+        Mutation("private table with data partition", m => m.Tables["Private"].Partitions[0].Source = new MPartitionSource { Expression = "secret" }, "SYNTH_DATA_PARTITION");
         // Verify private and untagged tables present at signing remain covered, not just additions.
         var privateModel = Build(); var hidden = Extra("LocalDateTable_signed"); hidden.IsPrivate = true;
         privateModel.Tables.Add(hidden);
@@ -269,38 +294,38 @@ class Fixtures
         Mutation("private table expression", m => ((CalculatedPartitionSource)m.Tables["Private"].Partitions[0].Source).Expression = "ROW(\"X\", 42)");
         Mutation("private-prefixed table expression", m => ((CalculatedPartitionSource)m.Tables["LocalDateTable_existing"].Partitions[0].Source).Expression = "ROW(\"X\", 42)");
         Mutation("format string", m => m.Tables["T"].Measures["M"].FormatString = "secret");
-        Check("marker replay different catalog", () => P.Verify(ctx, good with { Catalog = "catalog-B" }), true);
-        Check("missing marker", () => P.Verify(ctx, good with { MarkerValue = "" }), true);
+        Check("marker replay different catalog", () => P.Verify(ctx, good with { Catalog = "catalog-B" }), "SYNTH_CATALOG_MISMATCH");
+        Check("missing marker", () => P.Verify(ctx, good with { MarkerValue = "" }), "SYNTH_NO_MARKER");
         var manifestPath = Path.Combine(args[0], "synth-manifest-" + marker + ".bin");
         var signed = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(Dpapi.Unprotect(File.ReadAllBytes(manifestPath))))!.AsObject();
         signed["definition"] = "tampered";
         Vault.WriteProtected(manifestPath, signed.ToJsonString());
-        Check("invalid manifest signature", () => P.Verify(ctx, good), true);
+        Check("invalid manifest signature", () => P.Verify(ctx, good), "SYNTH_MANIFEST_SIGNATURE");
         P.Save(ctx, marker, definition, "catalog-A");
         int queries = 0;
         Check("verification unavailable", () => P.Buffered(
-            () => good with { MarkerValue = new string('b', 64) }, s => P.Verify(ctx, s), () => ++queries), true);
+            () => good with { MarkerValue = new string('b', 64) }, s => P.Verify(ctx, s), () => ++queries), "SYNTH_VERIFICATION_UNAVAILABLE");
         if (queries != 0) throw new Exception("query ran without verification");
         Check("live verification unavailable before query", () => P.Buffered<int>(
             () => throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: live definition unavailable"),
-            s => P.Verify(ctx, s), () => ++queries), true);
+            s => P.Verify(ctx, s), () => ++queries), "SYNTH_VERIFICATION_UNAVAILABLE");
         if (queries != 0) throw new Exception("query ran without live verification");
         int captures = 0;
         Check("edit between verification and execution", () => P.Buffered(
             () => ++captures == 1 ? good : good with { DefinitionValue = "edited" },
-            s => P.Verify(ctx, s), () => ++queries), true);
+            s => P.Verify(ctx, s), () => ++queries), "SYNTH_DEFINITION_CHANGED");
         if (queries != 1 || captures != 2) throw new Exception("race fixture did not execute both checks");
         captures = 0;
         Check("version changed while definition restored", () => P.Buffered(
             () => ++captures == 1 ? good : good with { Version = "v2" },
-            s => P.Verify(ctx, s), () => ++queries), true);
+            s => P.Verify(ctx, s), () => ++queries), "SYNTH_MODEL_CHANGED_DURING_QUERY");
         captures = 0;
         Check("live verification unavailable after query", () => P.Buffered(
             () => ++captures == 1 ? good : throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: live definition unavailable"),
-            s => P.Verify(ctx, s), () => ++queries), true);
+            s => P.Verify(ctx, s), () => ++queries), "SYNTH_VERIFICATION_UNAVAILABLE");
         Check("verified rows released", () => {
             if (P.Buffered(() => good, s => P.Verify(ctx, s), () => 7) != 7) throw new Exception("lost rows");
-        }, false);
+        }, null);
         Console.WriteLine($"{passed} passed, 0 failed");
     }
 }
