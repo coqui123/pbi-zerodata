@@ -85,11 +85,21 @@ public static class SyntheticProvenance
                 && p.Source is not Microsoft.AnalysisServices.Tabular.CalculationGroupSource))
                 throw new BadRequestException("SYNTH_DATA_PARTITION: every table must have only calculated partitions");
         }
-        var json = JsonNode.Parse(Microsoft.AnalysisServices.Tabular.JsonSerializer.SerializeObject(model,
-            new Microsoft.AnalysisServices.Tabular.SerializeOptions {
-                IncludeRestrictedInformation = true, IgnoreChildren = false,
-                IgnoreInferredObjects = false, IgnoreInferredProperties = true, IgnoreTimestamps = true
-            }))!.AsObject();
+        var options = new Microsoft.AnalysisServices.Tabular.SerializeOptions {
+            IncludeRestrictedInformation = true, IgnoreChildren = false,
+            IgnoreInferredObjects = false, IgnoreInferredProperties = true, IgnoreTimestamps = true
+        };
+        var database = model.Database;
+        // A database read from a TMDL folder records no compatibility mode, so serialization
+        // defaults to AnalysisServices mode and gates Power BI metadata on a sentinel level.
+        // Every database this engine opens is a Power BI database (Desktop reports PowerBI),
+        // so use its declared level and mode, treating Unknown as PowerBI.
+        var json = JsonNode.Parse(database is null
+            ? Microsoft.AnalysisServices.Tabular.JsonSerializer.SerializeObject(model, options)
+            : Microsoft.AnalysisServices.Tabular.JsonSerializer.SerializeObject(model, options,
+                database.CompatibilityLevel,
+                database.CompatibilityMode == Microsoft.AnalysisServices.CompatibilityMode.Unknown
+                    ? Microsoft.AnalysisServices.CompatibilityMode.PowerBI : database.CompatibilityMode))!.AsObject();
         // Identity is checked separately against the catalog pinned at synth-open. Compatibility
         // level and other Desktop model defaults are not part of the executable object definition.
         if ((json["tables"] as JsonArray)?.Count != model.Tables.Count)
