@@ -66,6 +66,21 @@ def enlist(path, before, after):
     _save(directory, journal)
 
 
+def mark_intended(path, after):
+    """Record the intended final version before local undo applies it."""
+    active = _active.get()
+    if active is None:
+        return
+    ws, _project, directory, journal = active
+    try:
+        rel = os.path.relpath(os.path.abspath(path), ws.mirror).replace("\\", "/")
+    except ValueError:
+        raise PbzError("RECOVERY_REQUIRED", os.path.basename(path)) from None
+    entry = next(e for e in journal["entries"] if e["path"] == rel)
+    entry["after"] = _hash(after)
+    _save(directory, journal)
+
+
 def mark_applied(path, after):
     """Record the version this operation successfully wrote."""
     active = _active.get()
@@ -142,7 +157,7 @@ def transaction(root, fn, *, ws=None, project=None):
             journal["state"] = "COMMITTED"
             try:
                 _save(directory, journal)
-            except Exception:
+            except BaseException:
                 try:
                     with open(os.path.join(directory, "journal.json"), encoding="utf-8") as handle:
                         journal = json.load(handle)

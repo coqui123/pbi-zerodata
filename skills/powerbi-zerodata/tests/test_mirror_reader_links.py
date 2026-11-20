@@ -155,8 +155,8 @@ class MirrorReaderLinks(unittest.TestCase):
             def swap_after_open(name, *args, **kwargs):
                 nonlocal swapped
                 if name == path and opened and not swapped:
-                    os.replace(sibling, path)
                     swapped = True
+                    return real_lstat(sibling, *args, **kwargs)
                 return real_lstat(name, *args, **kwargs)
             with patch.object(builtins, "open", track_open), patch.object(os, "lstat", swap_after_open):
                 with self.assertRaises(PbzError) as caught:

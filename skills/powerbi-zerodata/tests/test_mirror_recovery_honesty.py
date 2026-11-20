@@ -498,6 +498,90 @@ print(json.dumps(mirror.recover(ws, project)))
         self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
         self.assertFalse(mirror.pending_recovery(self.ws, self.project))
 
+    def _killed_local_undo(self, interrupted):
+        import subprocess
+        code = """
+import os, sys
+from unittest.mock import patch
+from pbz import common
+from pbz.mirror_txn import transaction
+ws = common.Workspace(sys.argv[1]); ws.private = sys.argv[2]
+project = ws.project()
+path = sys.argv[3]
+other = os.path.join(os.path.dirname(path), 'Fail.tmdl')
+write, replace = common.write_bytes, common.replace_bytes
+def fail_other(target, data, **kwargs):
+    if target == other:
+        raise OSError('inert')
+    return write(target, data, **kwargs)
+def interrupt_undo(target, data, **kwargs):
+    result = replace(target, data, **kwargs)
+    if target == path and data == b'B' and sys.argv[4] == 'True':
+        os._exit(94)
+    return result
+def edit():
+    common.commit_bytes([('write_bytes', path, b'B')], root=ws.mirror)
+    try:
+        with patch.object(common, 'write_bytes', fail_other), patch.object(common, 'replace_bytes', interrupt_undo):
+            common.commit_bytes([('write_bytes', path, b'C'),
+                                 ('write_bytes', other, b'fail')], root=ws.mirror)
+    except common.PbzError as error:
+        if error.code != 'FAILED':
+            raise
+        os._exit(95)
+transaction(ws.mirror, edit, ws=ws, project=project)
+"""
+        env = dict(os.environ)
+        env["PYTHONPATH"] = SKILL + os.pathsep + env.get("PYTHONPATH", "")
+        child = subprocess.run([sys.executable, "-c", code, self.ws.root, self.ws.private,
+                                self.path, str(interrupted)], env=env, capture_output=True, text=True)
+        self.assertEqual(child.returncode, 94 if interrupted else 95, child.stderr)
+        self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), b"B")
+        self.assertEqual(len(mirror.pending_recovery(self.ws, self.project)), 1)
+
+    def test_interrupted_local_undo_recovers(self):
+        self._killed_local_undo(True)
+        self.assertEqual(mirror.recover(self.ws, self.project)["result"], "RECOVERED")
+        self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
+        self.assertFalse(mirror.pending_recovery(self.ws, self.project))
+
+    def test_superseded_version_after_local_undo_is_external_conflict(self):
+        self._killed_local_undo(False)
+        common.replace_bytes(self.path, b"C", root=self.ws.mirror)
+        self.assertEqual(mirror.recover(self.ws, self.project)["result"], "RECOVERY_REQUIRED")
+        self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), b"C")
+        self.assertTrue(mirror.pending_recovery(self.ws, self.project))
+
+    def _terminal_save_interrupt(self, persisted):
+        from pbz import mirror_txn
+        save = mirror_txn._save
+        def interrupt_commit(directory, journal):
+            if journal["state"] == "COMMITTED":
+                if persisted:
+                    save(directory, journal)
+                raise KeyboardInterrupt("terminal save interrupted")
+            return save(directory, journal)
+        def edit():
+            self._write(self.path, b"new")
+            return "fn result"
+        with patch.object(mirror_txn, "_save", interrupt_commit):
+            if persisted:
+                self.assertEqual(self._run(edit), "fn result")
+            else:
+                with self.assertRaisesRegex(KeyboardInterrupt, "terminal save interrupted"):
+                    self._run(edit)
+        self.assertEqual(common.read_checked(self.path, root=self.ws.mirror),
+                         b"new" if persisted else self.before)
+        self.assertFalse(mirror.pending_recovery(self.ws, self.project))
+        parent = mirror._transaction_dir(self.ws, self.project)
+        self.assertFalse([n for n in os.listdir(parent) if n.startswith("edit-")])
+
+    def test_terminal_save_interrupted_before_persisting(self):
+        self._terminal_save_interrupt(False)
+
+    def test_terminal_save_interrupted_after_persisting(self):
+        self._terminal_save_interrupt(True)
+
     def _terminal_save_failure(self, persisted):
         from pbz import mirror_txn
         from unittest.mock import patch

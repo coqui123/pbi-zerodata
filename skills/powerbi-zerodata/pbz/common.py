@@ -854,7 +854,7 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
             done.append(path)
             mark_applied(path, after)
     except (OSError, PbzError, UnicodeError) as first:
-        from .mirror_txn import mark_applied
+        from .mirror_txn import mark_applied, mark_intended
         restore_fail = []
         touched = list(dict.fromkeys(reversed(done)))
         for path in touched:
@@ -865,9 +865,12 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
                 trust = _trust_root(path, root, roots)
                 current = _raw(path, trust)
                 if current == data:
+                    mark_intended(path, data)
+                    mark_applied(path, data)
                     continue
                 if current != written[path]:
                     raise PbzError("RECOVERY_REQUIRED", "file changed before undo")
+                mark_intended(path, data)
                 if data is None:
                     _contained(path, trust)
                     if os.path.lexists(path):
