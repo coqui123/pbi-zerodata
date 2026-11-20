@@ -449,6 +449,93 @@ class Fixtures
                 finally { beforeInventory.SetValue(null, null); }
             }
         }, null);
+        Check("copy timeout retains ownership until worker finishes and recovers stale snapshots", () => {
+            var source = Path.Combine(args[0], "timeout-source");
+            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(Build().Database, source);
+            var scratch = Path.Combine(args[0], "timeout-private");
+            var timeoutCtx = new Ctx("tmdl-validate");
+            var request = Req.Parse(new JsonObject { ["private_dir"] = scratch,
+                ["folder"] = source, ["timeout_s"] = 1 }.ToJsonString());
+            timeoutCtx.Init(request);
+            var afterCopy = typeof(TmdlValidate).GetField("AfterCopyFileForTests", BindingFlags.Static | BindingFlags.NonPublic)!;
+            var afterCleanup = typeof(TmdlValidate).GetField("AfterSnapshotCleanupForTests", BindingFlags.Static | BindingFlags.NonPublic)!;
+            using var paused = new ManualResetEventSlim();
+            using var resume = new ManualResetEventSlim();
+            using var cleaned = new ManualResetEventSlim();
+            using var returned = new ManualResetEventSlim();
+            Task<JsonObject>? validation = null;
+            string? copiedFile = null;
+            string? snapshot = null;
+            int copies = 0;
+            afterCopy.SetValue(null, (Action<string>)(target => {
+                if (Interlocked.Increment(ref copies) != 1) return;
+                copiedFile = target;
+                paused.Set();
+                if (!resume.Wait(TimeSpan.FromSeconds(120))) throw new Exception("copy timeout fixture was not released");
+            }));
+            afterCleanup.SetValue(null, (Action<string>)(path => {
+                if (path == snapshot) cleaned.Set();
+            }));
+            try
+            {
+                validation = Task.Run(() => {
+                    try { return TmdlValidate.Run(request, timeoutCtx); }
+                    finally { returned.Set(); }
+                });
+                if (!paused.Wait(TimeSpan.FromSeconds(120))) throw new Exception("copier did not produce a partial snapshot");
+                snapshot = Directory.GetDirectories(scratch, "tmdl-validate-*").Single();
+                if (copiedFile == null || !File.Exists(copiedFile)) throw new Exception("copier paused before copying a file");
+                if (!returned.Wait(TimeSpan.FromSeconds(120)))
+                    throw new Exception("blocked copier prevented the deadline from surfacing");
+                try
+                {
+                    validation.GetAwaiter().GetResult();
+                    throw new Exception("blocked copy did not time out");
+                }
+                catch (TimeoutException) { }
+                // Pins invariants 1 and 3: the deadline must return while the copier is
+                // blocked, without traversing/deleting its partial output (the old race).
+                if (!Directory.Exists(snapshot) || !File.Exists(copiedFile) || cleaned.IsSet)
+                    throw new Exception("timeout cleanup touched a snapshot with a live copier");
+                var stale = Path.Combine(scratch, "tmdl-validate-stale-fixture");
+                Directory.CreateDirectory(stale);
+                File.WriteAllText(Path.Combine(stale, "partial.tmdl"), "stale partial copy");
+                var recoveryCtx = new Ctx("tmdl-validate");
+                var recoveryRequest = Req.Parse(new JsonObject { ["private_dir"] = scratch,
+                    ["folder"] = source, ["timeout_s"] = 120 }.ToJsonString());
+                recoveryCtx.Init(recoveryRequest);
+                var recovered = TmdlValidate.Run(recoveryRequest, recoveryCtx);
+                if (recovered["valid"]?.GetValue<bool>() != true || Directory.Exists(stale))
+                    throw new Exception("subsequent validation did not recover the stale snapshot");
+                if (!Directory.Exists(snapshot) || !File.Exists(copiedFile) || cleaned.IsSet)
+                    throw new Exception("stale sweep touched a snapshot with a live copier");
+                resume.Set();
+                // Pins invariant 2: this signal follows actual worker completion and cleanup,
+                // so the released worker can never recreate entries after the final assertion.
+                if (!cleaned.Wait(TimeSpan.FromSeconds(120))) throw new Exception("released copy snapshot was not cleaned up");
+                if (Directory.EnumerateDirectories(scratch, "tmdl-validate-*").Any())
+                    throw new Exception("copy timeout left unaccounted validation snapshots");
+            }
+            finally
+            {
+                resume.Set();
+                try
+                {
+                    if (validation != null)
+                    {
+                        try { validation.GetAwaiter().GetResult(); }
+                        catch (TimeoutException) { }
+                        if (snapshot != null && !cleaned.Wait(TimeSpan.FromSeconds(120)))
+                            throw new Exception("copy cleanup did not finish before resetting hooks");
+                    }
+                }
+                finally
+                {
+                    afterCopy.SetValue(null, null);
+                    afterCleanup.SetValue(null, null);
+                }
+            }
+        }, null);
         Console.WriteLine($"{passed} passed, 0 failed");
     }
 }

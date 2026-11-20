@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -14,6 +15,10 @@ namespace PbzEngine;
 public static class TmdlValidate
 {
     internal static Action? BeforeInventoryForTests;
+    internal static Action<string>? AfterCopyFileForTests;
+    internal static Action<string>? AfterSnapshotCleanupForTests;
+
+    static readonly ConcurrentDictionary<string, byte> ActiveSnapshots = new(StringComparer.OrdinalIgnoreCase);
 
     static readonly Dictionary<string, string> RefDirs = new(StringComparer.Ordinal)
     {
@@ -38,29 +43,80 @@ public static class TmdlValidate
         LinkGuard.Refuse(folder);
         if (!Directory.Exists(folder)) throw new BadRequestException("folder not found");
 
-        string snapshot = Path.Combine(ctx.RequirePrivateDir(), "tmdl-validate-" + Guid.NewGuid().ToString("N"));
+        string privateDir = ctx.RequirePrivateDir();
+        string snapshot = Path.Combine(privateDir, "tmdl-validate-" + Guid.NewGuid().ToString("N"));
         if (IsInsideFolder(snapshot, folder))
             throw new BadRequestException("validation scratch directory must be outside the candidate folder");
         LinkGuard.Refuse(snapshot);
+        SweepSnapshots(privateDir);
+        ActiveSnapshots.TryAdd(snapshot, 0);
+        var cancellation = new CancellationTokenSource();
+        Task? copy = null;
         try
         {
-            ctx.Guard(() => { CopyTree(folder, snapshot); return 0; });
+            copy = Task.Run(() => CopyTree(folder, snapshot, cancellation.Token));
+            // Match Guard's deadline and exception semantics, but retain the worker for cleanup.
+            try
+            {
+                if (!copy.Wait(TimeSpan.FromSeconds(ctx.TimeoutSec + 10)))
+                    throw new TimeoutException("engine operation exceeded its deadline");
+            }
+            catch (AggregateException ae) when (ae.InnerException != null)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerException).Throw();
+            }
             return RunSnapshot(req, ctx, snapshot);
         }
         finally
         {
-            // Best effort: a leftover scratch directory must not fail a completed validation.
-            try
+            cancellation.Cancel();
+            if (copy == null || copy.IsCompleted)
             {
-                if (Directory.Exists(snapshot))
-                {
-                    ClearReadOnly(snapshot);
-                    Directory.Delete(snapshot, recursive: true);
-                }
+                _ = copy?.Exception;
+                CleanupSnapshot(snapshot);
+                cancellation.Dispose();
             }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
+            else
+            {
+                // A timed-out worker retains ownership until it has stopped writing. If the
+                // process exits first, the next Run's sweep recovers the inactive snapshot.
+                _ = copy.ContinueWith(completed =>
+                {
+                    _ = completed.Exception; // Observe any failure after the caller timed out.
+                    CleanupSnapshot(snapshot);
+                    cancellation.Dispose();
+                }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
         }
+    }
+
+    static void SweepSnapshots(string privateDir)
+    {
+        try
+        {
+            foreach (var stale in Directory.EnumerateDirectories(privateDir, "tmdl-validate-*"))
+                // Claim stale paths too, so concurrent sweeps cannot traverse the same tree.
+                if (ActiveSnapshots.TryAdd(stale, 0)) CleanupSnapshot(stale);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    static void CleanupSnapshot(string snapshot)
+    {
+        // Best effort: a leftover scratch directory must not fail a completed validation.
+        try
+        {
+            if (!LinkGuard.IsLink(snapshot) && Directory.Exists(snapshot))
+            {
+                ClearReadOnly(snapshot);
+                Directory.Delete(snapshot, recursive: true);
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        finally { ActiveSnapshots.TryRemove(snapshot, out _); }
+        AfterSnapshotCleanupForTests?.Invoke(snapshot);
     }
 
     internal static bool IsInsideFolder(string candidate, string folder)
@@ -81,18 +137,24 @@ public static class TmdlValidate
     }
 
     // Copy failures propagate: no validation or signing may fall back to the live folder.
-    static void CopyTree(string source, string destination)
+    static void CopyTree(string source, string destination, CancellationToken cancellation)
     {
+        cancellation.ThrowIfCancellationRequested();
         LinkGuard.Refuse(source);
         Directory.CreateDirectory(destination);
         foreach (var entry in Directory.EnumerateFileSystemEntries(source))
         {
+            cancellation.ThrowIfCancellationRequested();
             LinkGuard.Refuse(entry);
             string target = Path.Combine(destination, Path.GetFileName(entry));
             if (File.GetAttributes(entry).HasFlag(FileAttributes.Directory))
-                CopyTree(entry, target);
+                CopyTree(entry, target, cancellation);
             else if (string.Equals(Path.GetExtension(entry), ".tmdl", StringComparison.OrdinalIgnoreCase))
+            {
+                cancellation.ThrowIfCancellationRequested();
                 File.Copy(entry, target);
+                AfterCopyFileForTests?.Invoke(target);
+            }
         }
     }
 
