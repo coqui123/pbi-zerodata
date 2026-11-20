@@ -118,55 +118,84 @@ def file_lock(path: str, what_if: bool = False):
     path = os.path.realpath(path)
     parent = os.path.dirname(path)
     target_absent = not os.path.exists(path)
-    parent_created = not os.path.exists(parent)
-    os.makedirs(parent, exist_ok=True)
+    created_parents = []
+    missing = []
+    ancestor = parent
+    while not os.path.exists(ancestor):
+        missing.append(ancestor)
+        ancestor = os.path.dirname(ancestor)
     lock = path + '.pbz-lock'
+    deadline = time.monotonic() + 60
     try:
-        handle = open(lock, 'x+b')
-        lock_created = True
-    except FileExistsError:
-        handle = open(lock, 'a+b')
-        lock_created = False
-    try:
-        with handle:
-            deadline = time.monotonic() + 60
-            if os.name == 'nt':
-                import msvcrt
-                handle.seek(0, os.SEEK_END)
-                if handle.tell() == 0:
-                    handle.write(b'0')
-                    handle.flush()
-            else:
-                import fcntl
-            while True:
+        for directory in reversed(missing):
+            try:
+                os.mkdir(directory)
+                created_parents.append(directory)
+            except FileExistsError:
+                if not os.path.isdir(directory):
+                    raise
+        while True:
+            try:
+                handle = open(lock, 'x+b')
+                lock_created = True
+            except FileExistsError:
+                handle = open(lock, 'a+b')
+                lock_created = False
+            with handle:
+                if os.name == 'nt':
+                    import msvcrt
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b'0')
+                        handle.flush()
+                else:
+                    import fcntl
+                while True:
+                    try:
+                        if os.name == 'nt':
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError as error:
+                        if time.monotonic() >= deadline:
+                            raise InstallConflict(f'{path}: installer lock timeout') from error
+                        time.sleep(0.05)
                 try:
+                    descriptor = os.fstat(handle.fileno())
+                    try:
+                        current = os.stat(lock)
+                    except FileNotFoundError:
+                        current = None
+                    if current is None or (descriptor.st_dev, descriptor.st_ino) != (current.st_dev, current.st_ino):
+                        if time.monotonic() >= deadline:
+                            raise InstallConflict(f'{path}: installer lock timeout')
+                        continue
+                    try:
+                        yield
+                    finally:
+                        # Unlink while locked so waiters must re-open and validate
+                        # the replacement inode before entering their transaction.
+                        if target_absent and not os.path.exists(path) and lock_created:
+                            try:
+                                os.unlink(lock)
+                            except OSError:
+                                pass
+                    return
+                finally:
                     if os.name == 'nt':
                         handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                     else:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError as error:
-                    if time.monotonic() >= deadline:
-                        raise InstallConflict(f'{path}: installer lock timeout') from error
-                    time.sleep(0.05)
-            try:
-                yield
-            finally:
-                if os.name == 'nt':
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
         if target_absent and not os.path.exists(path):
-            if lock_created:
-                os.unlink(lock)
-            if parent_created:
+            for directory in reversed(created_parents):
                 try:
-                    os.rmdir(parent)
+                    os.rmdir(directory)
                 except OSError:
-                    pass
+                    break
 
 
 def _write_content(handle, text):
@@ -550,7 +579,7 @@ def _main() -> int:
             print(" ", line)
             if line.startswith("SKIP "):
                 skipped = True
-    if skipped and not uninstall:
+    if skipped:
         return 1
     if not uninstall:
         print(f"  hook command: {hook_cmd('claude')}")

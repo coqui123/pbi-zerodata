@@ -183,6 +183,92 @@ class InstallerTransactionTests(unittest.TestCase):
                 pass
             self.assertTrue(lock.exists())
 
+    def test_absent_noop_lock_removes_all_created_ancestors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = Path(tmp, 'existing')
+            existing.mkdir()
+            path = existing / 'first' / 'second' / 'settings.json'
+            self.inst.settings_step(str(path), 'codex', False, True)
+            self.assertFalse((existing / 'first').exists())
+            self.assertTrue(existing.is_dir())
+
+    def test_absent_noop_lock_tolerates_unlink_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'settings.json')
+            with patch.object(self.inst.os, 'unlink', side_effect=PermissionError('open sidecar')):
+                with self.inst.file_lock(str(path)):
+                    pass
+            self.assertTrue(Path(str(path) + '.pbz-lock').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX flock and unlink of open file')
+    def test_absent_noop_lock_unlinks_before_unlocking(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'settings.json')
+            lock = str(path) + '.pbz-lock'
+            unlink = os.unlink
+            def checked_unlink(name):
+                with open(name, 'a+b') as probe:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                unlink(name)
+            with patch.object(self.inst.os, 'unlink', side_effect=checked_unlink):
+                with self.inst.file_lock(str(path)):
+                    pass
+            self.assertFalse(Path(lock).exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX flock and unlink of open file')
+    def test_absent_noop_lock_waiter_retries_replaced_inode(self):
+        import fcntl
+        inst = self.inst
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'settings.json')
+            lock = str(path) + '.pbz-lock'
+            opened, replaced, entered, third_entered, release = (threading.Event() for _ in range(5))
+            errors = []
+            flock = fcntl.flock
+            def gated_flock(fd, operation):
+                if threading.current_thread() is waiter and operation & fcntl.LOCK_EX and not opened.is_set():
+                    opened.set()
+                    if not replaced.wait(5):
+                        raise RuntimeError('replacement timeout')
+                return flock(fd, operation)
+            def writer(is_waiter):
+                try:
+                    with inst.file_lock(str(path)):
+                        (entered if is_waiter else third_entered).set()
+                        if not release.wait(5):
+                            raise RuntimeError('writer release timeout')
+                        path.write_text('{}')
+                except BaseException as error:
+                    errors.append(error)
+            waiter = threading.Thread(target=writer, args=(True,))
+            third = threading.Thread(target=writer, args=(False,))
+            with open(lock, 'x+b') as holder, patch.object(fcntl, 'flock', side_effect=gated_flock):
+                flock(holder.fileno(), fcntl.LOCK_EX)
+                waiter.start()
+                try:
+                    self.assertTrue(opened.wait(5))
+                    # Model an absent no-op holder's cleanup explicitly: the
+                    # waiter already opened its inode, then cleanup unlinks it.
+                    # Gate acquisition so the third writer holds the replacement
+                    # before the waiter acquires and validates the stale inode.
+                    os.unlink(lock)
+                    flock(holder.fileno(), fcntl.LOCK_UN)
+                    third.start()
+                    self.assertTrue(third_entered.wait(5))
+                    replaced.set()
+                    self.assertFalse(entered.wait(.2), 'writers entered on different lock inodes')
+                finally:
+                    replaced.set()
+                    release.set()
+                    waiter.join(5)
+                    if third.ident is not None: third.join(5)
+            self.assertFalse(waiter.is_alive())
+            self.assertFalse(third.is_alive())
+            self.assertTrue(entered.is_set())
+            self.assertEqual(errors, [])
+
     @unittest.skipIf(os.name == 'nt', 'POSIX flock')
     def test_posix_lock_timeout_is_named_conflict(self):
         import fcntl
@@ -231,6 +317,24 @@ class InstallerTransactionTests(unittest.TestCase):
             for target in ('junction', 'settings_step', 'rule_block', 'mcp_step'):
                 with self.subTest(target=target), patch.object(inst, 'LINKS', ['link']), patch.object(inst, 'RULE_FILES', ['rules']), patch.object(inst, 'junction', return_value='ok'), patch.object(inst, 'settings_step', return_value=False), patch.object(inst, 'rule_block', return_value='ok'), patch.object(inst, target, side_effect=inst.InstallConflict('named-file refusal')):
                     self.assertEqual(inst.main(), 1)
+
+    def test_main_uninstall_refuses_mcp_conflicts_without_changing_bytes(self):
+        inst = self.inst
+        clean, _ = inst.merge_codex_toml('', False)
+        conflicts = ('[mcp_servers.pbz]\ncommand = "host"\n',
+                     clean + 'host_owned = true\n', 'invalid = [\n')
+        with tempfile.TemporaryDirectory() as tmp, patch.object(inst, 'LINKS', []), patch.object(inst, 'RULE_FILES', []), patch.object(inst, 'CLAUDE_SETTINGS', str(Path(tmp, 'claude-settings'))), patch.object(inst, 'CODEX_HOOKS', str(Path(tmp, 'codex-hooks'))), patch.object(inst, 'CLAUDE_JSON', str(Path(tmp, 'claude.json'))), patch.object(inst, 'CODEX_CONFIG', str(Path(tmp, 'config.toml'))), patch.object(sys, 'argv', ['install.py', '--uninstall']):
+            for text in conflicts:
+                with self.subTest(text=text):
+                    path = Path(inst.CODEX_CONFIG)
+                    path.write_text(text, encoding='utf-8')
+                    before = path.read_bytes()
+                    self.assertNotEqual(inst.main(), 0)
+                    self.assertEqual(path.read_bytes(), before)
+            Path(inst.CODEX_CONFIG).unlink()
+            self.assertEqual(inst.main(), 0)
+            self.assertFalse(Path(inst.CODEX_CONFIG).exists())
+            self.assertFalse(Path(inst.CLAUDE_JSON).exists())
 
     def test_interrupting_settings_file_write_preserves_original_bytes(self):
         self._interrupt_settings_transaction(False)
