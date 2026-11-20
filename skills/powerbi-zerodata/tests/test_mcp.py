@@ -1000,6 +1000,52 @@ def installer_ownership_checks(check, tmp, inst):
           "uninstall chose later host group")
     check(not os.path.exists(settings + ".pbz-owned.json"), "full uninstall retained sidecar")
 
+    for executable in ("/fixture/python3.13t.exe", "/fixture/pythonw.exe"):
+        with patch.object(inst, "python_exe", return_value=executable):
+            for agent in ("claude", "codex"):
+                check(inst.is_ours({"hooks": [{"command": inst.hook_cmd(agent)}]}),
+                      f"exact emitted {agent} command unrecognized: {executable}")
+            cycle = os.path.join(tmp, "executable-settings.json")
+            inst.settings_step(cycle, "claude", False, False)
+            inst.settings_step(cycle, "claude", False, False)
+            groups = inst.load_json(cycle)["hooks"]["PreToolUse"]
+            command = inst.hook_cmd("claude")
+            check(sum(h.get("command") == command for g in groups for h in g["hooks"]) == 1,
+                  "unusual executable duplicated guard on reinstall")
+            inst.settings_step(cycle, "claude", False, True)
+            check(not os.path.exists(cycle), "unusual executable guard survived uninstall")
+    with patch.object(inst, "python_exe", return_value="/path with spaces/python.exe"):
+        check(not inst.is_ours({"hooks": [host]}), "spaced hook command raised or recognized host")
+        check(inst.is_ours({"hooks": [ours]}), "spaced current executable disabled legacy recognition")
+
+    guests = os.path.join(tmp, "guest-settings.json")
+    inst.settings_step(guests, "claude", False, False)
+    installed = inst.load_json(guests)
+    installed["hooks"]["PreToolUse"][0]["hooks"].append(host)
+    inst.save_json(guests, installed, False)
+    inst.settings_step(guests, "claude", False, False)
+    groups = inst.load_json(guests)["hooks"]["PreToolUse"]
+    check(sum(h == ours for g in groups for h in g["hooks"]) == 1, "host guest duplicated recorded guard")
+    inst.settings_step(guests, "claude", False, True)
+    check(inst.load_json(guests) == {"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [host]}]}},
+          "uninstall lost host guest or retained guard")
+
+    for i, extra in enumerate(({}, {"host_metadata": True})):
+        separate = os.path.join(tmp, f"separate-settings-{i}.json")
+        inst.settings_step(separate, "claude", False, False)
+        installed = inst.load_json(separate)
+        host_group = {"matcher": ".*", "hooks": [host], **extra}
+        host_bytes = json.dumps(host_group).encode()
+        installed["hooks"]["PreToolUse"].append(host_group)
+        inst.save_json(separate, installed, False)
+        inst.settings_step(separate, "claude", False, False)
+        check(json.dumps(inst.load_json(separate)["hooks"]["PreToolUse"][-1]).encode() == host_bytes,
+              "reinstall changed separate host group bytes")
+        inst.settings_step(separate, "claude", False, True)
+        remaining = inst.load_json(separate)["hooks"]["PreToolUse"]
+        check(len(remaining) == 1 and json.dumps(remaining[0]).encode() == host_bytes,
+              "uninstall changed separate host group bytes")
+
     stale = {**ours, "command": ours["command"] + " --old"}
     inst.save_json(settings, {"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [stale]}]}}, False)
     inst.settings_step(settings, "claude", False, False)

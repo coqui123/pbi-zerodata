@@ -259,6 +259,12 @@ def is_ours(entry: dict) -> bool:
         command = hook.get("command", "")
         if not isinstance(command, str):
             continue
+        for agent in ("claude", "codex"):
+            try:
+                if command == hook_cmd(agent):
+                    return True
+            except SystemExit:
+                pass
         # The installer emits unquoted paths and isolated Python invocations.
         # Retain recognition of the old trailing --old migration marker.
         match = re.fullmatch(r"([^\s;&|<>]+) -I -S ([^\s;&|<>]+) --agent (claude|codex)(?: --old)?", command)
@@ -319,6 +325,13 @@ def merge_hooks(data: dict, agent: str, uninstall: bool, owned: dict | None = No
                         addition["shell"]["hooks"].remove(child)
                         recorded = any(a["event"] == event and a["child"] == child
                                        and a["shell"] == addition["shell"] for a in rec["additions"])
+                        if not recorded:
+                            for prior in rec["additions"]:
+                                if (prior["event"] == event and prior["child"] == child
+                                        and prior["shell"] == {**entry, "hooks": []}):
+                                    prior["shell"] = addition["shell"]
+                                    recorded = True
+                                    break
                         if allow_adoption and not recorded:
                             rec["additions"].append(addition)
                         adopted = adopted or allow_adoption or recorded

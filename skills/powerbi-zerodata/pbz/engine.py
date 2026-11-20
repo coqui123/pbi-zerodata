@@ -41,6 +41,8 @@ def _closed(value, schema, defs):
         return _closed(value, defs[schema["$ref"].rsplit("/", 1)[-1]], defs)
     if "anyOf" in schema or "oneOf" in schema:
         for option in schema.get("anyOf", schema.get("oneOf", [])):
+            if not isinstance(option, dict):
+                continue
             if "anyOf" not in schema and isinstance(value, dict):
                 if (option.get("additionalProperties") is False and "properties" in option
                         and any(k not in option["properties"] for k in value)):

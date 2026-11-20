@@ -9,6 +9,8 @@ Run: python tests/test_components.py
 from __future__ import annotations
 
 import json
+import io
+from contextlib import redirect_stdout
 import os
 import shutil
 import sys
@@ -200,8 +202,7 @@ def main() -> int:
         save(control_path, control)
         invalid = validate.report_author(st, fx, lambda s: s, schema_only=True)
         check(validator_gate(invalid, required), f"required control validator cannot run: {invalid}")
-        if validate.validator_attempted(invalid):
-            check(validate.invalid_control_rejected(invalid, src_pid), f"invalid control missing required displayName diagnostic: {invalid}")
+        check(validate.invalid_control_rejected(invalid, src_pid), f"invalid control missing required displayName diagnostic: {invalid}")
     else:
         print("note: live vendor validation unavailable (required lane fails closed)")
     comparison_checks(check)
@@ -277,6 +278,23 @@ def comparison_checks(check):
                 expected_code = "REPORT_VALIDATOR_FAILED" if schema_only else "REPORT_SCHEMA_NOT_RUN"
                 check([f["code"] for f in findings] == [expected_code], "wrong schema-only/fallback findings")
                 check(run.call_count == (1 if schema_only else 2), "wrong schema-only/fallback attempts")
+
+    # Exercise the live lane: optional availability must not skip control rejection
+    # once a clean baseline and copy have run.
+    def report_author(_root, _project, _redact, **kwargs):
+        return [{"code": "REPORT_VALIDATOR_FAILED", "severity": "error"}] if kwargs.get("schema_only") else [
+            {"code": "REPORT_SCHEMA_PASSED", "severity": "info"}]
+
+    output = io.StringIO()
+    with tempfile.TemporaryDirectory(prefix="pbzcomp-scenario-") as scenario, \
+            patch.object(tempfile, "mkdtemp", return_value=scenario), \
+            patch.object(validate, "report_author", side_effect=report_author) as runner, \
+            patch.object(sys.modules[__name__], "comparison_checks"), \
+            patch.object(sys, "argv", [sys.argv[0]]), redirect_stdout(output):
+        result = main()
+    check(result == 1 and "FAIL invalid control missing required displayName diagnostic:" in output.getvalue(),
+          "optional failed control escaped the live lane rejection assertion")
+    check(any(call.kwargs.get("schema_only") for call in runner.call_args_list), "live lane never ran schema-only control")
 
 
 if __name__ == "__main__":

@@ -72,6 +72,55 @@ class RecoveryTests(EvidenceTipTests):
                 self.assertFalse(any(os.path.exists(p) for p in paths))
                 self.assertEqual(json.loads(Path(self.anchor).read_text()), {"anchor": self._mac("b")})
 
+    def test_interrupted_future_prune_recovers_using_supplied_cutoff(self):
+        from pbz.checks import LEDGER_DAYS
+        today = dt.date.today()
+        future = today + dt.timedelta(days=LEDGER_DAYS + 30)
+        path = os.path.join(self.segs, "0001.jsonl")
+        self._write(path, self.expired_record("a", ts=today.isoformat() + "T00:00:00"))
+        with patch.object(evidence.os, "remove", side_effect=PermissionError("interrupted")):
+            with self.assertRaises(PbzError):
+                evidence._prune(self.ws, today=future)
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(json.loads(Path(self.anchor).read_text())["anchor"], self._mac("a"))
+        evidence._recover_prune(self.ws)
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(json.loads(Path(self.anchor).read_text()), {"anchor": self._mac("a")})
+
+    def test_interrupted_earlier_prune_preserves_retained_segment(self):
+        from pbz.checks import LEDGER_DAYS
+        wall_cutoff = dt.date.today() - dt.timedelta(days=LEDGER_DAYS)
+        earlier = dt.date.today() - dt.timedelta(days=30)
+        cutoff = earlier - dt.timedelta(days=LEDGER_DAYS)
+        old = os.path.join(self.segs, "0001.jsonl")
+        retained = os.path.join(self.segs, "0002.jsonl")
+        self._write(old, self.expired_record("a", ts=(cutoff - dt.timedelta(days=1)).isoformat() + "T00:00:00"))
+        self._write(retained, self.expired_record("b", self._mac("a"),
+                    ts=(wall_cutoff - dt.timedelta(days=1)).isoformat() + "T00:00:00"))
+        before = Path(retained).read_bytes()
+        with patch.object(evidence.os, "remove", side_effect=PermissionError("interrupted")):
+            with self.assertRaises(PbzError):
+                evidence._prune(self.ws, today=earlier)
+        pending = json.loads(Path(self.anchor).read_text())
+        self.assertEqual(pending["pending"], ["0001.jsonl"])
+        evidence._recover_prune(self.ws)
+        self.assertFalse(os.path.exists(old))
+        self.assertEqual(Path(retained).read_bytes(), before)
+        self.assertEqual(json.loads(Path(self.anchor).read_text()), {"anchor": self._mac("a")})
+        self.assertEqual(pending.get("cutoff"), cutoff.isoformat())
+
+    def test_recorded_earlier_cutoff_refuses_wall_clock_expired_pending(self):
+        from pbz.checks import LEDGER_DAYS
+        cutoff = dt.date.today() - dt.timedelta(days=LEDGER_DAYS)
+        path = self.pending([self.expired_record("a", ts=(cutoff - dt.timedelta(days=1)).isoformat() + "T00:00:00")],
+                            self._mac("a"))[0]
+        index = json.loads(Path(self.anchor).read_text())
+        index["cutoff"] = (cutoff - dt.timedelta(days=30)).isoformat()
+        self._write(self.anchor, json.dumps(index))
+        before = Path(path).read_bytes(), Path(self.anchor).read_bytes()
+        evidence._recover_prune(self.ws)
+        self.assertEqual((Path(path).read_bytes(), Path(self.anchor).read_bytes()), before)
+
     def test_pending_must_be_oldest_prefix(self):
         a = self.expired_record("a")
         b = self.expired_record("b", self._mac("a"))
@@ -100,7 +149,9 @@ class RecoveryTests(EvidenceTipTests):
     def test_malformed_index_never_deletes_or_raises_on_verify(self):
         path = self.pending([self._record("a")], self._mac("a"))[0]
         for raw in ('{', '{"anchor": 12}', json.dumps({"anchor": evidence.GENESIS, "pending": {}}),
-                    json.dumps({"anchor": evidence.GENESIS, "pending": [{}]})):
+                    json.dumps({"anchor": evidence.GENESIS, "pending": [{}]}),
+                    *(json.dumps({"anchor": evidence.GENESIS, "cutoff": bad})
+                      for bad in (None, 20260101, "2026-02-30", "20260101", "2026-1-01"))):
             with self.subTest(raw=raw):
                 self._write(self.anchor, raw)
                 before = Path(path).read_bytes()

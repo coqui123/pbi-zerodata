@@ -77,6 +77,11 @@ def _prune_index(ws):
             or any(not isinstance(n, str) or not re.fullmatch(r"\d{4}\.jsonl", n) for n in pending)
             or len(set(pending)) != len(pending) or pending != sorted(pending)):
         raise ValueError("pending")
+    if "cutoff" in doc:
+        cutoff = doc["cutoff"]
+        if (not isinstance(cutoff, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", cutoff)):
+            raise ValueError("cutoff")
+        dt.date.fromisoformat(cutoff)
     return doc
 
 
@@ -88,7 +93,7 @@ def _recover_prune(ws):
         doc = _prune_index(ws)
         pending = doc.get("pending", [])
         from .checks import LEDGER_DAYS
-        cutoff = (dt.date.today() - dt.timedelta(days=LEDGER_DAYS)).isoformat()
+        cutoff = doc.get("cutoff") or (dt.date.today() - dt.timedelta(days=LEDGER_DAYS)).isoformat()
         if pending and any(os.path.basename(p) not in pending and os.path.basename(p) < pending[-1]
                            for p in _segment_paths(ws)):
             return
@@ -439,7 +444,7 @@ def _prune(ws, today: dt.date | None = None) -> dict:
         anchor = verified
         doomed.append(path)
     if doomed:
-        write_text(_index_path(ws), json.dumps({"anchor": anchor, "pending": [os.path.basename(p) for p in doomed]}) + "\n", root=_workspace_root(ws))
+        write_text(_index_path(ws), json.dumps({"anchor": anchor, "pending": [os.path.basename(p) for p in doomed], "cutoff": cutoff}) + "\n", root=_workspace_root(ws))
         for path in doomed:
             try:
                 os.remove(path)

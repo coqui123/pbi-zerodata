@@ -1340,6 +1340,16 @@ class ProjectionTests(unittest.TestCase):
             with self.subTest(schema=schema), patch.object(Path, "read_text", return_value=json.dumps(schema)):
                 self.assertEqual(self.engine._project("deps", {"ok": True})["class"], "ENGINE_UNAVAILABLE")
 
+    def test_non_object_group_key_union_fails_closed(self):
+        contract = json.loads((S / "engine" / "contract.schema.json").read_text())
+        response = {"ok": True, "verb": "check", "checks": [
+            {"id": "fixture", "status": "FAIL", "groups": [{"Region": {"reveal": "public"}}]}]}
+        self.assertEqual(self.engine._project("check", response), response)
+        contract["$defs"]["groupKey"]["oneOf"] = [None]
+        with patch.object(Path, "read_text", return_value=json.dumps(contract)):
+            self.assertEqual(self.engine._project("check", response),
+                             {"ok": False, "verb": "check", "class": "ENGINE_UNAVAILABLE"})
+
 
 class CanaryScanTests(unittest.TestCase):
     def test_clean_positive_control(self):
