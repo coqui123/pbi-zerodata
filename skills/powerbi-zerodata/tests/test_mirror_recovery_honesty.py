@@ -60,17 +60,18 @@ class RecoveryHonestyTests(unittest.TestCase):
         directory, journal = mirror._begin_transaction(
             self.ws, self.project, "restore-race", [("workspace", rel, common.sha(after))])
         common.replace_bytes(target, after, root=self.ws.root)
-        operation = "remove_file" if before is None else "replace_bytes"
-        real = getattr(mirror, operation)
+        owner = mirror.os if before is None else mirror
+        operation = "remove" if before is None else "_install_before_image"
+        real = getattr(owner, operation)
 
         def mutate(path, *args, **kwargs):
             result = real(path, *args, **kwargs)
-            if path == target:
+            if (path.startswith(target + ".pbz-restore-") if before is None else path == target):
                 with open(target, "wb") as handle:
                     handle.write(editor)
             return result
 
-        with patch.object(mirror, operation, mutate):
+        with patch.object(owner, operation, mutate):
             out = mirror._restore_transaction(self.ws, self.project, directory, journal)
         self.assertEqual(out, {"result": "RECOVERY_CONFLICT", "conflicts": [rel]})
         with open(os.path.join(directory, "journal.json")) as handle:
@@ -83,6 +84,113 @@ class RecoveryHonestyTests(unittest.TestCase):
 
     def test_editor_after_restore_remove_requires_recovery(self):
         self._restore_with_editor_after_mutation(None)
+
+    def _restore_with_editor_at_rename(self, before, *, after_rename):
+        rel = self.project.name + ".Report/definition/restore.json"
+        target = mirror._real_path(self.ws, rel)
+        after = b"push bytes"
+        editor = b"editor bytes"
+        if before is not None:
+            common.replace_bytes(target, before, root=self.ws.root)
+        directory, journal = mirror._begin_transaction(
+            self.ws, self.project, "restore-race", [("workspace", rel, common.sha(after))])
+        common.replace_bytes(target, after, root=self.ws.root)
+        real = os.rename
+        quarantines = []
+
+        def rename(source, destination, *args, **kwargs):
+            if source != target or not destination.startswith(target + ".pbz-restore-"):
+                return real(source, destination, *args, **kwargs)
+            quarantines.append(destination)
+            if after_rename:
+                result = real(source, destination, *args, **kwargs)
+            with open(target, "wb") as handle:
+                handle.write(editor)
+            if after_rename:
+                return result
+            return real(source, destination, *args, **kwargs)
+
+        with patch.object(os, "rename", rename):
+            out = mirror._restore_transaction(self.ws, self.project, directory, journal)
+        self.assertEqual(out, {"result": "RECOVERY_CONFLICT", "conflicts": [rel]})
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "RECOVERY_REQUIRED")
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), editor)
+        self.assertEqual(len(quarantines), 1)
+        remaining = [os.path.join(os.path.dirname(target), name)
+                     for name in os.listdir(os.path.dirname(target))
+                     if name.startswith(os.path.basename(target) + ".pbz-restore-")]
+        if after_rename and before is not None:
+            self.assertEqual(remaining, quarantines)
+            with open(quarantines[0], "rb") as handle:
+                self.assertEqual(handle.read(), after)
+        else:
+            self.assertEqual(remaining, [])
+
+    def test_editor_before_restore_rename_replace_requires_recovery(self):
+        self._restore_with_editor_at_rename(b"before bytes", after_rename=False)
+
+    def test_editor_before_restore_rename_remove_requires_recovery(self):
+        self._restore_with_editor_at_rename(None, after_rename=False)
+
+    def test_editor_after_restore_rename_replace_requires_recovery(self):
+        self._restore_with_editor_at_rename(b"before bytes", after_rename=True)
+
+    def test_editor_after_restore_rename_remove_requires_recovery(self):
+        self._restore_with_editor_at_rename(None, after_rename=True)
+
+    def test_restore_transaction_deleted_target_uses_no_clobber_install(self):
+        rel = self.project.name + ".Report/definition/restore.json"
+        target = mirror._real_path(self.ws, rel)
+        before = b"before bytes"
+        editor = b"editor bytes"
+        install = mirror._install_before_image
+        for racing in (False, True):
+            with self.subTest(racing=racing):
+                common.replace_bytes(target, before, root=self.ws.root)
+                directory, journal = mirror._begin_transaction(
+                    self.ws, self.project, "restore-deleted-" + str(racing),
+                    [("workspace", rel, None)])
+                os.remove(target)
+
+                def install_with_editor(path, content):
+                    if racing:
+                        with open(path, "wb") as handle:
+                            handle.write(editor)
+                    return install(path, content)
+
+                with patch.object(mirror, "_install_before_image",
+                                  side_effect=install_with_editor) as attempted:
+                    out = mirror._restore_transaction(self.ws, self.project, directory, journal)
+                attempted.assert_called_once_with(target, before)
+                self.assertEqual(out, {"result": "RECOVERY_CONFLICT", "conflicts": [rel]}
+                                 if racing else {"result": "ROLLED_BACK"})
+                with open(os.path.join(directory, "journal.json")) as handle:
+                    self.assertEqual(json.load(handle)["state"],
+                                     "RECOVERY_REQUIRED" if racing else "ROLLED_BACK")
+                with open(target, "rb") as handle:
+                    self.assertEqual(handle.read(), editor if racing else before)
+
+    def test_restore_transaction_recreates_deleted_target_and_parent(self):
+        rel = self.project.name + ".Report/definition/restore-parent/restore.json"
+        target = mirror._real_path(self.ws, rel)
+        before = b'{"before": "exact bytes"}\n'
+        common.replace_bytes(target, before, root=self.ws.root)
+        directory, journal = mirror._begin_transaction(
+            self.ws, self.project, "restore-deleted-parent", [("workspace", rel, None)])
+        os.remove(target)
+        os.rmdir(os.path.dirname(target))
+        self.assertFalse(os.path.lexists(target))
+        self.assertFalse(os.path.lexists(os.path.dirname(target)))
+
+        out = mirror._restore_transaction(self.ws, self.project, directory, journal)
+
+        self.assertEqual(out, {"result": "ROLLED_BACK"})
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "ROLLED_BACK")
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), before)
 
     def test_pending_recovery_blocks_every_pull(self):
         self._journal({"version": 1, "state": "APPLYING", "entries": []})

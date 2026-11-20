@@ -741,6 +741,17 @@ def _begin_transaction(ws, project, stamp, targets, authorized_before: dict | No
     return directory, journal
 
 
+def _install_before_image(target, content):
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _restore_transaction(ws, project, directory, journal, *, preserve_external=False, applied=None):
     if not _journal_ok(journal):
         return {"result": "RECOVERY_REQUIRED"}
@@ -774,16 +785,42 @@ def _restore_transaction(ws, project, directory, journal, *, preserve_external=F
             continue
         if current == entry["before"]:
             continue
-        if entry["before"] is None:
-            if os.path.lexists(target):
-                trust = ws.root if entry.get("scope") == "workspace" else ws.private
-                remove_file(target, root=trust)
+        trust = ws.root if entry.get("scope") == "workspace" else ws.private
+        _must_stay(target, trust)
+        quarantine = target + ".pbz-restore-" + uuid.uuid4().hex
+        restored = False
+        try:
+            os.rename(target, quarantine)
+        except FileNotFoundError:
+            if entry["before"] is None:
+                restored = not os.path.lexists(target)
+            else:
+                with open(os.path.join(directory, "before", entry["backup"]), "rb") as f:
+                    content = f.read()
+                try:
+                    _install_before_image(target, content)
+                except FileExistsError:
+                    pass
+                else:
+                    restored = file_sha(target) == entry["before"]
         else:
-            with open(os.path.join(directory, "before", entry["backup"]), "rb") as f:
-                content = f.read()
-            trust = ws.root if entry.get("scope") == "workspace" else ws.private
-            replace_bytes(target, content, root=trust)
-        restored = not os.path.lexists(target) if entry["before"] is None else file_sha(target) == entry["before"]
+            if file_sha(quarantine) != current:
+                # Preserve a save captured between the ownership read and rename.
+                if not os.path.lexists(target):
+                    os.rename(quarantine, target)
+            elif entry["before"] is None:
+                os.remove(quarantine)
+                restored = not os.path.lexists(target)
+            else:
+                with open(os.path.join(directory, "before", entry["backup"]), "rb") as f:
+                    content = f.read()
+                try:
+                    _install_before_image(target, content)
+                except FileExistsError:
+                    pass
+                else:
+                    os.remove(quarantine)
+                    restored = file_sha(target) == entry["before"]
         if not restored:
             conflicts.append(entry["path"])
             journal["state"] = "RECOVERY_REQUIRED"
