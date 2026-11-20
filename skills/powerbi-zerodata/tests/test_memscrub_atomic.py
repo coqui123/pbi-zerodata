@@ -242,19 +242,18 @@ class MemscrubAtomicTests(unittest.TestCase):
         with open(note, "w", encoding="utf-8") as f:
             f.write("spent 1000 hours on CANARY-NOTE")
 
-        def fake_run(argv, cwd=None, env=None, stdin=None, capture_output=False, timeout=None):
+        def fake_bounded(command, cwd=None, env=None, timeout=None, mid=0):
+            fake_bounded.calls.append(command)
             out_buf = __import__("io").StringIO()
             with redirect_stdout(out_buf):
-                code = cli.main(argv[3:])
-            class Proc:
-                returncode = code
-                stdout = out_buf.getvalue().encode("utf-8")
-                stderr = b""
-            return Proc()
+                code = cli.main(command[3:])
+            return code, out_buf.getvalue().encode("utf-8"), None
+        fake_bounded.calls = []
 
-        with patch("pbz.mcp.subprocess.run", fake_run):
+        with patch("pbz.mcp._bounded_output", fake_bounded):
             out = __import__("pbz.mcp", fromlist=["mcp"]).call_tool(
                 "memscrub", {"dir": self.notes, "workspace": self.ws.root}, self.ws.root, None)
+        self.assertTrue(fake_bounded.calls)
         body = json.loads(out["content"][0]["text"])
         dumped = json.dumps(body)
         self.assertIn("files_changed", body)

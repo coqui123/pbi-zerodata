@@ -80,20 +80,18 @@ class MemoryDisclosureTests(unittest.TestCase):
                 patch("pbz.memory.checks.spend", lambda *a, **k: True), redirect_stdout(buf):
             cli.main(["--workspace", self.ws.root, "--project", "Parity", "audit", "memory"])
 
-            def fake_run(argv, **kwargs):
+            def fake_bounded(command, cwd=None, env=None, timeout=None, mid=0):
+                fake_bounded.calls.append(command)
                 out = io.StringIO()
                 with redirect_stdout(out):
-                    code = cli.main(argv[3:])
+                    code = cli.main(command[3:])
+                return code, out.getvalue().encode("utf-8"), None
+            fake_bounded.calls = []
 
-                class Proc:
-                    returncode = code
-                    stdout = out.getvalue().encode("utf-8")
-                    stderr = b""
-                return Proc()
-
-            with patch("pbz.mcp.subprocess.run", fake_run):
+            with patch("pbz.mcp._bounded_output", fake_bounded):
                 mcp_out = mcp.call_tool("audit", {"action": "memory", "workspace": self.ws.root,
                                                   "project": "Parity"}, self.ws.root, None)
+        self.assertTrue(fake_bounded.calls)
         combined = buf.getvalue() + mcp_out["content"][0]["text"]
         self.assertFalse(_bands(combined))
         self.assertIn("time_part", combined)
@@ -279,20 +277,18 @@ class MemoryDisclosureTests(unittest.TestCase):
                 patch("pbz.memory.checks.spend", lambda *a, **k: True), redirect_stdout(buf):
             rc = cli.main(["--workspace", self.ws.root, "--project", "Parity", "audit", "memory"])
 
-            def fake_run(argv, **kwargs):
+            def fake_bounded(command, cwd=None, env=None, timeout=None, mid=0):
+                fake_bounded.calls.append(command)
                 out = io.StringIO()
                 with redirect_stdout(out):
-                    code = cli.main(argv[3:])
+                    code = cli.main(command[3:])
+                return code, out.getvalue().encode("utf-8"), None
+            fake_bounded.calls = []
 
-                class Proc:
-                    returncode = code
-                    stdout = out.getvalue().encode("utf-8")
-                    stderr = b""
-                return Proc()
-
-            with patch("pbz.mcp.subprocess.run", fake_run):
+            with patch("pbz.mcp._bounded_output", fake_bounded):
                 mcp_out = mcp.call_tool("audit", {"action": "memory", "workspace": self.ws.root,
                                                   "project": "Parity"}, self.ws.root, None)
+        self.assertTrue(fake_bounded.calls)
         blob = buf.getvalue() + mcp_out["content"][0]["text"]
         self.assertNotEqual(rc, 0)
         self.assertTrue(mcp_out["isError"])

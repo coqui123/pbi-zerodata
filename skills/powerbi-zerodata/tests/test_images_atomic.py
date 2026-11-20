@@ -114,41 +114,54 @@ class ImageAtomicTests(unittest.TestCase):
         self.assertIs(real, common.write_text)
 
     def test_recovery_output_has_no_paths_bytes_or_exception_text(self):
-        ws, project, png = self._project()
+        for via_mcp in (False, True):
+            with self.subTest(via_mcp=via_mcp):
+                ws, project, png = self._project()
+                pending = images._pending_dir(ws, project)
+                report = images._report_json(project.mirror_report)
+                calls = []
+                real_remove = os.remove
 
-        def bad_restore(path, data, *, root=None, **_kw):
-            raise OSError(SECRET)
+                def boom(path, text, bom=b"", *, root=None, **_kw):
+                    calls.append(("write_text", path))
+                    raise OSError(SECRET)
 
-        def boom(path, text, bom=b"", *, root=None, **_kw):
-            raise OSError(SECRET)
+                def bad_remove(path, *args, **kwargs):
+                    if os.path.commonpath([os.path.abspath(path), pending]) == pending:
+                        calls.append(("pending_remove", os.fspath(path)))
+                        raise OSError(SECRET)
+                    return real_remove(path, *args, **kwargs)
 
-        argv = ["--workspace", ws.root, "--project", "Mini", "image", "add", png]
-        with patch("pbz.common.write_text", boom), patch("pbz.common.replace_bytes", bad_restore):
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                rc = cli.main(argv)
-            text = buf.getvalue()
+                def fake_bounded(command, cwd=None, env=None, timeout=None, mid=0):
+                    fake_bounded.calls.append(command)
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        code = cli.main(command[3:])
+                    return code, out.getvalue().encode("utf-8"), None
+                fake_bounded.calls = []
 
-            def fake_run(cmd, **kwargs):
-                out = io.StringIO()
-                with redirect_stdout(out):
-                    code = cli.main(cmd[3:])
-                class Proc:
-                    returncode = code
-                    stdout = out.getvalue().encode("utf-8")
-                    stderr = (SECRET + ws.private + PNG.decode("latin1")).encode("latin1", "replace")
-                return Proc()
-
-            with patch("pbz.mcp.subprocess.run", fake_run):
-                mcp_out = mcp.call_tool("image", {"action": "add", "target": png, "workspace": ws.root, "project": "Mini"},
-                                        ws.root, None)
-        blob = text + json.dumps(mcp_out)
-        self.assertNotEqual(rc, 0)
-        self.assertIn("RECOVERY_REQUIRED", text)
-        self.assertIn("RECOVERY_REQUIRED", blob)
-        for banned in (SECRET, ws.private, ws.root, png, "ORPHAN", PNG.decode("latin1"), "OSError", ".pbz-restore"):
-            self.assertNotIn(banned, blob)
-        self.assertEqual(list(Path(ws.root).rglob("*.pbz-tmp")), [])
+                argv = ["--workspace", ws.root, "--project", "Mini", "image", "add", png]
+                with patch("pbz.cli.find_workspace", return_value=ws), \
+                        patch("pbz.common.write_text", boom), patch("os.remove", bad_remove):
+                    if via_mcp:
+                        with patch("pbz.mcp._bounded_output", fake_bounded):
+                            mcp_out = mcp.call_tool("image", {"action": "add", "target": png,
+                                                    "workspace": ws.root, "project": "Mini"}, ws.root, None)
+                        self.assertTrue(fake_bounded.calls)
+                        self.assertTrue(mcp_out["isError"])
+                        text = json.dumps(mcp_out)
+                    else:
+                        buf = io.StringIO()
+                        with redirect_stdout(buf):
+                            rc = cli.main(argv)
+                        self.assertNotEqual(rc, 0)
+                        text = buf.getvalue()
+                self.assertIn(("write_text", report), calls)
+                self.assertTrue(any(kind == "pending_remove" for kind, _path in calls))
+                self.assertIn("RECOVERY_REQUIRED", text)
+                for banned in (SECRET, ws.private, ws.root, png, "ORPHAN", PNG.decode("latin1"), "OSError", ".pbz-restore"):
+                    self.assertNotIn(banned, text)
+                self.assertEqual(list(Path(ws.root).rglob("*.pbz-tmp")), [])
 
 
 if __name__ == "__main__":

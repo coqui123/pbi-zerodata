@@ -423,19 +423,17 @@ class PushBoundaryTests(unittest.TestCase):
 
         self._touch_mirror(".Report/")
 
-        def fake_run(argv, **kwargs):
+        def fake_bounded(command, cwd=None, env=None, timeout=None, mid=0):
+            fake_bounded.calls.append(command)
             out_buf = io.StringIO()
             with redirect_stdout(out_buf):
-                code = cli.main(argv[3:])
+                code = cli.main(command[3:])
+            return code, out_buf.getvalue().encode("utf-8"), None
+        fake_bounded.calls = []
 
-            class Proc:
-                returncode = code
-                stdout = out_buf.getvalue().encode("utf-8")
-                stderr = b""
-            return Proc()
-
-        with patch("pbz.mcp.subprocess.run", fake_run):
+        with patch("pbz.mcp._bounded_output", fake_bounded):
             mcp_out = mcp.call_tool("push", {"reload": True, "workspace": self.ws.root, "project": "Parity"}, self.ws.root, None)
+        self.assertTrue(fake_bounded.calls)
         mcp_body = json.loads(mcp_out["content"][0]["text"])
         self.assertTrue(mcp_out["isError"])
         self.assertEqual(mcp_body["outcome"]["exit_code"], 5)
@@ -538,9 +536,9 @@ class PushBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.get("result"), "REFUSED")
                 self.assertEqual(result.get("files"), [rel])
                 self.assertNotIn("CANARY-NAME", json.dumps(result))
-            self.assertNotIn(
-                f"{self.project.name}.Report/definition/CANARY-NAME.json",
-                mirror.mirror_texts(self.ws, self.project))
+            with self.assertRaises(common.PbzError) as caught:
+                mirror.mirror_texts(self.ws, self.project)
+            self.assertEqual(caught.exception.code, "UNSAFE_PATH")
         finally:
             os.rmdir(report)
             os.rename(held, report)

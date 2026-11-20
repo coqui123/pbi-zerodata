@@ -33,17 +33,14 @@ CASES = [
 
 
 def _mcp(cmd):
-    def fake_run(argv, **kwargs):
+    def fake_bounded(command, cwd=None, env=None, timeout=None, mid=0):
+        fake_bounded.calls.append(command)
         out = io.StringIO()
         with redirect_stdout(out):
-            code = cli.main(argv[3:])
-
-        class Proc:
-            returncode = code
-            stdout = out.getvalue().encode("utf-8")
-            stderr = b""
-        return Proc()
-    return fake_run
+            code = cli.main(command[3:])
+        return code, out.getvalue().encode("utf-8"), None
+    fake_bounded.calls = []
+    return fake_bounded
 
 
 class OutcomeMappingTests(unittest.TestCase):
@@ -71,8 +68,10 @@ class OutcomeMappingTests(unittest.TestCase):
                 self.assertEqual((env["outcome"]["status"], env["outcome"]["code"], got), (status, code, rc))
                 with patch("pbz.mirror.recover", lambda *a, **k: dict(payload)):
                     cli_rc, body = self._cli(["recover"])
-                    with patch("pbz.mcp.subprocess.run", _mcp(None)):
+                    fake_bounded = _mcp(None)
+                    with patch("pbz.mcp._bounded_output", fake_bounded):
                         mcp_out = mcp.call_tool("recover", {"workspace": self.ws.root, "project": "Parity"}, self.ws.root, None)
+                self.assertTrue(fake_bounded.calls)
                 self.assertEqual(cli_rc, rc)
                 self.assertEqual(body["outcome"]["status"], status)
                 self.assertEqual(body["outcome"]["exit_code"], rc)
@@ -140,11 +139,13 @@ class OutcomeMappingTests(unittest.TestCase):
         def query(*a, **k):
             return {"error": "SYNTAX"}
 
-        with patch("pbz.synthtest.QUERY", query):
+        with patch("pbz.synthtest.QUERY", query), patch("pbz.cli.find_workspace", return_value=self.ws):
             cli_rc, body = self._cli(["synth-test", "run", "err"])
-            with patch("pbz.mcp.subprocess.run", _mcp(None)):
+            fake_bounded = _mcp(None)
+            with patch("pbz.mcp._bounded_output", fake_bounded):
                 mcp_out = mcp.call_tool("synth_test", {"action": "run", "name": "err",
                                                        "workspace": self.ws.root, "project": "Parity"}, self.ws.root, None)
+        self.assertTrue(fake_bounded.calls)
         blob = json.dumps(body) + mcp_out["content"][0]["text"]
         self.assertEqual(cli_rc, 1)
         self.assertTrue(mcp_out["isError"])
