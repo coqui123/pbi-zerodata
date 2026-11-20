@@ -48,7 +48,10 @@ public static class TmdlValidate
         if (IsInsideFolder(snapshot, folder))
             throw new BadRequestException("validation scratch directory must be outside the candidate folder");
         LinkGuard.Refuse(snapshot);
-        SweepSnapshots(privateDir);
+        SweepSnapshots(privateDir, folder);
+        // A fresh GUID collision is unsafe: CreateNew must fail rather than overwrite
+        // or remove an existing owner's marker. Publish ownership before copying.
+        var lease = new FileStream(snapshot + ".pbz-owner", FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
         ActiveSnapshots.TryAdd(snapshot, 0);
         var cancellation = new CancellationTokenSource();
         Task? copy = null;
@@ -73,36 +76,50 @@ public static class TmdlValidate
             if (copy == null || copy.IsCompleted)
             {
                 _ = copy?.Exception;
-                CleanupSnapshot(snapshot);
+                CleanupSnapshot(snapshot, lease);
                 cancellation.Dispose();
             }
             else
             {
                 // A timed-out worker retains ownership until it has stopped writing. If the
-                // process exits first, the next Run's sweep recovers the inactive snapshot.
+                // process exits first, a later sweep recovers only marked snapshots whose
+                // exclusive cross-process lease can be acquired.
                 _ = copy.ContinueWith(completed =>
                 {
                     _ = completed.Exception; // Observe any failure after the caller timed out.
-                    CleanupSnapshot(snapshot);
+                    CleanupSnapshot(snapshot, lease);
                     cancellation.Dispose();
                 }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             }
         }
     }
 
-    static void SweepSnapshots(string privateDir)
+    static void SweepSnapshots(string privateDir, string folder)
     {
         try
         {
             foreach (var stale in Directory.EnumerateDirectories(privateDir, "tmdl-validate-*"))
+            {
+                if (string.Equals(Path.TrimEndingDirectorySeparator(stale), Path.TrimEndingDirectorySeparator(folder),
+                        StringComparison.OrdinalIgnoreCase)
+                    || IsInsideFolder(stale, folder) || IsInsideFolder(folder, stale)) continue;
+                try
+                {
+                    // Missing markers are unowned; an exclusive-open failure leaves a
+                    // live owner's tree alone, including owners in another process.
+                    using (new FileStream(stale + ".pbz-owner", FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                }
+                catch (IOException) { continue; }
+                catch (UnauthorizedAccessException) { continue; }
                 // Claim stale paths too, so concurrent sweeps cannot traverse the same tree.
                 if (ActiveSnapshots.TryAdd(stale, 0)) CleanupSnapshot(stale);
+            }
         }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
     }
 
-    static void CleanupSnapshot(string snapshot)
+    static void CleanupSnapshot(string snapshot, FileStream? lease = null)
     {
         // Best effort: a leftover scratch directory must not fail a completed validation.
         try
@@ -115,7 +132,20 @@ public static class TmdlValidate
         }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
-        finally { ActiveSnapshots.TryRemove(snapshot, out _); }
+        finally
+        {
+            // Hold ownership through the directory cleanup, then release before removing
+            // the sibling marker (Windows disallows deleting an exclusively held file).
+            lease?.Dispose();
+            try
+            {
+                // Retain proof of ownership when best-effort tree deletion failed.
+                if (!Directory.Exists(snapshot)) File.Delete(snapshot + ".pbz-owner");
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            ActiveSnapshots.TryRemove(snapshot, out _);
+        }
         AfterSnapshotCleanupForTests?.Invoke(snapshot);
     }
 

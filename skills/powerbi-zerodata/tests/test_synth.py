@@ -500,20 +500,33 @@ class Fixtures
                 var stale = Path.Combine(scratch, "tmdl-validate-stale-fixture");
                 Directory.CreateDirectory(stale);
                 File.WriteAllText(Path.Combine(stale, "partial.tmdl"), "stale partial copy");
+                // An abandoned engine snapshot has an ownership marker but no held lease.
+                File.WriteAllText(stale + ".pbz-owner", "");
+                var unowned = Path.Combine(scratch, "tmdl-validate-unowned-fixture");
+                Directory.CreateDirectory(unowned);
+                var unownedFile = Path.Combine(unowned, "partial.tmdl");
+                var unownedBytes = new byte[] { 0, 1, 127, 255 };
+                File.WriteAllBytes(unownedFile, unownedBytes);
                 var recoveryCtx = new Ctx("tmdl-validate");
                 var recoveryRequest = Req.Parse(new JsonObject { ["private_dir"] = scratch,
                     ["folder"] = source, ["timeout_s"] = 120 }.ToJsonString());
                 recoveryCtx.Init(recoveryRequest);
                 var recovered = TmdlValidate.Run(recoveryRequest, recoveryCtx);
-                if (recovered["valid"]?.GetValue<bool>() != true || Directory.Exists(stale))
+                if (recovered["valid"]?.GetValue<bool>() != true || Directory.Exists(stale)
+                    || File.Exists(stale + ".pbz-owner"))
                     throw new Exception("subsequent validation did not recover the stale snapshot");
+                // Ownership invariant 1: a matching name alone never authorizes deletion.
+                if (!Directory.Exists(unowned) || !File.ReadAllBytes(unownedFile).SequenceEqual(unownedBytes))
+                    throw new Exception("stale sweep changed unowned matching content");
                 if (!Directory.Exists(snapshot) || !File.Exists(copiedFile) || cleaned.IsSet)
                     throw new Exception("stale sweep touched a snapshot with a live copier");
                 resume.Set();
                 // Pins invariant 2: this signal follows actual worker completion and cleanup,
                 // so the released worker can never recreate entries after the final assertion.
                 if (!cleaned.Wait(TimeSpan.FromSeconds(120))) throw new Exception("released copy snapshot was not cleaned up");
-                if (Directory.EnumerateDirectories(scratch, "tmdl-validate-*").Any())
+                if (!Directory.EnumerateDirectories(scratch, "tmdl-validate-*").OrderBy(p => p)
+                        .SequenceEqual(new[] { unowned })
+                    || Directory.EnumerateFiles(scratch, "tmdl-validate-*.pbz-owner").Any())
                     throw new Exception("copy timeout left unaccounted validation snapshots");
             }
             finally
@@ -535,6 +548,71 @@ class Fixtures
                     afterCleanup.SetValue(null, null);
                 }
             }
+        }, null);
+        Check("validation preserves cross-process leases and matching candidate folders", () => {
+            var scratch = Path.Combine(args[0], "cross-process-private");
+            Directory.CreateDirectory(scratch);
+            var live = Path.Combine(scratch, "tmdl-validate-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(live);
+            var partial = Path.Combine(live, "partial.tmdl");
+            var partialBytes = new byte[] { 112, 97, 114, 116, 105, 97, 108, 0, 255 };
+            File.WriteAllBytes(partial, partialBytes);
+            var liveMarker = live + ".pbz-owner";
+            File.WriteAllText(liveMarker, "");
+            using var lease = new FileStream(liveMarker, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            var source = Path.Combine(scratch, "tmdl-validate-source");
+            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(Build().Database, source);
+            var sourceBytes = Directory.GetFiles(source, "*", SearchOption.AllDirectories)
+                .ToDictionary(f => Path.GetRelativePath(source, f), File.ReadAllBytes);
+            // Even an unleased marker must not override candidate protection (invariant 4).
+            File.WriteAllText(source + ".pbz-owner", "");
+            JsonObject Validate() {
+                var request = Req.Parse(new JsonObject { ["private_dir"] = scratch,
+                    ["folder"] = source, ["timeout_s"] = 120 }.ToJsonString());
+                var validationCtx = new Ctx("tmdl-validate");
+                validationCtx.Init(request);
+                return TmdlValidate.Run(request, validationCtx);
+            }
+            using var paused = new ManualResetEventSlim();
+            using var resume = new ManualResetEventSlim();
+            Task<JsonObject>? validation = null;
+            beforeInventory.SetValue(null, (Action)(() => {
+                paused.Set();
+                if (!resume.Wait(TimeSpan.FromSeconds(120))) throw new Exception("lease fixture was not released");
+            }));
+            try
+            {
+                validation = Task.Run(Validate);
+                if (!paused.Wait(TimeSpan.FromSeconds(120))) throw new Exception("lease fixture did not reach inventory");
+                resume.Set();
+                var result = validation.GetAwaiter().GetResult();
+                // Invariants 1 and 3: the fixture-held exclusive lease is indistinguishable
+                // from another process's live owner; its partial tree must survive verbatim.
+                if (!Directory.Exists(live) || !File.ReadAllBytes(partial).SequenceEqual(partialBytes)
+                    || !File.Exists(liveMarker))
+                    throw new Exception("sweep changed another process's live snapshot");
+                // Invariant 4: a candidate matching the sweep pattern must survive verbatim.
+                if (!Directory.Exists(source)
+                    || !Directory.GetFiles(source, "*", SearchOption.AllDirectories)
+                        .Select(f => Path.GetRelativePath(source, f)).OrderBy(f => f)
+                        .SequenceEqual(sourceBytes.Keys.OrderBy(f => f))
+                    || sourceBytes.Any(kv => !File.ReadAllBytes(Path.Combine(source, kv.Key)).SequenceEqual(kv.Value)))
+                    throw new Exception("sweep changed its matching candidate folder");
+                // Candidate protection must allow the validation itself to finish successfully.
+                if (result["valid"]?.GetValue<bool>() != true) throw new Exception("protected candidate validation failed");
+            }
+            finally
+            {
+                resume.Set();
+                try { if (validation != null) validation.GetAwaiter().GetResult(); }
+                finally { beforeInventory.SetValue(null, null); }
+            }
+            lease.Dispose(); // Process A has now exited; its ownership marker is abandoned.
+            var recovered = Validate();
+            // Invariants 1, 3 and 5: only after the lease ends may recovery delete tree and marker.
+            if (Directory.Exists(live) || File.Exists(liveMarker))
+                throw new Exception("abandoned cross-process snapshot was not recovered");
+            if (recovered["valid"]?.GetValue<bool>() != true) throw new Exception("recovery validation failed");
         }, null);
         Console.WriteLine($"{passed} passed, 0 failed");
     }
