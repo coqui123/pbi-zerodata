@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import io
+import hashlib
 from contextlib import redirect_stdout
 import os
 import shutil
@@ -162,9 +163,26 @@ def main() -> int:
     check(not [f for f in validate.run_mirror(ws, project) if f["severity"] == "error"], "copies fail mirror validation")
     gr = usage.build(ws, project)
     check(len([u for us in gr.usages.values() for u in us if u.page == "Overview Copy"]) > 0, "usage graph does not see the copy")
+
+    def project_snapshot():
+        snapshot = {}
+        for directory in (project.report_dir, project.model_dir):
+            for current, _dirs, files in os.walk(directory):
+                for name in files:
+                    path = os.path.join(current, name)
+                    with open(path, "rb") as f:
+                        snapshot[os.path.relpath(path, ws.root)] = hashlib.sha256(f.read()).hexdigest()
+        return snapshot
+
+    before_push = project_snapshot()
     res = mirror.push(ws, project)
     perr = [f for f in res.get("findings", []) if f["severity"] == "error"]
-    check(res["result"] == "PUSHED" and not perr, f"push: {res.get('result')} {perr}")
+    if os.path.exists(validate.REPORT_AUTHOR):
+        check(res["result"] == "INVALID", f"Parity push should be invalid: {res.get('result')}")
+        check(bool(perr) and all(f.get("code") == "PBIR" for f in perr), f"Parity push requires vendor errors: {perr}")
+        check(project_snapshot() == before_push, "invalid Parity push changed the real project")
+    else:
+        check(res["result"] == "PUSHED" and not perr, f"push: {res.get('result')} {perr}")
 
     # ---------------------------------------------------------------- Microsoft's validator on the Desktop-made fixture
     validate.report_author = real_author
@@ -205,6 +223,41 @@ def main() -> int:
         check(validate.invalid_control_rejected(invalid, src_pid), f"invalid control missing required displayName diagnostic: {invalid}")
     else:
         print("note: live vendor validation unavailable (required lane fails closed)")
+
+    # Independent real workspace: prove a valid Canary edit survives a staged push.
+    canary_root = os.path.join(tmp, "canary-push")
+    shutil.copytree(os.path.join(SKILL, "tests", "fixture"), canary_root)
+    ws2 = common.Workspace(canary_root)
+    ws2.private = os.path.join(tmp, "canary-private")
+    cproject = ws2.project()
+    mirror.pull(ws2, cproject)
+    canary_base = validate.report_author(ws2.mirror, cproject, lambda s: s)
+    canary_available = validate.validator_ran(canary_base)
+    if required:
+        check(validator_gate(canary_base, True), f"required Canary push validator cannot run: {canary_base}")
+    canary_pages = os.path.join(cproject.mirror_report, "definition", "pages")
+    canary_pid = next(p for p in sorted(os.listdir(canary_pages)) if os.path.isdir(os.path.join(canary_pages, p)))
+    canary_page_path = os.path.join(canary_pages, canary_pid, "page.json")
+    canary_page = load(canary_page_path)
+    canary_name = "Canary Page Renamed"
+    canary_page["displayName"] = canary_name
+    save(canary_page_path, canary_page)
+    staged_findings = []
+    real_run_stage = validate.run_stage
+
+    def capture_run_stage(*args, **kwargs):
+        findings = real_run_stage(*args, **kwargs)
+        staged_findings.extend(findings)
+        return findings
+
+    with patch.object(validate, "run_stage", side_effect=capture_run_stage):
+        res = mirror.push(ws2, cproject)
+    check(res["result"] == "PUSHED", f"Canary push: {res}")
+    real_canary_page = os.path.join(cproject.report_dir, "definition", "pages", canary_pid, "page.json")
+    check(load(real_canary_page)["displayName"] == canary_name, "Canary push did not update the real page")
+    if canary_available:
+        check(any(f.get("code") == "REPORT_SCHEMA_PASSED" for f in staged_findings),
+              f"Canary push did not run schema validation: {staged_findings}")
     comparison_checks(check)
 
     if fails:
@@ -228,6 +281,11 @@ def comparison_checks(check):
     expected = {"severity": "error", "code": "PBIR", "where": "definition/pages/control/page.json",
                 "message": "must have required property 'displayName'"}
     check(validate.invalid_control_rejected([expected], "control"), "expected control diagnostic rejected")
+    A = {"severity": "error", "code": "PBIR", "where": "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\pbzcomp-r7w0dit7\\fxroot\\pbz-workspace\\Canary.Report\\definition\\pages\\530d248092b44ccf9450\\page.json", "message": "page.json missing \"displayName\": C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\pbzcomp-r7w0dit7\\fxroot\\pbz-workspace\\Canary.Report\\definition\\pages\\530d248092b44ccf9450\\page.json"}
+    B = {"severity": "error", "code": "PBIR", "where": "/", "message": "Schema validation: / must have required property 'displayName': C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\pbzcomp-r7w0dit7\\fxroot\\pbz-workspace\\Canary.Report\\definition\\pages\\530d248092b44ccf9450\\page.json"}
+    check(validate.invalid_control_rejected([A, B], "530d248092b44ccf9450"), "split vendor control diagnostics rejected")
+    check(not validate.invalid_control_rejected([A], "530d248092b44ccf9450"), "path diagnostic alone accepted as control")
+    check(not validate.invalid_control_rejected([B], "530d248092b44ccf9450"), "required property diagnostic alone accepted as control")
     check(validate.invalid_control_rejected([{**expected, "where": expected["where"].replace("/", "\\")}], "control"),
           "Windows control path rejected")
     check(not validate.invalid_control_rejected([{**expected, "where": expected["where"] + ".bak"}], "control"),

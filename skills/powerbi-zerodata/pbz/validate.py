@@ -82,11 +82,15 @@ def validator_attempted(findings):
 def invalid_control_rejected(findings, page_id):
     # The control removes page.displayName. Require that exact schema failure,
     # rather than treating an unavailable validator or unrelated error as rejection.
-    return not any(f.get("code") in {"REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"}
-                   for f in findings) and any(
+    if any(f.get("code") in {"REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"}
+           for f in findings):
+        return False
+    return any(
         f.get("severity") == "error" and "displayName" in f.get("message", "")
-        and "required" in f.get("message", "").lower()
-        and f.get("where", "").replace("\\", "/").split("/")[-3:] == ["pages", page_id, "page.json"] for f in findings)
+        and f.get("where", "").replace("\\", "/").split("/")[-3:] == ["pages", page_id, "page.json"] for f in findings
+    ) and any(
+        f.get("severity") == "error" and "required property" in f.get("message", "")
+        and "displayName" in f.get("message", "") for f in findings)
 
 
 def report_author(stage: str, project, scrub, *, schema_only=False) -> list[dict]:
