@@ -230,6 +230,8 @@ def excluded_mirror_additions(ws: Workspace, project: Project) -> list[str]:
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
     def unreadable(err):
+        if err.filename is None or os.path.realpath(err.filename) == os.path.realpath(ws.mirror):
+            raise PbzError("REFUSED", project.name) from None
         if err.filename is not None:
             rel = os.path.relpath(err.filename, ws.mirror).replace("\\", "/").rstrip("/") + "/"
             if rel.startswith(prefixes):
@@ -934,6 +936,8 @@ def _recover(ws, project, transaction_id: str | None = None, *, _owns_lock=False
             elif journal.get("kind") == "mirror_edit":
                 from .mirror_txn import restore
                 result = restore(ws, project, directory, journal)
+                if result["result"] == "ROLLED_BACK":
+                    shutil.rmtree(directory, ignore_errors=True)
             else:
                 result = _restore_transaction(ws, project, directory, journal)
         except (OSError, ValueError, KeyError, PbzError):

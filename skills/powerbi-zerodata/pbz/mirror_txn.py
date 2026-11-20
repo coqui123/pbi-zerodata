@@ -47,7 +47,10 @@ def enlist(path, before, after):
         return
     ws, project, directory, journal = active
     path = os.path.abspath(path)
-    rel = os.path.relpath(path, ws.mirror).replace("\\", "/")
+    try:
+        rel = os.path.relpath(path, ws.mirror).replace("\\", "/")
+    except ValueError:
+        raise PbzError("RECOVERY_REQUIRED", os.path.basename(path)) from None
     if not any(_path_inside(path, root)
                for root in (project.mirror_model, project.mirror_report)):
         raise PbzError("RECOVERY_REQUIRED", rel)
@@ -69,7 +72,10 @@ def mark_applied(path, after):
     if active is None:
         return
     ws, _project, directory, journal = active
-    rel = os.path.relpath(os.path.abspath(path), ws.mirror).replace("\\", "/")
+    try:
+        rel = os.path.relpath(os.path.abspath(path), ws.mirror).replace("\\", "/")
+    except ValueError:
+        raise PbzError("RECOVERY_REQUIRED", os.path.basename(path)) from None
     entry = next(e for e in journal["entries"] if e["path"] == rel)
     entry["applied"] = _hash(after)
     _save(directory, journal)
@@ -90,7 +96,7 @@ def restore(ws, project, directory, journal):
             current = _hash(_raw(path, ws.mirror))
             if current == entry["before"]:
                 continue
-            if current != entry.get("applied", entry["after"]):
+            if current not in (entry.get("applied", entry["after"]), entry["after"]):
                 raise ValueError()
             data = None if entry["data"] is None else base64.b64decode(entry["data"], validate=True)
             if _hash(data) != entry["before"]:
@@ -134,7 +140,18 @@ def transaction(root, fn, *, ws=None, project=None):
         try:
             result = fn()
             journal["state"] = "COMMITTED"
-            _save(directory, journal)
+            try:
+                _save(directory, journal)
+            except Exception:
+                try:
+                    with open(os.path.join(directory, "journal.json"), encoding="utf-8") as handle:
+                        journal = json.load(handle)
+                except (OSError, ValueError):
+                    raise PbzError("RECOVERY_REQUIRED", project.name) from None
+                if journal.get("state") == "COMMITTED":
+                    shutil.rmtree(directory, ignore_errors=True)
+                    return result
+                raise
             shutil.rmtree(directory, ignore_errors=True)
             return result
         except BaseException:

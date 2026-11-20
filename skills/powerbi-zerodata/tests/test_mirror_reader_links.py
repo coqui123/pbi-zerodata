@@ -132,6 +132,38 @@ class MirrorReaderLinks(unittest.TestCase):
             self.assertEqual(caught.exception.code, "UNSAFE_PATH")
             self.assertNotIn("PBZ_CANARY_SWAP", str(caught.exception))
 
+    def test_post_open_path_swap_refused(self):
+        import builtins
+        from unittest.mock import patch
+        from pbz import common
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "page.json")
+            sibling = os.path.join(tmp, "replacement.json")
+            with open(path, "wb") as handle:
+                handle.write(b"original")
+            with open(sibling, "wb") as handle:
+                handle.write(b"POST_OPEN_SWAP")
+            self.assertNotEqual(os.lstat(path).st_ino, os.lstat(sibling).st_ino)
+            real_open, real_lstat = builtins.open, os.lstat
+            opened, swapped = False, False
+            def track_open(name, *args, **kwargs):
+                nonlocal opened
+                handle = real_open(name, *args, **kwargs)
+                if name == path:
+                    opened = True
+                return handle
+            def swap_after_open(name, *args, **kwargs):
+                nonlocal swapped
+                if name == path and opened and not swapped:
+                    os.replace(sibling, path)
+                    swapped = True
+                return real_lstat(name, *args, **kwargs)
+            with patch.object(builtins, "open", track_open), patch.object(os, "lstat", swap_after_open):
+                with self.assertRaises(PbzError) as caught:
+                    common.read_checked(path, root=tmp)
+            self.assertTrue(swapped)
+            self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+
     def test_gated_sources_do_not_raw_open_mirror_json(self):
         root = os.path.join(SKILL, "pbz")
         for name, needle in GATED.items():
@@ -532,6 +564,55 @@ class CurrentMirrorCollectionTests(unittest.TestCase):
             with self.assertRaises(PbzError) as caught:
                 mirror.excluded_mirror_additions(self.ws, self.project)
         self.assertEqual(caught.exception.code, "REFUSED")
+
+    def test_enumeration_errors_at_mirror_root_refuse(self):
+        from pbz import mirror
+        from unittest.mock import patch
+        for filename in (self.ws.mirror, None):
+            with self.subTest(filename=filename):
+                def broken_walk(*args, **kwargs):
+                    kwargs["onerror"](OSError(13, "inert", filename))
+                    return iter(())
+                with patch.object(mirror.os, "walk", broken_walk):
+                    with self.assertRaises(PbzError) as caught:
+                        mirror.excluded_mirror_additions(self.ws, self.project)
+                self.assertEqual(caught.exception.code, "REFUSED")
+
+    def _relate_reread_refuses(self, action):
+        from pbz import relate
+        from unittest.mock import patch
+        loaded = relate._model(self.project)
+        self.assertTrue(loaded[1].relationships)
+        path = os.path.join(loaded[0], "relationships.tmdl")
+        alias = os.path.join(self.tmp.name, "relationships-alias")
+        # Preserve parseable bytes, but make the on-disk file unsafe after model load.
+        with open(path, "rb") as handle:
+            data = handle.read()
+        with open(alias, "wb") as handle:
+            handle.write(data)
+        os.remove(path)
+        os.link(alias, path)
+        self.assertEqual(os.lstat(path).st_nlink, 2)
+        calls = {
+            "add": lambda: relate.add(self.ws, self.project, "Sales[Amount]", "Date[Date]", dry_run=True),
+            "remove": lambda: relate.remove(self.ws, self.project, "Sales[CustomerKey]", "Customer[CustomerKey]",
+                                             dry_run=True),
+            "set": lambda: relate.set_(self.ws, self.project, "Sales[CustomerKey]", "Customer[CustomerKey]",
+                                      both=True, dry_run=True),
+        }
+        with patch.object(relate, "_model", return_value=loaded):
+            with self.assertRaises(PbzError) as caught:
+                calls[action]()
+        self.assertEqual(caught.exception.code, "REFUSED")
+
+    def test_relate_add_reread_refuses_hardlink(self):
+        self._relate_reread_refuses("add")
+
+    def test_relate_remove_reread_refuses_hardlink(self):
+        self._relate_reread_refuses("remove")
+
+    def test_relate_set_reread_refuses_hardlink(self):
+        self._relate_reread_refuses("set")
 
     def test_model_enumeration_default_and_strict(self):
         from pbz import tmdl

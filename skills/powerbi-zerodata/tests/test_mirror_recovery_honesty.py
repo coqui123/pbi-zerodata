@@ -235,6 +235,7 @@ transaction(ws.mirror, edit, ws=ws, project=project)
         self.assertEqual(mirror.pull(self.ws, self.project)["result"], "RECOVERY_REQUIRED")
         self.assertEqual(mirror.recover(self.ws, self.project)["result"], "RECOVERED")
         self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
+        self.assertFalse(os.path.exists(directory))
 
     def test_previous_written_version_is_an_external_conflict(self):
         v1 = b"table T\n\tmeasure M = 2\n"
@@ -304,24 +305,47 @@ transaction(ws.mirror, edit, ws=ws, project=project)
         self._run(edit)
         self.assertFalse(os.path.exists(path))
 
-    def test_table_rename_write_set_is_inside_project(self):
+    def _assert_rename_write_set(self, kind, old):
         from pbz import mirror_txn, rename
-        from unittest.mock import patch
-        recorded = []
-        enlist = mirror_txn.enlist
-        def record(path, before, after):
-            recorded.append(path)
-            return enlist(path, before, after)
-        with patch.object(mirror_txn, "enlist", record):
-            self._run(lambda: rename.rename(self.ws, self.project, "table", "T", "Renamed"))
-        self.assertTrue(recorded)
-        for path in recorded:
-            self.assertTrue(any(common._path_inside(path, root) for root in
-                                (self.project.mirror_model, self.project.mirror_report)), path)
+        # Include a separate file referencing all three rename targets.
+        common.replace_bytes(self.path, b"table T\n\tmeasure M = 1\n\tcolumn C\n\t\tdataType: int64\n",
+                             root=self.ws.mirror)
+        reference = os.path.join(os.path.dirname(self.path), "Uses.tmdl")
+        common.replace_bytes(reference, b"table Uses\n\tmeasure Ref = [M] + SUM(T[C])\n", root=self.ws.mirror)
+        def edit():
+            before = file_map(self.ws.mirror)
+            rename.rename(self.ws, self.project, kind, old, "Renamed", table="T")
+            after = file_map(self.ws.mirror)
+            changed = {os.path.abspath(os.path.join(self.ws.mirror, *rel.split("/")))
+                       for rel in before.keys() | after.keys() if before.get(rel) != after.get(rel)}
+            _ws, _project, directory, _journal = mirror_txn._active.get()
+            with open(os.path.join(directory, "journal.json")) as handle:
+                journal = json.load(handle)
+            recorded = {os.path.abspath(os.path.join(self.ws.mirror, *e["path"].split("/")))
+                        for e in journal["entries"]}
+            self.assertTrue(recorded)
+            self.assertEqual(changed, recorded)
+            for path in recorded:
+                self.assertTrue(any(common._path_inside(path, root) for root in
+                                    (self.project.mirror_model, self.project.mirror_report)), path)
+            self.assertIn(reference, changed)
+            if kind == "table":
+                self.assertIn(self.path, changed)
+                self.assertIn(os.path.join(os.path.dirname(self.path), "Renamed.tmdl"), changed)
+        self._run(edit)
+
+    def test_table_rename_write_set_is_inside_project(self):
+        self._assert_rename_write_set("table", "T")
         self.assertFalse(os.path.exists(self.path))
         self.assertTrue(os.path.isfile(os.path.join(os.path.dirname(self.path), "Renamed.tmdl")))
 
-    def _killed_child(self, *, write):
+    def test_measure_rename_write_set_is_inside_project(self):
+        self._assert_rename_write_set("measure", "M")
+
+    def test_column_rename_write_set_is_inside_project(self):
+        self._assert_rename_write_set("column", "C")
+
+    def _killed_child(self, *, write, before_mark=False):
         import subprocess
         code = """
 import os, sys
@@ -331,7 +355,10 @@ project = ws.project()
 def edit():
     path = sys.argv[3]
     after = b'table T\\n\\tmeasure M = 9\\n'
-    if sys.argv[4] == 'write':
+    if sys.argv[4] == 'before_mark':
+        mirror_txn.mark_applied = lambda *args: os._exit(23)
+        common.commit_bytes([('write_bytes', path, after)], root=ws.mirror)
+    elif sys.argv[4] == 'write':
         common.commit_bytes([('write_bytes', path, after)], root=ws.mirror)
     else:
         mirror_txn.enlist(path, common.read_checked(path, root=ws.mirror), after)
@@ -341,19 +368,21 @@ mirror_txn.transaction(ws.mirror, edit, ws=ws, project=project)
         env = dict(os.environ)
         env["PYTHONPATH"] = SKILL + os.pathsep + env.get("PYTHONPATH", "")
         child = subprocess.run([sys.executable, "-c", code, self.ws.root, self.ws.private,
-                                self.path, "write" if write else "enlist"], env=env,
+                                self.path, "before_mark" if before_mark else "write" if write else "enlist"], env=env,
                                capture_output=True, text=True, timeout=30)
-        self.assertEqual(child.returncode, 17, child.stderr)
+        self.assertEqual(child.returncode, 23 if before_mark else 17, child.stderr)
 
     def test_kill_between_journal_and_write(self):
         self._killed_child(write=False)
         pending = mirror.pending_recovery(self.ws, self.project)
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["state"], "APPLYING")
+        directory = os.path.join(mirror._transaction_dir(self.ws, self.project), pending[0]["id"])
         self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
         self.assertEqual(mirror.recover(self.ws, self.project)["result"], "RECOVERED")
         self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
         self.assertFalse(mirror.pending_recovery(self.ws, self.project))
+        self.assertFalse(os.path.exists(directory))
 
     def test_two_process_stale_lock_recovery(self):
         import subprocess
@@ -399,6 +428,134 @@ print(json.dumps(mirror.recover(ws, project)))
                 if child.poll() is None:
                     child.kill()
                     child.communicate()
+
+    def test_kill_after_write_before_mark_applied_recovers(self):
+        self._killed_child(write=True, before_mark=True)
+        pending = mirror.pending_recovery(self.ws, self.project)
+        self.assertEqual(len(pending), 1)
+        directory = os.path.join(mirror._transaction_dir(self.ws, self.project), pending[0]["id"])
+        with open(os.path.join(directory, "journal.json")) as handle:
+            entry = json.load(handle)["entries"][0]
+        current = common.read_checked(self.path, root=self.ws.mirror)
+        self.assertNotEqual(current, self.before)
+        self.assertEqual(entry["after"], common.sha(current))
+        self.assertEqual(entry["applied"], common.sha(self.before))
+        self.assertEqual(mirror.recover(self.ws, self.project)["result"], "RECOVERED")
+        self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
+        self.assertFalse(os.path.exists(directory))
+
+    def test_local_undo_resyncs_prior_transaction_write(self):
+        from unittest.mock import patch
+        other = os.path.join(os.path.dirname(self.path), "Fail.tmdl")
+        write = common.write_bytes
+        def fail_other(path, data, **kwargs):
+            if path == other:
+                raise OSError("inert")
+            return write(path, data, **kwargs)
+        def edit():
+            self._write(self.path, b"B")
+            with patch.object(common, "write_bytes", fail_other):
+                common.commit_bytes([("write_bytes", self.path, b"C"),
+                                     ("write_bytes", other, b"fail")], root=self.ws.mirror)
+        with self.assertRaises(common.PbzError) as caught:
+            self._run(edit)
+        self.assertEqual(caught.exception.code, "FAILED")
+        self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
+        self.assertFalse(mirror.pending_recovery(self.ws, self.project))
+
+    def _terminal_save_failure(self, persisted):
+        from pbz import mirror_txn
+        from unittest.mock import patch
+        save = mirror_txn._save
+        def fail_commit(directory, journal):
+            if journal["state"] == "COMMITTED":
+                if persisted:
+                    save(directory, journal)
+                raise OSError("terminal save failed")
+            return save(directory, journal)
+        def edit():
+            self._write(self.path, b"new")
+            return "fn result"
+        with patch.object(mirror_txn, "_save", fail_commit):
+            if persisted:
+                self.assertEqual(self._run(edit), "fn result")
+            else:
+                with self.assertRaisesRegex(OSError, "terminal save failed"):
+                    self._run(edit)
+        self.assertEqual(common.read_checked(self.path, root=self.ws.mirror),
+                         b"new" if persisted else self.before)
+        self.assertFalse(mirror.pending_recovery(self.ws, self.project))
+        parent = mirror._transaction_dir(self.ws, self.project)
+        self.assertFalse([n for n in os.listdir(parent) if n.startswith("edit-")])
+
+    def test_terminal_save_fails_before_persisting(self):
+        self._terminal_save_failure(False)
+
+    def test_terminal_save_fails_after_persisting(self):
+        self._terminal_save_failure(True)
+
+    def test_killed_edit_external_conflict_keeps_directory(self):
+        self._killed_child(write=True)
+        pending = mirror.pending_recovery(self.ws, self.project)
+        self.assertEqual(len(pending), 1)
+        directory = os.path.join(mirror._transaction_dir(self.ws, self.project), pending[0]["id"])
+        common.replace_bytes(self.path, b"outsider", root=self.ws.mirror)
+        self.assertEqual(mirror.recover(self.ws, self.project)["result"], "RECOVERY_REQUIRED")
+        self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), b"outsider")
+        self.assertTrue(os.path.isdir(directory))
+
+    def test_unrelatable_paths_raise_recovery_required(self):
+        from pbz import mirror_txn
+        from unittest.mock import patch
+        def edit():
+            mirror_txn.enlist(self.path, self.before, b"new")
+            with patch.object(os.path, "relpath", side_effect=ValueError("inert")):
+                for call in (lambda: mirror_txn.enlist(self.path, self.before, b"new"),
+                             lambda: mirror_txn.mark_applied(self.path, self.before)):
+                    with self.assertRaises(common.PbzError) as caught:
+                        call()
+                    self.assertEqual(caught.exception.code, "RECOVERY_REQUIRED")
+                    self.assertEqual(caught.exception.detail, os.path.basename(self.path))
+        self._run(edit)
+
+    @unittest.skipIf(os.name == "nt", "fcntl recovery guard seam")
+    def test_recovery_guard_excludes_concurrent_recovery(self):
+        import subprocess
+        import time
+        self._killed_child(write=True)
+        current = common.read_checked(self.path, root=self.ws.mirror)
+        pending = mirror.pending_recovery(self.ws, self.project)
+        guard = os.path.join(mirror._transaction_dir(self.ws, self.project), ".commit-lock.recover")
+        ready = os.path.join(self.tmp.name, "guard-ready")
+        release = os.path.join(self.tmp.name, "guard-release")
+        code = """
+import fcntl, os, sys, time
+with open(sys.argv[1], 'a+b') as handle:
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    with open(sys.argv[2], 'w'): pass
+    while not os.path.exists(sys.argv[3]): time.sleep(.01)
+"""
+        child = subprocess.Popen([sys.executable, "-c", code, guard, ready, release],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 20
+            while not os.path.exists(ready):
+                if child.poll() is not None or time.monotonic() > deadline:
+                    self.fail("guard child failed to signal readiness")
+                time.sleep(.01)
+            self.assertEqual(mirror.recover(self.ws, self.project)["result"], "COMMIT_BUSY")
+            self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), current)
+            self.assertEqual(mirror.pending_recovery(self.ws, self.project), pending)
+            with open(release, "w"): pass
+            _stdout, stderr = child.communicate(timeout=30)
+            self.assertEqual(child.returncode, 0, stderr)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+        self.assertEqual(mirror.recover(self.ws, self.project)["result"], "RECOVERED")
+        self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
+        self.assertFalse(mirror.pending_recovery(self.ws, self.project))
 
     def test_recover_propagates_anchor_refusal(self):
         from unittest.mock import patch

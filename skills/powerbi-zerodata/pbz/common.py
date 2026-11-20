@@ -854,6 +854,7 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
             done.append(path)
             mark_applied(path, after)
     except (OSError, PbzError, UnicodeError) as first:
+        from .mirror_txn import mark_applied
         restore_fail = []
         touched = list(dict.fromkeys(reversed(done)))
         for path in touched:
@@ -875,6 +876,7 @@ def commit_bytes(ops: list[tuple], *, private: bool = False, root: str | None = 
                         os.remove(path)
                 else:
                     replace_bytes(path, data, root=trust)
+                mark_applied(path, data)
             except (OSError, PbzError, UnicodeError) as e:
                 restore_fail.append(f"{path}:{type(e).__name__}")
         if restore_fail:
