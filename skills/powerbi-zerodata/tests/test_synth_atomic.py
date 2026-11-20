@@ -88,9 +88,9 @@ class SynthAtomicTests(unittest.TestCase):
 
     def test_engine_wrapper_preserves_verification_and_reason(self):
         from pbz import engine
-        result = engine._project("synth-query", {"ok": False, "reason": "SYNTH_DEFINITION_CHANGED"})
+        result = engine._project("synth-query", {"ok": False, "verb": "synth-query", "class": "OTHER", "reason": "SYNTH_DEFINITION_CHANGED"})
         self.assertEqual(result["reason"], "SYNTH_DEFINITION_CHANGED")
-        result = engine._project("synth-bind", {"ok": True, "verified": True, "rows": [[1]]})
+        result = engine._project("synth-bind", {"ok": True, "verb": "synth-bind", "verified": True, "rows": [[1]]})
         self.assertIs(result["verified"], True)
         self.assertNotIn("rows", result)
 

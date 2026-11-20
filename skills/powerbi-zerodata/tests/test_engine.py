@@ -638,7 +638,7 @@ def test_offline(env: Env, tmp: Path) -> None:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     r = mod.call("ping", {"private_dir": str(env.pd)})
-    expect("engine.py call(ping) returns only ok and verb", r == {"ok": True, "verb": "ping"}, r)
+    expect("engine.py call(ping) returns ok, verb, and version", r == {"ok": True, "verb": "ping", "version": "1"}, r)
     saved = mod.ENGINE_EXE
     try:
         mod.ENGINE_EXE = S / "engine" / "bin" / "missing-engine.exe"

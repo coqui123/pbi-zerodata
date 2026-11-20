@@ -62,11 +62,11 @@ class EngineRequestTests(unittest.TestCase):
 
         def fake_run(args, input=None, **_kwargs):
             seen["input"] = input
-            return SimpleNamespace(returncode=0, stdout=b'{"ok": true, "verb": "ping"}')
+            return SimpleNamespace(returncode=0, stdout=b'{"ok": true, "verb": "ping", "version": "1"}')
 
         with patch.object(engine, "ENGINE_EXE", exe), patch.object(engine.subprocess, "run", side_effect=fake_run):
             out = engine.call("ping", {"name": "Ok", "n": 1.5})
-        self.assertEqual(out, {"ok": True, "verb": "ping"})
+        self.assertEqual(out, {"ok": True, "verb": "ping", "version": "1"})
         self.assertEqual(json.loads(seen["input"].decode("utf-8")), {"name": "Ok", "n": 1.5})
         self.assertNotIn(b"NaN", seen["input"])
 
@@ -196,11 +196,11 @@ class CalendarTests(unittest.TestCase):
         real = tmdl.load_model
         calls = {"n": 0}
 
-        def blow(mdef, texts=None):
+        def blow(mdef, texts=None, root=None):
             calls["n"] += 1
             if calls["n"] > 1:
                 raise RuntimeError("unreadable")
-            return real(mdef, texts)
+            return real(mdef, texts, root=root)
 
         with patch.object(calendars.tmdl, "load_model", side_effect=blow):
             with self.assertRaises(PbzError) as caught:
