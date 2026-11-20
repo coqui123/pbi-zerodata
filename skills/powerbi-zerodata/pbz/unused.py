@@ -301,11 +301,21 @@ def remove(ws, project, extra_reports=(), m_step: str = "remove", cascade: bool 
             rep = []  # report objects go in the first round only
         if not todo and not rep:
             break
+        tables = {g.objects[k].name.lower() for k in todo if k[0] == "table"}
         for k in todo:
             o = g.objects[k]
-            node = g.model.table(o.name).node if o.kind == "table" else _node_of(g.model, o)
+            if o.kind == "table" or o.table.lower() in tables:
+                continue
+            node = _node_of(g.model, o)
             if node is not None:
-                tmdl.refuse_out_of_span_description(g.model.docs[node.file], node)
+                try:
+                    tmdl.refuse_out_of_span_description(g.model.docs[node.file], node)
+                except PbzError as e:
+                    if e.code == "REFUSED" and committed:
+                        label = f"{o.kind} {o.label()}" + (f" ({o.table})" if o.kind == "measure" else "")
+                        skipped.append({"object": label, "reason": e.detail})
+                        return _partial(project, removed, skipped, committed, stamp)
+                    raise
         changes = _plan(ws, project, g, todo, rep, m_step, skipped)
         if not changes:
             break

@@ -217,6 +217,68 @@ class EditRefusalTests(unittest.TestCase):
                     self.assertEqual(common.read_checked(path, root=self.ws.mirror),
                                      (prefix + target + after).encode())
 
+    def _unused_description_fixture(self):
+        path, *_ = self._fenced_fixture("\n")
+        prefix = ("table Sales\n\n\t/// Before description\n\tmeasure Before = 1\n"
+                  "\t/// Target description\n\t\tformatString: Before\n")
+        target = "\tmeasure Target = 1\n\t\tformatString: Target\n\n"
+        after = "\t/// After description\n\tmeasure After = 1\n\n"
+        _write(path, prefix + target + after)
+        return path, prefix, target, after
+
+    def test_unused_whole_table_skips_member_description_guard(self):
+        path, *_ = self._unused_description_fixture()
+        # With no visual references, the table and all its measures are unused.
+        visual = os.path.join(self.project.mirror_report, "definition", "pages", "p1",
+                              "visuals", "v1", "visual.json")
+        os.remove(visual)
+        self.before = _bytes(self.ws.mirror)
+        for dry_run in (False, True):
+            with self.subTest(selection="measure", dry_run=dry_run):
+                err = self._refuse(lambda: unused.remove(self.ws, self.project, only=["measure"],
+                                                        dry_run=dry_run))
+                self.assertEqual(err.code, "REFUSED")
+                self.assertEqual(err.detail, "TMDL description outside node block span")
+        with self.subTest(selection="whole-table", dry_run=True):
+            preview = unused.remove(self.ws, self.project, only=["table", "measure"], dry_run=True)
+            self.assertEqual(preview["result"], "DRY_RUN")
+            self.assertIn("table Sales", preview["removed"])
+            self.assertEqual(_bytes(self.ws.mirror), self.before)
+        result = unused.remove(self.ws, self.project, only=["table", "measure"])
+        self.assertEqual(result["result"], "REMOVED")
+        self.assertEqual(result["removed"], preview["removed"])
+        self.assertFalse(os.path.exists(path))
+        restored = unused.restore(self.ws, self.project, result["restore_point"])
+        self.assertEqual(restored["result"], "RESTORED")
+        restored_bytes = {rel: data for rel, data in _bytes(self.ws.mirror).items()
+                          if not rel.startswith(unused.TRASH + os.sep)}
+        self.assertEqual(restored_bytes, self.before)
+
+    def test_unused_cascade_description_refusal_is_partial(self):
+        path, prefix, target, after = self._unused_description_fixture()
+        self.before = _bytes(self.ws.mirror)
+        # The same refusal before any committed round must remain a plain error.
+        err = self._refuse(lambda: unused.remove(self.ws, self.project, only=["measure"], cascade=True))
+        self.assertEqual(err.code, "REFUSED")
+        self.assertEqual(err.detail, "TMDL description outside node block span")
+        trigger = "\tmeasure Trigger = [Target]\n\n"
+        _write(path, prefix + target + after + trigger)
+        self.before = _bytes(self.ws.mirror)
+        result = unused.remove(self.ws, self.project, only=["measure"], cascade=True)
+        self.assertEqual(result["result"], "PARTIAL")
+        self.assertTrue(result["restore_point"])
+        self.assertEqual(result["rounds"], 1)
+        self.assertEqual(result["removed"], ["measure [Trigger]"])
+        self.assertEqual(result["skipped"], [{"object": "measure [Target] (Sales)",
+                                             "reason": err.detail}])
+        self.assertEqual(common.read_checked(path, root=self.ws.mirror),
+                         (prefix + target + after).encode())
+        restored = unused.restore(self.ws, self.project, result["restore_point"])
+        self.assertEqual(restored["result"], "RESTORED")
+        restored_bytes = {rel: data for rel, data in _bytes(self.ws.mirror).items()
+                          if not rel.startswith(unused.TRASH + os.sep)}
+        self.assertEqual(restored_bytes, self.before)
+
     def test_move_refuses_unclosed_fence_in_third_file_without_writes(self):
         path, *_ = self._fenced_fixture("\n", target_fenced=False)
         third = os.path.join(os.path.dirname(path), "References.tmdl")
