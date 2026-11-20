@@ -8,11 +8,13 @@ using Microsoft.AnalysisServices.Tabular.Tmdl;
 namespace PbzEngine;
 
 /// <summary>
-/// tmdl-validate: TmdlSerializer.DeserializeDatabaseFromFolder plus a ref/file inventory. No connection.
+/// tmdl-validate: TmdlSerializer.DeserializeDatabaseFromFolder plus a ref/file inventory of a private snapshot copy. No connection.
 /// Never echoes line text; messages are rebuilt without the Document/Line parts and scrubbed.
 /// </summary>
 public static class TmdlValidate
 {
+    internal static Action? BeforeInventoryForTests;
+
     static readonly Dictionary<string, string> RefDirs = new(StringComparer.Ordinal)
     {
         ["table"] = "tables",
@@ -37,22 +39,45 @@ public static class TmdlValidate
         if (!Directory.Exists(folder)) throw new BadRequestException("folder not found");
 
         string snapshot = Path.Combine(ctx.RequirePrivateDir(), "tmdl-validate-" + Guid.NewGuid().ToString("N"));
-        if (snapshot.StartsWith(Path.TrimEndingDirectorySeparator(folder) + Path.DirectorySeparatorChar,
-            StringComparison.OrdinalIgnoreCase))
+        if (IsInsideFolder(snapshot, folder))
             throw new BadRequestException("validation scratch directory must be outside the candidate folder");
         LinkGuard.Refuse(snapshot);
         try
         {
-            CopyTree(folder, snapshot);
+            ctx.Guard(() => { CopyTree(folder, snapshot); return 0; });
             return RunSnapshot(req, ctx, snapshot);
         }
         finally
         {
             // Best effort: a leftover scratch directory must not fail a completed validation.
-            try { if (Directory.Exists(snapshot)) Directory.Delete(snapshot, recursive: true); }
+            try
+            {
+                if (Directory.Exists(snapshot))
+                {
+                    ClearReadOnly(snapshot);
+                    Directory.Delete(snapshot, recursive: true);
+                }
+            }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
         }
+    }
+
+    internal static bool IsInsideFolder(string candidate, string folder)
+    {
+        candidate = Path.GetFullPath(candidate);
+        folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder));
+        string prefix = Path.EndsInDirectorySeparator(folder) ? folder : folder + Path.DirectorySeparatorChar;
+        return !string.Equals(Path.TrimEndingDirectorySeparator(candidate), folder, StringComparison.OrdinalIgnoreCase)
+            && candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static void ClearReadOnly(string path)
+    {
+        var attributes = File.GetAttributes(path);
+        File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+        if (attributes.HasFlag(FileAttributes.Directory))
+            foreach (var entry in Directory.EnumerateFileSystemEntries(path)) ClearReadOnly(entry);
     }
 
     // Copy failures propagate: no validation or signing may fall back to the live folder.
@@ -66,7 +91,7 @@ public static class TmdlValidate
             string target = Path.Combine(destination, Path.GetFileName(entry));
             if (File.GetAttributes(entry).HasFlag(FileAttributes.Directory))
                 CopyTree(entry, target);
-            else
+            else if (string.Equals(Path.GetExtension(entry), ".tmdl", StringComparison.OrdinalIgnoreCase))
                 File.Copy(entry, target);
         }
     }
@@ -111,6 +136,7 @@ public static class TmdlValidate
             errors.Add(Entry(null, 0, Errors.Classify(ex), scrub.Scrub(CleanMessage(ex.Message, null))));
         }
 
+        BeforeInventoryForTests?.Invoke();
         var (missing, orphans) = Inventory(folder);
         var missingArr = new JsonArray();
         foreach (var m in missing) missingArr.Add(m);

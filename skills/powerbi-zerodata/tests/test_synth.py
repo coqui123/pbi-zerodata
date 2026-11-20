@@ -193,6 +193,7 @@ PROVENANCE_FIXTURES = r'''
 using System;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Text.Json.Nodes;
@@ -258,7 +259,7 @@ class Fixtures
         var builtLive = good with { MarkerValue = builtMarker };
         Check("single RowNumber present only on live side", () => P.Verify(ctx,
             builtLive, requireCatalog: false), null);
-        Check("counts-less manifest binds", () => {
+        Check("manifest without counts binds", () => {
             // The same verify/save sequence used by Bind, without requiring a live Desktop.
             P.Verify(ctx, builtLive, requireCatalog: false);
             P.Save(ctx, builtMarker, builtLive.DefinitionValue, builtLive.Catalog);
@@ -335,14 +336,79 @@ class Fixtures
         Check("verified rows released", () => {
             if (P.Buffered(() => good, s => P.Verify(ctx, s), () => 7) != 7) throw new Exception("lost rows");
         }, null);
+        var isInsideFolder = typeof(TmdlValidate).GetMethod("IsInsideFolder", BindingFlags.Static | BindingFlags.NonPublic)!
+            .CreateDelegate<Func<string, string, bool>>();
+        Check("drive root contains same-drive descendant", () => {
+            if (!isInsideFolder(@"C:\private\tmdl-validate-fixture", @"C:\")) throw new Exception("root descendant missed");
+        }, null);
+        Check("ordinary folder contains descendant", () => {
+            if (!isInsideFolder(@"C:\models\foo\tables", @"C:\models\foo")) throw new Exception("descendant missed");
+        }, null);
+        Check("folder prefix sibling is outside", () => {
+            if (isInsideFolder(@"C:\models\foo2", @"C:\models\foo")) throw new Exception("sibling included");
+        }, null);
+        Check("folder itself is outside", () => {
+            if (isInsideFolder(@"C:\models\foo", @"C:\models\foo") || isInsideFolder(@"C:\", @"C:\"))
+                throw new Exception("folder itself included");
+        }, null);
+        var beforeInventory = typeof(TmdlValidate).GetField("BeforeInventoryForTests", BindingFlags.Static | BindingFlags.NonPublic)!;
+        Check("validation copies only TMDL and cleans read-only snapshot", () => {
+            var source = Path.Combine(args[0], "readonly-source");
+            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(Build().Database, source);
+            var readOnlyFile = Path.Combine(source, "tables", "T.tmdl");
+            var originalAttributes = File.GetAttributes(readOnlyFile);
+            File.SetAttributes(readOnlyFile, originalAttributes | FileAttributes.ReadOnly);
+            File.WriteAllText(Path.Combine(source, "cache.abf"), "must not be copied");
+            var snapshotPrivate = Path.Combine(args[0], "readonly-private");
+            var snapshotCtx = new Ctx("tmdl-validate");
+            var request = Req.Parse(new JsonObject { ["private_dir"] = snapshotPrivate,
+                ["folder"] = source, ["timeout_s"] = 120 }.ToJsonString());
+            snapshotCtx.Init(request);
+            using var paused = new ManualResetEventSlim();
+            using var resume = new ManualResetEventSlim();
+            Task<JsonObject>? validation = null;
+            var deadline = DateTime.UtcNow.AddSeconds(120);
+            beforeInventory.SetValue(null, (Action)(() => {
+                paused.Set();
+                if (!resume.Wait(TimeSpan.FromSeconds(120))) throw new Exception("snapshot fixture was not released");
+            }));
+            try
+            {
+                validation = Task.Run(() => TmdlValidate.Run(request, snapshotCtx));
+                if (!paused.Wait(TimeSpan.FromTicks(Math.Max(0, (deadline - DateTime.UtcNow).Ticks))))
+                    throw new Exception("no snapshot observed before inventory deadline");
+                var snapshot = Directory.GetDirectories(snapshotPrivate, "tmdl-validate-*").Single();
+                var files = Directory.GetFiles(snapshot, "*", SearchOption.AllDirectories);
+                if (files.Any(f => !string.Equals(Path.GetExtension(f), ".tmdl", StringComparison.OrdinalIgnoreCase)))
+                    throw new Exception("non-TMDL sentinel copied into snapshot");
+                var expectedFiles = Directory.GetFiles(source, "*", SearchOption.AllDirectories)
+                    .Where(f => string.Equals(Path.GetExtension(f), ".tmdl", StringComparison.OrdinalIgnoreCase))
+                    .Select(f => Path.GetRelativePath(source, f)).OrderBy(f => f).ToArray();
+                if (!expectedFiles.SequenceEqual(files.Select(f => Path.GetRelativePath(snapshot, f)).OrderBy(f => f)))
+                    throw new Exception("snapshot TMDL files differ from source");
+                if (!File.GetAttributes(Path.Combine(snapshot, "tables", "T.tmdl")).HasFlag(FileAttributes.ReadOnly))
+                    throw new Exception("fixture did not exercise read-only snapshot cleanup");
+                resume.Set();
+                var result = validation.GetAwaiter().GetResult();
+                if (result["valid"]?.GetValue<bool>() != true) throw new Exception("read-only snapshot validation failed");
+                if (Directory.GetDirectories(snapshotPrivate, "tmdl-validate-*").Length != 0)
+                    throw new Exception("read-only validation snapshot was not removed");
+            }
+            finally
+            {
+                resume.Set();
+                try { if (validation != null) validation.GetAwaiter().GetResult(); }
+                finally
+                {
+                    beforeInventory.SetValue(null, null);
+                    File.SetAttributes(readOnlyFile, originalAttributes);
+                }
+            }
+        }, null);
         Check("validation inventories and signs its snapshot", () => {
             var candidate = Build();
             var raceMarker = new string('d', 64);
             candidate.Annotations.Add(new Annotation { Name = "PBZ_SYNTHETIC", Value = raceMarker });
-            // Many TOM objects keep deserialization in flight after the small source file is read.
-            // The timing margin must be confirmed on Windows with the actual TOM build.
-            for (int i = 0; i < 50000; i++)
-                candidate.Tables["Other"].Measures.Add(new Measure { Name = "Slow" + i, Expression = "1" });
             var source = Path.Combine(args[0], "race-source");
             Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(candidate.Database, source);
             var expected = P.Definition(Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer
@@ -352,40 +418,36 @@ class Fixtures
             var request = Req.Parse(new JsonObject { ["private_dir"] = racePrivate,
                 ["folder"] = source, ["synthetic_marker"] = raceMarker, ["timeout_s"] = 120 }.ToJsonString());
             raceCtx.Init(request);
-            var validation = Task.Run(() => TmdlValidate.Run(request, raceCtx));
-            // Wait for the frozen tree, then give deserialization a short head start.
-            // With the old implementation there is no scratch tree; the same delay exposes
-            // the later live inventory after TOM has read T but is still building the model.
-            var deadline = DateTime.UtcNow.AddSeconds(10);
-            bool copied = false;
-            bool sawSnapshot = false;
-            while (!validation.IsCompleted && DateTime.UtcNow < deadline)
+            using var paused = new ManualResetEventSlim();
+            using var resume = new ManualResetEventSlim();
+            Task<JsonObject>? validation = null;
+            var deadline = DateTime.UtcNow.AddSeconds(120);
+            beforeInventory.SetValue(null, (Action)(() => {
+                paused.Set();
+                if (!resume.Wait(TimeSpan.FromSeconds(120))) throw new Exception("race fixture was not released");
+            }));
+            try
             {
-                foreach (var scratch in Directory.EnumerateDirectories(racePrivate, "tmdl-validate-*"))
-                {
-                    sawSnapshot = true;
-                    var files = Directory.GetFiles(source, "*", SearchOption.AllDirectories);
-                    copied = files.All(f => {
-                        var copy = Path.Combine(scratch, Path.GetRelativePath(source, f));
-                        return File.Exists(copy) && new FileInfo(copy).Length == new FileInfo(f).Length;
-                    });
-                    if (copied) break;
-                }
-                if (copied || (!sawSnapshot && DateTime.UtcNow > deadline.AddSeconds(-9.9))) break;
-                Thread.Sleep(1);
+                validation = Task.Run(() => TmdlValidate.Run(request, raceCtx));
+                if (!paused.Wait(TimeSpan.FromTicks(Math.Max(0, (deadline - DateTime.UtcNow).Ticks))))
+                    throw new Exception("no snapshot observed before inventory deadline");
+                File.Delete(Path.Combine(source, "tables", "T.tmdl"));
+                resume.Set();
+                var result = validation.GetAwaiter().GetResult();
+                if (result["valid"]?.GetValue<bool>() != true || result["missing_refs"]!.AsArray().Count != 0
+                    || result["orphan_files"]!.AsArray().Count != 0)
+                    throw new Exception("source mutation changed snapshot validation: " + result.ToJsonString());
+                if (P.Load(raceCtx, raceMarker)["definition"]!.GetValue<string>() != expected)
+                    throw new Exception("validation did not sign the complete original model");
+                if (Directory.EnumerateDirectories(racePrivate, "tmdl-validate-*").Any())
+                    throw new Exception("validation snapshot was not cleaned up");
             }
-            if (sawSnapshot && !copied) throw new Exception("snapshot copy did not finish within the fixture deadline");
-            Thread.Sleep(100);
-            if (validation.IsCompleted) throw new Exception("validation finished before source edit; increase race fixture size");
-            File.Delete(Path.Combine(source, "tables", "T.tmdl"));
-            var result = validation.GetAwaiter().GetResult();
-            if (result["valid"]?.GetValue<bool>() != true || result["missing_refs"]!.AsArray().Count != 0
-                || result["orphan_files"]!.AsArray().Count != 0)
-                throw new Exception("source mutation changed snapshot validation: " + result.ToJsonString());
-            if (P.Load(raceCtx, raceMarker)["definition"]!.GetValue<string>() != expected)
-                throw new Exception("validation did not sign the complete original model");
-            if (Directory.EnumerateDirectories(racePrivate, "tmdl-validate-*").Any())
-                throw new Exception("validation snapshot was not cleaned up");
+            finally
+            {
+                resume.Set();
+                try { if (validation != null) validation.GetAwaiter().GetResult(); }
+                finally { beforeInventory.SetValue(null, null); }
+            }
         }, null);
         Console.WriteLine($"{passed} passed, 0 failed");
     }
