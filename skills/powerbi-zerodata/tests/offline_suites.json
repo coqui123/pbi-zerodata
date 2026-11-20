@@ -774,7 +774,7 @@
       "tests/test_plan_pure.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": false
   },
   {
     "id": "plan_cli",

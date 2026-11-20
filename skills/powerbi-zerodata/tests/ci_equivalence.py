@@ -10,9 +10,39 @@ import statistics
 from ci_manifest import BASELINE, controls, allocate, MANIFEST
 
 
+def inventory():
+    frozen = json.loads(BASELINE.read_text(encoding='utf-8'))['suites']
+    additions = json.loads((BASELINE.parent / 'offline_additions.json').read_text(encoding='utf-8'))['suites']
+    rows = frozen + additions
+    if len({e['id'] for e in rows}) != len(rows):
+        raise ValueError('duplicate baseline/addition suite')
+    return rows
+
+
+def run_id(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip():
+        raise ValueError('run binding: invalid run identity')
+    return str(value)
+
+
+def attempt(value):
+    if isinstance(value, bool) or not re.fullmatch(r'[1-9][0-9]*', str(value)):
+        raise ValueError('run binding: explicit attempt required')
+    return str(value)
+
+
+def bind_reports(reference, shards, serial_run, sharded_run, serial_attempt, sharded_attempt):
+    for report, intended_run, intended_attempt in [(reference, serial_run, serial_attempt),
+            *((r, sharded_run, sharded_attempt) for r in shards)]:
+        binding = report.get('run', {})
+        if (run_id(binding.get('id')) != run_id(intended_run) or
+                attempt(binding.get('attempt')) != attempt(intended_attempt)):
+            raise ValueError('run binding: report run/attempt mismatch')
+
+
 def serial_inventory(report):
     """Normal serial CI checks coverage without inventing a historical skip baseline."""
-    expected = {e['id']: e['argv'] for e in json.loads(BASELINE.read_text(encoding='utf-8'))['suites']}
+    expected = {e['id']: e['argv'] for e in inventory()}
     rows = report['executed']
     if Counter(e['id'] for e in rows) != Counter(expected.keys()):
         raise ValueError('serial executed membership/multiplicity')
@@ -26,17 +56,19 @@ def serial_inventory(report):
 
 
 def compare(reference, shards, expected_shards=2, expected_failures=None, control_path=None):
-    inventory = json.loads(BASELINE.read_text(encoding='utf-8'))['suites']
-    inventory, configured_failures = controls(inventory, control_path, check_scripts=False)
+    declared, configured_failures = controls(inventory(), control_path, check_scripts=False)
     expected_failures = expected_failures or configured_failures
-    expected = {e['id']: e['argv'] for e in inventory}
+    expected = {e['id']: e['argv'] for e in declared}
+    sources = {e['id']: e.get('source') for e in declared}
     if len(shards) != expected_shards or Counter(str(s['shard']) for s in shards) != Counter(map(str, range(expected_shards))):
         raise ValueError('missing, duplicate or cancelled shards')
     if reference.get('run') and any(s.get('run') for s in shards):
         if not all(s.get('run') for s in shards):
             raise ValueError('run binding: missing shard binding')
-        shard_ids = {str(s['run']['id']) for s in shards}
-        if len(shard_ids) != 1 or str(reference['run']['id']) in shard_ids:
+        shard_ids = {run_id(s['run']['id']) for s in shards}
+        if len({attempt(s['run'].get('attempt')) for s in shards}) != 1:
+            raise ValueError('run binding: mixed shard attempts')
+        if len(shard_ids) != 1 or run_id(reference['run']['id']) in shard_ids:
             raise ValueError('run binding: reference and shards must be independent runs')
     allocation, _ = controls(json.loads(MANIFEST.read_text(encoding='utf-8')), control_path, check_scripts=False)
     groups = allocate(allocation, expected_shards)
@@ -63,6 +95,8 @@ def compare(reference, shards, expected_shards=2, expected_failures=None, contro
         if Counter(e['id'] for e in result) != Counter(expected.keys()):
             raise ValueError('executed membership/multiplicity')
         for row in result:
+            if row.get('source') != sources[row['id']]:
+                raise ValueError('wrong executed source identity')
             if row['argv'] != expected[row['id']]:
                 raise ValueError('wrong executed argv')
         return {e['id']: e for e in result}
@@ -74,7 +108,7 @@ def compare(reference, shards, expected_shards=2, expected_failures=None, contro
                 raise ValueError(f'{name}: different {key}')
         # Baseline skips are compared exactly; new skips need independent approval.
         allowed = json.loads((BASELINE.parent / 'offline_skips.json').read_text(encoding='utf-8'))
-        if left[name]['skip_reasons'] != allowed.get(name, []):
+        if left[name]['skip_reasons'] != allowed.get('windows' if reference['identity']['os'].startswith('Windows') else 'posix', {}).get(name, []):
             raise ValueError(name + ': unexpected skip')
         if name in failures:
             code, reason = failures[name]
@@ -82,6 +116,8 @@ def compare(reference, shards, expected_shards=2, expected_failures=None, contro
                 raise ValueError(name + ': expected failure reason absent')
         elif left[name]['exit_code'] != 0 or left[name].get('error'):
             raise ValueError(name + ': unexpected suite failure')
+    print('PBZ_INVENTORY ' + json.dumps({'frozen_count': len(json.loads(BASELINE.read_text())['suites']),
+                                        'post_migration': json.loads((BASELINE.parent / 'offline_additions.json').read_text())['suites']}))
     return True
 
 
@@ -96,10 +132,10 @@ def rollout(evidence):
     pairs = evidence['pairs']
     if len(pairs) < 10 or len({p['pair_id'] for p in pairs}) != len(pairs):
         raise ValueError('ten distinct completed pairs required')
-    run_ids = [p.get(k) for p in pairs for k in ('serial_run', 'sharded_run')]
-    cancelled = {str(r.get('run_id', r.get('id'))) if isinstance(r, dict) else str(r)
+    run_ids = [run_id(p.get(k)) for p in pairs for k in ('serial_run', 'sharded_run')]
+    cancelled = {run_id(r.get('run_id', r.get('id'))) if isinstance(r, dict) else run_id(r)
                  for r in evidence['cancelled_attempts']}
-    if any(str(r) in cancelled for r in run_ids):
+    if any(r in cancelled for r in run_ids):
         raise ValueError('run binding: counted run was cancelled')
     if len(set(run_ids)) != len(run_ids):
         raise ValueError('hosted runs reused across pairs')
@@ -108,9 +144,8 @@ def rollout(evidence):
     for p in pairs:
         if not all(k in p for k in ('reference', 'shards', 'serial_metrics', 'sharded_metrics')):
             raise ValueError('executed reports and completed hosted metrics required')
-        if (str(p['reference'].get('run', {}).get('id')) != str(p['serial_run']) or
-                any(str(r.get('run', {}).get('id')) != str(p['sharded_run']) for r in p['shards'])):
-            raise ValueError('run binding: reports differ from pair run IDs')
+        bind_reports(p['reference'], p['shards'], p['serial_run'], p['sharded_run'],
+                     p.get('serial_attempt'), p.get('sharded_attempt'))
         compare(p['reference'], p['shards'])
         if p.get('cold_cache') and not all(r.get('cold_cache') for r in [p['reference'], *p['shards']]):
             raise ValueError('missing cold-cache execution evidence')
@@ -118,7 +153,8 @@ def rollout(evidence):
             raise ValueError('pair SHA does not match executed evidence')
         for mode in ('serial', 'sharded'):
             measured = p[mode + '_metrics']
-            if measured['run_id'] != p[mode + '_run'] or measured['sha'] != p['sha'] or measured['conclusion'] != 'success':
+            if (run_id(measured['run_id']) != run_id(p[mode + '_run']) or
+                    attempt(measured.get('attempt')) != attempt(p.get(mode + '_attempt')) or measured['sha'] != p['sha'] or measured['conclusion'] != 'success'):
                 raise ValueError('hosted metric identity/verdict mismatch')
             if measured['elapsed_seconds'] != p[mode + '_seconds'] or measured['billed_minutes'] != p[mode + '_billed_minutes']:
                 raise ValueError('metric values differ from collected evidence')
@@ -136,6 +172,16 @@ def rollout(evidence):
         raise ValueError('maximum elapsed regressed')
     if sum(p['sharded_billed_minutes'] for p in pairs) > 1.5 * sum(p['serial_billed_minutes'] for p in pairs):
         raise ValueError('billed runner-minute ceiling exceeded')
+    def bind_control(control):
+        identities = [run_id(control.get(k)) for k in ('reference_run_id', 'run_id')]
+        if any(r in cancelled for r in identities):
+            raise ValueError('run binding: control run was cancelled')
+        if len(set([*run_ids, *identities])) != len(run_ids) + len(identities):
+            raise ValueError('run binding: control hosted run reused')
+        bind_reports(control['reference'], control['shards'], identities[0], identities[1],
+                     control.get('reference_attempt'), control.get('attempt'))
+        run_ids.extend(identities)
+
     for name, purpose in (('historical_failure', 'historical'), ('injected_failure', 'injected')):
         control = evidence.get(name, {})
         if not control.get('run_id') or not control.get('controls') or not control.get('reference') or not control.get('shards'):
@@ -144,10 +190,16 @@ def rollout(evidence):
             raise ValueError('wrong expected-failure control purpose: ' + name)
         if purpose == 'historical' and not re.fullmatch(r'[0-9a-f]{40}', control.get('historical_revision', '')):
             raise ValueError('historical revision identity required')
+        if purpose == 'historical' and not all(
+                c.get('revision') == control['historical_revision']
+                for c in control['controls'] if c['purpose'] == 'historical'):
+            raise ValueError('historical revision record mismatch or absent')
+        bind_control(control)
         compare(control['reference'], control['shards'], control_path=control['controls'])
     canary = evidence.get('canary_without_engine', {})
     if not canary.get('run_id') or canary.get('aggregate_verdict') != 'failure' or not canary.get('shards'):
         raise ValueError('missing canary aggregate failure evidence')
+    bind_control(canary)
     if any(not r.get('scan', {}).get('completed') for r in canary['shards']):
         raise ValueError('incomplete canary scan')
     planted = [r for r in canary['shards'] if not r['scan'].get('ok')]

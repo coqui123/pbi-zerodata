@@ -1,1 +1,11 @@
-{}
+{
+  "windows": {
+    "mcp": [
+      "PBZ_SKIP {\"test\": \"__main__.GitHookTests.test_chain_bytes_args_stdin_and_status\", \"reason\": \"direct shell hook execution is POSIX-only\"}",
+      "PBZ_SKIP {\"test\": \"__main__.GitHookTests.test_non_executable_host_is_ignored\", \"reason\": \"executable mode semantics require POSIX\"}",
+      "PBZ_SKIP {\"test\": \"__main__.InstallerTransactionTests.test_atomic_text_preserves_mode_and_symlink\", \"reason\": \"POSIX modes and symlink\"}",
+      "PBZ_SKIP {\"test\": \"__main__.InstallerTransactionTests.test_posix_lock_timeout_is_named_conflict\", \"reason\": \"POSIX flock\"}"
+    ]
+  },
+  "posix": {}
+}

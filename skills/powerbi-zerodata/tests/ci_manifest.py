@@ -1,4 +1,5 @@
 """Explicit registration and deterministic whole-script allocation."""
+import hashlib
 import collections
 import json
 import re
@@ -54,8 +55,8 @@ def validate(entries, tests=TESTS):
             raise ValueError('engine requires --offline')
         if not isinstance(e['windows'], bool) or not isinstance(e['engine'], bool):
             raise ValueError('requirements must be boolean')
-        if e['id'] == 'ci_registration' and e['engine']:
-            raise ValueError('ci_registration must be engine-free')
+        if e['id'] in ('ci_registration', 'plan_pure') and e['engine']:
+            raise ValueError(e['id'] + ' must be engine-free')
         if script.name == 'test_engine.py' and not (e['engine'] and e['windows']):
             raise ValueError('engine-offline requires engine and windows')
         if e.get('weight', 1) <= 0:
@@ -113,20 +114,31 @@ def controls(entries, path=None, check_scripts=True):
         if record['purpose'] == 'injected' and name in result:
             raise ValueError('injected control must have a separate suite ID')
         argv = list(record.get('argv', [record.get('script', '')]))
+        source, execution_argv = None, list(argv)
         if 'revision' in record or 'script' in record:
             revision, script = record.get('revision', ''), Path(record.get('script', ''))
             if (not re.fullmatch(r'[0-9a-fA-F]{40}', revision) or script.is_absolute()
                     or '..' in script.parts or not script.parts):
                 raise ValueError('invalid historical revision/script')
-            if check_scripts:
+            data = None
+            if check_scripts or not record.get('sha256'):
                 data = subprocess.check_output(['git', 'show', f'{revision}:{script.as_posix()}'], cwd=ROOT)
+            digest = hashlib.sha256(data).hexdigest() if data is not None else record['sha256']
+            if (not re.fullmatch(r'[0-9a-f]{64}', digest) or
+                    record.get('sha256', digest) != digest):
+                raise ValueError('historical content identity mismatch')
+            source = dict(revision=revision, path=script.as_posix(), sha256=digest)
+            if check_scripts:
                 directory = tempfile.TemporaryDirectory(prefix='pbz-controls-')
                 _CONTROL_DIRS.append(directory)
                 target = Path(directory.name) / script.name
                 target.write_bytes(data)
-                argv[0] = str(target)
+                execution_argv[0] = str(target)
         elif check_scripts and not (TESTS.parent / argv[0]).is_file():
             raise ValueError('missing control script')
         result[name] = dict(id=name, argv=argv, windows=True, engine=True)
+        if source is not None:
+            result[name]['source'] = source
+            result[name]['execution_argv'] = execution_argv
         expected[name] = (record['exit_code'], record['reason'])
     return list(result.values()), expected

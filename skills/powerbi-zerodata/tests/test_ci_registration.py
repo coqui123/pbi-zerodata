@@ -10,7 +10,7 @@ import contextlib
 import io
 import os
 import types
-from ci_equivalence import compare, rollout, serial_inventory
+from ci_equivalence import compare, rollout, serial_inventory, inventory
 from ci_timing import measured, instrument
 from ci_hosted_metrics import metrics
 import unittest
@@ -24,8 +24,12 @@ class CiRegistrationTests(unittest.TestCase):
         self.entries = load()
 
     def test_checked_in_workflow_registers_offline_suites(self):
-        self.assertEqual([{k: e[k] for k in ('id', 'argv')} for e in self.entries],
-                         json.loads(BASELINE.read_text())['suites'])
+        self.assertCountEqual([{k: e[k] for k in ('id', 'argv')} for e in self.entries],
+                         inventory())
+        self.assertEqual({e['id'] for e in json.loads((BASELINE.parent / 'offline_additions.json').read_text())['suites']},
+                         {'checks', 'rename_bindings', 'usage', 'evidence'})
+        self.assertFalse({'checks', 'rename_bindings', 'usage', 'evidence'} &
+                         {e['id'] for e in json.loads(BASELINE.read_text())['suites']})
         self.assertEqual(sum(e['argv'] == ['tests/test_engine.py', '--offline'] for e in self.entries), 1)
 
     def test_unregistered_offline_suite_fails_the_guard(self):
@@ -66,6 +70,7 @@ class CiRegistrationTests(unittest.TestCase):
         for name, key, value, reason in [('guard', 'windows', 1, 'boolean'),
                                          ('guard', 'engine', 'true', 'boolean'),
                                          ('ci_registration', 'engine', True, 'engine-free'),
+                                         ('plan_pure', 'engine', True, 'engine-free'),
                                          ('engine-offline', 'engine', False, 'engine and windows'),
                                          ('engine-offline', 'windows', False, 'engine and windows')]:
             entries = copy.deepcopy(self.entries)
@@ -75,6 +80,7 @@ class CiRegistrationTests(unittest.TestCase):
         registration = next(e for e in self.entries if e['id'] == 'ci_registration')
         self.assertFalse(registration['windows'])
         self.assertFalse(registration['engine'])
+        self.assertFalse(next(e for e in self.entries if e['id'] == 'plan_pure')['engine'])
 
     def test_workflow_offline_jobs_use_only_executors(self):
         root = Path(__file__).resolve().parents[3]
@@ -170,6 +176,27 @@ class CiRegistrationTests(unittest.TestCase):
             self.assertEqual(report['executed'][0]['exit_code'], 7)
             self.assertEqual(report['executed'][0]['failure_reason'], 'HISTORICAL_FAILURE')
             self.assertFalse(report['ok'])
+            self.assertEqual(report['executed'][0]['argv'], ['suite.py'])
+            def child(argv, **kwargs):
+                if Path(argv[2]).name == 'suite.py':
+                    return subprocess.run(argv, **kwargs)
+                return subprocess.CompletedProcess(argv, 0)
+            fixed = {k: 'fixed' for k in ('python', 'os', 'image', 'dotnet', 'dependencies',
+                                         'nuget', 'source', 'project', 'payload')}
+            with patch.object(run_offline, 'identity', return_value=fixed), patch.object(run_offline, 'ROOT', root), contextlib.redirect_stdout(io.StringIO()):
+                def execute(group, shard):
+                    return run_offline.execute(group, shard=shard, output=root / str(shard), run=child,
+                                              expected_failures=expected, scanner=lambda roots: {'completed': True, 'ok': True})
+                reference = execute(entries, 'serial')
+                shards = [execute(group, i) for i, group in enumerate(allocate(entries, 2))]
+                self.assertTrue(compare(reference, shards, control_path=[record]))
+            source = next(row for row in reference['executed'] if row['id'] == 'guard')['source']
+            self.assertEqual(source['revision'], revision)
+            self.assertEqual(source['path'], 'suite.py')
+            self.assertEqual(len(source['sha256']), 64)
+            next(row for row in shards[0]['executed'] + shards[1]['executed'] if row['id'] == 'guard')['source']['sha256'] = '0' * 64
+            with self.assertRaisesRegex(ValueError, 'source identity'):
+                compare(reference, shards, control_path=[record])
 
     def test_real_fresh_process_reports_exit_skip_and_scan(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(run_offline, 'identity', return_value={}), contextlib.redirect_stdout(io.StringIO()), patch.object(run_offline.subprocess, 'check_output', return_value='fixture'):
@@ -193,6 +220,69 @@ class CiRegistrationTests(unittest.TestCase):
         self.assertFalse(report['ok'])
         self.assertEqual(report['executed'][0]['exit_code'], 91)
         self.assertEqual(report['executed'][0]['failure_reason'], 'PBZ_INJECTED_FAILURE')
+
+    def test_output_setup_and_scanner_failure_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocked = Path(tmp, 'file')
+            blocked.write_text('not a directory')
+            scanner = unittest.mock.Mock(return_value={'completed': True, 'ok': True})
+            report = run_offline.execute([], output=blocked, scanner=scanner)
+            scanner.assert_called_once()
+            self.assertFalse(report['ok'])
+            self.assertEqual(report['error'], 'FileExistsError')
+            def child(argv, **kwargs):
+                kwargs['stdout'].write(b'raw private log')
+                return subprocess.CompletedProcess(argv, 0)
+            with patch.object(run_offline, 'identity', return_value={}), patch.object(run_offline.subprocess, 'check_output', return_value='sha'), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'scanner'):
+                    run_offline.execute([self.entries[0]], output=tmp, run=child,
+                                        scanner=unittest.mock.Mock(side_effect=RuntimeError('scanner')))
+            self.assertEqual(list(Path(tmp).glob('*.log')), [])
+
+    def test_controls_are_workflow_environment_data(self):
+        root = Path(__file__).resolve().parents[3]
+        for name in ('tests.yml', 'offline-shadow.yml'):
+            lines = (root / '.github/workflows' / name).read_text().splitlines()
+            for i, line in enumerate(lines):
+                if 'run: python' in line and '--rollout' not in line and ('run_offline.py' in line or 'ci_equivalence.py' in line):
+                    self.assertNotIn('--controls', line)
+                    self.assertNotIn('PBZ_CI_CONTROLS', line)
+                    self.assertIn('PBZ_CI_CONTROLS:', lines[i-1])
+
+    def test_staged_checker_isolates_absolute_outer_index(self):
+        root = Path(__file__).resolve().parents[3]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+            env['GIT_INDEX_FILE'] = str(repo / 'alternate-index')
+            def git(*args):
+                return subprocess.check_output(['git', *args], cwd=repo, env=env)
+            git('init', '-q')
+            tests = repo / 'skills/powerbi-zerodata/tests'
+            tests.mkdir(parents=True)
+            (repo / 'outer.txt').write_text('outer')
+            (tests / 'run_offline.py').write_text('pass')
+            (tests / 'test_plan_pure.py').write_text('pass')
+            (tests / 'test_ci_registration.py').write_text("""import subprocess, tempfile
+from pathlib import Path
+with tempfile.TemporaryDirectory() as tmp:
+    def git(*args):
+        subprocess.run(['git', *args], cwd=tmp, check=True, capture_output=True)
+    git('init', '-q')
+    git('config', 'user.name', 'Fixture')
+    git('config', 'user.email', 'fixture@example.test')
+    Path(tmp, 'suite.py').write_text('pass')
+    git('add', '.')
+    git('commit', '-qm', 'fixture')
+""")
+            git('add', 'outer.txt', 'skills')
+            before = (repo / 'alternate-index').read_bytes()
+            staged = git('ls-files', '--stage')
+            result = subprocess.run([sys.executable, str(root / 'scripts/check_staged.py')], cwd=repo,
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((repo / 'alternate-index').read_bytes(), before)
+            self.assertEqual(git('ls-files', '--stage'), staged)
 
 
 class EquivalenceTests(unittest.TestCase):
@@ -273,24 +363,26 @@ class EquivalenceTests(unittest.TestCase):
 
     def evidence(self):
         result = {'cancelled_attempts': [], 'pairs': [dict(pair_id=i, sha='same', equivalent=True, cold_cache=i == 0,
-                              serial_run=f'serial-{i}', sharded_run=f'sharded-{i}',
+                              serial_run=f'serial-{i}', sharded_run=f'sharded-{i}', serial_attempt='1', sharded_attempt='1',
                               serial_seconds=400, sharded_seconds=250,
                               serial_billed_minutes=7, sharded_billed_minutes=9) for i in range(10)],
                 **{k: {'verified': True, 'run_id': 'control', 'reason': 'expected specific failure'} for k in
                    ('historical_failure', 'injected_failure', 'canary_without_engine')}}
         for p in result['pairs']:
             p['reference'], p['shards'] = self.reports()
-            p['reference']['run'] = {'id': p['serial_run']}
-            for r in p['shards']: r['run'] = {'id': p['sharded_run']}
+            p['reference']['run'] = {'id': p['serial_run'], 'attempt': '1'}
+            for r in p['shards']: r['run'] = {'id': p['sharded_run'], 'attempt': '1'}
             for r in [p['reference'], *p['shards']]: r['cold_cache'] = p['cold_cache']
             for mode in ('serial', 'sharded'):
-                p[mode + '_metrics'] = dict(run_id=p[mode + '_run'], sha=p['sha'], conclusion='success',
+                p[mode + '_metrics'] = dict(run_id=p[mode + '_run'], attempt='1', sha=p['sha'], conclusion='success',
                                            elapsed_seconds=p[mode + '_seconds'], billed_minutes=p[mode + '_billed_minutes'])
         for key, purpose in (('historical_failure', 'historical'), ('injected_failure', 'injected')):
             ref, shards = self.reports()
             control = dict(id='guard' if purpose == 'historical' else 'injected-control',
                            argv=['tests/test_guard.py'] if purpose == 'historical' else ['tests/test_ci_registration.py', '--injected-failure'],
                            exit_code=91, reason='specific failure reason', purpose=purpose)
+            if purpose == 'historical':
+                control.update(revision='a' * 40, script='tests/test_guard.py', sha256='b' * 64)
             if purpose == 'injected':
                 row = dict(id=control['id'], argv=control['argv'], exit_code=91, error=None,
                            skip_reasons=[], failure_reason=control['reason'])
@@ -303,7 +395,8 @@ class EquivalenceTests(unittest.TestCase):
                 for r in [ref, *shards]:
                     for row in r['executed']:
                         if row['id'] == control['id']:
-                            row.update(exit_code=91, failure_reason=control['reason'])
+                            row.update(exit_code=91, failure_reason=control['reason'],
+                                       source=dict(revision=control['revision'], path=control['script'], sha256=control['sha256']))
             for r in [ref, *shards]:
                 r['ok'] = all(e['exit_code'] == 0 for e in r['executed'])
             result[key] = dict(run_id='control-' + purpose, controls=[control], reference=ref, shards=shards,
@@ -313,6 +406,12 @@ class EquivalenceTests(unittest.TestCase):
         planted['ok'] = False
         planted['scan'] = dict(completed=True, ok=False, failures=[{'reason': 'canary'}])
         result['canary_without_engine'] = dict(run_id='canary-control', aggregate_verdict='failure', reference=ref, shards=shards)
+        for key in ('historical_failure', 'injected_failure', 'canary_without_engine'):
+            control = result[key]
+            control.update(reference_run_id=control['run_id'] + '-reference', reference_attempt='1', attempt='1')
+            control['reference']['run'] = dict(id=control['reference_run_id'], attempt='1')
+            for shard in control['shards']:
+                shard['run'] = dict(id=control['run_id'], attempt='1')
         return result
 
     def test_rollout_positive_and_all_thresholds(self):
@@ -344,8 +443,8 @@ class EquivalenceTests(unittest.TestCase):
         for variant, reason in [('same-run', 'run binding'), ('split-run', 'run binding'),
                                 ('partial-binding', 'run binding'), ('allocation', 'allocation'), ('agreeing-skip', 'unexpected skip')]:
             ref, shards = self.reports()
-            ref['run'] = {'id': 'serial'}
-            for shard in shards: shard['run'] = {'id': 'shards'}
+            ref['run'] = {'id': 'serial', 'attempt': '1'}
+            for shard in shards: shard['run'] = {'id': 'shards', 'attempt': '1'}
             if variant == 'same-run':
                 ref['run']['id'] = 'shards'
             elif variant == 'split-run':
@@ -384,11 +483,85 @@ class EquivalenceTests(unittest.TestCase):
             with self.subTest(variant=variant), self.assertRaisesRegex(ValueError, reason):
                 rollout(evidence)
 
+
+    def test_unrecorded_manifest_addition_is_rejected(self):
+        import ci_equivalence
+        ref, shards = self.reports()
+        entries = json.loads(MANIFEST.read_text()) + [dict(id='unrecorded', argv=['tests/test_unrecorded.py'])]
+        row = dict(entries[-1], exit_code=0, skip_reasons=[], error=None)
+        ref['executed'].append(row)
+        rows = {r['id']: r for r in ref['executed']}
+        for shard, group in zip(shards, allocate(entries, 2)):
+            shard['executed'] = [rows[e['id']] for e in group]
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp, 'manifest.json')
+            manifest.write_text(json.dumps(entries))
+            with patch.object(ci_equivalence, 'MANIFEST', manifest), self.assertRaisesRegex(ValueError, 'membership'):
+                compare(ref, shards)
+
+    def test_platform_scoped_mcp_skips(self):
+        allowed = json.loads((BASELINE.parent / 'offline_skips.json').read_text())['windows']['mcp']
+        self.assertEqual(len(allowed), 4)
+        for platform, extra, passes in [('Windows-2025', False, True), ('Windows-2025', True, False), ('Linux', False, False)]:
+            ref, shards = self.reports()
+            for report in [ref, *shards]:
+                report['identity']['os'] = platform
+                for row in report['executed']:
+                    if row['id'] == 'mcp':
+                        row['skip_reasons'] = allowed + (['undeclared'] if extra else [])
+            if passes:
+                self.assertTrue(compare(ref, shards))
+            else:
+                with self.assertRaisesRegex(ValueError, 'unexpected skip'):
+                    compare(ref, shards)
+
+    def test_rollout_requires_recorded_historical_revision(self):
+        for revision in (None, '0' * 40):
+            evidence = self.evidence()
+            record = evidence['historical_failure']['controls'][0]
+            if revision is None:
+                for key in ('revision', 'script', 'sha256'):
+                    record.pop(key)
+            else:
+                record['revision'] = revision
+            with self.assertRaisesRegex(ValueError, 'revision record'):
+                rollout(evidence)
+
+    def test_canonical_run_attempt_and_control_bindings(self):
+        for variant in ('mixed-duplicate', 'shard-attempt', 'metric-attempt', 'missing-attempt',
+                        'control-unbound', 'control-mismatch', 'control-attempt', 'control-cancelled', 'control-reused', 'canary-unbound'):
+            evidence = self.evidence()
+            pair = evidence['pairs'][0]
+            if variant == 'mixed-duplicate':
+                pair['serial_run'] = 123
+                evidence['pairs'][1]['serial_run'] = '123'
+            elif variant == 'shard-attempt':
+                pair['shards'][0]['run']['attempt'] = '2'
+            elif variant == 'metric-attempt':
+                pair['serial_metrics']['attempt'] = '2'
+            elif variant == 'missing-attempt':
+                pair.pop('serial_attempt')
+            elif variant == 'control-unbound':
+                evidence['historical_failure']['reference'].pop('run')
+            elif variant == 'control-mismatch':
+                evidence['injected_failure']['run_id'] = 'wrong'
+            elif variant == 'control-cancelled':
+                evidence['cancelled_attempts'] = [evidence['injected_failure']['run_id']]
+            elif variant == 'control-reused':
+                evidence['injected_failure']['run_id'] = evidence['historical_failure']['run_id']
+            elif variant == 'control-attempt':
+                evidence['injected_failure']['shards'][0]['run']['attempt'] = '2'
+            else:
+                evidence['canary_without_engine']['run_id'] = 'wrong'
+            with self.subTest(variant=variant), self.assertRaisesRegex(ValueError, 'run binding|runs reused|metric identity'):
+                rollout(evidence)
+
     def test_hosted_metrics_include_setup_and_final_aggregate(self):
-        run = dict(id='run', head_sha='same', status='completed', conclusion='success', created_at='2026-11-19T00:00:00Z')
+        run = dict(id='run', run_attempt=2, head_sha='same', status='completed', conclusion='success', created_at='2026-11-19T00:00:00Z')
         jobs = [dict(status='completed', conclusion='success', started_at='2026-11-19T00:00:10Z', completed_at='2026-11-19T00:01:11Z'),
                 dict(status='completed', conclusion='success', started_at='2026-11-19T00:01:20Z', completed_at='2026-11-19T00:01:30Z')]
         result = metrics(run, jobs, 3)
+        self.assertEqual(result['attempt'], 2)
         self.assertEqual(result['elapsed_seconds'], 90)
         self.assertEqual(result['rounded_job_minutes_estimate'], 3)
         self.assertEqual(result['billed_minutes'], 3)

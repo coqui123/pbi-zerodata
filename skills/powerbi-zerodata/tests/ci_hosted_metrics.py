@@ -21,7 +21,7 @@ def metrics(run, jobs, billed_minutes):
                  if j['conclusion'] != 'skipped']
     if not intervals or billed_minutes <= 0:
         raise ValueError('observed billing and completed jobs required')
-    return {'run_id': run['id'], 'sha': run['head_sha'], 'conclusion': run['conclusion'],
+    return {'run_id': run['id'], 'attempt': run.get('run_attempt'), 'sha': run['head_sha'], 'conclusion': run['conclusion'],
             'elapsed_seconds': max(seconds(j['completed_at']) for j in jobs if j['conclusion'] != 'skipped') - seconds(run['created_at']),
             'runner_minutes': sum(intervals) / 60,
             'rounded_job_minutes_estimate': sum(math.ceil(s / 60) for s in intervals),

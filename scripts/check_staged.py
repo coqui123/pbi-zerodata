@@ -14,7 +14,9 @@ def main():
         for path in tree.rglob('*.py'):
             compile(path.read_bytes(), str(path.relative_to(tree)), 'exec')
         skill = tree / 'skills/powerbi-zerodata'
-        env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}
+        # Export uses the caller's index; checks must own their Git repositories.
+        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        env['PYTHONDONTWRITEBYTECODE'] = '1'
         for argv in (['tests/run_offline.py', '--check'], ['tests/test_ci_registration.py'], ['tests/test_plan_pure.py']):
             subprocess.run([sys.executable, *argv], cwd=skill, env=env, check=True)
     return 0

@@ -59,7 +59,9 @@ jobs:
       - run: python -m pip install --disable-pip-version-check jsonschema
       - run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
       - if: always()
-        run: python tests/run_offline.py --report ci-results/serial.json --output-root "${{ runner.temp }}" --controls "${{ inputs.controls }}"
+        env:
+          PBZ_CI_CONTROLS: ${{ inputs.controls }}
+        run: python tests/run_offline.py --report ci-results/serial.json --output-root "${{ runner.temp }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -94,7 +96,9 @@ jobs:
       - run: python -m pip install --disable-pip-version-check jsonschema
       - run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
       - if: always()
-        run: python tests/run_offline.py --shard ${{ matrix.shard }} --shards 2 --report ci-results/shard-${{ matrix.shard }}.json --output-root "${{ runner.temp }}" --controls "${{ inputs.controls }}"
+        env:
+          PBZ_CI_CONTROLS: ${{ inputs.controls }}
+        run: python tests/run_offline.py --shard ${{ matrix.shard }} --shards 2 --report ci-results/shard-${{ matrix.shard }}.json --output-root "${{ runner.temp }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -115,9 +119,13 @@ jobs:
         with:
           path: evidence
       - if: inputs.mode == 'serial'
-        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --serial-only evidence --controls "${{ inputs.controls }}"
+        env:
+          PBZ_CI_CONTROLS: ${{ inputs.controls }}
+        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --serial-only evidence
       - if: inputs.mode == 'sharded'
-        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --shards-only evidence --controls "${{ inputs.controls }}"
+        env:
+          PBZ_CI_CONTROLS: ${{ inputs.controls }}
+        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --shards-only evidence
       - name: Reject unsuccessful or cancelled jobs
         shell: pwsh
         run: |

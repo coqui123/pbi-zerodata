@@ -1,0 +1,28 @@
+{
+  "suites": [
+    {
+      "id": "checks",
+      "argv": [
+        "tests/test_checks.py"
+      ]
+    },
+    {
+      "id": "rename_bindings",
+      "argv": [
+        "tests/test_rename_bindings.py"
+      ]
+    },
+    {
+      "id": "usage",
+      "argv": [
+        "tests/test_usage.py"
+      ]
+    },
+    {
+      "id": "evidence",
+      "argv": [
+        "tests/test_evidence.py"
+      ]
+    }
+  ]
+}

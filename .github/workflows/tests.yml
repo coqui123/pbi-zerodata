@@ -53,7 +53,8 @@ jobs:
         if: always()
         env:
           PYTHONIOENCODING: utf-8
-        run: python tests/run_offline.py --report ci-results/serial.json --output-root "${{ runner.temp }}" --controls "${{ vars.PBZ_CI_CONTROLS }}"
+          PBZ_CI_CONTROLS: ${{ vars.PBZ_CI_CONTROLS }}
+        run: python tests/run_offline.py --report ci-results/serial.json --output-root "${{ runner.temp }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -99,7 +100,8 @@ jobs:
       - if: always()
         env:
           PYTHONIOENCODING: utf-8
-        run: python tests/run_offline.py --shard ${{ matrix.shard }} --report ci-results/shard-${{ matrix.shard }}.json --output-root "${{ runner.temp }}" --controls "${{ vars.PBZ_CI_CONTROLS }}"
+          PBZ_CI_CONTROLS: ${{ vars.PBZ_CI_CONTROLS }}
+        run: python tests/run_offline.py --shard ${{ matrix.shard }} --report ci-results/shard-${{ matrix.shard }}.json --output-root "${{ runner.temp }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -121,9 +123,13 @@ jobs:
           pattern: ${{ vars.PBZ_OFFLINE_MODE == 'sharded' && 'shard-*' || 'serial' }}
           path: evidence
       - if: vars.PBZ_OFFLINE_MODE == 'sharded'
-        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --shards-only evidence --controls "${{ vars.PBZ_CI_CONTROLS }}"
+        env:
+          PBZ_CI_CONTROLS: ${{ vars.PBZ_CI_CONTROLS }}
+        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --shards-only evidence
       - if: vars.PBZ_OFFLINE_MODE != 'sharded'
-        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --inventory-only evidence --controls "${{ vars.PBZ_CI_CONTROLS }}"
+        env:
+          PBZ_CI_CONTROLS: ${{ vars.PBZ_CI_CONTROLS }}
+        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --inventory-only evidence
       - name: Stable required check (rollback selects serial with no protection gap)
         shell: pwsh
         run: |
