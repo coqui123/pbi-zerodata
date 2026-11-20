@@ -324,6 +324,24 @@ class Env:
         return d
 
 
+def _tree_manifest(root: Path) -> dict[str, str]:
+    """Fingerprint every file in a source tree, including existing build outputs."""
+    return {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob("*") if path.is_file()}
+
+
+def _manifest_changes(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    changes = []
+    for path in sorted(before.keys() | after.keys()):
+        if path not in before:
+            changes.append(f"added: {path}")
+        elif path not in after:
+            changes.append(f"removed: {path}")
+        elif before[path] != after[path]:
+            changes.append(f"content-changed: {path}")
+    return sorted(changes)
+
+
 def test_grouped_streaming(tmp: Path) -> None:
     """Offline .NET acceptance: execute the production aggregators with a lazy row source.
 
@@ -477,6 +495,7 @@ try {
     label = "offline grouped streaming: exact verdicts, samples, consumption, retention and index loads"
     # Global settings also apply to implicit restore and referenced projects. The engine
     # sets BaseOutputPath itself, so override it along with the SDK artifacts layout.
+    source_manifests = {source: _tree_manifest(source) for source in (helper, S / "engine")}
     for attempt in range(2):
         try:
             proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Grouped.csproj"),
@@ -490,10 +509,10 @@ try {
                proc.returncode == 0 and b"grouped streaming acceptance passed" in proc.stdout,
                {"exit": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace"),
                 "stderr": proc.stderr.decode("utf-8", "replace")})
-        source_artifacts = [str(path) for source in (helper, S / "engine")
-                            for name in ("obj", "bin") for path in source.rglob(name) if path.is_dir()]
-        expect(f"grouped streaming build {attempt + 1}: no source obj/bin directories",
-               not source_artifacts, {"paths": source_artifacts})
+        source_changes = {str(source): changes for source, before in source_manifests.items()
+                          if (changes := _manifest_changes(before, _tree_manifest(source)))}
+        expect(f"grouped streaming build {attempt + 1}: source trees unchanged",
+               not source_changes, {"paths": source_changes})
 
 
 def test_offline(env: Env, tmp: Path) -> None:
@@ -1282,6 +1301,37 @@ class PerfPrivacyTests(unittest.TestCase):
 
 
 class GroupedStreamingLauncherTests(unittest.TestCase):
+    def test_source_tree_manifest_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "engine" / "bin" / "pbz-engine.exe"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"original")
+            before = _tree_manifest(root)
+            self.assertEqual(set(before), {"engine/bin/pbz-engine.exe"})
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)), [])
+
+            added = executable.parent / "new.dll"
+            added.write_bytes(b"new")
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)),
+                             ["added: engine/bin/new.dll"])
+            before = _tree_manifest(root)
+            executable.write_bytes(b"modified")  # Same size; content must be compared.
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)),
+                             ["content-changed: engine/bin/pbz-engine.exe"])
+            before = _tree_manifest(root)
+            added.unlink()
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)),
+                             ["removed: engine/bin/new.dll"])
+
+            before = _tree_manifest(root)
+            build_output = root / "engine" / "build" / "output.dll"
+            build_output.parent.mkdir()
+            build_output.write_bytes(b"output")
+            executable.unlink()
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)),
+                             ["added: engine/build/output.dll", "removed: engine/bin/pbz-engine.exe"])
+
     def assert_launch_failure(self, error):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory, \
