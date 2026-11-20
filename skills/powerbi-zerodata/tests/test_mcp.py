@@ -40,6 +40,47 @@ class InstallerTransactionTests(unittest.TestCase):
     def setUp(self):
         self.inst = load_installer()
 
+    def test_reinstall_preserves_later_identical_host_hook(self):
+        inst = self.inst
+        child = {"type": "command", "command": inst.hook_cmd("claude"), "timeout": 15}
+        host = {"matcher": ".*", "hooks": [child, {"type": "command", "command": "host-hook"}],
+                "host_metadata": True}
+        host_bytes = json.dumps(host).encode()
+        for remove_recorded in (False, True):
+            with self.subTest(remove_recorded=remove_recorded), tempfile.TemporaryDirectory() as tmp:
+                path = str(Path(tmp, "settings.json"))
+                inst.settings_step(path, "claude", False, False)
+                installed = inst.load_json(path)
+                if remove_recorded:
+                    installed["hooks"]["PreToolUse"].clear()
+                installed["hooks"]["PreToolUse"].append(json.loads(host_bytes))
+                inst.save_json(path, installed, False)
+                inst.settings_step(path, "claude", False, False)
+                reinstalled = inst.load_json(path)["hooks"]["PreToolUse"]
+                self.assertEqual(len(reinstalled), 2)
+                self.assertIn({"matcher": ".*", "hooks": [child]}, reinstalled)
+                inst.settings_step(path, "claude", False, True)
+                remaining = inst.load_json(path)["hooks"]["PreToolUse"]
+                self.assertEqual(remaining, [host])
+                self.assertEqual(json.dumps(remaining[0]).encode(), host_bytes)
+
+    def test_unrelated_guard_mentions_survive_install_and_uninstall(self):
+        inst = self.inst
+        for command in ("echo powerbi-zerodata && python /some/other/guard.py",
+                        "python -I -S /unrelated/powerbi-zerodata/pbz/guard.py --agent claude",
+                        "python -I -S /some/other/guard.py --agent claude # powerbi-zerodata"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as tmp:
+                path = str(Path(tmp, "settings.json"))
+                original = {"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [
+                    {"type": "command", "command": command}]}]}}
+                self.assertFalse(inst.is_ours(original["hooks"]["PreToolUse"][0]))
+                inst.save_json(path, original, False)
+                before = Path(path).read_bytes()
+                inst.settings_step(path, "claude", False, False)
+                self.assertEqual(inst.load_json(path)["hooks"]["PreToolUse"][0], original["hooks"]["PreToolUse"][0])
+                inst.settings_step(path, "claude", False, True)
+                self.assertEqual(Path(path).read_bytes(), before)
+
     def test_host_keys_and_nested_tables_refused_on_apply_update_uninstall(self):
         clean, _ = self.inst.merge_codex_toml('', False)
         for host in ('extra = "host"\n', '[mcp_servers.pbz.env]\nHOST = "keep"\n',
@@ -858,14 +899,18 @@ def installer_ownership_checks(check, tmp, inst):
                 argv = ["install.py"] + (["--uninstall"] if uninstall else []) + (["--what-if"] if what_if else [])
                 with patch.object(sys, "argv", argv), patch.object(inst, "LINKS", []), \
                         patch.object(inst, "RULE_FILES", []), patch.object(inst, "_refuse_spaced_paths"), \
+                        patch.object(inst, "CLAUDE_SETTINGS", r"C:\Users\fixture\.claude\settings.json"), \
+                        patch.object(inst, "CODEX_HOOKS", r"C:\Users\fixture\.codex\hooks.json"), \
                         patch.object(inst, "settings_step", return_value=changed), \
                         patch.object(inst, "mcp_step", return_value=[]), patch("builtins.print") as output:
                     inst.main()
-                lines = [str(c) for c in output.call_args_list]
-                check(any(("hooks + deny rules -> " if changed else "ok ") + inst.CLAUDE_SETTINGS in l for l in lines),
-                      "Claude settings status missing")
-                check(any(("hooks -> " if changed else "ok ") + inst.CODEX_HOOKS in l for l in lines),
-                      "Codex settings status missing")
+                    lines = [c.args[0] for c in output.call_args_list if c.args]
+                    # Status messages use print(" ", message): inspect those real arguments too.
+                    lines.extend(arg for c in output.call_args_list for arg in c.args[1:])
+                    check(any(("hooks + deny rules -> " if changed else "ok ") + inst.CLAUDE_SETTINGS in l for l in lines),
+                          "Claude settings status missing")
+                    check(any(("hooks -> " if changed else "ok ") + inst.CODEX_HOOKS in l for l in lines),
+                          "Codex settings status missing")
 
 
 if __name__ == "__main__":

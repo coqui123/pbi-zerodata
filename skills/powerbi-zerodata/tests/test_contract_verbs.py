@@ -82,6 +82,23 @@ class ContractVerbTests(unittest.TestCase):
         response = {"ok": True, "verb": "synth-query", "verified": True, "columns": ["X"], "rows": [["synthetic"]], "truncated": False}
         self.assertEqual(engine._project("synth-query", response), response)
 
+    def test_group_key_single_shapes_and_mixed_union(self):
+        def response(key):
+            return {"ok": True, "verb": "check", "checks": [
+                {"id": "fixture", "status": "FAIL", "groups": [{"Column": key}]}]}
+
+        with open(os.path.join(ENGINE, "contract.schema.json"), encoding="utf-8") as handle:
+            defs = json.load(handle)["$defs"]
+        for key in ({"reveal": "label"}, {"hmac": "a" * 64}, {"blank": True}):
+            with self.subTest(key=key):
+                self.assertEqual(engine._closed(key, {"$ref": "#/$defs/groupKey"}, defs), key)
+                self.assertEqual(engine._project("check", response(key)), response(key))
+        mixed = {"reveal": "label", "blank": True}
+        with self.assertRaisesRegex(ValueError, "union"):
+            engine._closed(mixed, {"$ref": "#/$defs/groupKey"}, defs)
+        self.assertEqual(engine._project("check", response(mixed)),
+                         {"ok": False, "verb": "check", "class": "ENGINE_UNAVAILABLE"})
+
     def test_every_dispatch_verb_is_in_the_schema_and_the_contract(self):
         program = open(os.path.join(ENGINE, "Program.cs"), encoding="utf-8").read()
         schema = json.load(open(os.path.join(ENGINE, "contract.schema.json"), encoding="utf-8"))

@@ -20,6 +20,7 @@ import datetime as dt
 import tempfile
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -223,13 +224,26 @@ def update_toml(path, uninstall, what_if=False):
 
 
 def is_ours(entry: dict) -> bool:
-    return any("powerbi-zerodata" in str(h.get("command", "")) and "guard.py" in str(h.get("command", ""))
-               for h in entry.get("hooks", []))
+    guards = {os.path.join(base, "pbz", "guard.py").replace("\\", "/")
+              for base in [CANON, *LINKS]}
+    for hook in entry.get("hooks", []):
+        command = hook.get("command", "")
+        if not isinstance(command, str):
+            continue
+        # The installer emits unquoted paths and isolated Python invocations.
+        # Retain recognition of the old trailing --old migration marker.
+        match = re.fullmatch(r"([^\s;&|<>]+) -I -S ([^\s;&|<>]+) --agent (claude|codex)(?: --old)?", command)
+        if (match and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?",
+                                   match[1].replace("\\", "/").rsplit("/", 1)[-1], re.IGNORECASE)
+                and match[2].replace("\\", "/") in guards):
+            return True
+    return False
 
 
 def merge_hooks(data: dict, agent: str, uninstall: bool, owned: dict | None = None) -> dict:
     owned = owned if owned is not None else {}
     rec = owned.get("hooks", {})
+    allow_adoption = not rec
     if uninstall:
         hooks = data.get("hooks", {})
         for addition in rec.get("additions", []):
@@ -272,11 +286,13 @@ def merge_hooks(data: dict, agent: str, uninstall: bool, owned: dict | None = No
                 if old == child:
                     if entry.get("matcher") == matcher:
                         addition = {"event": event, "child": child,
-                                    "shell": {**entry, "hooks": []}}
-                        if not any(a["event"] == event and a["child"] == child
-                                   and a["shell"] == addition["shell"] for a in rec["additions"]):
+                                    "shell": {**entry, "hooks": list(entry["hooks"])}}
+                        addition["shell"]["hooks"].remove(child)
+                        recorded = any(a["event"] == event and a["child"] == child
+                                       and a["shell"] == addition["shell"] for a in rec["additions"])
+                        if allow_adoption and not recorded:
                             rec["additions"].append(addition)
-                        adopted = True
+                        adopted = adopted or allow_adoption or recorded
                 elif old.get("command") != child["command"]:
                     entry["hooks"].remove(old)
                     removed_stale = True
@@ -292,8 +308,9 @@ def merge_hooks(data: dict, agent: str, uninstall: bool, owned: dict | None = No
         if matcher:
             entry["matcher"] = matcher
         hooks.setdefault(event, []).append(entry)
-        rec["additions"].append({"event": event, "child": child,
-                                  "shell": {**entry, "hooks": []}})
+        addition = {"event": event, "child": child, "shell": {**entry, "hooks": []}}
+        if addition not in rec["additions"]:
+            rec["additions"].append(addition)
     if not rec["additions"]:
         owned.pop("hooks", None)
     return data

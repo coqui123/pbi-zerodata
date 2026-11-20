@@ -187,8 +187,9 @@ def main() -> int:
     # Copy ids need no mapping: this lane requires a clean baseline. Any finding
     # on any source or copied object is a regression, including duplicate findings.
     meaningful = lambda fs: [f for f in fs if f.get("code") not in {"REPORT_SCHEMA_PASSED", "REPORT_SCHEMA_NOT_RUN"}]
-    if available:
+    if validate.validator_attempted(base):
         check(not meaningful(base), f"validator baseline must be clean: {base}")
+    if available:
         after = validate.report_author(st, fx, lambda s: s)
         check(validate.validator_ran(after), f"validator cannot run after copy: {after}")
         added = validate.diagnostic_counts(meaningful(after)) - validate.diagnostic_counts(meaningful(base))
@@ -197,8 +198,10 @@ def main() -> int:
         control = load(control_path)
         control.pop("displayName")
         save(control_path, control)
-        invalid = validate.report_author(st, fx, lambda s: s)
-        check(validate.invalid_control_rejected(invalid, src_pid), f"invalid control missing required displayName diagnostic: {invalid}")
+        invalid = validate.report_author(st, fx, lambda s: s, schema_only=True)
+        check(validator_gate(invalid, required), f"required control validator cannot run: {invalid}")
+        if validate.validator_attempted(invalid):
+            check(validate.invalid_control_rejected(invalid, src_pid), f"invalid control missing required displayName diagnostic: {invalid}")
     else:
         print("note: live vendor validation unavailable (required lane fails closed)")
     comparison_checks(check)
@@ -211,7 +214,8 @@ def main() -> int:
 
 
 def validator_gate(findings, required):
-    return not required or validate.validator_ran(findings)
+    return not required or (validate.validator_attempted(findings)
+                            and not any(f.get("code") == "REPORT_SCHEMA_NOT_RUN" for f in findings))
 
 
 def comparison_checks(check):
@@ -223,11 +227,19 @@ def comparison_checks(check):
     expected = {"severity": "error", "code": "PBIR", "where": "definition/pages/control/page.json",
                 "message": "must have required property 'displayName'"}
     check(validate.invalid_control_rejected([expected], "control"), "expected control diagnostic rejected")
+    check(validate.invalid_control_rejected([{**expected, "where": expected["where"].replace("/", "\\")}], "control"),
+          "Windows control path rejected")
+    check(not validate.invalid_control_rejected([{**expected, "where": expected["where"] + ".bak"}], "control"),
+          "backup accepted as exact control file")
+    check(validate.validator_attempted([expected]), "dirty validator baseline treated as unavailable")
+    check(validator_gate([expected], True), "schema diagnostic failed availability gate")
+    check(not validate.validator_attempted([]), "empty validator findings counted as attempted")
     check(not validate.invalid_control_rejected([{**expected, "message": "unrelated failure"}], "control"),
           "unrelated diagnostic accepted as control")
     for code in ("REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"):
         findings = [{"severity": "error", "code": code}]
         check(not validate.validator_ran(findings), f"{code} counted as a run")
+        check(not validate.validator_attempted(findings), f"{code} counted as attempted")
         check(not validate.invalid_control_rejected(findings + [expected], "control"), "crash accepted as invalid control")
     check(not validate.invalid_control_rejected([expected], "other"), "another page accepted as control")
     check(not validator_gate([], True), "empty findings passed required gate")
@@ -240,6 +252,9 @@ def comparison_checks(check):
     project = types.SimpleNamespace(name="Canary")
     with patch.object(validate.os.path, "isdir", return_value=True), patch.object(validate.os.path, "exists", return_value=False):
         check(not validate.validator_ran(validate.report_author("unused", project, lambda s: s)), "missing validator passed")
+        with patch.object(validate, "REPORT_AUTHOR", "missing-validator-binary"):
+            findings = validate.report_author("unused", project, lambda s: s, schema_only=True)
+        check([f["code"] for f in findings] == ["REPORT_VALIDATOR_FAILED"], "schema-only missing validator did not fail")
     for error in (OSError("crash"), subprocess.TimeoutExpired("validator", 600)):
         with patch.object(validate.os.path, "isdir", return_value=True), \
                 patch.object(validate.os.path, "exists", return_value=True), \
@@ -248,6 +263,20 @@ def comparison_checks(check):
             check(not validate.validator_ran(findings), "crash or timeout passed")
             check(run.call_count == 2, "both validator attempts must run")
             check([f["code"] for f in findings] == ["REPORT_VALIDATOR_FAILED"], "wrong crash finding")
+    offline = types.SimpleNamespace(stdout=b'{"data":{"result":"succeeded"}}', returncode=0)
+    errors = (OSError("crash"), subprocess.TimeoutExpired("validator", 600),
+              types.SimpleNamespace(stdout=b'{"error":"schema unavailable"}', returncode=1),
+              types.SimpleNamespace(stdout=b'not json', returncode=1))
+    for error in errors:
+        for schema_only in (False, True):
+            with patch.object(validate.os.path, "isdir", return_value=True), \
+                    patch.object(validate, "REPORT_AUTHOR", "validator"), \
+                    patch.object(validate.os.path, "exists", return_value=True), \
+                    patch.object(validate.subprocess, "run", side_effect=[error, offline]) as run:
+                findings = validate.report_author("unused", project, lambda s: s, schema_only=schema_only)
+                expected_code = "REPORT_VALIDATOR_FAILED" if schema_only else "REPORT_SCHEMA_NOT_RUN"
+                check([f["code"] for f in findings] == [expected_code], "wrong schema-only/fallback findings")
+                check(run.call_count == (1 if schema_only else 2), "wrong schema-only/fallback attempts")
 
 
 if __name__ == "__main__":

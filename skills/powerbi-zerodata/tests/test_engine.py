@@ -1245,8 +1245,9 @@ class ProjectionTests(unittest.TestCase):
         for error in (FileNotFoundError("missing"), PermissionError("unreadable")):
             with patch.object(Path, "read_text", side_effect=error):
                 self.assertEqual(self.engine._project("deps", {"ok": True})["class"], "ENGINE_UNAVAILABLE")
-        with patch.object(Path, "read_text", return_value='{}'):
-            self.assertEqual(self.engine._project("deps", {"ok": True})["class"], "ENGINE_UNAVAILABLE")
+        for schema in ({}, [], {"$defs": []}, {"$defs": {"bad": []}}):
+            with self.subTest(schema=schema), patch.object(Path, "read_text", return_value=json.dumps(schema)):
+                self.assertEqual(self.engine._project("deps", {"ok": True})["class"], "ENGINE_UNAVAILABLE")
 
 
 class CanaryScanTests(unittest.TestCase):

@@ -87,6 +87,11 @@ def _recover_prune(ws):
     try:
         doc = _prune_index(ws)
         pending = doc.get("pending", [])
+        from .checks import LEDGER_DAYS
+        cutoff = (dt.date.today() - dt.timedelta(days=LEDGER_DAYS)).isoformat()
+        if pending and any(os.path.basename(p) not in pending and os.path.basename(p) < pending[-1]
+                           for p in _segment_paths(ws)):
+            return
         segments = []
         prev = None
         key = _chain_key(ws)
@@ -97,7 +102,10 @@ def _recover_prune(ws):
                 if segments:
                     return
                 continue
-            first = next((json.loads(line) for line in text.splitlines() if line.strip()), None)
+            newest = _newest_day(text)
+            if newest is None or newest >= cutoff:
+                return
+            first = next((json.loads(line) for line in text.split("\n") if line.strip()), None)
             if not isinstance(first, dict):
                 return
             if prev is None:
@@ -450,7 +458,10 @@ def prune(ws, today: dt.date | None = None) -> dict:
 def verify_chain(ws) -> dict:
     """Recompute the HMAC chain across rotated segments and the active log."""
     key = _chain_key(ws)
-    prev = _anchor(ws)
+    try:
+        prev = _prune_index(ws)["anchor"] if os.path.lexists(_index_path(ws)) else GENESIS
+    except (ValueError, TypeError, UnicodeError, RecursionError, OSError, PbzError):
+        return {"verb": "evidence", "chain": "BROKEN", "reason": "MISMATCH", "records": 0}
     chained = 0
     files = _log_files(ws)
     for path in files:

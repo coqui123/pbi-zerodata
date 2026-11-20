@@ -41,6 +41,12 @@ def _closed(value, schema, defs):
         return _closed(value, defs[schema["$ref"].rsplit("/", 1)[-1]], defs)
     if "anyOf" in schema or "oneOf" in schema:
         for option in schema.get("anyOf", schema.get("oneOf", [])):
+            if "anyOf" not in schema and isinstance(value, dict):
+                if (option.get("additionalProperties") is False and "properties" in option
+                        and any(k not in option["properties"] for k in value)):
+                    continue
+                if any(k not in value for k in option.get("required", [])):
+                    continue
             try:
                 return _closed(value, option, defs)
             except ValueError:
@@ -95,7 +101,11 @@ def _closed(value, schema, defs):
 
 def _contract_project(verb, response):
     schema = json.loads((Path(__file__).resolve().parent.parent / "engine" / "contract.schema.json").read_text())
+    if not isinstance(schema, dict) or not isinstance(schema.get("$defs"), dict):
+        raise ValueError("definitions")
     defs = schema["$defs"]
+    if any(not isinstance(node, dict) for node in defs.values()):
+        raise ValueError("definition")
     if response.get("ok") is False:
         if isinstance(response.get("verb"), str) and response["verb"] != verb:
             raise ValueError("verb")

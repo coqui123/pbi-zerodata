@@ -74,6 +74,11 @@ def validator_ran(findings):
             and not any(f.get("code") in unavailable for f in findings))
 
 
+def validator_attempted(findings):
+    unavailable = {"REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"}
+    return bool(findings) and not any(f.get("code") in unavailable for f in findings)
+
+
 def invalid_control_rejected(findings, page_id):
     # The control removes page.displayName. Require that exact schema failure,
     # rather than treating an unavailable validator or unrelated error as rejection.
@@ -81,17 +86,19 @@ def invalid_control_rejected(findings, page_id):
                    for f in findings) and any(
         f.get("severity") == "error" and "displayName" in f.get("message", "")
         and "required" in f.get("message", "").lower()
-        and ("/pages/" + page_id + "/page.json") in ("/" + f.get("where", "").replace("\\", "/")) for f in findings)
+        and f.get("where", "").replace("\\", "/").split("/")[-3:] == ["pages", page_id, "page.json"] for f in findings)
 
 
-def report_author(stage: str, project, scrub) -> list[dict]:
+def report_author(stage: str, project, scrub, *, schema_only=False) -> list[dict]:
     rdir = os.path.join(stage, project.name + ".Report")
     if not os.path.isdir(rdir):
         return []
-    if not os.path.exists(REPORT_AUTHOR):
+    if not os.path.exists(REPORT_AUTHOR) and not schema_only:
         return [{"severity": "info", "code": "REPORT_VALIDATOR_MISSING", "where": "report", "message": "skipped"}]
-    for args in ([REPORT_AUTHOR, "validate", rdir, "--format", "json"],
-                 [REPORT_AUTHOR, "validate", rdir, "--no-schema", "--format", "json"]):
+    attempts = [[REPORT_AUTHOR, "validate", rdir, "--format", "json"]]
+    if not schema_only:
+        attempts.append([REPORT_AUTHOR, "validate", rdir, "--no-schema", "--format", "json"])
+    for args in attempts:
         try:
             p = subprocess.run(args, capture_output=True, timeout=600)
         except (subprocess.SubprocessError, OSError):
