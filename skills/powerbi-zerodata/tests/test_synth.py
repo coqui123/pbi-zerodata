@@ -191,6 +191,7 @@ def live(fails: list) -> None:
 # They are deliberately opt-in and fail if the SDK is unavailable; Linux cannot run DPAPI/TOM.
 PROVENANCE_FIXTURES = r'''
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -227,8 +228,50 @@ class Fixtures
         return model;
     }
 
+    static int ChildValidate(string[] args)
+    {
+        var resultFile = args[7];
+        try
+        {
+            var privateDir = args[2];
+            var folder = args[3];
+            var timeoutSec = int.Parse(args[4]);
+            var gate = args[5];
+            using var paused = EventWaitHandle.OpenExisting(args[6] + "-paused");
+            using var resume = EventWaitHandle.OpenExisting(args[6] + "-resume");
+            int calls = 0;
+            void Pause() {
+                if (Interlocked.Increment(ref calls) != 1) return;
+                paused.Set();
+                if (!resume.WaitOne(TimeSpan.FromSeconds(600)))
+                    throw new Exception("child validation was not released");
+            }
+            if (gate == "copy")
+                typeof(TmdlValidate).GetField("AfterCopyFileForTests", BindingFlags.Static | BindingFlags.NonPublic)!
+                    .SetValue(null, (Action<string>)(_ => Pause()));
+            else if (gate == "inventory")
+                typeof(TmdlValidate).GetField("BeforeInventoryForTests", BindingFlags.Static | BindingFlags.NonPublic)!
+                    .SetValue(null, (Action)Pause);
+            else if (gate != "none") throw new Exception("unknown child gate: " + gate);
+            var ctx = new Ctx("tmdl-validate");
+            var request = Req.Parse(new JsonObject { ["private_dir"] = privateDir,
+                ["folder"] = folder, ["timeout_s"] = timeoutSec }.ToJsonString());
+            ctx.Init(request);
+            var result = TmdlValidate.Run(request, ctx);
+            File.WriteAllText(resultFile, new JsonObject { ["valid"] = result["valid"]!.GetValue<bool>() }.ToJsonString());
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            File.WriteAllText(resultFile, new JsonObject { ["error"] = ex.GetType().Name + ": " + ex.Message }.ToJsonString());
+            return 2;
+        }
+    }
+
     static void Main(string[] args)
     {
+        if (args.Length > 1 && args[1] == "child-validate")
+            Environment.Exit(ChildValidate(args));
         var ctx = new Ctx("synth-query");
         ctx.Init(Req.Parse(new JsonObject { ["private_dir"] = args[0] }.ToJsonString()));
         var marker = new string('a', 64);
@@ -613,6 +656,138 @@ class Fixtures
             if (Directory.Exists(live) || File.Exists(liveMarker))
                 throw new Exception("abandoned cross-process snapshot was not recovered");
             if (recovered["valid"]?.GetValue<bool>() != true) throw new Exception("recovery validation failed");
+        }, null);
+        Check("validation owned by a separate process survives a peer sweep and is recovered after the owner dies", () => {
+            var privateDir = Path.Combine(args[0], "two-process-private");
+            var source = Path.Combine(args[0], "two-process-source");
+            Directory.CreateDirectory(privateDir);
+            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(Build().Database, source);
+            System.Collections.Generic.Dictionary<string, byte[]> SnapshotBytes(string dir) =>
+                Directory.GetFiles(dir, "*", SearchOption.AllDirectories)
+                    .ToDictionary(f => Path.GetRelativePath(dir, f), File.ReadAllBytes);
+            string Quote(string value) {
+                // Windows command-line quoting, including quotes and trailing backslashes.
+                var quoted = new System.Text.StringBuilder("\"");
+                int slashes = 0;
+                foreach (var ch in value)
+                {
+                    if (ch == '\\') { slashes++; continue; }
+                    quoted.Append('\\', ch == '"' ? slashes * 2 + 1 : slashes);
+                    quoted.Append(ch);
+                    slashes = 0;
+                }
+                return quoted.Append('\\', slashes * 2).Append('"').ToString();
+            }
+            Process StartChild(string gate, int timeoutSec, string resultFile,
+                out EventWaitHandle paused, out EventWaitHandle resume) {
+                var prefix = "pbz-tmdl-" + Guid.NewGuid().ToString("N");
+                paused = new EventWaitHandle(false, EventResetMode.ManualReset, prefix + "-paused");
+                // The caller's finally owns both handles, including launch failures.
+                resume = new EventWaitHandle(false, EventResetMode.ManualReset, prefix + "-resume");
+                var childArgs = string.Join(" ", new[] { args[0], "child-validate", privateDir, source,
+                    timeoutSec.ToString(System.Globalization.CultureInfo.InvariantCulture), gate, prefix, resultFile }.Select(Quote));
+                var executable = Environment.ProcessPath;
+                var useDotnet = executable == null || Path.GetFileName(executable).StartsWith("dotnet", StringComparison.OrdinalIgnoreCase);
+                var info = new ProcessStartInfo {
+                    FileName = useDotnet ? "dotnet" : executable!,
+                    Arguments = (useDotnet ? "exec " + Quote(typeof(Fixtures).Assembly.Location) + " " : "") + childArgs,
+                    UseShellExecute = false
+                };
+                return Process.Start(info) ?? throw new Exception("could not start child validation");
+            }
+            JsonObject ReadChildResult(string resultFile) => JsonNode.Parse(File.ReadAllText(resultFile))!.AsObject();
+            void FinishChild(Process process, string resultFile) {
+                if (!process.WaitForExit(300000)) throw new Exception("child validation did not exit before deadline");
+                var result = ReadChildResult(resultFile);
+                if (process.ExitCode != 0 || result.ContainsKey("error") || result["valid"]?.GetValue<bool>() != true)
+                    throw new Exception("child validation failed: " + result.ToJsonString());
+            }
+            void DisposeChild(Process? process, EventWaitHandle? paused, EventWaitHandle? resume) {
+                try
+                {
+                    resume?.Set();
+                    if (process != null && !process.WaitForExit(300000))
+                    {
+                        process.Kill();
+                        if (!process.WaitForExit(300000)) throw new Exception("child did not exit after termination");
+                        throw new Exception("child required termination after cleanup deadline");
+                    }
+                }
+                finally { process?.Dispose(); paused?.Dispose(); resume?.Dispose(); }
+            }
+            void AssertNoSnapshots() {
+                if (Directory.GetDirectories(privateDir, "tmdl-validate-*").Any()
+                    || Directory.GetFiles(privateDir, "tmdl-validate-*.pbz-owner").Any())
+                    throw new Exception("child validation left snapshots or ownership markers");
+            }
+            void LiveOwnerPhase(string gate) {
+                Process? owner = null, peer = null;
+                EventWaitHandle? pausedA = null, resumeA = null, pausedB = null, resumeB = null;
+                var ownerResult = Path.Combine(args[0], "two-process-" + gate + "-owner.json");
+                var peerResult = Path.Combine(args[0], "two-process-" + gate + "-peer.json");
+                try
+                {
+                    owner = StartChild(gate, 300, ownerResult, out pausedA, out resumeA);
+                    if (!pausedA.WaitOne(TimeSpan.FromSeconds(180))) throw new Exception("owner did not pause at " + gate);
+                    var snapshot = Directory.GetDirectories(privateDir, "tmdl-validate-*").Single();
+                    if (!File.Exists(snapshot + ".pbz-owner")) throw new Exception("owner did not publish a lease");
+                    var before = SnapshotBytes(snapshot);
+                    if (before.Count == 0) throw new Exception("owner paused without copied files");
+                    peer = StartChild("none", 120, peerResult, out pausedB, out resumeB);
+                    FinishChild(peer, peerResult);
+                    if (!Directory.Exists(snapshot) || !File.Exists(snapshot + ".pbz-owner"))
+                        throw new Exception("peer sweep removed live owner snapshot or marker at " + gate);
+                    var after = SnapshotBytes(snapshot);
+                    if (!after.Keys.OrderBy(f => f).SequenceEqual(before.Keys.OrderBy(f => f))
+                        || before.Any(kv => !after[kv.Key].SequenceEqual(kv.Value)))
+                        throw new Exception("peer sweep changed live snapshot bytes at " + gate);
+                    resumeA.Set();
+                    FinishChild(owner, ownerResult);
+                    if (Directory.Exists(snapshot) || File.Exists(snapshot + ".pbz-owner"))
+                        throw new Exception("owner did not clean up its snapshot and marker");
+                    AssertNoSnapshots();
+                }
+                finally
+                {
+                    try { DisposeChild(owner, pausedA, resumeA); }
+                    finally { DisposeChild(peer, pausedB, resumeB); }
+                }
+            }
+            // Phase 1 pins Run publishing and holding its lease during copying, and
+            // prevents a peer sweep from deleting a live, partially copied snapshot.
+            LiveOwnerPhase("copy");
+            // Phase 2 pins lease ownership after copying finishes, through validation
+            // and cleanup: releasing the lease before inventory lets the peer delete it.
+            LiveOwnerPhase("inventory");
+            // Phase 3 pins real Run lease publication and abandoned marked recovery.
+            // Without a published lease, a killed owner's unmarked tree must be kept.
+            Process? abandoned = null, recovery = null;
+            EventWaitHandle? pausedC = null, resumeC = null, pausedD = null, resumeD = null;
+            var abandonedResult = Path.Combine(args[0], "two-process-abandoned.json");
+            var recoveryResult = Path.Combine(args[0], "two-process-recovery.json");
+            try
+            {
+                abandoned = StartChild("copy", 300, abandonedResult, out pausedC, out resumeC);
+                if (!pausedC.WaitOne(TimeSpan.FromSeconds(180))) throw new Exception("abandoned owner did not pause during copy");
+                var snapshot = Directory.GetDirectories(privateDir, "tmdl-validate-*").Single();
+                if (!File.Exists(snapshot + ".pbz-owner")) throw new Exception("abandoned owner did not publish a lease");
+                var before = SnapshotBytes(snapshot);
+                if (before.Count == 0) throw new Exception("abandoned owner did not copy any files");
+                abandoned.Kill();
+                if (!abandoned.WaitForExit(300000)) throw new Exception("killed owner did not exit before deadline");
+                if (!Directory.Exists(snapshot) || !File.Exists(snapshot + ".pbz-owner"))
+                    throw new Exception("killed owner did not leave its snapshot and marker");
+                recovery = StartChild("none", 120, recoveryResult, out pausedD, out resumeD);
+                FinishChild(recovery, recoveryResult);
+                if (Directory.Exists(snapshot) || File.Exists(snapshot + ".pbz-owner"))
+                    throw new Exception("peer sweep did not recover the killed owner's snapshot and marker");
+                AssertNoSnapshots();
+            }
+            finally
+            {
+                try { DisposeChild(abandoned, pausedC, resumeC); }
+                finally { DisposeChild(recovery, pausedD, resumeD); }
+            }
         }, null);
         Console.WriteLine($"{passed} passed, 0 failed");
     }
