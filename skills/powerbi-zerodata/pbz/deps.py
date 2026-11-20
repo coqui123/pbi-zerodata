@@ -193,7 +193,7 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
             continue
         elif t.kind == "bracket":
             prev = sig[i - 1] if i else None
-            uncertain = bool(prev and prev.kind == "ident" and prev.text.upper() != "VAR"
+            uncertain = bool(prev and prev.end == t.start and prev.kind == "ident" and prev.text.upper() != "VAR"
                              and not res.table(prev.text))
             add(_bare(t.value, home, res, row_home, row_tables(), extension), i, uncertain)
         elif t.kind == "table":
@@ -414,22 +414,41 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0,
                 continue
             if t.text == "#":
                 construct = name(i + 1) if i + 1 < hi else None
-                if construct == "shared" and i + 2 < hi and sig[i + 2].kind == "bracket":
-                    nm = sig[i + 2].value
-                    if nm in res.expressions and nm != own:
-                        found.append((i + 2, nm, False))
-                    i += 3
-                    continue
+                if construct == "shared" and i + 2 < hi:
+                    selector = sig[i + 2]
+                    if selector.kind == "bracket":
+                        # Lex the inner text to strip only surrounding M trivia;
+                        # the edit span must leave comments and whitespace intact.
+                        inner = lexers.significant(lexers.lex_m(selector.text[1:-1], selector.start + 1))
+                        if len(inner) == 1 and inner[0].kind == "ident":
+                            ident = inner[0]
+                            nm = ident.text
+                            if nm in res.expressions and nm != own:
+                                found.append((i + 2, nm, False, (ident.start, ident.end)))
+                        i += 3
+                        continue
+                    if (i + 4 < hi and selector.text == "[" and pairs.get(i + 2) == i + 4
+                            and sig[i + 3].kind == "qident"):
+                        nm = sig[i + 3].value
+                        if nm in res.expressions and nm != own:
+                            found.append((i + 3, nm, False, None))
+                        i += 5
+                        continue
                 if construct not in {"date", "time", "datetime", "datetimezone", "duration", "table", "binary"}:
                     uncertain = True
                 else:
                     i += 2
                     continue
             if t.kind == "ident" and t.text == "type":
-                # A type ends at a delimiter at this level. Nested containers
-                # belong to the type and must also be scanned for shared names.
+                # Operators and expression keywords end a type at this level.
+                # Nested containers still belong to the type and are scanned.
                 j = i + 1
                 while j < hi and sig[j].text not in {",", ")", "]", "}", "meta"}:
+                    tok = sig[j]
+                    if ((tok.kind == "op" and j not in pairs)
+                            or (tok.kind == "ident" and tok.text.lower() in {
+                                "and", "or", "not", "is", "as", "in", "if", "then", "else", "each", "let"})):
+                        break
                     end = pairs.get(j, j)
                     if any(possible_name(k) in res.expressions for k in range(j, end + 1)):
                         uncertain = True
@@ -442,17 +461,17 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0,
             if nm in res.expressions and nm != own:
                 prev = sig[i - 1] if i else None
                 if not (prev and prev.text == "."):
-                    found.append((i, nm, nm in local))
+                    found.append((i, nm, nm in local, None))
             i += 1
 
     walk(0, len(sig), set())
     if uncertain:
         # Include tokens skipped as declarations or selectors too: uncertainty must
         # never make the graph less conservative than a plain identifier scan.
-        found = [(i, possible_name(i), False) for i in range(len(sig))
+        found = [(i, possible_name(i), False, None) for i in range(len(sig))
                  if possible_name(i) in res.expressions and possible_name(i) != own]
-    return [Binding(Ref("m_query", "", nm, "m"), *span(i),
-                    uncertain=uncertain) for i, nm, local in found if not local]
+    return [Binding(Ref("m_query", "", nm, "m"), *(explicit_span or span(i)),
+                    uncertain=uncertain) for i, nm, local, explicit_span in found if not local]
 
 
 def m(expr: str, res: Resolver, own: str = "") -> list[Ref]:

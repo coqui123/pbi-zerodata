@@ -238,5 +238,38 @@ class PreviewTests(unittest.TestCase):
         self.assertNotIn('interaction_certified', blob)
 
 
+class ChangesPreviewTests(unittest.TestCase):
+    def test_calculation_item_diff_reports_measure_before_home_column(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_modeling_atomic import ModelingAtomicTests
+        from pbz import changes, deps, mirror, rename, tmdl, usage
+
+        ws, project, mdef = ModelingAtomicTests._project(self)
+        ws.private = str(Path(ws.root, 'private'))
+        path = Path(mdef, 'tables', 'Sales.tmdl')
+        path.write_text('table Sales\n\tcolumn x\n\tmeasure x = 1\n'
+                        '\tcalculationGroup\n\t\tcalculationItem Item = 1\n')
+        mirror.snapshot(ws, project, 'test')
+        path.write_text(path.read_text().replace('calculationItem Item = 1',
+                                                'calculationItem Item = [x]'))
+        result = changes.run(ws, project)
+        self.assertEqual(result['result'], 'CHANGED')
+        item = next(r for r in result['model'] if r['kind'] == 'calculationItem')
+        self.assertEqual(item['expressions'][0]['refs_added'], ['[x]'])
+        model = tmdl.load_model(mdef)
+        doc = model.docs['tables/Sales.tmdl']
+        reg = next(r for r in doc.regions if r.node.kind == 'calculationItem')
+        bindings = deps.dax_region(doc.text, reg, deps.Resolver(model)).bindings
+        self.assertEqual([b.ref for b in bindings], [deps.Ref('measure', 'Sales', 'x')])
+        graph = usage.build(ws, project)
+        self.assertIn(usage.key('measure', 'Sales', 'x'),
+                      [e.dst for e in graph.out[usage.key('calc_item', 'Sales', 'Item')]])
+        self.assertNotIn(usage.key('column', 'Sales', 'x'),
+                         [e.dst for e in graph.out[usage.key('calc_item', 'Sales', 'Item')]])
+        edits = rename.dax_ref_edits(doc.text, reg.start, reg.end, 'measure',
+                                     'Sales', 'x', 'Renamed', 'Sales', res=deps.Resolver(model))
+        self.assertEqual(edits, [(bindings[0].start, bindings[0].end, '[Renamed]')])
+
+
 if __name__ == '__main__':
     unittest.main()

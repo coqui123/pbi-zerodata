@@ -12,7 +12,7 @@ SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.dirname(__file__))
 
-from pbz import consolidate, deps, rename, tmdl, pbir
+from pbz import consolidate, deps, rename, tmdl, pbir, usage, unused
 from pbz.common import PbzError
 from pbz.tokens import apply_edits
 import test_modeling_atomic as fixtures
@@ -202,10 +202,29 @@ class RenameBindingsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'AMBIGUOUS')
         self.assertEqual(_bytes(ws.mirror), before)
 
+    def test_spaced_bare_after_keyword_is_certain_and_home_rename_succeeds(self):
+        for expr, name in (('VAR x = 1 RETURN [Total]', 'Total'), ('NOT [Flag]', 'Flag')):
+            with self.subTest(expr=expr):
+                ws, project, mdef = self._project()
+                path = Path(mdef, 'tables', 'Sales.tmdl')
+                path.write_text(f'table Sales\n\tmeasure {name} = 1\n\tmeasure Use = {expr}\n')
+                bindings = deps.dax_bindings(expr, 'Sales', deps.Resolver(tmdl.load_model(mdef))).bindings
+                self.assertEqual([b.ref for b in bindings], [deps.Ref('measure', 'Sales', name)])
+                self.assertFalse(bindings[0].uncertain)
+                rename.rename(ws, project, 'table', 'Sales', 'Revenue')
+                path = Path(mdef, 'tables', 'Revenue.tmdl')
+                self.assertIn('measure Use = ' + expr, path.read_text())
+                rename.rename(ws, project, 'measure', name, 'New')
+                self.assertIn(expr.replace(f'[{name}]', '[New]'), path.read_text())
+
     def test_bare_after_identifier_refuses_rename(self):
         ws, project, mdef = self._project()
         Path(mdef, 'tables', 'Sales.tmdl').write_text(
             'table Sales\n\tmeasure Total = 1\n\tmeasure Use = VAR x = 1 RETURN[Total]\n')
+        bindings = deps.dax_bindings('VAR x = 1 RETURN[Total]', 'Sales',
+                                     deps.Resolver(tmdl.load_model(mdef))).bindings
+        self.assertEqual([b.ref for b in bindings], [deps.Ref('measure', 'Sales', 'Total')])
+        self.assertTrue(bindings[0].uncertain)
         before = _bytes(ws.mirror)
         with self.assertRaises(PbzError) as caught:
             rename.rename(ws, project, 'measure', 'Total', 'New')
@@ -243,6 +262,76 @@ class RenameBindingsTests(unittest.TestCase):
                 path.write_text('table Sales\n\tpartition Sales = m\n\t\tsource = ' + expr + '\n')
                 rename.rename(ws, project, 'table', 'Sales', 'Revenue')
                 self.assertIn('source = ' + expected, Path(mdef, 'tables', 'Revenue.tmdl').read_text())
+
+    def test_m_shared_selector_trivia_and_quoted_name(self):
+        for expr, target, expected in (
+            ('#shared[/* note */ Sales]', 'Revenue', '#shared[/* note */ Revenue]'),
+            ('#shared[ /* before */ Sales /* after */ ]', 'Revenue',
+             '#shared[ /* before */ Revenue /* after */ ]'),
+            ('#shared[// note\n Sales // end\n]', 'Revenue', '#shared[// note\n Revenue // end\n]'),
+            ('#shared[#"Sales"]', 'New Sales', '#shared[#"New Sales"]'),
+        ):
+            with self.subTest(expr=expr):
+                ws, project, mdef = self._project()
+                path = Path(mdef, 'tables', 'Sales.tmdl')
+                source = '\n'.join('\t\t\t\t' + line for line in expr.splitlines())
+                path.write_text('table Sales\n\tpartition Sales = m\n\t\tsource =\n' + source + '\n')
+                res = deps.Resolver(tmdl.load_model(mdef))
+                res.expressions.update({name: name for name in res.model.tables})
+                bindings = deps.m_bindings(expr, res, base=7)
+                self.assertEqual([b.ref for b in bindings], [deps.Ref('m_query', '', 'Sales', 'm')])
+                self.assertFalse(bindings[0].uncertain)
+                token = '#"Sales"' if '#"Sales"' in expr else 'Sales'
+                start = 7 + expr.index(token)
+                self.assertEqual((bindings[0].start, bindings[0].end), (start, start + len(token)))
+                before = path.read_bytes()
+                rename.rename(ws, project, 'table', 'Sales', target)
+                renamed = Path(mdef, 'tables', target + '.tmdl').read_bytes()
+                # All non-name bytes, including comments, survive the real rename.
+                decl_name = rename.lexers.tmdl_name(target).encode()
+                expected_bytes = before.replace(b'table Sales', b'table ' + decl_name).replace(
+                    b'partition Sales', b'partition ' + decl_name).replace(
+                    b'#"Sales"' if token.startswith('#') else b'Sales',
+                    rename._m_ident(target).encode())
+                self.assertEqual(renamed, expected_bytes)
+                self.assertIn(expected.splitlines()[0], renamed.decode())
+
+    def test_m_shared_selector_only_dependency_is_used(self):
+        from test_unused_atomic import UnusedAtomicTests, SALES
+
+        for selector in ('#shared[/* note */ Sales]', '#shared[#"Sales"]'):
+            with self.subTest(selector=selector):
+                ws, project = UnusedAtomicTests._project(self)
+                mdef = Path(project.mirror_model, 'definition')
+                (mdef / 'expressions.tmdl').write_text(
+                    'expression Sales = 1\n\nexpression GenuinelyUnused = 1\n')
+                (mdef / 'tables' / 'Sales.tmdl').write_text(
+                    SALES + '\tpartition Sales = m\n\t\tsource = ' + selector + '\n')
+                graph = usage.build(ws, project)
+                used = usage.key('m_query', '', 'Sales')
+                dead = usage.key('m_query', '', 'GenuinelyUnused')
+                self.assertIn(used, [e.dst for e in graph.out[usage.key('table', '', 'Sales')]])
+                self.assertEqual(graph.state[used], 'used')
+                self.assertEqual(graph.state[dead], 'unused')
+                self.assertEqual(unused.remove(ws, project, only=['m_query'])['result'], 'REMOVED')
+                self.assertEqual(set(tmdl.load_model(str(mdef)).expressions), {'Sales'})
+
+    def test_m_type_scan_stops_before_expression_operators(self):
+        expressions = ['(Value.Type(1) = type number and Sales)',
+                       '(Value.Type(1) = type number = Sales)']
+        for expr in expressions:
+            with self.subTest(expr=expr):
+                ws, project, mdef = self._project()
+                path = Path(mdef, 'tables', 'Sales.tmdl')
+                path.write_text('table Sales\n\tpartition Sales = m\n\t\tsource = ' + expr + '\n')
+                model = tmdl.Model()
+                model.expressions = {'Sales': None}
+                bindings = deps.m_bindings(expr, deps.Resolver(model))
+                self.assertEqual([b.ref.name for b in bindings], ['Sales'])
+                self.assertFalse(bindings[0].uncertain)
+                rename.rename(ws, project, 'table', 'Sales', 'Revenue')
+                self.assertIn(expr.replace('Sales', 'Revenue'),
+                              Path(mdef, 'tables', 'Revenue.tmdl').read_text())
 
     def test_m_capture_and_type_query_refuse_without_writes(self):
         for expr in ('let Revenue = 1 in Sales',
@@ -285,7 +374,9 @@ class RenameBindingsTests(unittest.TestCase):
             self.assertFalse(any(b.uncertain for b in bindings), expr)
         for expr in ('type Sales', 'type [A = Sales]', 'type {Sales}', 'type table [A = Sales]',
                      'try Sales otherwise 1', '#unknown() & Sales', 'Sales meta []', '@Sales', 'shared Sales'):
-            self.assertTrue(all(b.uncertain for b in deps.m_bindings(expr, res)), expr)
+            bindings = deps.m_bindings(expr, res)
+            self.assertIn('Sales', [b.ref.name for b in bindings], expr)
+            self.assertTrue(all(b.uncertain for b in bindings), expr)
 
     def test_table_dax_qualifiers_and_unbindable_refusal(self):
         ws, project, mdef = self._column_project()

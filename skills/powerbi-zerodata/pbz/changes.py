@@ -142,7 +142,7 @@ def _ref_label(ref: deps.Ref) -> str:
 def _refs(lang: str, text: str, home: str, res, kind: str = "") -> set[str]:
     if lang == "dax":
         refs = deps.dax_bindings(text, home, res,
-                                 row_home=kind in {"column", "tablePermission", "calculationItem"},
+                                 row_home=kind in {"column", "tablePermission"},
                                  function=kind == "function").refs
     else:
         refs = deps.m(text, res)

@@ -556,7 +556,7 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
             continue
         doc(p.file).cut(reg.start, reg.end, edit)
     # Power Query editor order lists query names: drop removed tables and queries
-    gone_queries = {g.objects[k].name.lower() for k in todo if k[0] in ("table", "m_query")}
+    gone_queries = {g.objects[k].name for k in todo if k[0] in ("table", "m_query")}
     for rel, d0 in model.docs.items():
         for node in d0.nodes:
             if node.kind == "annotation" and node.name == "PBI_QueryOrder" and node.parent is None and gone_queries:
@@ -565,9 +565,9 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
                     names = json.loads(d0.text[reg.start:reg.end]) if reg else None
                 except ValueError:
                     names = None
-                if isinstance(names, list) and any(str(n).lower() in gone_queries for n in names):
+                if isinstance(names, list) and any(str(n) in gone_queries for n in names):
                     doc(rel).cut(reg.start, reg.end, json.dumps(
-                        [n for n in names if str(n).lower() not in gone_queries],
+                        [n for n in names if str(n) not in gone_queries],
                         separators=(",", ":"), ensure_ascii=False))
     # perspectives: drop entries of removed objects
     for pname, pnode in model.perspectives.items():

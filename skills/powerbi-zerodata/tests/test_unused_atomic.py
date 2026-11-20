@@ -135,6 +135,25 @@ class UnusedAtomicTests(unittest.TestCase):
         self.assertIn("SharedOnly", remaining)
         self.assertNotIn("GenuinelyUnused", remaining)
 
+    def test_query_order_removal_is_case_exact(self):
+        ws, project = self._project()
+        mdef = Path(project.mirror_model, 'definition')
+        queries = mdef / 'expressions.tmdl'
+        queries.write_text('expression Source = 1\n\nexpression source = 2\n')
+        model_path = mdef / 'model.tmdl'
+        model_path.write_text(MODEL + '\nannotation PBI_QueryOrder = ["Source","source"]\n')
+        _write(self._sales(ws, project), SALES +
+               '\tpartition Sales = m\n\t\tsource = Source\n')
+        graph = usage.build(ws, project)
+        self.assertEqual(graph.state[usage.key('m_query', '', 'Source')], 'used')
+        self.assertEqual(graph.state[usage.key('m_query', '', 'source')], 'unused')
+        self.assertEqual(unused.remove(ws, project, only=['m_query'])['result'], 'REMOVED')
+        from pbz import tmdl
+        self.assertEqual(set(tmdl.load_model(str(mdef)).expressions), {'Source'})
+        self.assertIn('expression Source = 1', queries.read_text())
+        order = model_path.read_text().split('annotation PBI_QueryOrder = ', 1)[1].strip()
+        self.assertEqual(json.loads(order), ['Source'])
+
     def test_failed_outcome_is_exit_1(self):
         out, rc = envelope({"ok": False, "error": "FAILED",
                             "detail": "write failed; mirror rolled back, no file changed"})
