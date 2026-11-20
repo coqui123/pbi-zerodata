@@ -109,7 +109,7 @@ class MemoryDisclosureTests(unittest.TestCase):
                 json.dump({"columns": {"Sales[Comment]": {"type": "string", "class": "high"}}}, handle)
             dpapi.write_protected(os.path.join(self.ws.private, "categories.bin"), b"{}")
             return {"ok": True, "tables": [{"table": "Sales", "rows_bucket": "10-99", "columns": [
-                {"column": "Comment", "class": "high", "card_bucket": "10-99", "blank_bucket": "0"}]}]}
+                {"column": "Comment", "class": "high", "card_bucket": "10-99", "blank_bucket": "none"}]}]}
 
         with patch("pbz.checks.engine_call", index_engine), patch("pbz.checks.desktop.require_port", return_value=1):
             checks.index(self.ws, self.project)
@@ -119,10 +119,28 @@ class MemoryDisclosureTests(unittest.TestCase):
                  lambda: describe.values(self.ws, self.project, "Sales[Comment]"))
         for read in paths:
             self.assertIn("_bucket", json.dumps(read()))  # Shape positive control on every path.
+        self.assertEqual(describe._index_summary(self.ws, self.project)["Sales"]["columns"], [
+            {"column": "Comment", "class": "high", "card_bucket": "10-99", "blank_bucket": "none"}])
+        column = describe.describe(self.ws, self.project, "Sales[Comment]")
+        self.assertEqual(column, {"verb": "describe", "column": "Sales[Comment]", "type": "string",
+            "class": "sensitive", "calculated": False, "hidden": False,
+            "card_bucket": "10-99", "blank_bucket": "none", "used_by_visuals": []})
         pol["disclosure"] = "strict"
         policy.save(self.ws, pol)  # Same stored generation, no reindex.
         for read in paths:
             self.assertNotIn("_bucket", json.dumps(read()))
+
+    def test_summary_drops_unknown_band_vocabulary_and_keeps_siblings(self):
+        pol = policy.load(self.ws)
+        pol["disclosure"] = "shape"
+        policy.save(self.ws, pol)
+        summary = {"project": self.project.name, "tables": [{"table": "Sales", "rows_bucket": "lots",
+            "columns": [{"column": "Bad", "card_bucket": "lots", "blank_bucket": "lots"},
+                        {"column": "Good", "card_bucket": "1-9", "blank_bucket": "<1%"}]}]}
+        stored = {"index-summary.json": json.dumps(summary).encode()}
+        self.assertEqual(describe._index_summary(self.ws, self.project, stored=stored), {
+            "Sales": {"table": "Sales", "columns": [{"column": "Bad"},
+                {"column": "Good", "card_bucket": "1-9", "blank_bucket": "<1%"}]}})
 
     def test_probe_defaults_to_mirror_columns_and_preserves_flags(self):
         def probe_engine(verb, payload, timeout=30):

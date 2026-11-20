@@ -743,6 +743,10 @@ database.Model.SaveChanges();
             return
         rb = engine("index", b.req(), "index-before-row-add")
         publish_index(b, rb, "B")
+        control = grouped(b, "binding-b-before-row-add", shared)
+        groups = control.get("checks", control.get("results", []))[0].get("groups", [])
+        expect("B category member reveals before mutation", groups == [
+            {"Project[Status]": {"reveal": "Closed"}}], control)
         if not change_rows(["Closed", "Active", "NewStatus"]):
             return
         stale = grouped(b, "binding-new-live-value", ['Project[Status] IN {"Closed", "NewStatus"}'])

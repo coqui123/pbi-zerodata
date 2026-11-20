@@ -318,7 +318,12 @@ class Classifier:
         return "category" if name_words(column) & CATEGORY_WORDS else "sensitive"
 
     def category_values(self, table: str, column: str) -> list | None:
-        if self.model is not None and self.model.column(table, column) is None:
+        col = self.model.column(table, column) if self.model is not None else None
+        if self.model is not None and col is None:
+            return None
+        info = (self.index or {}).get("columns", {}).get(self.label(table, column), {})
+        if info.get("type") and col is not None and col.data_type \
+                and info["type"].lower() != col.data_type.lower():
             return None
         if self.column_class(table, column) != "category":
             return None

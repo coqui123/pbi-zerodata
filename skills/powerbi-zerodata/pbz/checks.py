@@ -819,12 +819,13 @@ def _index(ws, project) -> dict:
     if not res.get("ok"):
         raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
     moved = harden_index(ws, pol)
-    expected = {name: hashlib.sha256(read_checked(os.path.join(ws.private, name), root=ws.private)).hexdigest()
-                for name in ("index.json", "categories.bin")}
-    res["tables"] = _rebuild_summary(ws.private, res.get("tables", []))
+    blobs = {name: read_checked(os.path.join(ws.private, name), root=ws.private)
+             for name in ("index.json", "categories.bin")}
+    expected = {name: hashlib.sha256(raw).hexdigest() for name, raw in blobs.items()}
+    res["tables"] = _rebuild_summary(ws.private, res.get("tables", []), idx=json.loads(blobs["index.json"]))
     from . import index_store
     res["project"] = project.name
-    index_store.publish(ws.private, project.name, res, expected=expected)
+    index_store.publish(ws.private, project.name, res, expected=expected, blobs=blobs)
     cols = [c for t in res.get("tables", []) for c in t.get("columns", [])]
     return {"verb": "index", "project": project.name, "tables": len(res.get("tables", [])), "columns": len(cols),
             "category_columns": sum(1 for c in cols if c.get("class") == "category"),
@@ -832,9 +833,10 @@ def _index(ws, project) -> dict:
             "hint": "run `pbz pull --force` (or --rebase) to reclassify the mirror with the new index"}
 
 
-def _rebuild_summary(private_dir, tables):
+def _rebuild_summary(private_dir, tables, idx=None):
     """Copy hardened classes into the engine summary tables."""
-    idx = json.loads(read_checked(os.path.join(private_dir, "index.json"), root=private_dir))
+    if idx is None:
+        idx = json.loads(read_checked(os.path.join(private_dir, "index.json"), root=private_dir))
     for table in tables:
         for col in table.get("columns", []):
             info = idx.get("columns", {}).get(f"{table['table']}[{col['column']}]", {})

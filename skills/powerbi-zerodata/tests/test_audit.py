@@ -15,7 +15,7 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 import test_parity  # noqa: E402
-from pbz import audit, common, dpapi, index_store, mirror  # noqa: E402
+from pbz import audit, common, dpapi, index_store, mirror, policy  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 
 T = "\t"
@@ -259,6 +259,25 @@ def main() -> int:
     check(find(r, "HIGH_CARDINALITY_BIDIRECTIONAL"), "bidirectional relationship on a 10k+ key")
     check(find(r, "UNUSED_HIGH_CARDINALITY", "'Sales'[Amount Copy]"), "unused high-cardinality column")
     check(r["evidence"]["index"] is True, "index evidence flagged")
+
+    shape_findings = {(f["rule"], f["object"]): f for f in r["findings"]}
+    pol = policy.load(ws)
+    original_disclosure = pol.get("disclosure", "shape")
+    pol["disclosure"] = "strict"
+    policy.save(ws, pol)
+    strict = audit.run(ws, project)
+    strict_findings = {(f["rule"], f["object"]): f for f in strict["findings"]}
+    check({k: f["severity"] for k, f in shape_findings.items()}
+          == {k: f["severity"] for k, f in strict_findings.items()},
+          "same populated generation has identical severity under shape and strict")
+    for rule in ("ITERATOR_MEASURE_CALL", "HIGH_CARDINALITY_BIDIRECTIONAL", "UNUSED_HIGH_CARDINALITY"):
+        check(bool(find(strict, rule)), f"strict retains band-driven rule {rule}")
+    check("10k+" not in json.dumps([f["evidence"] for f in strict["findings"]]),
+          "strict evidence withholds index bands")
+    check(find(strict, "ITERATOR_MEASURE_CALL", "[Iter Call]")[0]["evidence"] == ["static (rows unknown: run pbz index)"],
+          "strict iterator uses existing no-band evidence")
+    pol["disclosure"] = original_disclosure
+    policy.save(ws, pol)
 
     # ---------------------------------------------------------------- memory bands
     mem = {"tables": [{"name": "Sales", "size_band": "100-1000 MiB", "share_band": ">=20%", "columns": [

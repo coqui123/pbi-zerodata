@@ -322,10 +322,10 @@ public static class IndexFile
                 blobs[name] = raw;
             }
             var index = JsonNode.Parse(Encoding.UTF8.GetString(blobs["index.json"])) as JsonObject;
-            // Bind to the actual connection identity and, for new indexes, live structure and refresh time.
+            // Bind to the actual connection identity live structure and refresh time.
             if (index == null || J.Str(index, "database_id") != conn.Meta.DatabaseId
                 || J.Int(index, "port") != conn.Port) return null;
-            if (index.ContainsKey("model_stamp") && J.Str(index, "model_stamp") != ModelStamp(conn)) return null;
+            if (J.Str(index, "model_stamp") != ModelStamp(conn)) return null;
             index["categories"] = JsonNode.Parse(Encoding.UTF8.GetString(Dpapi.Unprotect(blobs["categories.bin"])));
             return index;
         }

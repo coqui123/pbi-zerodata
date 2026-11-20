@@ -1,6 +1,7 @@
 """Offline checks for pbz doctor and the narrow fail-closed input gate."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -362,20 +363,89 @@ class IndexGenerationTests(unittest.TestCase):
             self.assertEqual(index_store.load(self.ws.private, "A"), before)
 
     def test_index_pins_artifacts_before_rebuilding_summary(self):
-        self.run_index(self.a)
-        before = index_store.load(self.ws.private, "A")
         rebuild = checks._rebuild_summary
+        for name in ("categories.bin", "index.json"):
+            with self.subTest(file=name):
+                snapshot = {}
 
-        def replace_categories(private_dir, tables):
-            result = rebuild(private_dir, tables)
-            dpapi.write_protected(str(Path(private_dir) / "categories.bin"), b"{}")
-            return result
+                def replace_staging(private_dir, tables, idx=None):
+                    for artifact in ("index.json", "categories.bin"):
+                        snapshot[artifact] = (Path(private_dir) / artifact).read_bytes()
+                    # Replace before rebuilding: both classes and published bytes must be pinned.
+                    (Path(private_dir) / name).write_bytes(b'{"columns": {"T[Owner]": {"class": "category"}}}')
+                    return rebuild(private_dir, tables, idx=idx)
 
-        with patch("pbz.checks._rebuild_summary", replace_categories):
-            with self.assertRaises(PbzError) as raised:
-                self.run_index(self.a)
-        self.assertEqual(raised.exception.code, "REFUSED")
-        self.assertEqual(index_store.load(self.ws.private, "A"), before)
+                with patch("pbz.checks._rebuild_summary", replace_staging):
+                    self.run_index(self.a)
+                stored = index_store.load(self.ws.private, "A")
+                self.assertIsNotNone(stored)
+                manifest = json.loads((Path(self.ws.private) / "index-current.json").read_bytes())
+                for artifact, raw in snapshot.items():
+                    self.assertEqual(stored[artifact], raw)
+                    self.assertEqual(manifest["sha256"][artifact], hashlib.sha256(raw).hexdigest())
+                summary = json.loads(stored["index-summary.json"])
+                self.assertEqual(summary["tables"][0]["columns"][1]["class"], "high")
+                self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Owner]"]["class"], "high")
+                self.assertNotIn("T[Owner]", json.loads(dpapi.unprotect(stored["categories.bin"])))
+
+    def test_category_values_require_matching_known_type(self):
+        self.run_index(self.a)
+        col = self.model.column("T", "Status")
+        for dtype, expected in (("STRING", ["Shared", "Member"]), ("boolean", None),
+                                ("", ["Shared", "Member"])):
+            with self.subTest(dtype=dtype):
+                col.data_type = dtype
+                clf = Classifier(self.model, self.ws.private, {}, "A")
+                self.assertEqual(clf.category_values("T", "Status"), expected)
+
+    def test_prune_failure_does_not_undo_committed_publication(self):
+        self.run_index(self.a)
+        path = Path(self.ws.private) / "index-current.json"
+        first = json.loads(path.read_bytes())["generation"]
+        self.cls = "high"
+        with patch("pbz.index_store.shutil.rmtree", side_effect=OSError("open handle")):
+            self.run_index(self.a)
+        manifest = json.loads(path.read_bytes())
+        self.assertNotEqual(manifest["generation"], first)
+        self.assertTrue((Path(self.ws.private) / first).is_dir())
+        stored = index_store.load(self.ws.private, "A")
+        self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Status]"]["class"], "high")
+        self.assertEqual((Path(self.ws.private) / manifest["generation"] / "index.json").read_bytes(),
+                         stored["index.json"])
+
+    def test_load_retries_if_manifest_generation_was_pruned(self):
+        self.run_index(self.a)
+        path = Path(self.ws.private) / "index-current.json"
+        stale = path.read_bytes()
+        self.cls = "high"
+        self.run_index(self.a)
+        expected = index_store.load(self.ws.private, "A")
+        real_read = index_store.read_checked
+        reads = []
+
+        def racing_read(filename, **kwargs):
+            if Path(filename) == path:
+                reads.append(filename)
+                if len(reads) == 1:
+                    return stale
+            return real_read(filename, **kwargs)
+
+        with patch("pbz.index_store.read_checked", racing_read):
+            self.assertEqual(index_store.load(self.ws.private, "A"), expected)
+        self.assertEqual(len(reads), 2)
+
+    def test_strict_load_refuses_damaged_project_identity(self):
+        self.run_index(self.a)
+        self.assertIsNone(index_store.load_strict(self.ws.private, "B"))
+        self.assertIsNone(Classifier(self.model, self.ws.private, {}, "B").index)
+        for damaged in ({}, {"project": 123}):
+            (Path(self.ws.private) / "index-current.json").write_text(json.dumps(damaged))
+            for read in (lambda: index_store.load_strict(self.ws.private, "A"),
+                         lambda: Classifier(self.model, self.ws.private, {}, "A")):
+                with self.subTest(manifest=damaged), self.assertRaises(PbzError) as raised:
+                    read()
+                self.assertEqual(raised.exception.code, "REFUSED")
+                self.assertEqual(str(raised.exception), "REFUSED: private index could not be read")
 
     def test_audit_and_unused_receive_project_summary(self):
         self.run_index(self.a)

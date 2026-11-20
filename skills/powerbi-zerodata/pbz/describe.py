@@ -13,8 +13,9 @@ from .common import PbzError, read_text_checked, list_names
 _LOAD_STORED = object()
 
 
-def _index_summary(ws, project=None, *, stored=_LOAD_STORED) -> dict:
+def _index_summary(ws, project=None, *, stored=_LOAD_STORED, internal=False) -> dict:
     from . import memory
+    from .engine import _COUNTS, _SHARES
     if stored is _LOAD_STORED:
         stored = index_store.load(ws.private, project.name if project else None)
     if stored is None:
@@ -25,7 +26,7 @@ def _index_summary(ws, project=None, *, stored=_LOAD_STORED) -> dict:
         return {}
     if not isinstance(data, dict) or project is None or data.get("project") != project.name:
         return {}
-    if policy_mod.load(ws).get("disclosure", "shape") != "shape":
+    if not internal and policy_mod.load(ws).get("disclosure", "shape") != "shape":
         data = memory._strip_bands(data)
     out = {}
     for table in memory._list(data.get("tables")):
@@ -33,15 +34,16 @@ def _index_summary(ws, project=None, *, stored=_LOAD_STORED) -> dict:
         if name is None:
             continue
         entry = {"table": name, "columns": []}
-        if isinstance(table.get("rows_bucket"), str):
+        if isinstance(table.get("rows_bucket"), str) and table["rows_bucket"] in _COUNTS:
             entry["rows_bucket"] = table["rows_bucket"]
         for col in memory._list(table.get("columns")):
             cname = memory._name(col.get("column"))
             if cname is None:
                 continue
             column = {"column": cname}
-            for key in ("card_bucket", "class"):
-                if isinstance(col.get(key), str):
+            for key in ("card_bucket", "blank_bucket", "class"):
+                vocab = _COUNTS if key == "card_bucket" else _SHARES if key == "blank_bucket" else None
+                if isinstance(col.get(key), str) and (vocab is None or col[key] in vocab):
                     column[key] = col[key]
             entry["columns"].append(column)
         out[name] = entry
