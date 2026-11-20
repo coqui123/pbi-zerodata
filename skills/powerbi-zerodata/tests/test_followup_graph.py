@@ -20,14 +20,6 @@ from pbz import cli, evidence, governance, images, mcp, mirror_txn, perf, policy
 SENTINEL = "424242"
 
 
-def _mac(ch: str) -> str:
-    return ch * 64
-
-
-def _record(mac: str) -> str:
-    return json.dumps({"chain_mac": mac}) + "\n"
-
-
 def _model(specs: list[tuple[str, str, str]]) -> tmdl.Model:
     model = tmdl.Model()
     tables: dict[str, tmdl.Table] = {}
@@ -64,6 +56,128 @@ def _perf_body(**over) -> dict:
     return body
 
 
+class LocatedBindingTests(unittest.TestCase):
+    def model(self, measure=False):
+        model = tmdl.load_model("", texts={
+            "tables/Sales.tmdl": "table Sales\n\tcolumn Amount\n\tcolumn OnlyHere\n",
+            "tables/Other.tmdl": "table Other\n\tcolumn Amount\n",
+            "tables/Home.tmdl": "table Home\n" + ("\tmeasure Amount = 1\n" if measure else ""),
+        })
+        return model
+
+    def test_dax_golden_occurrence_offsets(self):
+        from pbz import deps, rename, changes
+        # «...» here marks independently selected golden spans, removed before
+        # resolution. No expected offset is derived from deps or rename output.
+        fixtures = [
+            ("«[Amount]» + Sales«[Amount]»", "Sales", False, False),
+            ("Other[Amount]", "Sales", False, False),
+            ("SUMX(Sales, «[Amount]» + SUMX(Other, [Amount]) + «[Amount]»)", "Home", False, False),
+            ("SUMX(Other, [Amount]) + «[Amount]»", "Sales", False, False),
+            ("«[OnlyHere]»", "Home", False, False),
+            ("Sales«[Amount]» > 0 && «[Amount]» > 0", "Sales", True, False),
+            ("[Amount] + Sales«[Amount]» + Other[Amount]", "Sales", False, True),
+            ("Other[Amount] + Sales«[Amount]»", "Sales", False, False),
+            ("Home[Amount] + Sales«[Amount]»", "Sales", False, True),
+            ("Other[Amount] + «[Amount]»", "Sales", True, True),
+        ]
+        for marked, home, row, measure in fixtures:
+            with self.subTest(fixture=marked):
+                text, expected, opened = "", [], None
+                for ch in marked:
+                    if ch == "«":
+                        opened = len(text)
+                    elif ch == "»":
+                        expected.append((opened, len(text)))
+                    else:
+                        text += ch
+                res = deps.Resolver(self.model(measure))
+                old = "OnlyHere" if "OnlyHere" in text else "Amount"
+                info = deps.dax_bindings(text, home, res, row_home=row, base=7)
+                found = [(b.start - 7, b.end - 7) for b in info.bindings
+                         if b.ref == deps.Ref("column", "Sales", old)]
+                self.assertEqual(found, expected)
+                edits = rename.dax_ref_edits("prefix!" + text, 7, 7 + len(text), "column",
+                                             "Sales", old, "New", home, res=res, row_home=row)
+                self.assertEqual(edits, [(a + 7, b + 7, "[New]") for a, b in expected])
+                labels = changes._refs("dax", text, home, res, "tablePermission" if row else "measure")
+                self.assertEqual("Sales[" + old + "]" in labels, bool(expected))
+
+    def test_region_context_rls_and_function_original_offsets(self):
+        from pbz import deps, rename
+        res = deps.Resolver(self.model(True))
+        text = "role Reader\n\ttablePermission Sales = [Amount] > 0 && Sales[Amount] > 0\n"
+        doc = tmdl.parse("roles/Reader.tmdl", text)
+        reg = next(r for r in doc.regions if r.kind == "dax")
+        bindings = deps.dax_region(text, reg, res).bindings
+        self.assertEqual(rename._binding_edits(bindings, "column", "Sales", "Amount", "New", text),
+                         [(text.index("[Amount]"), text.index("[Amount]") + 8, "[New]"),
+                          (text.rindex("[Amount]"), text.rindex("[Amount]") + 8, "[New]")])
+        expr = "(x: scalar) => Sales[Amount] + x"
+        binding = deps.dax_bindings(expr, "", res, function=True, base=10).bindings[0]
+        self.assertEqual((binding.start, binding.end), (30, 38))
+
+    def test_unresolved_rename_candidate_refused(self):
+        from pbz import deps, rename
+        from pbz.common import PbzError
+        for expr, home in (("[Amount]", ""), ("Missing[Amount]", "Sales")):
+            with self.subTest(expr=expr), self.assertRaises(PbzError) as caught:
+                rename.dax_ref_edits(expr, 0, len(expr), "column", "Sales", "Amount", "New",
+                                     home, res=deps.Resolver(self.model()))
+            self.assertEqual(caught.exception.code, "AMBIGUOUS")
+
+    def test_semantic_preview_preserves_rls_home_context(self):
+        from pbz import changes, deps
+        from types import SimpleNamespace
+        model = self.model(True)
+        prefix = "Mini.SemanticModel/definition/"
+        texts = {prefix + rel: doc.text for rel, doc in model.docs.items()}
+        role = prefix + "roles/Reader.tmdl"
+        texts[role] = "role Reader\n\ttablePermission Sales = [Amount] > 0\n"
+        before, ma = changes._model_side(texts, SimpleNamespace(name="Mini"))
+        texts[role] = "role Reader\n\ttablePermission Sales = Other[Amount] > 0\n"
+        after, mb = changes._model_side(texts, SimpleNamespace(name="Mini"))
+        result = changes._compare_model(before, after, deps.Resolver(ma), deps.Resolver(mb))
+        rule = next(r for r in result if r["kind"] == "tablePermission")
+        self.assertEqual(rule["expressions"][0]["refs_removed"], ["Sales[Amount]"])
+        self.assertEqual(rule["expressions"][0]["refs_added"], ["Other[Amount]"])
+
+    def test_m_tracker_scopes_and_case(self):
+        from pbz import deps
+        model = tmdl.Model()
+        model.expressions = {name: None for name in ("Sales", "Other", "Source", "_")}
+        res = deps.Resolver(model)
+        fixtures = [
+            ("if Sales = Other then Sales else Other", ["Sales", "Other", "Sales", "Other"]),
+            ("let x = (let Sales = 1 in Sales), y = Sales in y", ["Sales"]),
+            ("let Sales = Other in Sales", ["Other"]),
+            ("let r = [Sales = 1, x = Sales], y = Sales in y", ["Sales"]),
+            ("let source = 1 in Source", ["Source"]),
+            ("let Sales = 1 in Sales", []),
+            ("let r = [Sales = 1, x = Sales] in r", []),
+            ("let Sales = Sales in Sales", ["Sales"]),
+            ("[Sales = Sales, x = Sales]", ["Sales"]),
+            ("let Sales = 1 in (let Sales = Sales in Sales)", []),
+            ("(Sales as number) => Sales + Other", ["Other"]),
+            ("let f = each [Sales] + Sales + _, x = _ in x", ["Sales", "_"]),
+            ('let r = [#"Sales" = 1, x = #"Sales"] in Sales', ["Sales"]),
+            ("if true then let Sales = 1 in Sales else Sales", ["Sales"]),
+            ("let f = (Sales) => Sales, x = Sales in x", ["Sales"]),
+        ]
+        for expr, expected in fixtures:
+            with self.subTest(expr=expr):
+                bindings = deps.m_bindings(expr, res, base=5)
+                self.assertEqual([b.ref.name for b in bindings], expected)
+                self.assertFalse(any(b.uncertain for b in bindings))
+                self.assertEqual([expr[b.start-5:b.end-5].removeprefix('#"').removesuffix('"') for b in bindings], expected)
+                self.assertEqual([r.name for r in deps.m(expr, res)], list(dict.fromkeys(expected)))
+        for expr, expected in (("let Sales = 1", ["Sales"]),
+                               ("try let Sales = 1 in Sales otherwise Sales", ["Sales"] * 3)):
+            uncertain = deps.m_bindings(expr, res)
+            self.assertEqual([b.ref.name for b in uncertain], expected)
+            self.assertTrue(all(b.uncertain for b in uncertain))
+
+
 class EvidenceTipTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -71,9 +185,21 @@ class EvidenceTipTests(unittest.TestCase):
         self.root = os.path.join(self.tmp.name, "ws")
         os.makedirs(self.root)
         self.ws = Workspace(self.root)
+        self.ws.private = os.path.join(self.tmp.name, "private")
+        self.key = evidence.dpapi.load_key(self.ws.private)
+        self.macs = {}
         self.active = os.path.join(self.ws.pbz_dir, "evidence.jsonl")
         self.segs = os.path.join(self.ws.pbz_dir, "evidence.d")
         self.anchor = os.path.join(self.ws.pbz_dir, "evidence.chain.json")
+
+    def _mac(self, name: str) -> str:
+        return self.macs[name]
+
+    def _record(self, name: str, prev: str = evidence.GENESIS) -> str:
+        entry = {"fixture": name, "chain_prev": prev}
+        entry["chain_mac"] = evidence._mac(self.key, prev, entry)
+        self.macs[name] = entry["chain_mac"]
+        return json.dumps(entry) + "\n"
 
     def _write(self, path: str, text: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -81,26 +207,36 @@ class EvidenceTipTests(unittest.TestCase):
             handle.write(text)
 
     def test_active_mac_wins_over_newer_segment(self):
-        self._write(os.path.join(self.segs, "0002.jsonl"), _record(_mac("a")) + _record(_mac("b")))
-        self._write(self.active, _record(_mac("c")) + '{"legacy": true}\n')
-        self.assertEqual(evidence._tip(self.ws), _mac("c"))
+        self._write(os.path.join(self.segs, "0002.jsonl"),
+                    self._record("a") + self._record("b", self._mac("a")))
+        self._write(self.active, self._record("c", self._mac("b")) + '{"legacy": true}\n')
+        self.assertEqual(evidence._tip(self.ws), self._mac("c"))
 
     def test_active_without_mac_uses_newest_segment_then_anchor(self):
-        self._write(os.path.join(self.segs, "0001.jsonl"), _record(_mac("a")))
-        self._write(os.path.join(self.segs, "0002.jsonl"), _record(_mac("b")) + _record(_mac("c")))
+        self._write(os.path.join(self.segs, "0001.jsonl"), self._record("a"))
+        self._write(os.path.join(self.segs, "0002.jsonl"),
+                    self._record("b", self._mac("a")) + self._record("c", self._mac("b")))
         self._write(self.active, '{"legacy": true}\n')
-        self.assertEqual(evidence._tip(self.ws), _mac("c"))
+        self.assertEqual(evidence._tip(self.ws), self._mac("c"))
 
-        self._write(self.anchor, json.dumps({"anchor": _mac("e")}) + "\n")
+        # The older segment supplies the final authenticated tip when the
+        # newer segment and active log contain no chained records.
+        self._record("e")
+        self._write(self.anchor, json.dumps({"anchor": self._mac("e")}) + "\n")
+        self._write(os.path.join(self.segs, "0001.jsonl"), self._record("a", self._mac("e")))
         self._write(os.path.join(self.segs, "0002.jsonl"), '{"legacy": true}\n')
         self._write(self.active, "\n")
-        self.assertEqual(evidence._tip(self.ws), _mac("e"))
+        self.assertEqual(evidence._tip(self.ws), self._mac("a"))
+        batch = [{"fixture": "appended"}]
+        evidence._append_lines(self.ws, batch)
+        self.assertEqual(batch[0]["chain_prev"], self._mac("a"))
+        self.assertEqual(evidence._tip(self.ws), batch[0]["chain_mac"])
 
     def test_missing_active_still_uses_newest_segment(self):
-        self._write(os.path.join(self.segs, "0001.jsonl"), _record(_mac("a")))
-        self._write(os.path.join(self.segs, "0002.jsonl"), _record(_mac("d")))
+        self._write(os.path.join(self.segs, "0001.jsonl"), self._record("a"))
+        self._write(os.path.join(self.segs, "0002.jsonl"), self._record("d", self._mac("a")))
         self.assertFalse(os.path.lexists(self.active))
-        self.assertEqual(evidence._tip(self.ws), _mac("d"))
+        self.assertEqual(evidence._tip(self.ws), self._mac("d"))
 
     def test_empty_log_uses_the_anchor(self):
         self.assertEqual(evidence._tip(self.ws), evidence.GENESIS)
@@ -179,6 +315,31 @@ class PerfDisclosureTests(unittest.TestCase):
         self.assertNotIn("NO_BASELINE", json.dumps(out))
         self.assertNotIn("status", out)
 
+    def test_check_identity_and_hard_ratio_fail_closed(self):
+        from pbz import common
+        project = common.Project(self.ws, "One")
+        with patch("pbz.perf.desktop.require_port", return_value=1), \
+             patch("pbz.perf.checks.spend", return_value=True), \
+             patch("pbz.perf.engine_call") as engine:
+            engine.return_value = _perf_body(verdict="SAME", ratio_verdict="WITHIN_LIMIT")
+            self.assertEqual(perf.expect(self.ws, project, "EVALUATE {1}", check_id="a:b")["status"], "PASS")
+            engine.return_value = _perf_body(verdict="NOISY", ratio_verdict="WITHIN_LIMIT")
+            self.assertEqual(perf.expect(self.ws, project, "EVALUATE {1}", check_id="a:b")["status"], "PASS")
+            first = engine.call_args.args[1]
+            self.assertEqual(first["baseline"], "a:b")
+            for verdict in ("NOISY", "SAME"):
+                engine.return_value = _perf_body(verdict=verdict, ratio_verdict="OVER_LIMIT")
+                self.assertEqual(perf.expect(self.ws, project, "EVALUATE {1}", check_id="other")["status"], "FAIL")
+            engine.return_value = _perf_body(verdict="SAME")
+            self.assertEqual(perf.expect(self.ws, project, "EVALUATE {1}")["status"], "ERROR")
+            engine.return_value = {"ok": True, "baseline": "MISSING", "query": "secret", "workload": "private-fingerprint"}
+            self.assertEqual(perf.expect(self.ws, project, "EVALUATE {2}")["status"], "ERROR")
+            out = perf.run(self.ws, common.Project(self.ws, "Two"), "EVALUATE {1}", baseline="a:b", action="save")
+            self.assertNotEqual(first["project_identity"], engine.call_args.args[1]["project_identity"])
+            self.assertNotIn("query", out)
+            self.assertNotIn("workload", out)
+            self.assertNotIn("fingerprint", str(out))
+
     def test_run_uses_workspace_policy(self):
         self._strict()
         with patch("pbz.perf.engine_call", return_value=_perf_body(verdict="SLOWER", baseline="SAVED")), \
@@ -200,7 +361,7 @@ class MirrorTransactionTests(unittest.TestCase):
     def test_base_exception_restores_and_reraises(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        root = os.path.join(tmp.name, "tree")
+        root = os.path.join(tmp.name, "pbz-workspace", "Txn.SemanticModel")
         os.makedirs(os.path.join(root, "sub"))
         kept = os.path.join(root, "sub", "kept.txt")
         prior = b"prior-bytes\n"
@@ -209,15 +370,18 @@ class MirrorTransactionTests(unittest.TestCase):
         created = os.path.join(root, "created.txt")
         boom = _Cut("stop")
 
+        from pbz.common import Workspace, Project
+        ws = Workspace(tmp.name)
+        ws.private = os.path.join(tmp.name, "private")
+        project = Project(ws, "Txn")
+
         def fn():
-            with open(kept, "wb") as handle:
-                handle.write(b"changed\n")
-            with open(created, "wb") as handle:
-                handle.write(b"new\n")
+            from pbz.common import commit_bytes
+            commit_bytes([("write_bytes", kept, b"changed\n"), ("write_bytes", created, b"new\n")], root=root)
             raise boom
 
         with self.assertRaises(_Cut) as caught:
-            mirror_txn.transaction(root, fn)
+            mirror_txn.transaction(root, fn, ws=ws, project=project)
         self.assertIs(caught.exception, boom)
         with open(kept, "rb") as handle:
             self.assertEqual(handle.read(), prior)
@@ -226,18 +390,23 @@ class MirrorTransactionTests(unittest.TestCase):
     def test_success_keeps_bytes_and_return_value(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        root = os.path.join(tmp.name, "tree")
+        root = os.path.join(tmp.name, "pbz-workspace", "Txn.SemanticModel")
         os.makedirs(root)
         kept = os.path.join(root, "kept.txt")
         with open(kept, "wb") as handle:
             handle.write(b"prior\n")
 
+        from pbz.common import Workspace, Project
+        ws = Workspace(tmp.name)
+        ws.private = os.path.join(tmp.name, "private")
+        project = Project(ws, "Txn")
+
         def fn():
-            with open(kept, "wb") as handle:
-                handle.write(b"changed\n")
+            from pbz.common import commit_bytes
+            commit_bytes([("write_bytes", kept, b"changed\n")], root=root)
             return 7
 
-        self.assertEqual(mirror_txn.transaction(root, fn), 7)
+        self.assertEqual(mirror_txn.transaction(root, fn, ws=ws, project=project), 7)
         with open(kept, "rb") as handle:
             self.assertEqual(handle.read(), b"changed\n")
 

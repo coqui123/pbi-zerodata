@@ -445,8 +445,8 @@ def walk_fields_with_path(root, model=None) -> list[tuple[FieldRef, tuple]]:
 
     def visit(node, aliases, path):
         if isinstance(node, JArr):
-            for v in node.items:
-                visit(v, aliases, path)
+            for i, v in enumerate(node.items):
+                visit(v, aliases, path + (i,))
             return
         if not isinstance(node, JObj):
             return

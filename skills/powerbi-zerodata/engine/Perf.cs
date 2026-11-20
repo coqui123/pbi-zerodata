@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -22,7 +23,6 @@ public static class Perf
         "DirectQueryEnd", "AggregateTableRewriteQuery", "DAXQueryPlan",
     };
 
-    static readonly Regex BaselineName = new("^[A-Za-z0-9._\\-]{1,64}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
     static readonly Regex RecordsRx = new(@"#Records\s*=\s*(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     sealed class Sample
@@ -54,9 +54,15 @@ public static class Perf
         if (action != null && action is not ("save" or "compare"))
             throw new BadRequestException("action must be save or compare");
         string? baseline = req.Str("baseline");
-        if (action != null && (baseline == null || !BaselineName.IsMatch(baseline)))
+        if (action != null && string.IsNullOrWhiteSpace(baseline))
             throw new BadRequestException("baseline name is not allowed");
 
+        // Desktop database-name stability cannot be assumed. Bind to the caller's project instead.
+        string? project = req.Str("project_identity");
+        if (action != null && string.IsNullOrWhiteSpace(project))
+            throw new BadRequestException("project identity is required");
+        string workload = Hash(NormalizeQuery(dax));
+        string key = Hash(project + "\n" + baseline + "\n" + workload);
         using var conn = Conn.Open(ctx, port);
         string databaseId = conn.Meta.DatabaseId;
         var server = new TOM.Server();
@@ -102,7 +108,7 @@ public static class Perf
                 samples.Add(Interpret(hits, dax));
                 foreach (var h in hits) h.Text = "";
             }
-            return Finish(ctx, samples, collected, action, baseline);
+            return Finish(ctx, samples, collected, action, key, workload);
         }
         finally
         {
@@ -129,13 +135,14 @@ public static class Perf
         return "SAME";
     }
 
-    static JsonObject Finish(Ctx ctx, List<Sample> samples, bool captured, string? action, string? baseline)
+    static JsonObject Finish(Ctx ctx, List<Sample> samples, bool captured, string? action, string? baseline, string workload)
     {
         var timed = new List<double>();
         foreach (var s in samples)
             if (s.HasEnd && double.IsFinite(s.Ms) && s.Ms >= 0) timed.Add(s.Ms);
         timed.Sort();
 
+        bool complete = captured && timed.Count == samples.Count;
         bool banded = timed.Count > 0;
         double median = 0;
         double spread = 0;
@@ -189,18 +196,22 @@ public static class Perf
 
         if (action == "save")
         {
-            if (captured && banded && baseline != null)
+            if (complete && banded && median > 0 && baseline != null)
             {
-                SaveBaseline(ctx.RequirePrivateDir(), baseline, median, spread);
+                SaveBaseline(ctx.RequirePrivateDir(), baseline, workload, median, spread);
                 fields["baseline"] = "SAVED";
             }
         }
         else if (action == "compare" && baseline != null)
         {
-            if (!TryReadBaseline(ctx.RequirePrivateDir(), baseline, out double old, out double oldSpread))
+            if (!TryReadBaseline(ctx.RequirePrivateDir(), baseline, workload, out double old, out double oldSpread))
                 fields["baseline"] = "MISSING";
-            else if (captured && banded)
-                fields["verdict"] = Verdict(old, median, Math.Max(oldSpread, spread));
+            else if (complete && banded)
+            {
+                fields["verdict"] = Verdict(old, median, oldSpread);
+                fields["ratio_verdict"] = median > old * Ratio ? "OVER_LIMIT" : "WITHIN_LIMIT";
+            }
+            else fields["baseline"] = "MISSING";
         }
         return Ctx.Ok("perf", fields);
     }
@@ -218,17 +229,13 @@ public static class Perf
     static Sample Interpret(List<EngineTrace.Hit> hits, string dax)
     {
         var sample = new Sample();
-        string needle = Compact(dax);
+        string needle = NormalizeQuery(dax);
         EngineTrace.Hit? end = null;
-        EngineTrace.Hit? longest = null;
         foreach (var h in hits)
         {
             if (h.Class != "QueryEnd" || h.Duration == EngineTrace.Hit.MissingDuration) continue;
-            if (longest == null || h.Duration > longest.Duration) longest = h;
             if (QueryTextMatches(h.Text, needle) && (end == null || h.Duration > end.Duration)) end = h;
         }
-        // The window was armed around this query. If the trace omitted or truncated the text, keep the longest QueryEnd.
-        end ??= longest;
         if (end == null)
         {
             foreach (var h in hits) h.Text = "";
@@ -296,11 +303,63 @@ public static class Perf
     static bool QueryTextMatches(string text, string needle)
     {
         if (needle.Length == 0) return false;
-        string got = Compact(text);
-        if (got.Contains(needle, StringComparison.Ordinal)) return true;
-        int take = Math.Min(needle.Length, 240);
-        return take >= 24 && got.Contains(needle.Substring(0, take), StringComparison.Ordinal);
+        return string.Equals(NormalizeQuery(text), needle, StringComparison.Ordinal);
     }
+
+    // Keep literal and comment boundaries while normalizing formatting whitespace.
+    static string NormalizeQuery(string text)
+    {
+        var tokens = new List<string>();
+        int i = 0;
+        while (i < text.Length)
+        {
+            if (char.IsWhiteSpace(text[i])) { i++; continue; }
+            int start = i;
+            bool comment = false;
+            if (i + 1 < text.Length && ((text[i] == '/' && text[i + 1] == '/')
+                || (text[i] == '-' && text[i + 1] == '-')))
+            {
+                comment = true;
+                i += 2;
+                while (i < text.Length && text[i] != '\r' && text[i] != '\n') i++;
+            }
+            else if (i + 1 < text.Length && text[i] == '/' && text[i + 1] == '*')
+            {
+                comment = true;
+                i += 2;
+                while (i + 1 < text.Length && !(text[i] == '*' && text[i + 1] == '/')) i++;
+                i = Math.Min(text.Length, i + 2);
+            }
+            else if (text[i] == '"' || text[i] == '\'' || text[i] == '[')
+            {
+                char close = text[i] == '[' ? ']' : text[i];
+                i++;
+                while (i < text.Length)
+                {
+                    if (text[i++] != close) continue;
+                    if (i < text.Length && text[i] == close) { i++; continue; }
+                    break;
+                }
+            }
+            else if ("+-*/^&=<>(),{}.:;!|".Contains(text[i]))
+            {
+                i++;
+            }
+            else
+            {
+                i++;
+                while (i < text.Length && !char.IsWhiteSpace(text[i])
+                    && !"+-*/^&=<>(),{}.:;!|".Contains(text[i])
+                    && text[i] != '"' && text[i] != '\'' && text[i] != '['
+                    && !(i + 1 < text.Length && text[i] == '/' && (text[i + 1] == '/' || text[i + 1] == '*'))) i++;
+            }
+            string token = text.Substring(start, i - start);
+            tokens.Add(comment ? Regex.Replace(token, @"\s+", " ", RegexOptions.CultureInvariant) : token);
+        }
+        return string.Join("\u001f", tokens);
+    }
+
+    static string Hash(string text) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
 
     static bool HasCallback(string text)
         => text.Contains("CallbackDataID", StringComparison.OrdinalIgnoreCase)
@@ -328,14 +387,6 @@ public static class Perf
         return n;
     }
 
-    static string Compact(string s)
-    {
-        var sb = new StringBuilder(s.Length);
-        foreach (char c in s)
-            if (!char.IsWhiteSpace(c)) sb.Append(c);
-        return sb.ToString();
-    }
-
     static void ClearCache(TOM.Server server, string databaseId)
     {
         string id = System.Security.SecurityElement.Escape(databaseId) ?? "";
@@ -359,7 +410,7 @@ public static class Perf
     {
         string dir = Path.Combine(privateDir, "perf");
         Directory.CreateDirectory(dir);
-        string path = Path.GetFullPath(Path.Combine(dir, name + ".bin"));
+        string path = Path.GetFullPath(Path.Combine(dir, Hash(name) + ".bin"));
         string root = Path.GetFullPath(dir + Path.DirectorySeparatorChar);
         if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
             throw new BadRequestException("baseline name is not allowed");
@@ -384,13 +435,13 @@ public static class Perf
         }
     }
 
-    static void SaveBaseline(string privateDir, string name, double median, double spread)
+    static void SaveBaseline(string privateDir, string name, string workload, double median, double spread)
     {
-        var body = new JsonObject { ["median"] = median, ["spread"] = spread };
+        var body = new JsonObject { ["version"] = 2, ["workload"] = workload, ["median"] = median, ["spread"] = spread };
         Vault.WriteProtected(BaselinePath(privateDir, name), body.ToJsonString());
     }
 
-    static bool TryReadBaseline(string privateDir, string name, out double median, out double spread)
+    static bool TryReadBaseline(string privateDir, string name, string workload, out double median, out double spread)
     {
         median = 0;
         spread = 0;
@@ -400,7 +451,8 @@ public static class Perf
             if (!File.Exists(path)) return false;
             string text = Encoding.UTF8.GetString(Dpapi.Unprotect(File.ReadAllBytes(path)));
             if (JsonNode.Parse(text) is not JsonObject o) return false;
-            if (!TryDouble(o["median"], out median)) return false;
+            if (o["version"]?.GetValue<int>() != 2 || o["workload"]?.GetValue<string>() != workload) return false;
+            if (!TryDouble(o["median"], out median) || median <= 0) return false;
             if (!TryDouble(o["spread"], out spread) || spread < 0 || !double.IsFinite(spread)) spread = 0;
             return true;
         }

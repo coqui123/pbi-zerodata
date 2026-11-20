@@ -1,0 +1,14 @@
+{
+  "windows": {
+    "mcp": [
+      "PBZ_SKIP {\"test\": \"__main__.GitHookTests.test_chain_bytes_args_stdin_and_status\", \"reason\": \"direct shell hook execution is POSIX-only\"}",
+      "PBZ_SKIP {\"test\": \"__main__.GitHookTests.test_non_executable_host_is_ignored\", \"reason\": \"executable mode semantics require POSIX\"}",
+      "PBZ_SKIP {\"test\": \"__main__.InstallerTransactionTests.test_atomic_text_preserves_mode_and_symlink\", \"reason\": \"POSIX modes and symlink\"}",
+      "PBZ_SKIP {\"test\": \"__main__.InstallerTransactionTests.test_posix_lock_timeout_is_named_conflict\", \"reason\": \"POSIX flock\"}",
+      "PBZ_SKIP {\"test\": \"__main__.InstallerTransactionTests.test_absent_noop_holder_removes_parents_before_waiter_retries\", \"reason\": \"POSIX flock\"}",
+      "PBZ_SKIP {\"test\": \"__main__.InstallerTransactionTests.test_absent_noop_lock_unlinks_before_unlocking\", \"reason\": \"POSIX flock and unlink of open file\"}",
+      "PBZ_SKIP {\"test\": \"__main__.InstallerTransactionTests.test_absent_noop_lock_waiter_retries_replaced_inode\", \"reason\": \"POSIX flock and unlink of open file\"}"
+    ]
+  },
+  "posix": {}
+}

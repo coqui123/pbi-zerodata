@@ -1,0 +1,12 @@
+[
+  {
+    "id": "injected-control",
+    "argv": [
+      "tests/test_ci_registration.py",
+      "--injected-failure"
+    ],
+    "purpose": "injected",
+    "exit_code": 91,
+    "reason": "PBZ_INJECTED_FAILURE"
+  }
+]

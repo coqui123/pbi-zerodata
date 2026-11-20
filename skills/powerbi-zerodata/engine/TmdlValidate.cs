@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -8,11 +9,17 @@ using Microsoft.AnalysisServices.Tabular.Tmdl;
 namespace PbzEngine;
 
 /// <summary>
-/// tmdl-validate: TmdlSerializer.DeserializeDatabaseFromFolder plus a ref/file inventory. No connection.
+/// tmdl-validate: TmdlSerializer.DeserializeDatabaseFromFolder plus a ref/file inventory of a private snapshot copy. No connection.
 /// Never echoes line text; messages are rebuilt without the Document/Line parts and scrubbed.
 /// </summary>
 public static class TmdlValidate
 {
+    internal static Action? BeforeInventoryForTests;
+    internal static Action<string>? AfterCopyFileForTests;
+    internal static Action<string>? AfterSnapshotCleanupForTests;
+
+    static readonly ConcurrentDictionary<string, byte> ActiveSnapshots = new(StringComparer.OrdinalIgnoreCase);
+
     static readonly Dictionary<string, string> RefDirs = new(StringComparer.Ordinal)
     {
         ["table"] = "tables",
@@ -36,11 +43,159 @@ public static class TmdlValidate
         LinkGuard.Refuse(folder);
         if (!Directory.Exists(folder)) throw new BadRequestException("folder not found");
 
-        var scrub = new Scrubber(CollectNames(folder));
-        var errors = new JsonArray();
+        string privateDir = ctx.RequirePrivateDir();
+        string snapshot = Path.Combine(privateDir, "tmdl-validate-" + Guid.NewGuid().ToString("N"));
+        if (IsInsideFolder(snapshot, folder))
+            throw new BadRequestException("validation scratch directory must be outside the candidate folder");
+        LinkGuard.Refuse(snapshot);
+        SweepSnapshots(privateDir, folder);
+        // A fresh GUID collision is unsafe: CreateNew must fail rather than overwrite
+        // or remove an existing owner's marker. Publish ownership before copying.
+        var lease = new FileStream(snapshot + ".pbz-owner", FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+        ActiveSnapshots.TryAdd(snapshot, 0);
+        var cancellation = new CancellationTokenSource();
+        Task? copy = null;
         try
         {
-            ctx.Guard(() => TmdlSerializer.DeserializeDatabaseFromFolder(folder));
+            copy = Task.Run(() => CopyTree(folder, snapshot, cancellation.Token));
+            // Match Guard's deadline and exception semantics, but retain the worker for cleanup.
+            try
+            {
+                if (!copy.Wait(TimeSpan.FromSeconds(ctx.TimeoutSec + 10)))
+                    throw new TimeoutException("engine operation exceeded its deadline");
+            }
+            catch (AggregateException ae) when (ae.InnerException != null)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerException).Throw();
+            }
+            return RunSnapshot(req, ctx, snapshot);
+        }
+        finally
+        {
+            cancellation.Cancel();
+            if (copy == null || copy.IsCompleted)
+            {
+                _ = copy?.Exception;
+                CleanupSnapshot(snapshot, lease);
+                cancellation.Dispose();
+            }
+            else
+            {
+                // A timed-out worker retains ownership until it has stopped writing. If the
+                // process exits first, a later sweep recovers only marked snapshots whose
+                // exclusive cross-process lease can be acquired.
+                _ = copy.ContinueWith(completed =>
+                {
+                    _ = completed.Exception; // Observe any failure after the caller timed out.
+                    CleanupSnapshot(snapshot, lease);
+                    cancellation.Dispose();
+                }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
+        }
+    }
+
+    static void SweepSnapshots(string privateDir, string folder)
+    {
+        try
+        {
+            foreach (var stale in Directory.EnumerateDirectories(privateDir, "tmdl-validate-*"))
+            {
+                if (string.Equals(Path.TrimEndingDirectorySeparator(stale), Path.TrimEndingDirectorySeparator(folder),
+                        StringComparison.OrdinalIgnoreCase)
+                    || IsInsideFolder(stale, folder) || IsInsideFolder(folder, stale)) continue;
+                try
+                {
+                    // Missing markers are unowned; an exclusive-open failure leaves a
+                    // live owner's tree alone, including owners in another process.
+                    using (new FileStream(stale + ".pbz-owner", FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                }
+                catch (IOException) { continue; }
+                catch (UnauthorizedAccessException) { continue; }
+                // Claim stale paths too, so concurrent sweeps cannot traverse the same tree.
+                if (ActiveSnapshots.TryAdd(stale, 0)) CleanupSnapshot(stale);
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    static void CleanupSnapshot(string snapshot, FileStream? lease = null)
+    {
+        // Best effort: a leftover scratch directory must not fail a completed validation.
+        try
+        {
+            if (!LinkGuard.IsLink(snapshot) && Directory.Exists(snapshot))
+            {
+                ClearReadOnly(snapshot);
+                Directory.Delete(snapshot, recursive: true);
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        finally
+        {
+            // Hold ownership through the directory cleanup, then release before removing
+            // the sibling marker (Windows disallows deleting an exclusively held file).
+            lease?.Dispose();
+            try
+            {
+                // Retain proof of ownership when best-effort tree deletion failed.
+                if (!Directory.Exists(snapshot)) File.Delete(snapshot + ".pbz-owner");
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            ActiveSnapshots.TryRemove(snapshot, out _);
+        }
+        AfterSnapshotCleanupForTests?.Invoke(snapshot);
+    }
+
+    internal static bool IsInsideFolder(string candidate, string folder)
+    {
+        candidate = Path.GetFullPath(candidate);
+        folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder));
+        string prefix = Path.EndsInDirectorySeparator(folder) ? folder : folder + Path.DirectorySeparatorChar;
+        return !string.Equals(Path.TrimEndingDirectorySeparator(candidate), folder, StringComparison.OrdinalIgnoreCase)
+            && candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static void ClearReadOnly(string path)
+    {
+        var attributes = File.GetAttributes(path);
+        File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+        if (attributes.HasFlag(FileAttributes.Directory))
+            foreach (var entry in Directory.EnumerateFileSystemEntries(path)) ClearReadOnly(entry);
+    }
+
+    // Copy failures propagate: no validation or signing may fall back to the live folder.
+    static void CopyTree(string source, string destination, CancellationToken cancellation)
+    {
+        cancellation.ThrowIfCancellationRequested();
+        LinkGuard.Refuse(source);
+        Directory.CreateDirectory(destination);
+        foreach (var entry in Directory.EnumerateFileSystemEntries(source))
+        {
+            cancellation.ThrowIfCancellationRequested();
+            LinkGuard.Refuse(entry);
+            string target = Path.Combine(destination, Path.GetFileName(entry));
+            if (File.GetAttributes(entry).HasFlag(FileAttributes.Directory))
+                CopyTree(entry, target, cancellation);
+            else if (string.Equals(Path.GetExtension(entry), ".tmdl", StringComparison.OrdinalIgnoreCase))
+            {
+                cancellation.ThrowIfCancellationRequested();
+                File.Copy(entry, target);
+                AfterCopyFileForTests?.Invoke(target);
+            }
+        }
+    }
+
+    static JsonObject RunSnapshot(Req req, Ctx ctx, string folder)
+    {
+        var scrub = new Scrubber(CollectNames(folder));
+        var errors = new JsonArray();
+        Database? db = null;
+        try
+        {
+            db = ctx.Guard(() => TmdlSerializer.DeserializeDatabaseFromFolder(folder));
         }
         catch (TmdlFormatException fe)
         {
@@ -73,11 +228,18 @@ public static class TmdlValidate
             errors.Add(Entry(null, 0, Errors.Classify(ex), scrub.Scrub(CleanMessage(ex.Message, null))));
         }
 
+        BeforeInventoryForTests?.Invoke();
         var (missing, orphans) = Inventory(folder);
         var missingArr = new JsonArray();
         foreach (var m in missing) missingArr.Add(m);
         var orphanArr = new JsonArray();
         foreach (var o in orphans) orphanArr.Add(o);
+        if (errors.Count == 0 && missing.Count == 0 && req.Str("synthetic_marker") is string marker)
+        {
+            if (db!.Model.Annotations.Find("PBZ_SYNTHETIC")?.Value != marker)
+                throw new BadRequestException("SYNTH_MARKER_MISMATCH: candidate marker differs");
+            SyntheticProvenance.Save(ctx, marker, SyntheticProvenance.Definition(db.Model));
+        }
         return Ctx.Ok("tmdl-validate", new JsonObject
         {
             ["valid"] = errors.Count == 0 && missing.Count == 0,

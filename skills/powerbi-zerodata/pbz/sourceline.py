@@ -216,14 +216,14 @@ def native_sql(ws, project) -> dict:
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     queries = []
     for table in model.tables.values():
         for part in table.partition_nodes:
             doc = model.docs.get(part.file)
             if doc is None:
                 continue
-            reg = next((r for r in doc.regions if r.node is part and r.kind == "m"), None)
+            reg = next((r for r in doc.regions_for(part) if r.kind == "m"), None)
             if reg is None:
                 continue
             text = doc.text[reg.start:reg.end]

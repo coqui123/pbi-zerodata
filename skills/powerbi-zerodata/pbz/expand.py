@@ -41,7 +41,7 @@ def _function_body(model, node) -> str:
         doc = next((item for path, item in model.docs.items() if path.lower() == low), None)
     if doc is None:
         return ""
-    reg = next((r for r in doc.regions if r.node is node and r.kind == "dax"), None)
+    reg = next((r for r in doc.regions_for(node) if r.kind == "dax"), None)
     if reg is None:
         return ""
     return doc.text[reg.start:reg.end]
@@ -51,7 +51,7 @@ def run(ws, project, target: str) -> dict:
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     root = _measure(model, target)
     res = deps.Resolver(model)
     order, seen = [], set()

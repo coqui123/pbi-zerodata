@@ -14,7 +14,7 @@ from unittest.mock import patch
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 
-from pbz import common, modeling  # noqa: E402
+from pbz import common, modeling, rename  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 
 
@@ -51,6 +51,72 @@ class ModelingAtomicTests(unittest.TestCase):
         _write(os.path.join(mdef, "functions.tmdl"),
                "function AddOne = (x : int64) => x + 1\n\tlineageTag: t1\n")
         return ws, project, mdef
+
+    def test_table_refs_preserve_line_endings(self):
+        for ending in (b"\n", b"\r\n"):
+            for old in ("Sales", "Old Table"):
+                with self.subTest(ending=ending, old=old):
+                    ws, project, mdef = self._project()
+                    quoted = "'Old Table'" if " " in old else old
+                    raw = ending.join([b"model Model", b"", ("ref table " + quoted).encode(), b""])
+                    Path(mdef, "model.tmdl").write_bytes(raw)
+                    Path(mdef, "tables", "Sales.tmdl").write_bytes(
+                        ending.join([("table " + quoted).encode(), b"\tcolumn Amount", b"\t\tdataType: int64", ("\tmeasure Count = COUNTROWS(" + quoted + ")").encode(), b""]))
+                    table_raw = Path(mdef, "tables", "Sales.tmdl").read_bytes()
+                    rename.rename(ws, project, "table", old, "New Table")
+                    target = "New Table.tmdl" if old == "Sales" else "Sales.tmdl"
+                    self.assertEqual(Path(mdef, "tables", target).read_bytes(),
+                                     table_raw.replace(quoted.encode(), b"'New Table'"))
+                    self.assertEqual(Path(mdef, "model.tmdl").read_bytes(),
+                                     raw.replace(quoted.encode(), b"'New Table'"))
+
+    def test_case_only_table_rename(self):
+        ws, project, mdef = self._column_project()
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "SALES")
+        self.assertEqual(caught.exception.code, "UNSUPPORTED")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def _column_project(self):
+        ws, project, mdef = self._project()
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n"
+               "\tmeasure Keep = SUM(Sales[Amount])\n")
+        _write(os.path.join(mdef, "tables", "Other.tmdl"),
+               "table Other\n\tcolumn Amount\n\t\tdataType: int64\n"
+               "\tmeasure Elsewhere = SUM(Other[Amount])\n"
+               "\tcolumn Alternate\n\t\talternateOf\n\t\t\tbaseColumn: Sales.Amount\n")
+        _write(os.path.join(mdef, "roles", "Reader.tmdl"),
+               "role Reader\n\ttablePermission Sales\n\t\tcolumnPermission Amount\n\t\t\tmetadataPermission: none\n"
+               "\ttablePermission Other\n\t\tcolumnPermission Amount\n\t\t\tmetadataPermission: read\n")
+        return ws, project, mdef
+
+    def test_column_role_base_and_scope(self):
+        ws, project, mdef = self._column_project()
+        role = Path(mdef, "roles", "Reader.tmdl")
+        before = role.read_bytes()
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(role.read_bytes(), before.replace(b"columnPermission Amount", b"columnPermission Value", 1))
+        other = Path(mdef, "tables", "Other.tmdl").read_text()
+        self.assertIn("baseColumn: Sales.Value", other)
+        self.assertIn("column Amount", other)
+        self.assertIn("SUM(Other[Amount])", other)
+
+    def test_missed_binding_refuses_without_writes(self):
+        ws, project, _mdef = self._column_project()
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename._binding_edits", return_value=[]):
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_case_only_column_rename(self):
+        ws, project, mdef = self._column_project()
+        rename.rename(ws, project, "column", "Amount", "AMOUNT", table="Sales")
+        self.assertIn("SUM(Sales[AMOUNT])", Path(mdef, "tables", "Sales.tmdl").read_text())
+        self.assertIn("SUM(Other[Amount])", Path(mdef, "tables", "Other.tmdl").read_text())
 
     def test_unknown_ref_with_upgrade_leaves_database(self):
         ws, project, mdef = self._project()

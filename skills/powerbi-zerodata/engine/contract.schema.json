@@ -19,6 +19,7 @@
     { "$ref": "#/$defs/snapshotCompare" },
     { "$ref": "#/$defs/smoke" },
     { "$ref": "#/$defs/deps" },
+    { "$ref": "#/$defs/synthBind" },
     { "$ref": "#/$defs/synthQuery" },
     { "$ref": "#/$defs/memory" },
     { "$ref": "#/$defs/perf" }
@@ -26,7 +27,7 @@
   "$defs": {
     "verb": {
       "enum": ["ping", "connect", "health", "provenance", "tmdl-validate", "refresh", "compiles", "index", "check", "probe",
-               "snapshot-save", "snapshot-compare", "smoke", "deps", "synth-query", "memory", "perf"]
+               "snapshot-save", "snapshot-compare", "smoke", "deps", "synth-bind", "synth-query", "memory", "perf"]
     },
     "anyVerb": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_\\-]*$" },
     "errorClass": {
@@ -58,7 +59,10 @@
         "ok": { "const": false },
         "verb": { "$ref": "#/$defs/anyVerb" },
         "class": { "$ref": "#/$defs/errorClass" },
-        "log_id": { "$ref": "#/$defs/logId" }
+        "log_id": { "$ref": "#/$defs/logId" },
+        "reason": { "enum": ["SYNTH_DATA_PARTITION", "SYNTH_NO_MARKER", "SYNTH_MANIFEST_SIGNATURE",
+          "SYNTH_VERIFICATION_UNAVAILABLE", "SYNTH_DEFINITION_CHANGED", "SYNTH_CATALOG_MISMATCH",
+          "SYNTH_MARKER_MISMATCH", "SYNTH_MODEL_CHANGED_DURING_QUERY"] }
       }
     },
 
@@ -410,14 +414,26 @@
         }
       }
     },
+    "synthBind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "verb", "verified"],
+      "properties": {
+        "ok": { "const": true },
+        "verb": { "const": "synth-bind" },
+        "verified": { "const": true }
+      }
+    },
+
     "synthQuery": {
       "description": "Rows of a query against a verified pbz synthetic model (fake data only); the one verb whose strings are not a closed vocabulary.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["ok", "verb", "columns", "rows", "truncated"],
+      "required": ["ok", "verb", "verified", "columns", "rows", "truncated"],
       "properties": {
         "ok": { "const": true },
         "verb": { "const": "synth-query" },
+        "verified": { "const": true },
         "columns": { "type": "array", "items": { "type": "string", "maxLength": 512 } },
         "rows": {
           "type": "array",
@@ -562,6 +578,7 @@
         "trace": { "enum": ["CAPTURED", "UNAVAILABLE"] },
         "verdict": { "enum": ["FASTER", "SAME", "SLOWER", "NOISY"] },
         "baseline": { "enum": ["SAVED", "MISSING"] },
+        "ratio_verdict": { "enum": ["WITHIN_LIMIT", "OVER_LIMIT"] },
         "plan": {
           "type": "object",
           "additionalProperties": false,

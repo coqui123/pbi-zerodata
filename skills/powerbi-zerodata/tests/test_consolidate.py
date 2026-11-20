@@ -14,6 +14,7 @@ import re
 import shutil
 import sys
 import tempfile
+from unittest.mock import patch
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
@@ -104,6 +105,41 @@ def main() -> int:
         check(notes.get("NESTED_MEASURES", {}).get("measures") == ["[C]"]
               and notes.get("DUPLICATE_MEMBERS", {}).get("pairs") == [["[A YoY 2]", "[A YoY]"]], f"family notes: {notes}")
     check(consolidate.families(um, min_bases=4) == [], "min_bases 4")
+
+    # Both precision pairs must remain distinct at the families() layer.
+    for literals in (("9007199254740993", "9007199254740992"),
+                     ("0.1", "0.10000000000000001")):
+        decimal_text = "table T\n\tcolumn X\n"
+        for i, base in enumerate("ABCDEF"):
+            decimal_text += f"\tmeasure {base} = SUM(T[X]) + {i}\n"
+            literal = literals[0] if i < 3 else literals[1]
+            decimal_text += f"\tmeasure '{base} Large' = [{base}] + {literal}\n"
+        decimal_model = tmdl.load_model("", texts={"tables/T.tmdl": decimal_text})
+        decimal_families = consolidate.families(decimal_model)
+        check(len(decimal_families) == 2, f"exact decimal family groups {literals}: {decimal_families}")
+        check({f["templates"][0]["expression"] for f in decimal_families} ==
+              {"SELECTEDMEASURE() + " + literal for literal in literals},
+              f"exact decimals preserved in templates: {literals}")
+
+    tier_text = unit + "".join(
+        f"\tmeasure '{base} MTD' = CALCULATE([{base}], DATESMTD('D'[Date]))\n" for base in "AB")
+    tier_model = tmdl.load_model("", texts={"tables/T.tmdl": tier_text})
+    tier3 = consolidate.families(tier_model, min_bases=3)
+    tier2 = consolidate.families(tier_model, min_bases=2)
+    check(len(tier3) == 1 and tier3 != tier2, "tiers have different family templates")
+    selected = consolidate._pick_family(tier_model, None, ["A YoY"])
+    check(selected == tier3[0], "member selection resolves in first matching tier")
+    with patch("pbz.similar._h", return_value="a" * 64):
+        collided = consolidate.families(decimal_model)
+        check(len(collided) == 2 and len({f["id"] for f in collided}) == 1, "forced family id collision")
+        try:
+            consolidate._pick_family(decimal_model, "a" * 10, None)
+        except PbzError as exc:
+            check(exc.code == "AMBIGUOUS", f"family collision refusal: {exc.code}")
+        else:
+            check(False, "family collision must refuse")
+        selected = consolidate._pick_family(decimal_model, "a" * 10, ["A Large"])
+        check(selected["bases"] == ["A", "B", "C"], "members disambiguate collided family id")
 
     # ================================================================ 1. merge 'Sales Copy' into 'Total Sales'
     tmp1, ws, project = setup("pbzcons1-")

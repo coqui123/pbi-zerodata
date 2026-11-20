@@ -1,7 +1,24 @@
 #!/bin/sh
+# PBZ owned offline checks v1
 # Refuse the git command unless the offline suites in .github/workflows/tests.yml pass.
 set -e
 root=$(git rev-parse --show-toplevel) || exit 1
+# Always inspect staged content; a passing working tree is not evidence for the index.
+export PYTHONDONTWRITEBYTECODE=1
+checker=$(mktemp "${TMPDIR:-/tmp}/pbz-check-staged.XXXXXX")
+trap 'rm -f "$checker"' EXIT HUP INT TERM
+git show :scripts/check_staged.py > "$checker"
+if command -v python >/dev/null 2>&1; then
+  python "$checker"
+else
+  py -3 "$checker"
+fi
+rm -f "$checker"
+trap - EXIT HUP INT TERM
+# Retain the full gate until hosted offline is verified required on main.
+if [ "$(git config --local --get pbz.requiredCI || true)" = "main-offline-required" ]; then
+  exit 0
+fi
 cd "$root/skills/powerbi-zerodata" || exit 1
 export PYTHONIOENCODING=utf-8
 echo "pbz: building the engine, then running the offline CI suites"

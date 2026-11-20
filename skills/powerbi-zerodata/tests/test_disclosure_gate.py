@@ -1,17 +1,21 @@
 """Offline checks for pbz doctor and the narrow fail-closed input gate."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
 import tempfile
 import unittest
+import subprocess
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL))
 
-from pbz import cli, dpapi, tokens  # noqa: E402
+from pbz import audit, checks, cli, describe, dpapi, index_store, tmdl, tokens, unused  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 from pbz.classify import Classifier, looks_like_phone  # noqa: E402
 from _junction import make_junction  # noqa: E402
@@ -277,6 +281,360 @@ class IndexLinkTests(unittest.TestCase):
         heuristic = Classifier(None, bare.name, {})
         self.assertEqual(heuristic.mode, "heuristic")
         self.assertIsNone(heuristic.index)
+
+
+class IndexGenerationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = SimpleNamespace(private=self.tmp.name)
+        self.a = SimpleNamespace(name="A", mirror_model=self.tmp.name, mirror_report=self.tmp.name)
+        self.b = SimpleNamespace(name="B", mirror_model=self.tmp.name)
+        self.pol = {"disclosure": "shape"}
+        self.cls = "category"
+        self.model = tmdl.Model()
+        definition = Path(self.tmp.name) / "definition"
+        (definition / "tables").mkdir(parents=True)
+        (definition / "tables" / "T.tmdl").write_text(
+            "table T\n\tcolumn Status\n\t\tdataType: string\n\tcolumn Owner\n\t\tdataType: string\n")
+        self.model = tmdl.load_model(str(definition))
+
+    def engine(self, verb, payload, timeout=30):
+        cols = {"T[Status]": {"type": "string", "class": self.cls},
+                "T[Owner]": {"type": "string", "class": "category"}}
+        (Path(self.ws.private) / "index.json").write_text(json.dumps({"columns": cols}))
+        dpapi.load_key(self.ws.private)
+        cats = {"T[Owner]": ["Ada Jones"]}
+        if self.cls == "category":
+            cats["T[Status]"] = ["Shared", "Member"]
+        dpapi.write_protected(str(Path(self.ws.private) / "categories.bin"), json.dumps(cats).encode())
+        return {"ok": True, "tables": [{"table": "T", "rows_bucket": "1-9", "columns": [
+            {"column": "Status", "class": self.cls, "card_bucket": "1-9"},
+            {"column": "Owner", "class": "category", "card_bucket": "1-9"}]}]}
+
+    def run_index(self, project):
+        with patch("pbz.checks.policy_mod.load", return_value=self.pol), \
+                patch("pbz.checks.desktop.require_port", return_value=1), \
+                patch("pbz.checks.engine_call", self.engine):
+            return checks.index(self.ws, project)
+
+    def test_project_b_after_index_a_last_and_membership(self):
+        self.cls = "high"
+        self.run_index(self.b)
+        self.cls = "category"
+        self.run_index(self.a)  # Pin the order: A overwrites the shared staging store last.
+        a = Classifier(self.model, self.ws.private, {}, "A")
+        b = Classifier(self.model, self.ws.private, {}, "B")
+        self.assertEqual(a.category_values("T", "Status"), ["Shared", "Member"])
+        self.assertIsNone(a.literal("Member", "string", ("T", "Status")))
+        self.assertEqual(a.literal("New", "string", ("T", "Status")), "T[Status]")
+        self.assertIsNone(b.category_values("T", "Status"))
+        # Shared is a member in A: rejecting it in B requires identity, not membership.
+        self.assertEqual(b.literal("Shared", "string", ("T", "Status")), "T[Status]")
+        self.assertEqual(b.literal("Other", "string", ("T", "Status")), "T[Status]")
+        with patch("pbz.describe.policy_mod.load", return_value={}):
+            self.assertEqual(describe.values(self.ws, self.a, "T[Status]")["values"], ["Shared", "Member"])
+            labels_b = describe.values(self.ws, self.b, "T[Status]")
+        self.assertNotIn("values", labels_b)
+        self.assertNotIn("Shared", json.dumps(labels_b))
+
+
+    def test_removed_column_cannot_use_stored_membership(self):
+        self.run_index(self.a)
+        missing = tmdl.Model()
+        clf = Classifier(missing, self.ws.private, {}, "A")
+        self.assertIsNone(clf.category_values("T", "Status"))
+        self.assertEqual(clf.column_class("T", "Status"), "sensitive")
+        self.assertEqual(Classifier(None, self.ws.private, {}, "A").category_values("T", "Status"),
+                         ["Shared", "Member"])
+
+    def test_publish_hash_mismatch_keeps_previous_generation(self):
+        self.run_index(self.a)
+        before = index_store.load(self.ws.private, "A")
+        self.assertIsNotNone(before)
+        manifest = (Path(self.ws.private) / "index-current.json").read_bytes()
+        directories = sorted(Path(self.ws.private).glob("index-*"))
+        for name in ("index.json", "categories.bin"):
+            with self.subTest(file=name), self.assertRaises(PbzError) as raised:
+                index_store.publish(self.ws.private, "A", {}, expected={name: "0" * 64})
+            self.assertEqual(raised.exception.code, "REFUSED")
+            self.assertEqual((Path(self.ws.private) / "index-current.json").read_bytes(), manifest)
+            self.assertEqual(sorted(Path(self.ws.private).glob("index-*")), directories)
+            self.assertEqual(index_store.load(self.ws.private, "A"), before)
+
+    def test_index_pins_artifacts_before_rebuilding_summary(self):
+        rebuild = checks._rebuild_summary
+        for name in ("categories.bin", "index.json"):
+            with self.subTest(file=name):
+                snapshot = {}
+
+                def replace_staging(private_dir, tables, idx=None):
+                    for artifact in ("index.json", "categories.bin"):
+                        snapshot[artifact] = (Path(private_dir) / artifact).read_bytes()
+                    # Replace before rebuilding: both classes and published bytes must be pinned.
+                    (Path(private_dir) / name).write_bytes(b'{"columns": {"T[Owner]": {"class": "category"}}}')
+                    return rebuild(private_dir, tables, idx=idx)
+
+                with patch("pbz.checks._rebuild_summary", replace_staging):
+                    self.run_index(self.a)
+                stored = index_store.load(self.ws.private, "A")
+                self.assertIsNotNone(stored)
+                manifest = json.loads((Path(self.ws.private) / "index-current.json").read_bytes())
+                for artifact, raw in snapshot.items():
+                    self.assertEqual(stored[artifact], raw)
+                    self.assertEqual(manifest["sha256"][artifact], hashlib.sha256(raw).hexdigest())
+                summary = json.loads(stored["index-summary.json"])
+                self.assertEqual(summary["tables"][0]["columns"][1]["class"], "high")
+                self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Owner]"]["class"], "high")
+                self.assertNotIn("T[Owner]", json.loads(dpapi.unprotect(stored["categories.bin"])))
+
+    def test_index_publishes_hardener_bytes_after_staging_replacement(self):
+        harden = checks.harden_index
+        snapshot = {}
+
+        def replace_staging(ws, pol):
+            result = harden(ws, pol)
+            snapshot.update(result[1])
+            path = Path(ws.private) / "index.json"
+            idx = json.loads(path.read_bytes())
+            idx["columns"]["T[Owner]"]["class"] = "category"
+            path.write_bytes(json.dumps(idx).encode("utf-8"))
+            return result
+
+        with patch("pbz.checks.harden_index", replace_staging):
+            self.run_index(self.a)
+        stored = index_store.load(self.ws.private, "A")
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["index.json"], snapshot["index.json"])
+        self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Owner]"]["class"], "high")
+        manifest = json.loads((Path(self.ws.private) / "index-current.json").read_bytes())
+        self.assertEqual((Path(self.ws.private) / manifest["generation"] / "index.json").read_bytes(),
+                         snapshot["index.json"])
+
+    def test_prune_enumeration_failure_keeps_committed_publication(self):
+        for mid_iteration in (False, True):
+            with self.subTest(mid_iteration=mid_iteration):
+                self.cls = "category"
+                self.run_index(self.a)
+                path = Path(self.ws.private) / "index-current.json"
+                first = json.loads(path.read_bytes())["generation"]
+                self.cls = "high"
+
+                def broken_scan(*args):
+                    if mid_iteration:
+                        yield SimpleNamespace(name="unrelated")
+                    raise OSError("enumeration failed")
+
+                kwargs = ({"side_effect": broken_scan} if mid_iteration else
+                          {"side_effect": OSError("enumeration failed")})
+                with patch("pbz.index_store.os.scandir", **kwargs):
+                    self.run_index(self.a)
+                manifest = json.loads(path.read_bytes())
+                self.assertNotEqual(manifest["generation"], first)
+                stored = index_store.load(self.ws.private, "A")
+                self.assertIsNotNone(stored)
+                self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Status]"]["class"], "high")
+                for name, raw in stored.items():
+                    self.assertEqual((Path(self.ws.private) / manifest["generation"] / name).read_bytes(), raw)
+
+    def test_category_values_require_matching_known_type(self):
+        self.run_index(self.a)
+        col = self.model.column("T", "Status")
+        for dtype, expected in (("STRING", ["Shared", "Member"]), ("binary", None),
+                                ("", ["Shared", "Member"])):
+            with self.subTest(dtype=dtype):
+                col.data_type = dtype
+                clf = Classifier(self.model, self.ws.private, {}, "A")
+                self.assertEqual(clf.category_values("T", "Status"), expected)
+
+    def test_prune_failure_does_not_undo_committed_publication(self):
+        self.run_index(self.a)
+        path = Path(self.ws.private) / "index-current.json"
+        first = json.loads(path.read_bytes())["generation"]
+        self.cls = "high"
+        with patch("pbz.index_store.shutil.rmtree", side_effect=OSError("open handle")):
+            self.run_index(self.a)
+        manifest = json.loads(path.read_bytes())
+        self.assertNotEqual(manifest["generation"], first)
+        self.assertTrue((Path(self.ws.private) / first).is_dir())
+        stored = index_store.load(self.ws.private, "A")
+        self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Status]"]["class"], "high")
+        self.assertEqual((Path(self.ws.private) / manifest["generation"] / "index.json").read_bytes(),
+                         stored["index.json"])
+
+    def test_prune_reparse_point_is_unlinked_and_unlink_failure_is_harmless(self):
+        self.run_index(self.a)
+        path = Path(self.ws.private) / "index-current.json"
+        first = json.loads(path.read_bytes())["generation"]
+        old = Path(self.ws.private) / first
+        real_reparse = index_store._reparse_link
+
+        def reparse(filename):
+            return Path(filename) == old or real_reparse(filename)
+
+        with patch("pbz.index_store._reparse_link", reparse), \
+                patch("pbz.index_store.os.unlink", side_effect=OSError("open junction")) as unlink, \
+                patch("pbz.index_store.shutil.rmtree", side_effect=AssertionError("must not traverse junction")):
+            self.run_index(self.a)
+        unlink.assert_called_once_with(str(old))
+        self.assertNotEqual(json.loads(path.read_bytes())["generation"], first)
+        self.assertIsNotNone(index_store.load(self.ws.private, "A"))
+
+    def test_load_retries_if_manifest_generation_was_pruned(self):
+        self.run_index(self.a)
+        path = Path(self.ws.private) / "index-current.json"
+        stale = path.read_bytes()
+        self.cls = "high"
+        self.run_index(self.a)
+        expected = index_store.load(self.ws.private, "A")
+        real_read = index_store.read_checked
+        reads = []
+
+        def racing_read(filename, **kwargs):
+            if Path(filename) == path:
+                reads.append(filename)
+                if len(reads) == 1:
+                    return stale
+            return real_read(filename, **kwargs)
+
+        with patch("pbz.index_store.read_checked", racing_read):
+            self.assertEqual(index_store.load(self.ws.private, "A"), expected)
+        self.assertEqual(len(reads), 2)
+
+    def test_strict_load_refuses_damaged_project_identity(self):
+        self.run_index(self.a)
+        self.assertIsNone(index_store.load_strict(self.ws.private, "B"))
+        self.assertIsNone(Classifier(self.model, self.ws.private, {}, "B").index)
+        for damaged in ({}, {"project": 123}):
+            (Path(self.ws.private) / "index-current.json").write_text(json.dumps(damaged))
+            for read in (lambda: index_store.load_strict(self.ws.private, "A"),
+                         lambda: Classifier(self.model, self.ws.private, {}, "A")):
+                with self.subTest(manifest=damaged), self.assertRaises(PbzError) as raised:
+                    read()
+                self.assertEqual(raised.exception.code, "REFUSED")
+                self.assertEqual(str(raised.exception), "REFUSED: private index could not be read")
+
+    def test_audit_and_unused_receive_project_summary(self):
+        self.run_index(self.a)
+        with patch("pbz.describe.policy_mod.load", return_value={"disclosure": "shape"}):
+            self.assertEqual(audit._index(self.ws, self.a)["t"]["cols"]["status"], "1-9")
+            self.assertEqual(unused._index_summary(self.ws, self.a)["T"]["rows_bucket"], "1-9")
+        with patch("pbz.describe._index_summary", return_value={"T": {}, "U": {
+                "columns": [None, 4, {}, {"column": "Status", "card_bucket": "1-9"}]}}):
+            summary = audit._index(self.ws, self.a)
+        self.assertEqual(summary["t"]["cols"], {})
+        self.assertEqual(summary["u"]["cols"], {"status": "1-9"})
+
+    def test_publish_prunes_old_generations_and_unlinks_symlinks(self):
+        self.run_index(self.a)
+        first = json.loads((Path(self.ws.private) / "index-current.json").read_text())["generation"]
+        target = Path(self.tmp.name) / "keep"
+        target.mkdir()
+        (target / "marker").write_text("keep")
+        link = Path(self.ws.private) / ("index-" + "f" * 32)
+        link.symlink_to(target, target_is_directory=True)
+        self.cls = "high"
+        self.run_index(self.a)
+        directories = [p for p in Path(self.ws.private).glob("index-*") if p.is_dir()]
+        self.assertEqual(len(directories), 1)
+        self.assertNotEqual(directories[0].name, first)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual((target / "marker").read_text(), "keep")
+        stored = index_store.load(self.ws.private, "A")
+        self.assertIsNotNone(stored)
+        self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Status]"]["class"], "high")
+
+    def test_strict_load_refuses_missing_generation_files(self):
+        self.assertIsNone(index_store.load_strict(self.ws.private, "A"))
+        self.run_index(self.a)
+        self.assertIsNone(index_store.load_strict(self.ws.private, "B"))
+        manifest = json.loads((Path(self.ws.private) / "index-current.json").read_text())
+        (Path(self.ws.private) / manifest["generation"] / "index.json").unlink()
+        self.assertIsNone(index_store.load(self.ws.private, "A"))
+        with self.assertRaises(PbzError) as raised:
+            index_store.load_strict(self.ws.private, "A")
+        self.assertEqual(raised.exception.code, "REFUSED")
+
+    def test_describe_readers_pin_one_generation(self):
+        self.run_index(self.a)
+        stored = index_store.load(self.ws.private, "A")
+        for read in (lambda: describe.describe(self.ws, self.a, "T"),
+                     lambda: describe.values(self.ws, self.a, "T[Owner]")):
+            with self.subTest(read=read), patch("pbz.index_store.load", return_value=stored) as load, \
+                    patch("pbz.index_store.load_strict", side_effect=AssertionError("unexpected reload")), \
+                    patch("pbz.describe.policy_mod.load", return_value={}):
+                read()
+                load.assert_called_once_with(self.ws.private, "A")
+        with patch("pbz.index_store.load_strict", side_effect=AssertionError("unexpected reload")):
+            self.assertIsNone(Classifier(self.model, self.ws.private, {}, "A", stored=None).index)
+        with patch("pbz.index_store.load", side_effect=AssertionError("unexpected reload")):
+            self.assertEqual(describe._index_summary(self.ws, self.a, stored=None), {})
+
+    def test_hardened_summary_and_all_artifacts_are_one_generation(self):
+        out = self.run_index(self.a)
+        stored = index_store.load(self.ws.private, "A")
+        idx = json.loads(stored["index.json"])
+        cats = json.loads(dpapi.unprotect(stored["categories.bin"]))
+        summary = json.loads(stored["index-summary.json"])
+        self.assertEqual(out["personal_or_id_columns_hashed"], 1)
+        self.assertEqual(idx["columns"]["T[Owner]"]["class"], "high")
+        self.assertNotIn("T[Owner]", cats)
+        self.assertEqual(summary["tables"][0]["columns"][1]["class"], "high")
+        manifest = json.loads((Path(self.ws.private) / "index-current.json").read_text())
+        path = Path(self.ws.private) / manifest["generation"] / "categories.bin"
+        path.write_bytes(b"mixed generation")
+        self.assertIsNone(index_store.load(self.ws.private, "A"))
+        with self.assertRaises(PbzError) as raised:
+            Classifier(self.model, self.ws.private, {}, "A")
+        self.assertEqual(raised.exception.code, "REFUSED")
+        self.assertEqual(describe._index_summary(self.ws, self.a), {})
+        self.assertEqual(audit._index(self.ws, self.a), {})
+        self.assertEqual(unused._index_summary(self.ws, self.a), {})
+
+    def test_kill_before_hardening_never_publishes_personal_category(self):
+        # A real child dies after the engine writes a low-cardinality PERSONAL column,
+        # before hardening. This fixture would move Owner to high if allowed to finish.
+        script = r"""
+import json, os, signal, sys
+from types import SimpleNamespace
+from unittest.mock import patch
+from pbz import checks, dpapi
+ws = SimpleNamespace(private=sys.argv[1])
+def engine(*args, **kwargs):
+    with open(os.path.join(ws.private, "index.json"), "w") as f:
+        json.dump({"columns": {"T[Owner]": {"type": "string", "class": "category"}}}, f)
+    dpapi.load_key(ws.private)
+    dpapi.write_protected(os.path.join(ws.private, "categories.bin"), b'{"T[Owner]":["Ada Jones"]}')
+    return {"ok": True, "tables": [{"table": "T", "columns": [{"column": "Owner", "class": "category"}]}]}
+def kill(*args):
+    with open(sys.argv[2], "w") as marker:
+        marker.write("harden hook reached")
+    os.kill(os.getpid(), signal.SIGTERM)
+with patch("pbz.checks.policy_mod.load", return_value={}), patch("pbz.checks.desktop.require_port", return_value=1), patch("pbz.checks.engine_call", engine), patch("pbz.checks.harden_index", kill):
+    checks.index(ws, SimpleNamespace(name="A"))
+"""
+        marker = Path(self.tmp.name) / "harden-reached"
+        proc = subprocess.run([sys.executable, "-c", script, self.ws.private, str(marker)], cwd=SKILL,
+                              capture_output=True, timeout=30)
+        self.assertNotEqual(proc.returncode, 0, proc.stderr.decode())
+        self.assertTrue(marker.is_file())
+        staged = json.loads((Path(self.ws.private) / "index.json").read_text())
+        self.assertEqual(staged["columns"]["T[Owner]"]["class"], "category")
+        self.assertIsNone(index_store.load(self.ws.private, "A"))
+        self.assertIsNone(Classifier(self.model, self.ws.private, {}, "A").category_values("T", "Owner"))
+        self.assertEqual(describe._index_summary(self.ws, self.a), {})
+        self.assertEqual(audit._index(self.ws, self.a), {})
+        self.assertEqual(unused._index_summary(self.ws, self.a), {})
+
+    def test_failed_reindex_keeps_previous_completed_generation(self):
+        self.run_index(self.a)
+        before = index_store.load(self.ws.private, "A")
+        self.assertIsNotNone(before)
+        with patch("pbz.checks.harden_index", side_effect=RuntimeError("interrupted")):
+            with self.assertRaises(RuntimeError):
+                self.run_index(self.b)
+        self.assertEqual(index_store.load(self.ws.private, "A"), before)
+        self.assertIsNone(index_store.load(self.ws.private, "B"))
 
 
 if __name__ == "__main__":

@@ -5,11 +5,13 @@ tokenized in place and references analysed, without re-serializing anything.
 """
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
+import heapq
 import os
 import re
 from dataclasses import dataclass, field
 
-from .common import PbzError, _reparse_link
+from .common import PbzError, _reparse_link, read_text_checked
 
 _UNSAFE = PbzError("UNSAFE_PATH", "refusing to write through a link")
 
@@ -90,6 +92,8 @@ class Node:
     expr: Region | None = None
     decl_value: str = ""   # e.g. "m" / "calculated" for partitions
     file: str = ""         # document path the node was parsed from
+    block_start: int = 0
+    block_end: int = 0
 
     def __repr__(self) -> str:  # parent/children links make the default repr recursive
         return f"Node({self.kind} {self.name!r} @ {self.file}:{self.line + 1})"
@@ -113,6 +117,21 @@ class TmdlDoc:
     text: str
     nodes: list
     regions: list
+    unclosed_fence: bool = False
+    _regions_by_node: dict = field(init=False, repr=False)
+    lines: list | None = field(default=None, repr=False)
+    line_offsets: list = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._regions_by_node = {}
+        for ordinal, reg in enumerate(self.regions):
+            self._regions_by_node.setdefault(id(reg.node), []).append((ordinal, reg))
+        if self.lines is None:
+            self.lines = _lines(self.text)
+        self.line_offsets = [off for off, _ in self.lines]
+
+    def regions_for(self, node: Node) -> list[Region]:
+        return [r for _, r in self._regions_by_node.get(id(node), ())]
 
 
 def _lines(text: str) -> list[tuple[int, str]]:
@@ -130,10 +149,13 @@ def _indent(line: str) -> int:
 
 def parse(path: str, text: str) -> TmdlDoc:
     lines = _lines(text)
+    line_offsets = [off for off, _ in lines]
     nodes: list[Node] = []
     regions: list[Region] = []
     stack: list[Node] = []
+    blocks: list[Node] = []
     pending_desc: list[tuple[int, int]] = []
+    unclosed_fence = False
     i, n = 0, len(lines)
 
     def owner_for(ind: int) -> Node | None:
@@ -150,15 +172,20 @@ def parse(path: str, text: str) -> TmdlDoc:
 
     def take_expr(line_idx: int, ind: int, rest: str, rest_offset: int, node: Node, prop: str) -> int:
         """Record an expression region starting at rest_offset; return index of next unconsumed line."""
+        nonlocal unclosed_fence
         lang = lang_for(node, prop)
         if rest.strip().startswith("```"):
             j = line_idx + 1
             start = lines[j][0] if j < n else rest_offset + len(rest)
             while j < n and lines[j][1].strip() != "```":
                 j += 1
+            if j == n:
+                unclosed_fence = True
             end = lines[j][0] if j < n else len(text)
             reg = Region(lang, start, end, node, prop)
             regions.append(reg)
+            if prop == "expression":
+                node.expr = node.expr or reg
             return j + 1
         start = rest_offset
         end = rest_offset + len(rest)
@@ -180,6 +207,8 @@ def parse(path: str, text: str) -> TmdlDoc:
         reg = Region(lang, start, end, node, prop)
         if end > start:
             regions.append(reg)
+            if prop == "expression":
+                node.expr = node.expr or reg
         return last_content + 1
 
     while i < n:
@@ -189,6 +218,10 @@ def parse(path: str, text: str) -> TmdlDoc:
             i += 1
             continue
         ind = _indent(line)
+        # Expression bodies (including their closing fences) are consumed by take_expr.
+        # Only structural lines can close a block; a sibling's description closes it too.
+        while blocks and blocks[-1].indent >= ind:
+            blocks.pop().block_end = off
         if stripped.startswith("///"):
             s = off + line.index("///") + 3
             pending_desc.append((s, off + len(line)))
@@ -202,6 +235,17 @@ def parse(path: str, text: str) -> TmdlDoc:
             parent = owner_for(ind)
             name = m.group("name") or ""
             node = Node(kw, unquote(name), ind, i, parent, file=path)
+            first = i
+            while first > 0 and lines[first - 1][1].strip().startswith("///") and _indent(lines[first - 1][1]) == ind:
+                first -= 1
+            node.block_start = lines[first][0]
+            if pending_desc:
+                desc_line = bisect_right(line_offsets, pending_desc[0][0]) - 1
+                if all(not ln.strip() or ln.strip().startswith("///")
+                       for _, ln in lines[desc_line + 1:i]):
+                    node.block_start = min(node.block_start, lines[desc_line][0])
+            node.block_end = len(text)
+            blocks.append(node)
             nodes.append(node)
             if parent:
                 parent.children.append(node)
@@ -254,38 +298,33 @@ def parse(path: str, text: str) -> TmdlDoc:
             if owner is not None:
                 owner.props[stripped] = "true"
         i += 1
-    return TmdlDoc(path, text, nodes, regions)
+    return TmdlDoc(path, text, nodes, regions, unclosed_fence=unclosed_fence, lines=lines)
 
 
+# block_span and prop_edit use parser spans and the cached line table.
 def block_span(doc: TmdlDoc, node: Node) -> tuple[int, int]:
-    """Character span of a node's whole block: its /// description lines, its own line, every deeper
-    line, and the blank lines that follow it (up to the next line at the same or a lower indent)."""
-    lines = _lines(doc.text)
-    first = node.line
-    while first > 0 and lines[first - 1][1].strip().startswith("///") and _indent(lines[first - 1][1]) == node.indent:
-        first -= 1
-    j = node.line + 1
-    in_fence = False
-    while j < len(lines):
-        ln = lines[j][1]
-        if ln.strip().startswith("```"):
-            in_fence = not in_fence
-            j += 1
-            continue
-        if not in_fence and ln.strip() and _indent(ln) <= node.indent:
-            break
-        j += 1
-    end = lines[j][0] if j < len(lines) else len(doc.text)
-    return lines[first][0], end
+    """Parser-owned span, including descendants and trailing blanks, excluding sibling descriptions."""
+    if doc.unclosed_fence:
+        raise PbzError("REFUSED", "unclosed TMDL expression fence")
+    if doc.text and node.block_start == 0 and node.block_end == 0:
+        raise PbzError("REFUSED", "node has no parser span")
+    return node.block_start, node.block_end
+
+
+def refuse_out_of_span_description(doc: TmdlDoc, node: Node) -> None:
+    """Refuse block removal when it would leave an owned description behind."""
+    if any(r.prop == "description" and (r.start < node.block_start or r.end > node.block_end)
+           for r in doc.regions_for(node)):
+        raise PbzError("REFUSED", "TMDL description outside node block span")
 
 
 def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tuple[int, int, str]]:
     """Edits that set `prop: value` on a node (value None: a bare flag line such as isHidden).
     Replaces an existing value in place, else inserts a line right after the declaration and its
     expression. Returns [] when the property already has that value."""
-    lines = _lines(doc.text)
+    lines = doc.lines
     s, e = block_span(doc, node)
-    for off, ln in lines:
+    for off, ln in lines[bisect_left(doc.line_offsets, s):bisect_left(doc.line_offsets, e)]:
         if off < s or off >= e or _indent(ln) != node.indent + 1:
             continue
         m = PROP_RE.match(ln)
@@ -297,10 +336,15 @@ def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tu
             return [(off + m.start("val"), off + len(ln), value)]
         if ln.strip() == prop:
             return [] if value is None else [(off + len(ln) - len(ln.lstrip("\t")), off + len(ln), f"{prop}: {value}")]
-    regs = [r for r in doc.regions if r.node is node and r.prop == "expression"]
+    regs = [r for r in doc.regions_for(node) if r.prop == "expression"]
     after = max([r.end for r in regs] + [lines[node.line][0] + len(lines[node.line][1])])
     nl = doc.text.find("\n", after)
-    eol = "\r\n" if "\r\n" in doc.text else "\n"
+    line_index = bisect_right(doc.line_offsets, after) - 1
+    line_end = doc.line_offsets[line_index] + len(lines[line_index][1])
+    if line_end == len(doc.text) and line_index > 0:
+        # An unterminated final line inherits the preceding line's ending.
+        line_end = doc.line_offsets[line_index - 1] + len(lines[line_index - 1][1])
+    eol = "\r\n" if doc.text[line_end:line_end + 2] == "\r\n" else "\n"
     line = "\t" * (node.indent + 1) + prop + (f": {value}" if value is not None else "") + eol
     if nl < 0:
         return [(len(doc.text), len(doc.text), eol + line)]
@@ -309,8 +353,10 @@ def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tu
 
 def node_regions(doc: TmdlDoc, node: Node, deep: bool = True) -> list[Region]:
     """Expression regions owned by a node (and, with deep, by its child nodes: KPIs, format strings...)."""
-    ids = {id(node)} | ({id(d) for d in node.descendants()} if deep else set())
-    return [r for r in doc.regions if id(r.node) in ids]
+    owners = [node, *node.descendants()] if deep else [node]
+    # Merge by global ordinal: parents may have regions after a child's regions.
+    streams = [doc._regions_by_node[id(n)] for n in owners if id(n) in doc._regions_by_node]
+    return [r for _, r in heapq.merge(*streams, key=lambda item: item[0])]
 
 
 # ---------------------------------------------------------------- model index
@@ -415,11 +461,16 @@ class Model:
         return names
 
 
-def tmdl_files(definition_dir: str) -> list[str]:
+def tmdl_files(definition_dir: str, *, strict: bool = False, root: str | None = None) -> list[str]:
     if _reparse_link(definition_dir):
         raise _UNSAFE
     out = []
-    for cur, dirs, files in os.walk(definition_dir):
+    def unreadable(err):
+        if strict:
+            path = err.filename or definition_dir
+            detail = os.path.relpath(path, root) if root is not None else path
+            raise PbzError("REFUSED", detail.replace("\\", "/")) from None
+    for cur, dirs, files in os.walk(definition_dir, onerror=unreadable):
         if _reparse_link(cur):
             raise _UNSAFE
         for d in dirs:
@@ -435,17 +486,22 @@ def tmdl_files(definition_dir: str) -> list[str]:
     return sorted(out)
 
 
-def load_model(definition_dir: str, texts: dict | None = None) -> Model:
+def load_model(definition_dir: str, texts: dict | None = None, *, root: str | None = None) -> Model:
     """Build a Model from a TMDL definition folder (or from {relpath: text})."""
     model = Model()
     if texts is None:
         texts = {}
-        for p in tmdl_files(definition_dir):
-            with open(p, "rb") as f:
-                raw = f.read()
-            if raw.startswith(b"\xef\xbb\xbf"):
-                raw = raw[3:]
-            texts[os.path.relpath(p, definition_dir).replace("\\", "/")] = raw.decode("utf-8")
+        for p in tmdl_files(definition_dir, strict=(root is not None), root=root):
+            if root is not None:
+                try:
+                    text = read_text_checked(p, root=root)[0]
+                except (OSError, UnicodeError, PbzError):
+                    raise PbzError("REFUSED", os.path.relpath(p, root).replace("\\", "/")) from None
+            else:
+                with open(p, "rb") as f:
+                    raw = f.read()
+                text = raw.removeprefix(b"\xef\xbb\xbf").decode("utf-8")
+            texts[os.path.relpath(p, definition_dir).replace("\\", "/")] = text
     for relp, text in texts.items():
         if relp.lower().startswith("cultures/"):
             continue  # translations and linguistic metadata, not model objects
@@ -460,19 +516,19 @@ def load_model(definition_dir: str, texts: dict | None = None) -> Model:
             elif node.kind == "column" and node.parent and node.parent.kind == "table":
                 t = model.tables.setdefault(node.parent.name, Table(node.parent.name, relp))
                 t.columns[node.name] = Column(
-                    t.name, node.name, node.props.get("dataType", "").strip(), node.expr is not None or any(
-                        r.node is node and r.kind == "dax" for r in doc.regions),
+                    t.name, node.name, node.props.get("dataType", "").strip(), any(r.kind == "dax" for r in doc.regions_for(node)),
                     unquote(node.props.get("sourceColumn", "").strip()), unquote(node.props.get("sortByColumn", "").strip()),
                     "isHidden" in node.props, node)
             elif node.kind == "measure" and node.parent and node.parent.kind == "table":
                 t = model.tables.setdefault(node.parent.name, Table(node.parent.name, relp))
-                reg = next((r for r in doc.regions if r.node is node and r.kind == "dax"), None)
+                reg = next((r for r in doc.regions_for(node) if r.kind == "dax"), None)
                 t.measures[node.name] = Measure(t.name, node.name, text[reg.start:reg.end] if reg else "",
                                                 node.props.get("formatString", "").strip(),
                                                 node.props.get("displayFolder", "").strip(), node)
             elif node.kind == "partition" and node.parent and node.parent.kind == "table":
                 t = model.tables.setdefault(node.parent.name, Table(node.parent.name, relp))
-                reg = next((r for r in doc.regions if r.node is node), None)
+                # Item 30a: partition descriptions are text regions, never the source expression.
+                reg = next((r for r in doc.regions_for(node) if r.prop == "source"), None)
                 kind = node.decl_value.strip().lower() or "m"
                 t.partitions.append((node.name, kind, text[reg.start:reg.end] if reg else ""))
                 t.partition_nodes.append(node)

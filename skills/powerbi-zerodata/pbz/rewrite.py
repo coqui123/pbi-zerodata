@@ -18,7 +18,7 @@ def _model(project):
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    return mdef, tmdl.load_model(mdef)
+    return mdef, tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
 
 
 def _measure(model, target: str):
@@ -33,7 +33,7 @@ def _measure(model, target: str):
 
 def _region(model, measure):
     doc = model.docs[measure.node.file]
-    reg = next((r for r in doc.regions if r.node is measure.node and r.kind == "dax"), None)
+    reg = next((r for r in doc.regions_for(measure.node) if r.kind == "dax"), None)
     if reg is None:
         raise PbzError("BAD_REQUEST", "measure has no expression")
     return doc, reg

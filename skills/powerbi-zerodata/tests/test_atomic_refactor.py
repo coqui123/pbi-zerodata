@@ -101,6 +101,58 @@ class AtomicRefactorTests(unittest.TestCase):
             os.makedirs(project.model_dir, exist_ok=True)
         return ws, project
 
+    def test_m_rename_edits_comparisons_but_preserves_scopes_and_case(self):
+        from pbz import rename
+        ws, project = self._project()
+        mdef = os.path.join(project.mirror_model, "definition")
+        path = os.path.join(mdef, "tables", "Metrics.tmdl")
+        _write(path, METRICS + "\tpartition Metrics = m\n\t\tsource = "
+               "{if Sales = Other then Sales else Other, (let Sales = 1 in Sales), sales, "
+               "[Sales = 1, x = Sales], Sales, (Sales) => Sales, each [Sales] + Sales}\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("if Revenue = Other then Revenue else Other", text)
+        self.assertIn("(let Sales = 1 in Sales), sales", text)
+        self.assertIn("[Sales = 1, x = Sales], Revenue, (Sales) => Sales, each [Sales] + Revenue", text)
+
+    def test_uncertain_m_rename_refuses_before_writing(self):
+        from pbz import rename
+        ws, project = self._project()
+        path = os.path.join(project.mirror_model, "definition", "tables", "Metrics.tmdl")
+        _write(path, METRICS + "\tpartition Metrics = m\n\t\tsource = try let Sales = 1 in Sales otherwise Sales\n")
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(caught.exception.code, "AMBIGUOUS")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_rls_and_uncertain_candidate_atomicity(self):
+        from pbz import rename
+        ws, project = self._project()
+        mdef = os.path.join(project.mirror_model, "definition")
+        path = os.path.join(mdef, "tables", "Sales.tmdl")
+        _write(path, SALES + "\tcolumn Qty\n\tmeasure Homed = [Qty]\n"
+               "\tmeasure Iterator = SUMX(Metrics, [Qty])\n")
+        other = os.path.join(mdef, "tables", "Metrics.tmdl")
+        _write(other, METRICS + "\tcolumn Qty\n")
+        role = os.path.join(mdef, "roles", "Reader.tmdl")
+        _write(role, "role Reader\n\ttablePermission Sales = [Qty] > 0 && Sales[Qty] > 0\n")
+        # A bare candidate in a third table is ambiguous; no declaration or RLS
+        # edits may be committed before that is detected.
+        unknown = os.path.join(mdef, "tables", "Unknown.tmdl")
+        _write(unknown, "table Unknown\n\tmeasure Ambiguous = [Qty]\n")
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError):
+            rename.rename(ws, project, "column", "Qty", "New", table="Sales")
+        self.assertEqual(_bytes(ws.mirror), before)
+        _write(unknown, "table Unknown\n")
+        rename.rename(ws, project, "column", "Qty", "New", table="Sales")
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("column New", text)
+        self.assertIn("Homed = [New]", text)
+        self.assertIn("SUMX(Metrics, [Qty])", text)
+        self.assertIn("[New] > 0 && Sales[New] > 0", Path(role).read_text(encoding="utf-8"))
+
     def test_shared_alias_leaves_mirror_unchanged(self):
         ws, project = self._project(shared=True, culture=True, perspective=True)
         before = _bytes(ws.mirror)

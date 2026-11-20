@@ -46,7 +46,7 @@ def _model(project):
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    return mdef, tmdl.load_model(mdef)
+    return mdef, tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
 
 
 def _rel(project, rel: str) -> str:
@@ -93,7 +93,7 @@ def _report_dirs(ws, project) -> list[tuple[str, str]]:
 
 def _expr_span(doc, node) -> tuple[int, int]:
     """Span from just after the declaration's `=` to the end of the node's own expression (fences included)."""
-    lines = tmdl._lines(doc.text)
+    lines = doc.lines
     off, line = lines[node.line]
     m = tmdl.DECL_RE.match(line)
     if not m or m.group("rest") is None:
@@ -104,7 +104,7 @@ def _expr_span(doc, node) -> tuple[int, int]:
         while j < len(lines) and lines[j][1].strip() != "```":
             j += 1
         return start, (lines[j][0] + len(lines[j][1]) if j < len(lines) else len(doc.text))
-    regs = [r for r in doc.regions if r.node is node and r.prop == "expression"]
+    regs = [r for r in doc.regions_for(node) if r.prop == "expression"]
     return start, max([r.end for r in regs] + [off + len(line)])
 
 
@@ -150,7 +150,7 @@ def _format_of(model, m, res) -> tuple:
     dyn: tuple = ()
     if fsd is not None:
         doc = model.docs[m.node.file]
-        text = "".join(doc.text[r.start:r.end] for r in doc.regions if r.node is fsd)
+        text = "".join(doc.text[r.start:r.end] for r in doc.regions_for(fsd))
         dyn = tuple(similar.canon(text, m.table, res).words("hash"))
     return static, dyn
 
@@ -191,14 +191,15 @@ def _report_area(file_kind: str, path: tuple) -> str:
     return {"sort": "sorts", "formatting": "conditional_formatting"}.get(via, "other_report")
 
 
-def _retarget_dax(expr: str, d, t) -> tuple[str, int]:
-    """A DAX string with every reference to measure d pointing at measure t (requalified first when the
+def _retarget_dax(expr: str, d, t, res) -> tuple[str, int]:
+    """A DAX string with every reference to measure d pointing at measure t (requalified when the
     tables differ). Returns (new text, references rewritten)."""
     text = expr
+    edits = rename.dax_ref_edits(text, 0, len(text), "measure", d.table, d.name, t.name, cur=d.table, res=res)
+    count = len(edits)
     if d.table.lower() != t.table.lower():
-        text = apply_edits(text, move.dax_qualifier_edits(text, 0, len(text), d.name, d.table, t.table))
-    edits = rename.dax_ref_edits(text, 0, len(text), "measure", t.table, d.name, t.name)
-    return apply_edits(text, edits), len(edits)
+        edits += move.dax_qualifier_edits(text, 0, len(text), d.name, d.table, t.table)
+    return apply_edits(text, edits), count
 
 
 def _alias_text(doc, node, target: str) -> str:
@@ -238,7 +239,7 @@ def _perspective_text(rel: str, text: str, d, t, alias: bool) -> tuple[str, int]
     return text, changed
 
 
-def _report_measure_edits(root, d, t, counts: dict) -> list[tuple[int, int, str]]:
+def _report_measure_edits(root, d, t, counts: dict, res) -> list[tuple[int, int, str]]:
     """reportExtensions.json: DAX of report-level measures and their `references` entries."""
     out = []
 
@@ -263,7 +264,7 @@ def _report_measure_edits(root, d, t, counts: dict) -> list[tuple[int, int, str]
                 continue
             ex = mm.get("expression")
             if isinstance(ex, pbir.JStr):
-                new, n = _retarget_dax(ex.value, d, t)
+                new, n = _retarget_dax(ex.value, d, t, res)
                 if n:
                     counts["report_measures"] += n
                     out.append((ex.start, ex.end, json.dumps(new, ensure_ascii=False)))
@@ -333,23 +334,18 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
         texts[d.node.file] = _alias_text(ddoc, d.node, t.name)
     else:
         texts[d.node.file] = apply_edits(ddoc.text, [tmdl.block_span(ddoc, d.node) + ("",)])
-    # ---- model DAX: requalify 'Src'[dup] (move planner), then [dup] -> [into] (rename planner)
+    # ---- model DAX: plan name and qualifier edits against the original bindings
     cross = d.table.lower() != t.table.lower()
     named: dict[str, int] = {}   # DAX string literals spelling the duplicate's name (never rewritten)
     for rel in list(texts):
         text = texts[rel]
         doc = model.docs[rel] if text == model.docs[rel].text else tmdl.parse(rel, text)
-        if cross:
-            a = [ed for reg in doc.regions if reg.kind == "dax"
-                 for ed in move.dax_qualifier_edits(text, reg.start, reg.end, d.name, d.table, t.table)]
-            if a:
-                text = apply_edits(text, a)
-                doc = tmdl.parse(rel, text)
-        b = []
+        b = [ed for reg in doc.regions if reg.kind == "dax"
+             for ed in move.dax_qualifier_edits(text, reg.start, reg.end, d.name, d.table, t.table)] if cross else []
         for reg in doc.regions:
             if reg.kind != "dax":
                 continue
-            es = rename.dax_ref_edits(text, reg.start, reg.end, "measure", t.table, d.name, t.name)
+            es = rename.dax_ref_edits(text, reg.start, reg.end, "measure", d.table, d.name, t.name, cur=d.table, res=res)
             if es:
                 counts[_area(reg)] = counts.get(_area(reg), 0) + len(es)
                 b += es
@@ -406,7 +402,7 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
                 c = [(n.start, n.end, json.dumps(f"{t.table}.{t.name}", ensure_ascii=False))
                      for key, n in pbir.string_nodes(root) if key not in FIELD_STRING_KEYS and n.value.lower() in olds]
                 if fkind == "extensions":
-                    c += _report_measure_edits(root, d, t, counts)
+                    c += _report_measure_edits(root, d, t, counts, res)
                 if c:
                     text = apply_edits(text, sorted(set(c)))
                 if not alias and any(f.kind == "measure" and f.name.lower() == d.name.lower() and f.table.lower() in
@@ -537,7 +533,7 @@ def families(model, min_bases: int = 3) -> list[dict]:
             if similar.discovery(c).words("hash") == TRIVIAL or any(
                     r.split("[", 1)[0].lower() in cg_tables for r in c.refs()):
                 continue  # an alias, or already a wrapper that applies a calculation group
-            key = similar._h(" ".join(c.words("hash")))
+            key = tuple(c.words("hash"))
             grp = groups.setdefault(key, {"bases": {}, "text": {}, "dups": []})
             if base in grp["bases"]:
                 grp["dups"].append((m.name, grp["bases"][base]))
@@ -571,7 +567,7 @@ def families(model, min_bases: int = 3) -> list[dict]:
             if len(mem) < min_bases:
                 continue  # its members already belong to a wider template of this family
             assigned |= {mb.lower() for mb in mem.values()}
-            templates.append({"key": k, "expression": groups[k]["text"][next(iter(mem))], "members": mem})
+            templates.append({"key": similar._h(repr(k)), "expression": groups[k]["text"][next(iter(mem))], "members": mem})
         if not templates:
             continue
         used: set[str] = set()
@@ -625,12 +621,18 @@ def _pick_family(model, family: str | None, measures: list[str] | None) -> dict:
         raise PbzError("BAD_REQUEST", "name a family id (pbz consolidate families) or member measures")
     want = {_find_measure(model, m).name.lower() for m in measures or []}
     for mb in (3, 2):
+        matches = []
         for f in families(model, min_bases=mb):
             if family and f["id"] != family:
                 continue
             if want and not want <= {m.lower() for m in f["members"]}:
                 continue
-            return f
+            if f not in matches:
+                matches.append(f)
+        if len(matches) > 1:
+            raise PbzError("AMBIGUOUS", "multiple calculation-group families match; select member measures")
+        if matches:
+            return matches[0]
     raise PbzError("NOT_FOUND", f"no calculation-group family {family}" if family else
                    "no calculation-group family covers those measures")
 

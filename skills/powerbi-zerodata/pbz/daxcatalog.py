@@ -74,7 +74,7 @@ def _udf_arity(model) -> dict[str, int]:
         text = ""
         doc = model.docs.get(node.file)
         if doc is not None:
-            reg = next((r for r in doc.regions if r.node is node and r.kind == "dax"), None)
+            reg = next((r for r in doc.regions_for(node) if r.kind == "dax"), None)
             if reg is not None:
                 text = doc.text[reg.start:reg.end]
         params = text.split("=>", 1)[0]
@@ -110,7 +110,7 @@ def _column_dax(model, column) -> str | None:
     doc = model.docs.get(node.file)
     if doc is None:
         return None
-    regs = [r for r in doc.regions if r.node is node and r.kind == "dax"]
+    regs = [r for r in doc.regions_for(node) if r.kind == "dax"]
     reg = next((r for r in regs if r.prop == "expression"), None)
     if reg is None and regs:
         reg = regs[0]

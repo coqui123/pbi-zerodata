@@ -111,10 +111,20 @@ def main() -> int:
     for f in sorted(os.listdir(os.path.join(SKILL, "pbz"))):
         if f.endswith(".py") and f != "guard.py":   # the guard names tools only to block them
             src += open(os.path.join(SKILL, "pbz", f), encoding="utf-8").read()
-    calls = re.findall(r"subprocess\.run\(\s*\[([^\],]+)", src)
-    allowed = {"exe", "str(exe)", "BRIDGE", "sys.executable"}  # PowerShell, pbz-engine, optional Desktop bridge
-    odd = [c.strip() for c in calls if c.strip() not in allowed and not c.strip().startswith(("REPORT_AUTHOR", "args"))]
+    def odd_executables(source):
+        calls = re.findall(r"subprocess\.run\(\s*\[([^\],]+)", source)
+        allowed = {"exe", "str(exe)", "BRIDGE", "sys.executable", '"taskkill"'}
+        # OS-shipped utilities are within the self-containment rule. taskkill is
+        # the Windows process-tree kill; the stdlib has no Windows tree-kill.
+        return [c.strip() for c in calls if c.strip() not in allowed and not c.strip().startswith(("REPORT_AUTHOR", "args"))]
+
+    odd = odd_executables(src)
     check(not odd, f"unexpected external executables: {odd}")
+    mcp_src = open(os.path.join(SKILL, "pbz", "mcp.py"), encoding="utf-8").read()
+    check(src.count('"taskkill"') == 1 and mcp_src.count('"taskkill"') == 1,
+          "taskkill must occur exactly once, in mcp.py")
+    check(odd_executables('subprocess.run(["eviltool", "x"])') == ['"eviltool"'],
+          "external executable scan missed eviltool")
     check(not re.search(r"(?i)measure ?killer\.exe|tabulareditor\.exe|daxstudio|bravo\.exe|['\"]git['\"]", src),
           "a third-party binary is invoked")
 

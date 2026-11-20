@@ -90,7 +90,7 @@ def _perf_check(ws, project, raw: dict, cid: str) -> dict:
     from . import perf
     query = raw.get("query") if isinstance(raw.get("query"), str) else ""
     try:
-        got = perf.expect(ws, project, query)
+        got = perf.expect(ws, project, query, check_id=cid)
     except PbzError as err:
         return {"id": cid, "status": "ERROR", "class": _class_of(err.code, _PY_CLASS) or "OTHER"}
     status = got.get("status") if got.get("status") in _CHECK_STATUS else "ERROR"
@@ -321,8 +321,9 @@ def _unlock_fd(fd: int) -> None:
 class _StateLock:
     """Exclusive lock file beside state.json, held across a read-modify-write."""
 
-    def __init__(self, ws):
+    def __init__(self, ws, name=None):
         self.ws = ws
+        self.name = name
         self.fd = -1
         self.path = ""
 
@@ -330,7 +331,9 @@ class _StateLock:
         if _reparse_link(self.ws.private):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         os.makedirs(self.ws.private, exist_ok=True)
-        self.path = _state_path(self.ws) + ".lock"
+        if _reparse_link(self.ws.private):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        self.path = os.path.join(self.ws.private, self.name) if self.name else _state_path(self.ws) + ".lock"
         if _reparse_link(self.path):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR)
@@ -358,7 +361,7 @@ class _StateLock:
                 os.close(fd)
             except OSError:
                 pass
-        if path:
+        if path and self.name is None:
             try:
                 os.remove(path)
             except OSError:
@@ -543,10 +546,10 @@ def run_checks(ws, project, spec: dict) -> dict:
         st = _load_state(ws)
         known = model_literals(project)
         real_model = tmdl.load_model(os.path.join(project.model_dir, "definition"))
-        clf = Classifier(real_model, ws.private, pol)
+        clf = Classifier(real_model, ws.private, pol, project.name)
         from . import deps
         mdef = os.path.join(project.mirror_model, "definition")
-        mmodel = tmdl.load_model(mdef) if os.path.isdir(mdef) else tmdl.Model()
+        mmodel = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model)) if os.path.isdir(mdef) else tmdl.Model()
         mres = deps.Resolver(mmodel)
         authored = set(st["ledger"]["authored"])
         results, to_engine, compiles_items, negate = [], [], [], set()
@@ -669,39 +672,42 @@ def run_checks(ws, project, spec: dict) -> dict:
                                     "reveal": sorted(set(reveal)), "checks": to_engine}, timeout=600)
         if not res.get("ok"):
             raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
-        key = dpapi.load_key(ws.private)
-        for r in res.get("checks", res.get("results", [])):
-            r = dict(r)
-            if r.get("id") in negate and r.get("status") in ("PASS", "FAIL"):
-                r["status"] = "FAIL" if r["status"] == "PASS" else "PASS"
-                r["note"] = "differs"
-            groups = []
-            for g in r.get("groups", []) or []:
-                ng = {}
-                for col, v in g.items():
-                    if isinstance(v, dict) and v.get("blank"):
-                        ng[col] = "(blank)"
-                    elif isinstance(v, dict) and "reveal" in v:
-                        ng[col] = v["reveal"]
-                    elif isinstance(v, dict) and "hmac" in v:
-                        lab = _canon_col(col)
-                        ng[col] = tm.find_by_hmac(key, lab, v["hmac"]) or tm.opaque(lab, v["hmac"])
-                if ng:
-                    groups.append(ng)
-            if groups and not strict:
-                r["groups"] = groups
-            else:
-                r.pop("groups", None)
-            if strict:
-                for k in list(r):
-                    if k.endswith("_bucket"):
-                        r.pop(k)
-            if str(r.get("id")) in rls_ids:
-                r = _rls_clean(r, rls_ids)
-            else:
-                r = _closed_engine_row(r, allowed_ids)
-            if r is not None:
-                results.append(r)
+        with tokens.WorkspaceLock(ws.private):
+            tm = tokens.TokenMap(ws.private)
+            key = dpapi.load_key(ws.private)
+            for r in res.get("checks", res.get("results", [])):
+                r = dict(r)
+                if r.get("id") in negate and r.get("status") in ("PASS", "FAIL"):
+                    r["status"] = "FAIL" if r["status"] == "PASS" else "PASS"
+                    r["note"] = "differs"
+                groups = []
+                for g in r.get("groups", []) or []:
+                    ng = {}
+                    for col, v in g.items():
+                        if isinstance(v, dict) and v.get("blank"):
+                            ng[col] = "(blank)"
+                        elif isinstance(v, dict) and "reveal" in v:
+                            ng[col] = v["reveal"]
+                        elif isinstance(v, dict) and "hmac" in v:
+                            lab = _canon_col(col)
+                            ng[col] = tm.find_by_hmac(key, lab, v["hmac"]) or tm.opaque(lab, v["hmac"])
+                    if ng:
+                        groups.append(ng)
+                if groups and not strict:
+                    r["groups"] = groups
+                else:
+                    r.pop("groups", None)
+                if strict:
+                    for k in list(r):
+                        if k.endswith("_bucket"):
+                            r.pop(k)
+                if str(r.get("id")) in rls_ids:
+                    r = _rls_clean(r, rls_ids)
+                else:
+                    r = _closed_engine_row(r, allowed_ids)
+                if r is not None:
+                    results.append(r)
+            tm.save()
     if compiles_items:
         res = engine_call("compiles", {"private_dir": ws.private, "port": port, "items": compiles_items}, timeout=300)
         if not res.get("ok"):
@@ -712,7 +718,6 @@ def run_checks(ws, project, spec: dict) -> dict:
             row = _closed_engine_row(item, allowed_ids)
             if row is not None:
                 results.append(row)
-    tm.save()
     results.extend(row for _index, row in perf_done)
     order = {str(c.get("id") or f"c{i + 1}"): i for i, c in enumerate(spec.get("checks", []))}
     results.sort(key=lambda r: order.get(str(r.get("id")), 1e9))
@@ -740,8 +745,14 @@ def probe(ws, project, table: str, columns: list[str] | None) -> dict:
         return {"verb": "probe", "status": "BUDGET", "note": "daily probe budget reached; the user can reset it"}
     port = desktop.require_port(project)
     req = {"private_dir": ws.private, "port": port, "table": table, "disclosure": pol.get("disclosure", "shape")}
-    if columns:
-        req["columns"] = columns
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
+    matched = next((t for t in model.tables.values() if t.name == table), None)
+    if matched is None:
+        matched = next((t for t in model.tables.values() if t.name.casefold() == table.casefold()), None)
+    if not columns and matched is None:
+        raise PbzError("NOT_FOUND", "table not found in mirror")
+    known = [c.name for c in matched.columns.values()] if matched is not None else []
+    req["columns"] = columns or known
     res = engine_call("probe", req, timeout=300)
     if not res.get("ok"):
         raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
@@ -795,6 +806,12 @@ def _write_policy_snapshot(ws, pol: dict) -> None:
 
 
 def index(ws, project) -> dict:
+    # Keep this lock file: unlinking lets another writer lock a different inode.
+    with _StateLock(ws, "index.lock"):
+        return _index(ws, project)
+
+
+def _index(ws, project) -> dict:
     pol = policy_mod.load(ws)
     _write_policy_snapshot(ws, pol)
     port = desktop.require_port(project)
@@ -803,33 +820,35 @@ def index(ws, project) -> dict:
                                 "value_cap": 50000, "disclosure": pol.get("disclosure", "shape")}, timeout=1800)
     if not res.get("ok"):
         raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
-    summary_path = os.path.join(ws.private, "index-summary.json")
-    if _reparse_link(ws.private) or _reparse_link(summary_path):
-        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-    os.makedirs(ws.private, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix="index-summary.", dir=ws.private)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(res, handle)
-        if _reparse_link(ws.private) or _reparse_link(summary_path):
-            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-        os.replace(tmp, summary_path)
-        tmp = ""
-    finally:
-        if tmp:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-    moved = harden_index(ws, pol)
+    moved, pinned = harden_index(ws, pol)
+    blobs = {name: pinned[name] if pinned[name] is not None else
+             read_checked(os.path.join(ws.private, name), root=ws.private)
+             for name in ("index.json", "categories.bin")}
+    expected = {name: hashlib.sha256(raw).hexdigest() for name, raw in blobs.items()}
+    res["tables"] = _rebuild_summary(ws.private, res.get("tables", []), idx=json.loads(blobs["index.json"]))
+    from . import index_store
+    res["project"] = project.name
+    index_store.publish(ws.private, project.name, res, expected=expected, blobs=blobs)
     cols = [c for t in res.get("tables", []) for c in t.get("columns", [])]
     return {"verb": "index", "project": project.name, "tables": len(res.get("tables", [])), "columns": len(cols),
-            "category_columns": sum(1 for c in cols if c.get("class") == "category") - moved,
+            "category_columns": sum(1 for c in cols if c.get("class") == "category"),
             "personal_or_id_columns_hashed": moved,
             "hint": "run `pbz pull --force` (or --rebase) to reclassify the mirror with the new index"}
 
 
-def harden_index(ws, pol: dict) -> int:
+def _rebuild_summary(private_dir, tables, idx=None):
+    """Copy hardened classes into the engine summary tables."""
+    if idx is None:
+        idx = json.loads(read_checked(os.path.join(private_dir, "index.json"), root=private_dir))
+    for table in tables:
+        for col in table.get("columns", []):
+            info = idx.get("columns", {}).get(f"{table['table']}[{col['column']}]", {})
+            if "class" in info:
+                col["class"] = info["class"]
+    return tables
+
+
+def harden_index(ws, pol: dict) -> tuple[int, dict[str, bytes | None]]:
     """Low-cardinality columns with personal or ID names are sensitive whatever their size: move their
     values out of categories.bin into HMAC sets (whole values + name words) so free text can be checked."""
     from .classify import is_id_column, is_pii_column
@@ -842,12 +861,15 @@ def harden_index(ws, pol: dict) -> int:
     except OSError:
         raise PbzError("REFUSED", "index is missing or unreadable") from None
     try:
-        idx = json.loads(read_checked(idx_path, root=ws.private).decode("utf-8"))
+        idx_raw = read_checked(idx_path, root=ws.private)
+        idx = json.loads(idx_raw.decode("utf-8"))
     except PbzError:
         raise
     except ValueError:
         raise PbzError("REFUSED", "index is missing or unreadable") from None
-    raw = dpapi.read_protected(cat_path)
+    cat_raw = read_checked(cat_path, root=ws.private) if os.path.lexists(cat_path) else None
+    raw = dpapi.unprotect(cat_raw) if cat_raw is not None else None
+    pinned = {"index.json": idx_raw, "categories.bin": cat_raw}
     cats = json.loads(raw.decode("utf-8")) if raw else {}
     key = dpapi.load_key(ws.private)
     forced = {c.lower() for c in pol.get("sensitive_columns", [])}
@@ -877,8 +899,9 @@ def harden_index(ws, pol: dict) -> int:
         directory = os.path.dirname(idx_path) or "."
         fd, tmp = tempfile.mkstemp(prefix="index.", suffix=".tmp", dir=directory)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(idx, handle)
+            data = json.dumps(idx).encode("utf-8")
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
             if _reparse_link(idx_path):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")
             os.replace(tmp, idx_path)
@@ -889,8 +912,10 @@ def harden_index(ws, pol: dict) -> int:
                     os.remove(tmp)
                 except OSError:
                     pass
-        dpapi.write_protected(cat_path, json.dumps(cats, ensure_ascii=False).encode("utf-8"))
-    return moved
+        pinned["index.json"] = data
+        pinned["categories.bin"] = dpapi.write_protected(
+            cat_path, json.dumps(cats, ensure_ascii=False).encode("utf-8"))
+    return moved, pinned
 
 
 def _snapshot_spec_path(ws, name: str) -> str:

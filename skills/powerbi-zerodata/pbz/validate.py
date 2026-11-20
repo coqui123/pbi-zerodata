@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+from collections import Counter
 
 from . import daxcatalog, deps, lint, pbir, pbircheck, tmdl
 from .classify import PII_IN_TEXT
@@ -62,17 +63,49 @@ def _diagnostics(data) -> list[dict]:
     return out
 
 
-def report_author(stage: str, project, scrub) -> list[dict]:
+def diagnostic_counts(findings):
+    """Full diagnostic identity, including object location, with multiplicities."""
+    return Counter(json.dumps(f, sort_keys=True, ensure_ascii=False) for f in findings)
+
+
+def validator_ran(findings):
+    unavailable = {"REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"}
+    return (any(f.get("code") == "REPORT_SCHEMA_PASSED" for f in findings)
+            and not any(f.get("code") in unavailable for f in findings))
+
+
+def validator_attempted(findings):
+    unavailable = {"REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"}
+    return bool(findings) and not any(f.get("code") in unavailable for f in findings)
+
+
+def invalid_control_rejected(findings, page_id):
+    # The control removes page.displayName. Require that exact schema failure,
+    # rather than treating an unavailable validator or unrelated error as rejection.
+    if any(f.get("code") in {"REPORT_VALIDATOR_MISSING", "REPORT_VALIDATOR_FAILED", "REPORT_VALIDATOR_RESPONSE"}
+           for f in findings):
+        return False
+    return any(
+        f.get("severity") == "error" and "displayName" in f.get("message", "")
+        and f.get("where", "").replace("\\", "/").split("/")[-3:] == ["pages", page_id, "page.json"] for f in findings
+    ) and any(
+        f.get("severity") == "error" and "required property" in f.get("message", "")
+        and "displayName" in f.get("message", "") for f in findings)
+
+
+def report_author(stage: str, project, scrub, *, schema_only=False) -> list[dict]:
     rdir = os.path.join(stage, project.name + ".Report")
     if not os.path.isdir(rdir):
         return []
-    if not os.path.exists(REPORT_AUTHOR):
+    if not os.path.exists(REPORT_AUTHOR) and not schema_only:
         return [{"severity": "info", "code": "REPORT_VALIDATOR_MISSING", "where": "report", "message": "skipped"}]
-    for args in ([REPORT_AUTHOR, "validate", rdir, "--format", "json"],
-                 [REPORT_AUTHOR, "validate", rdir, "--no-schema", "--format", "json"]):
+    attempts = [[REPORT_AUTHOR, "validate", rdir, "--format", "json"]]
+    if not schema_only:
+        attempts.append([REPORT_AUTHOR, "validate", rdir, "--no-schema", "--format", "json"])
+    for args in attempts:
         try:
             p = subprocess.run(args, capture_output=True, timeout=600)
-        except subprocess.SubprocessError:
+        except (subprocess.SubprocessError, OSError):
             continue
         try:
             data = json.loads(p.stdout.decode("utf-8", errors="replace") or "{}")
@@ -174,7 +207,7 @@ def run_stage(ws, project, stage: str, tm) -> list[dict]:
         else:
             findings.append({"severity": "error", "code": "TOM_" + str(res.get("class", "UNAVAILABLE")),
                              "where": "model", "message": "TMDL not checked by TOM"})
-        model = tmdl.load_model(mdef)
+        model = tmdl.load_model(mdef, root=stage)
         for f in lint.run(model):
             f["message"] = scrub(f["message"])
             findings.append(f)
@@ -262,7 +295,7 @@ def circular_dependencies(model) -> list[dict]:
 def run_mirror(ws, project) -> list[dict]:
     """Metadata-only checks on the mirror itself (no engine): lint + field references."""
     mdef = os.path.join(project.mirror_model, "definition")
-    model = tmdl.load_model(mdef) if os.path.isdir(mdef) else tmdl.Model()
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model)) if os.path.isdir(mdef) else tmdl.Model()
     ident = lambda s: s  # mirror text is already sanitized
     out = lint.run(model) + synthetic_marker(model)
     out += circular_dependencies(model)

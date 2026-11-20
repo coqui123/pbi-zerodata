@@ -359,6 +359,10 @@ class FollowupStateTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "NOT_FOUND")
 
     def test_open_engine_class_becomes_engine_unavailable(self):
+        tables = os.path.join(self.project.mirror_model, "definition", "tables")
+        os.makedirs(tables)
+        with open(os.path.join(tables, "T.tmdl"), "w", encoding="utf-8") as handle:
+            handle.write("table T\n\n\tcolumn A\n\t\tdataType: int64\n")
         bad = {"ok": False, "class": "not-closed"}
         calls = (
             lambda: checks.health(self.ws, self.project),

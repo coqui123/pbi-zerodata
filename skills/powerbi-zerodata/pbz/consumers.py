@@ -247,7 +247,7 @@ def _mirror_names(project) -> set[str]:
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    return model_names(tmdl.load_model(mdef))
+    return model_names(tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model)))
 
 
 def _object_parts(text: str) -> list[str] | None:

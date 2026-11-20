@@ -7,8 +7,8 @@ import json
 import os
 import re
 
-from . import deps, lexers, tmdl
-from .common import PbzError, commit_bytes, preflight_regular, read_checked, read_text, write_text, list_names
+from . import deps, lexers, tmdl, tokens
+from .common import PbzError, definition_root, commit_bytes, preflight_regular, read_checked, read_text, write_text, list_names
 from .tokens import TOKEN_RE, TokenMap, apply_edits
 
 CODE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
@@ -27,7 +27,7 @@ def _model(project):
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    return mdef, tmdl.load_model(mdef)
+    return mdef, tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
 
 
 def _rel(project, rel: str) -> str:
@@ -285,7 +285,7 @@ def culture_edits_move(mdef: str, src: str, dst: str, measure: str) -> list[str]
 def perspective_move_texts(mdef: str, src: str, dst: str, measure: str, texts: dict | None = None) -> dict[str, str]:
     """{rel: new text} moving perspective membership. `texts` overrides disk (planned TMDL). Does not write."""
     if texts is None:
-        pairs = [(r, d) for r, d in tmdl.load_model(mdef).docs.items() if r.startswith("perspectives/")]
+        pairs = [(r, d) for r, d in tmdl.load_model(mdef, root=definition_root(mdef)).docs.items() if r.startswith("perspectives/")]
     else:
         pairs = [(r, tmdl.parse(r, t)) for r, t in texts.items() if r.startswith("perspectives/")]
     out = {}
@@ -665,7 +665,7 @@ def culture_missing(ws, project, code: str) -> dict:
 
 
 def _perspective(mdef: str, name: str):
-    for rel, doc in ((r, d) for r, d in tmdl.load_model(mdef).docs.items() if r.startswith("perspectives/")):
+    for rel, doc in ((r, d) for r, d in tmdl.load_model(mdef, root=definition_root(mdef)).docs.items() if r.startswith("perspectives/")):
         node = next((n for n in doc.nodes if n.kind == "perspective" and n.name.lower() == name.lower()), None)
         if node is not None:
             return rel, doc, node
@@ -843,9 +843,10 @@ def _member_token(ws, member: str) -> str:
     """A token already in hand, or the same `pii` token `tokenize_tmdl` writes for a role member."""
     if TOKEN_RE.fullmatch(member or ""):
         return member
-    tm = TokenMap(ws.private)
-    token = tm.raw("pii", member, "tmdl")
-    tm.save()
+    with tokens.WorkspaceLock(ws.private):
+        tm = TokenMap(ws.private)
+        token = tm.raw("pii", member, "tmdl")
+        tm.save()
     if not TOKEN_RE.fullmatch(token):
         raise PbzError("REFUSED", "member must be a token")
     return token

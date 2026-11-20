@@ -505,7 +505,7 @@ class EvidenceHonestyTests(unittest.TestCase):
 
         def grow(ws, entries):
             with open(path, "ab") as handle:
-                handle.write((SENTINEL + "\n").encode())
+                handle.write((json.dumps({"legacy": SENTINEL}) + "\n").encode())
             return real(ws, entries)
 
         with patch("pbz.evidence._append_lines", side_effect=grow):
@@ -516,7 +516,7 @@ class EvidenceHonestyTests(unittest.TestCase):
 
     def test_created_log_between_read_and_accept_is_preserved(self):
         real = evidence._append_lines
-        injected = b"injected-line\n"
+        injected = b'{"legacy": "injected-line"}\n'
 
         def create(ws, entries):
             os.makedirs(self.ws.pbz_dir, exist_ok=True)
@@ -679,18 +679,19 @@ class EvidenceHonestyTests(unittest.TestCase):
         self.assertEqual(self.accepts, [])
         self.assertEqual(self.packets, [])
 
-    def test_nested_array_line_is_skipped_and_accepts(self):
+    def test_nested_array_line_refuses_accept(self):
         good = _line("validate", "PARSED", "validate", {"errors": 0, "warnings": 0, "outcome": "PASS"})
         nested = "[" * 10000 + "0" + "]" * 10000
         self.assertLess(len(nested.encode()), evidence.LOG_CAP)
-        self._write_log(nested + "\n" + good + "\n")
-        out = self._review(accept=True)
-        self.assertEqual(out["result"], "INCOMPLETE")
-        self.assertEqual(out["skipped"], 2)
+        path = self._write_log(nested + "\n" + good + "\n")
+        before = Path(path).read_bytes()
+        with self.assertRaises(PbzError) as caught:
+            self._review(accept=True)
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(Path(path).read_bytes(), before)
+        self.assertEqual(evidence.verify_chain(self.ws)["chain"], "BROKEN")
         self.assertEqual(self.accepts, [])
-        rendered = self._rendered(out)
-        self.assertNotIn("[[" * 20, rendered)
-        self.assertIn("HUMAN_ACCEPTED", open(os.path.join(self.ws.pbz_dir, "evidence.jsonl"), encoding="utf-8").read())
+        self.assertEqual(self.packets, [])
 
     def test_hardlinked_synth_test_is_not_opened(self):
         os.makedirs(os.path.join(self.ws.pbz_dir, "synth-tests"), exist_ok=True)

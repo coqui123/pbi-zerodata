@@ -40,3 +40,184 @@ public static class Provenance
         });
     }
 }
+
+/// <summary>Private, signed definition manifests. No row output is allowed without one.</summary>
+public static class SyntheticProvenance
+{
+    const string Marker = "PBZ_SYNTHETIC";
+
+    // TOM serializes definitions, including expressions and dynamic format strings. Keep the
+    // entire definition of each object rather than maintaining an expression-only allowlist.
+    // These are engine-maintained status fields, never executable model definitions.
+    static readonly HashSet<string> RuntimeFields = new(StringComparer.Ordinal)
+        { "modifiedTime", "structureModifiedTime", "refreshedTime", "state", "errorMessage" };
+
+    static JsonNode? Canonical(JsonNode? node)
+    {
+        if (node is JsonObject obj)
+        {
+            var result = new JsonObject();
+            foreach (var entry in obj.OrderBy(e => e.Key, StringComparer.Ordinal))
+                if (!RuntimeFields.Contains(entry.Key)) result[entry.Key] = Canonical(entry.Value);
+            return result;
+        }
+        if (node is JsonArray array)
+        {
+            var result = new JsonArray();
+            // Named TOM collections are unordered; other arrays may encode ordered definitions.
+            var values = array.Where(n => n is not JsonObject o || o["type"]?.ToString() != "rowNumber").ToList();
+            if (values.All(n => n is JsonObject o && o["name"] != null))
+                values = values.OrderBy(n => n!["name"]!.ToString(), StringComparer.Ordinal).ToList();
+            foreach (var value in values) result.Add(Canonical(value));
+            return result;
+        }
+        return node?.DeepClone();
+    }
+
+    public static string Definition(Microsoft.AnalysisServices.Tabular.Model model)
+    {
+        foreach (var table in model.Tables) // Includes private, private-prefixed and untagged tables.
+        {
+            if (table.Columns.Count(c => c.Type == Microsoft.AnalysisServices.Tabular.ColumnType.RowNumber) > 1)
+                throw new BadRequestException("SYNTH_DEFINITION_CHANGED: more than one RowNumber column in a table");
+            if (table.Partitions.Count == 0 || table.Partitions.Any(p =>
+                p.Source is not Microsoft.AnalysisServices.Tabular.CalculatedPartitionSource
+                && p.Source is not Microsoft.AnalysisServices.Tabular.CalculationGroupSource))
+                throw new BadRequestException("SYNTH_DATA_PARTITION: every table must have only calculated partitions");
+        }
+        var options = new Microsoft.AnalysisServices.Tabular.SerializeOptions {
+            IncludeRestrictedInformation = true, IgnoreChildren = false,
+            IgnoreInferredObjects = false, IgnoreInferredProperties = true, IgnoreTimestamps = true
+        };
+        var database = model.Database;
+        // A database read from a TMDL folder records no compatibility mode, so serialization
+        // defaults to AnalysisServices mode and gates Power BI metadata on a sentinel level.
+        // Every database this engine opens is a Power BI database (Desktop reports PowerBI),
+        // so use its declared level and mode, treating Unknown as PowerBI.
+        var json = JsonNode.Parse(database is null
+            ? Microsoft.AnalysisServices.Tabular.JsonSerializer.SerializeObject(model, options)
+            : Microsoft.AnalysisServices.Tabular.JsonSerializer.SerializeObject(model, options,
+                database.CompatibilityLevel,
+                database.CompatibilityMode == Microsoft.AnalysisServices.CompatibilityMode.Unknown
+                    ? Microsoft.AnalysisServices.CompatibilityMode.PowerBI : database.CompatibilityMode))!.AsObject();
+        // Identity is checked separately against the catalog pinned at synth-open. Compatibility
+        // level and other Desktop model defaults are not part of the executable object definition.
+        if ((json["tables"] as JsonArray)?.Count != model.Tables.Count)
+            throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: incomplete table serialization");
+        var definition = new JsonObject { ["version"] = 2 };
+        foreach (var name in new[] { "tables", "relationships", "roles", "expressions", "functions", "cultures", "perspectives" })
+            definition[name] = Canonical(json[name]);
+        return definition.ToJsonString();
+    }
+
+    static string PathFor(Ctx ctx, string marker)
+    {
+        if (marker.Length != 64 || marker.Any(c => !Uri.IsHexDigit(c)))
+            throw new BadRequestException("SYNTH_NO_MARKER: valid marker required");
+        return Path.Combine(ctx.RequirePrivateDir(), "synth-manifest-" + marker + ".bin");
+    }
+
+    static string Signature(Vault vault, string marker, string definition, string? catalog)
+        => vault.HmacOf(new JsonArray("pbz-synthetic-manifest-v2", marker, definition, catalog).ToJsonString());
+
+    public static void Save(Ctx ctx, string marker, string definition, string? catalog = null)
+    {
+        var vault = Vault.Open(ctx.RequirePrivateDir());
+        Vault.WriteProtected(PathFor(ctx, marker), new JsonObject {
+            ["marker"] = marker, ["definition"] = definition, ["catalog"] = catalog,
+            ["signature"] = Signature(vault, marker, definition, catalog)
+        }.ToJsonString());
+    }
+
+    public static JsonObject Load(Ctx ctx, string marker)
+    {
+        try
+        {
+            var doc = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(
+                Dpapi.Unprotect(File.ReadAllBytes(PathFor(ctx, marker)))))!.AsObject();
+            var expected = Signature(Vault.Open(ctx.RequirePrivateDir()), marker,
+                doc["definition"]!.GetValue<string>(), doc["catalog"]?.GetValue<string>());
+            if (doc["marker"]?.GetValue<string>() != marker || !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                System.Text.Encoding.UTF8.GetBytes(expected), System.Text.Encoding.UTF8.GetBytes(doc["signature"]!.GetValue<string>())))
+                throw new BadRequestException("SYNTH_MANIFEST_SIGNATURE: manifest does not verify");
+            return doc;
+        }
+        catch (BadRequestException) { throw; }
+        catch (Exception ex) when (ex is not TimeoutException)
+        { throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: trusted manifest unavailable"); }
+    }
+
+    public sealed record Snapshot(string MarkerValue, string Catalog, string DefinitionValue, string Version);
+
+    static string ModelVersion(Conn conn)
+    {
+        var rows = conn.Dmv("TMSCHEMA_MODEL", new[] { "ModifiedTime", "StructureModifiedTime" });
+        if (rows.Count != 1 || rows[0].Length != 2 || rows[0].Any(v => v is not DateTime time || time == DateTime.MinValue))
+            throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: model version unavailable");
+        var version = new JsonArray();
+        foreach (var value in rows[0])
+            version.Add(((DateTime)value!).ToString("O", System.Globalization.CultureInfo.InvariantCulture));
+        return version.ToJsonString();
+    }
+
+    public static Snapshot Capture(Req req, Ctx ctx, Conn conn)
+    {
+        try
+        {
+            // Read independently on each side of the query; never reuse Conn.Meta or cached TOM.
+            var version = ModelVersion(conn);
+            using var server = new Microsoft.AnalysisServices.Tabular.Server();
+            ctx.Guard(() => { server.Connect("Data Source=localhost:" + req.Port() + ";"); return 0; });
+            var db = server.Databases.Cast<Microsoft.AnalysisServices.Tabular.Database>().Single();
+            var marker = db.Model.Annotations.Find(Marker)?.Value ?? "";
+            var definition = Definition(db.Model);
+            if (db.Name != conn.Meta.DatabaseName || version != ModelVersion(conn))
+                throw new BadRequestException("SYNTH_MODEL_CHANGED_DURING_QUERY: model changed during capture");
+            var catalog = new JsonArray(req.Port(), db.ID).ToJsonString();
+            return new Snapshot(marker, catalog, definition, version);
+        }
+        catch (BadRequestException) { throw; }
+        catch (Exception ex) when (ex is not TimeoutException)
+        { throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: live definition unavailable"); }
+    }
+
+    public static T Buffered<T>(Func<Snapshot> capture, Action<Snapshot> verify, Func<T> query)
+    {
+        var before = capture();
+        verify(before);
+        var rows = query();
+        var after = capture();
+        verify(after);
+        if (before != after)
+            throw new BadRequestException("SYNTH_MODEL_CHANGED_DURING_QUERY: buffered rows discarded");
+        return rows;
+    }
+
+    public static readonly HashSet<string> Reasons = new(StringComparer.Ordinal) {
+        "SYNTH_DATA_PARTITION", "SYNTH_NO_MARKER", "SYNTH_MANIFEST_SIGNATURE",
+        "SYNTH_VERIFICATION_UNAVAILABLE", "SYNTH_DEFINITION_CHANGED", "SYNTH_CATALOG_MISMATCH",
+        "SYNTH_MARKER_MISMATCH", "SYNTH_MODEL_CHANGED_DURING_QUERY"
+    };
+
+    public static void Verify(Ctx ctx, Snapshot snapshot, bool requireCatalog = true)
+    {
+        var trusted = Load(ctx, snapshot.MarkerValue);
+        var definition = trusted["definition"]!.GetValue<string>();
+        if (definition != snapshot.DefinitionValue)
+            throw new BadRequestException("SYNTH_DEFINITION_CHANGED: live model differs from signed build");
+        if (requireCatalog && trusted["catalog"]?.GetValue<string>() != snapshot.Catalog)
+            throw new BadRequestException("SYNTH_CATALOG_MISMATCH: model is not the registered Desktop catalog");
+    }
+
+    // Called only by synth-open after Python locates the Desktop instance holding the owned PBIP.
+    public static JsonObject Bind(Req req, Ctx ctx)
+    {
+        using var conn = Conn.Open(ctx, req.Port());
+        var snapshot = Capture(req, ctx, conn);
+        if (snapshot.MarkerValue != req.Str("marker"))
+            throw new BadRequestException("SYNTH_MARKER_MISMATCH: opened model is not the requested build");
+        Verify(ctx, snapshot, requireCatalog: false);
+        Save(ctx, snapshot.MarkerValue, snapshot.DefinitionValue, snapshot.Catalog);
+        return Ctx.Ok("synth-bind", new JsonObject { ["verified"] = true });
+    }
+}

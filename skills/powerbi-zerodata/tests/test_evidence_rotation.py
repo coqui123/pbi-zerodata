@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import multiprocessing as mp
+from contextlib import contextmanager
 import os
 import sys
 import tempfile
@@ -24,6 +26,91 @@ def _entry(ts: str, n: int) -> dict:
     return {"ts": ts, "project": "Canary", "verb": "validate", "mirror_rev": "m" + "a" * 12,
             "real_rev": "r" + "b" * 12, "stage": "PARSED", "scope": "validate",
             "summary": {"errors": 0, "warnings": n, "outcome": "PASS"}}
+
+
+def _race_writer(root, private, kind, entered, release, ready, acknowledgements, archived):
+    ws = Workspace(root)
+    ws.private = private
+    project = Project(ws, "Canary")
+    evidence.LOG_CAP = 700
+    original_lock = evidence._workspace_lock
+    original_remove = evidence.os.remove
+    @contextmanager
+    def at_lock(ws):
+        ready.set()  # Signal at the lock attempt, while the rotating writer holds it.
+        with original_lock(ws):
+            yield
+    def archive_remove(path):
+        if str(path).endswith(".jsonl") and os.path.exists(path):
+            with open(path, encoding="utf-8") as handle:
+                archived.put(handle.read())
+        return original_remove(path)
+    evidence._workspace_lock = at_lock
+    evidence.os.remove = archive_remove
+    if kind != "prune":
+        evidence._prune = lambda ws: {}  # Only the concurrent pruner may delete segments.
+    original_append = evidence._append_lines
+    written = []
+    def record_append(ws, entries):
+        original_append(ws, entries)
+        written.extend(json.loads(json.dumps(entries)))
+    evidence._append_lines = record_append
+    try:
+        if kind == "rotate":
+            original = evidence._rotate
+            def rotate(ws):
+                entered.set()
+                if not release.wait(20):
+                    raise RuntimeError("release timeout")
+                return original(ws)
+            with patch.object(evidence, "_rotate", rotate):
+                evidence._append_lines(ws, [_entry(dt.date.today().isoformat() + "T00:00:01", 101)])
+            acknowledgements.put(("write", written))
+        elif kind == "accept":
+            with patch("pbz.cli._is_human", return_value=True), \
+                    patch("pbz.evidence.mirror_rev", return_value="m" + "a" * 12), \
+                    patch("pbz.evidence.real_rev", return_value="r" + "b" * 12), \
+                    patch("pbz.changes.run", return_value={"result": "UNCHANGED"}), \
+                    patch("pbz.evidence._suggested_tests", return_value=[]), \
+                    patch("pbz.consumers.load_registry", return_value={"consumers": []}), \
+                    patch("pbz.handoff.write_packet", return_value={}), \
+                    patch("pbz.handoff.accept_generated"):
+                out = evidence.review(ws, project, accept=True)
+                if out["coverage"]["human_visual_review"] != "CURRENT":
+                    raise RuntimeError("acceptance lost")
+            acknowledgements.put(("accept", written))
+        else:
+            result = evidence.prune(ws)
+            acknowledgements.put(("prune", result["pruned_segments"]))
+    except Exception as err:
+        acknowledgements.put(("error", type(err).__name__, str(err)))
+        raise
+
+
+def _hold(root, private, phase, entered, release):
+    ws = Workspace(root)
+    ws.private = private
+    def stop(*args, **kwargs):
+        entered.set()
+        release.wait(30)
+    if phase == "lock":
+        with evidence._workspace_lock(ws):
+            stop()
+    else:
+        original_remove = evidence.os.remove
+        def delete_then_stop(path):
+            original_remove(path)
+            stop()
+        with patch.object(evidence.os, "remove", delete_then_stop):
+            evidence.prune(ws)
+
+
+def _waiting_writer(root, private, ready, completed):
+    ws = Workspace(root)
+    ws.private = private
+    ready.set()
+    evidence._append_lines(ws, [_entry(dt.date.today().isoformat() + "T00:00:01", 1)])
+    completed.set()
 
 
 class EvidenceRotationTests(unittest.TestCase):
@@ -132,6 +219,108 @@ class EvidenceRotationTests(unittest.TestCase):
         self.assertEqual(kept["chain_prev"], anchor["anchor"])
         self.assertEqual(anchor["anchor"], evidence._last_mac(old_text))
         self.assertIn(yesterday.isoformat(), kept_text)
+
+    def test_forced_process_rotation_prune_and_review_accept(self):
+        ctx = mp.get_context("spawn")
+        entered, release = ctx.Event(), ctx.Event()
+        ack = ctx.Queue()
+        archived = ctx.Queue()
+        # A seeded old segment is the only record eligible for pruning.
+        seed = [_entry("2020-01-01T00:00:01", 0)]
+        with patch.object(evidence, "_prune", return_value={}), self._cap(700):
+            evidence._append_lines(self.ws, seed)
+        processes = []
+        for kind in ("rotate", "accept", "prune"):
+            ready = ctx.Event()
+            proc = ctx.Process(target=_race_writer, args=(self.root, self.ws.private, kind,
+                               entered, release, ready, ack, archived))
+            proc.start()
+            processes.append(proc)
+            self.addCleanup(lambda p=proc: p.terminate() if p.is_alive() else None)
+            self.assertTrue(ready.wait(15))
+            if kind == "rotate":
+                self.assertTrue(entered.wait(15))  # Writer holds the lock at the rotation boundary.
+        release.set()  # Both other processes have reached their ledger operations.
+        results = [ack.get(timeout=30) for _ in processes]
+        for proc in processes:
+            proc.join(15)
+            self.assertEqual(proc.exitcode, 0, results)
+        self.assertEqual({r[0] for r in results}, {"accept", "prune", "write"})
+        self.assertEqual(dict(results)["prune"], 1)
+        self.assertEqual(evidence.verify_chain(self.ws)["chain"], "OK")
+        # Compare all acknowledged writes independently, not just the retained count.
+        removed = archived.get(timeout=15)  # Capture the pruned seed, independently of retained records.
+        records = [json.loads(line) for line in removed.splitlines() if line.strip()]
+        records += [json.loads(line) for path in evidence._log_files(self.ws)
+                   for line in evidence._read_log(self.ws, path).splitlines() if line.strip()]
+        expected = seed + dict(results)["write"] + dict(results)["accept"]
+        identity = lambda r: json.dumps(r, sort_keys=True)
+        self.assertEqual(sorted(map(identity, records)), sorted(map(identity, expected)))
+        entries, skipped = evidence._load_entries(self.ws, self.project)
+        self.assertEqual(skipped, 0)
+        self.assertTrue(any(e["stage"] == "HUMAN_ACCEPTED" for e in entries))
+
+    def test_kill_during_prune_recovers_before_read_or_write(self):
+        with patch.object(evidence, "_prune", return_value={}), self._cap(700):
+            evidence._append_lines(self.ws, [_entry("2020-01-01T00:00:01", 0)])
+            evidence._append_lines(self.ws, [_entry("2020-01-02T00:00:01", 0)])
+            evidence._append_lines(self.ws, [_entry(dt.date.today().isoformat() + "T00:00:01", 1)])
+        self.assertEqual(len(evidence._segment_paths(self.ws)), 2)
+        ctx = mp.get_context("spawn")
+        entered, release = ctx.Event(), ctx.Event()
+        proc = ctx.Process(target=_hold, args=(self.root, self.ws.private, "prune", entered, release))
+        proc.start()
+        self.addCleanup(lambda: proc.terminate() if proc.is_alive() else None)
+        self.assertTrue(entered.wait(15))  # Journal committed; first deletion finished, second pending.
+        self.assertEqual(len(evidence._segment_paths(self.ws)), 1)
+        proc.terminate()
+        proc.join(15)
+        self.assertEqual(evidence.verify_chain(self.ws)["chain"], "OK")
+        self.assertEqual(evidence.prune(self.ws)["pruned_segments"], 0)
+        evidence._append_lines(self.ws, [_entry(dt.date.today().isoformat() + "T00:00:02", 2)])
+        self.assertEqual(evidence.verify_chain(self.ws)["records"], 2)
+
+    def test_killed_lock_holder_releases_workspace_lock(self):
+        ctx = mp.get_context("spawn")
+        entered, release = ctx.Event(), ctx.Event()
+        proc = ctx.Process(target=_hold, args=(self.root, self.ws.private, "lock", entered, release))
+        proc.start()
+        self.addCleanup(lambda: proc.terminate() if proc.is_alive() else None)
+        self.assertTrue(entered.wait(15))
+        writer_ready, completed = ctx.Event(), ctx.Event()
+        writer = ctx.Process(target=_waiting_writer, args=(self.root, self.ws.private, writer_ready, completed))
+        writer.start()
+        self.addCleanup(lambda: writer.terminate() if writer.is_alive() else None)
+        self.assertTrue(writer_ready.wait(15))
+        self.assertFalse(completed.wait(0.5), "writer completed while lock was held")
+        proc.terminate()
+        proc.join(15)
+        self.assertTrue(completed.wait(15))
+        writer.join(15)
+        self.assertEqual(writer.exitcode, 0)
+        self.assertEqual(evidence.verify_chain(self.ws)["chain"], "OK")
+
+    def test_corrupt_tip_refuses_append_and_io_errors_are_closed(self):
+        evidence._append_lines(self.ws, [_entry(dt.date.today().isoformat() + "T00:00:01", 1)])
+        path = evidence._log_path(self.ws)
+        original = open(path, "rb").read()
+        obj = json.loads(original)
+        obj["chain_mac"] = "f" * 64
+        with open(path, "w") as handle:
+            handle.write(json.dumps(obj) + "\n")
+        corrupt = open(path, "rb").read()
+        with self.assertRaises(PbzError):
+            evidence._append_lines(self.ws, [_entry(dt.date.today().isoformat() + "T00:00:02", 2)])
+        self.assertEqual(open(path, "rb").read(), corrupt)
+        with open(path, "wb") as handle:
+            handle.write(original)
+        for target in ("_stamp", "_rotate"):
+            with self._cap(700), patch.object(evidence, target, side_effect=OSError("fixture")):
+                with self.assertRaises(PbzError):
+                    evidence._append_lines(self.ws, [_entry(dt.date.today().isoformat() + "T00:00:02", 2)])
+        with patch.object(evidence, "_prune", side_effect=OSError("fixture")):
+            evidence._append_lines(self.ws, [_entry(dt.date.today().isoformat() + "T00:00:03", 3)])
+        self.assertEqual(evidence.verify_chain(self.ws)["chain"], "OK")
 
     def test_cr_is_normalized_before_the_mac(self):
         evidence._append_lines(self.ws, [{"k": "a\r\nb"}])

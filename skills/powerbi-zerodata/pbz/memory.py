@@ -40,12 +40,12 @@ def _disclosure(ws) -> str:
 
 
 def _strip_bands(body: dict) -> dict:
-    """Drop size, share, segment and RI-count bands at every level. Encoding and ri stay."""
+    """Drop size, share, segment, RI-count bands and all *_bucket keys at every level. Encoding and ri stay."""
     drop = {"size_band", "share_band", "segment_band", "ri_count"}
 
     def walk(value):
         if isinstance(value, dict):
-            return {k: walk(v) for k, v in value.items() if k not in drop}
+            return {k: walk(v) for k, v in value.items() if k not in drop and not k.endswith("_bucket")}
         if isinstance(value, list):
             return [walk(v) for v in value]
         return value

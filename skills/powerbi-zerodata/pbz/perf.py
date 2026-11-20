@@ -5,7 +5,8 @@ ratio the engine uses when it decides FASTER, SAME, SLOWER or NOISY. Python neve
 """
 from __future__ import annotations
 
-import re
+import hashlib
+import os
 
 from . import checks, desktop, policy as policy_mod
 from .common import PbzError, engine_call
@@ -65,6 +66,8 @@ def _closed(res: dict, ws=None) -> dict:
         out["trace"] = res["trace"]
     if res.get("verdict") in VERDICT:
         out["verdict"] = res["verdict"]
+    if res.get("ratio_verdict") in ("WITHIN_LIMIT", "OVER_LIMIT"):
+        out["ratio_verdict"] = res["ratio_verdict"]
     if res.get("baseline") in ("SAVED", "MISSING"):
         out["baseline"] = res["baseline"]
     if shape:
@@ -86,7 +89,9 @@ def run(ws, project, query: str, runs: int = 1, baseline: str | None = None, act
     if not checks.spend(ws, "probes"):
         return {"verb": "perf", "status": "BUDGET", "note": "daily probe budget reached; the user can reset it"}
     res = engine_call("perf", {"private_dir": ws.private, "port": port, "dax": query, "runs": int(runs),
-                               "baseline": baseline, "action": action}, timeout=600)
+                               "baseline": baseline, "action": action,
+                               "project_identity": hashlib.sha256(os.path.normcase(os.path.abspath(os.path.join(
+                                   ws.root, getattr(project, "name", "") + ".pbip"))).encode("utf-8")).hexdigest()}, timeout=600)
     if not isinstance(res, dict) or res.get("ok") is not True:
         klass = res.get("class") if isinstance(res, dict) else None
         if klass not in {"SYNTAX", "UNKNOWN_OBJECT", "TYPE_MISMATCH", "CONVERSION", "CIRCULAR", "DUPLICATE_KEY",
@@ -96,13 +101,14 @@ def run(ws, project, query: str, runs: int = 1, baseline: str | None = None, act
     return _closed(res, ws)
 
 
-def expect(ws, project, query: str, expect_verdict: str = "NOT_SLOWER") -> dict:
+def expect(ws, project, query: str, expect_verdict: str = "NOT_SLOWER", check_id: str = "check") -> dict:
     """Check kind `perf`: not slower than the saved baseline. The query text is not returned."""
     if expect_verdict != "NOT_SLOWER":
         raise PbzError("BAD_REQUEST", "perf expect is NOT_SLOWER")
-    result = run(ws, project, query, runs=3, baseline="check", action="compare")
+    result = run(ws, project, query, runs=3, baseline=check_id, action="compare")
     if result.get("status") == "BUDGET":
         return {"status": "BUDGET", "verdict": "UNAVAILABLE"}
     verdict_ = result.get("verdict")
-    status = "PASS" if verdict_ in ("FASTER", "SAME", "NOISY") else "FAIL" if verdict_ == "SLOWER" else "ERROR"
+    status = ("FAIL" if result.get("ratio_verdict") == "OVER_LIMIT" or verdict_ == "SLOWER" else
+              "PASS" if verdict_ in ("FASTER", "SAME", "NOISY") and result.get("ratio_verdict") == "WITHIN_LIMIT" else "ERROR")
     return {"status": status, "verdict": verdict_ or "UNAVAILABLE"}

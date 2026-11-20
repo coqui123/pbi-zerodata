@@ -131,7 +131,7 @@ def move_measure(ws, project, name: str, target: str) -> dict:
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    model = tmdl.load_model(mdef)
+    model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     m = model.measure(name)
     if m is None or m.node is None:
         raise PbzError("NOT_FOUND", f"measure {name}")
@@ -146,11 +146,13 @@ def move_measure(ws, project, name: str, target: str) -> dict:
         raise PbzError("UNSUPPORTED", "cultures not in this mirror: run pbz pull")
     sdoc, ddoc = model.docs[src.file], model.docs[dst.file]
     s, e = tmdl.block_span(sdoc, m.node)
+    tmdl.refuse_out_of_span_description(sdoc, m.node)
     block = sdoc.text[s:e]
-    if not block.endswith("\n"):
-        block += "\n"
-    if not block.endswith("\n\n"):
-        block += "\n"
+    eol = "\r\n" if "\r\n" in block else "\n"
+    if not block.endswith(eol):
+        block += eol
+    if not block.endswith(eol * 2):
+        block += eol
     changed = []
     texts = {rel: doc.text for rel, doc in model.docs.items()}
     edits: dict[str, list] = {}
@@ -163,6 +165,9 @@ def move_measure(ws, project, name: str, target: str) -> dict:
     edits.setdefault(src.file, []).append((s, e, ""))
     at, sep = _insert_point(ddoc, dst.node)
     edits.setdefault(dst.file, []).append((at, at, sep + block))
+    for rel, eds in edits.items():
+        if eds and model.docs[rel].unclosed_fence:
+            raise PbzError("REFUSED", "unclosed TMDL expression fence")
     planned = dict(texts)
     for rel, eds in edits.items():
         planned[rel] = apply_edits(texts[rel], sorted(eds))

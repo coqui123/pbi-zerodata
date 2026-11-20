@@ -21,7 +21,7 @@ import json
 import os
 from dataclasses import dataclass, field
 
-from . import deps, lexers, mlineage, similar, tmdl, usage
+from . import deps, lexers, mlineage, similar, tmdl, usage, policy as policy_mod
 from .common import PbzError, pbz_state_path, read_checked, write_text
 
 SEVERITY = ("high", "medium", "low", "info")
@@ -259,25 +259,14 @@ def _dax_text(model, node) -> str:
     return "\n".join(doc.text[r.start:r.end] for r in tmdl.node_regions(doc, node, deep=False) if r.kind == "dax")
 
 
-def _index(ws) -> dict:
-    path = os.path.join(ws.private, "index-summary.json")
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return {}
-    except OSError:
-        raise PbzError("REFUSED", "index summary is unreadable") from None
-    try:
-        data = json.loads(read_checked(path, root=ws.private).decode("utf-8"))
-    except PbzError:
-        raise
-    except (OSError, ValueError, UnicodeError):
-        raise PbzError("REFUSED", "index summary is unreadable") from None
+def _index(ws, project) -> dict:
+    from .describe import _index_summary
     out = {}
-    for t in data.get("tables", []):
-        out[(t.get("table") or "").lower()] = {"rows": t.get("rows_bucket"),
-                                               "cols": {(c.get("column") or "").lower(): c.get("card_bucket")
-                                                        for c in t.get("columns", [])}}
+    for name, table in _index_summary(ws, project, internal=True).items():
+        out[name.lower()] = {"rows": table.get("rows_bucket"),
+                             "cols": {c["column"].lower(): c.get("card_bucket")
+                                      for c in (table.get("columns") or [])
+                                      if isinstance(c, dict) and isinstance(c.get("column"), str)}}
     return out
 
 
@@ -373,6 +362,7 @@ def _nontrivial(step: str) -> bool:
 class Audit:
     def __init__(self, ws, project, g, idx: dict, mem):
         self.ws, self.project, self.g = ws, project, g
+        self.shape = policy_mod.load(ws).get("disclosure", "shape") == "shape"
         self.model = g.model
         self.res = deps.Resolver(self.model)
         self.idx, self.mem = idx, _mem_index(mem) if mem else {}
@@ -456,7 +446,7 @@ class Audit:
                 fact = dom in self.facts
                 rows = self.rows(dom)
                 big = rows == HIGH_COUNT
-                ev = [f"rows: {rows} (index)"] if rows else []
+                ev = [f"rows: {rows} (index)"] if rows and self.shape else []
                 # nested iterators, direct or through called measures
                 inner = []
                 for k, (s, e) in enumerate(c.args):
@@ -484,7 +474,9 @@ class Audit:
                         f"{c.name}('{dom}') iterates {', '.join(sorted(set(inner))[:4])} for every row: reduce the "
                         "outer grain (iterate VALUES of the needed columns) or hoist the inner part into a VAR when it "
                         "does not depend on the row",
-                        severity=sev, confidence="medium", evidence=ev or ["static (rows unknown: run pbz index)"],
+                        severity=sev, confidence="medium",
+                        evidence=ev or (["static (rows withheld: strict disclosure)"] if rows is not None else
+                                         ["static (rows unknown: run pbz index)"]),
                         fix="rewrite, then compare old and new with pbz synth check (equal) before pbz check",
                         identity=f"{_tag(m.node, m.name)}|{c.name}|{dom}"))
                     continue
@@ -501,7 +493,8 @@ class Audit:
                     "per row). Iterate the distinct values that matter (VALUES or SUMMARIZE of the grouping columns) or "
                     "aggregate the column directly when the measure is a plain aggregation",
                     severity="medium" if big else "low", confidence="medium" if fact else "low",
-                    evidence=ev or ["static (rows unknown: run pbz index)"],
+                    evidence=ev or (["static (rows withheld: strict disclosure)"] if rows is not None else
+                                     ["static (rows unknown: run pbz index)"]),
                     fix="rewrite, then compare old and new with pbz synth check (equal) before pbz check",
                     identity=f"{_tag(m.node, m.name)}|{c.name}|{dom}"))
 
@@ -577,7 +570,7 @@ class Audit:
                         f"aggregation with {xs}('{t.name}', <the column's expression>) and remove the column. "
                         "Trades storage for query time: keep it if those measures become slow",
                         severity="medium" if big else "low", confidence="medium",
-                        evidence=([f"rows: {rows} (index)"] if rows else []) + self.mem_ev(t.name, c.name),
+                        evidence=([f"rows: {rows} (index)"] if rows and self.shape else []) + self.mem_ev(t.name, c.name),
                         members=sorted(users)[:20],
                         fix="rewrite the measures, then pbz unused --remove --only columns",
                         verify="pbz synth check equal of each measure before and after (old expression as left)",
@@ -594,7 +587,7 @@ class Audit:
                         "(Table.AddColumn) or the source. Columns computed before compression usually compress "
                         "better and refresh faster",
                         severity="medium" if card == HIGH_COUNT else "low", confidence="medium",
-                        evidence=([f"distinct: {card} (index)"] if card else []) + self.mem_ev(t.name, c.name),
+                        evidence=([f"distinct: {card} (index)"] if card and self.shape else []) + self.mem_ev(t.name, c.name),
                         fix="add the Power Query step, refresh, then pbz unused --remove the old column after moving "
                             "its bindings", verify="pbz snapshot save before, pbz snapshot compare after refresh",
                         identity=ident))
@@ -647,10 +640,13 @@ class Audit:
                 if card == HIGH_COUNT:
                     self.add(Finding(
                         "HIGH_CARDINALITY_BIDIRECTIONAL", f"{r.from_table}[{r.from_column}] <-> {r.to_table}[{r.to_column}]",
-                        "relationship", "filters both directions on a key with 10k+ distinct values (Microsoft's rule "
+                        "relationship", ("filters both directions on a key with 10k+ distinct values (Microsoft's rule "
                         "flags above 100k; the index bucket cannot tell): single direction plus CROSSFILTER in the "
-                        "measures that need it", severity="medium", confidence="low",
-                        evidence=[f"distinct: {card} (index)"],
+                        "measures that need it" if self.shape else
+                        "filters both directions on a high-cardinality key (cardinality band withheld under strict "
+                        "disclosure): single direction plus CROSSFILTER in the measures that need it"),
+                        severity="medium", confidence="low",
+                        evidence=[f"distinct: {card} (index)"] if self.shape else [],
                         fix=f"pbz relationship set \"'{r.from_table}'[{r.from_column}]\" \"'{r.to_table}'[{r.to_column}]\" "
                             "(single direction), CROSSFILTER(..., Both) where needed",
                         verify="pbz synth check of the affected measures, then pbz smoke on the pages that slice by it",
@@ -760,7 +756,7 @@ class Audit:
                     "UNUSED_HIGH_CARDINALITY", f"'{t.name}'[{c.name}]", "column",
                     "unused and expensive: remove it before smaller cleanups",
                     severity="medium", confidence="high",
-                    evidence=([f"distinct: {card} (index)"] if card else []) + self.mem_ev(t.name, c.name),
+                    evidence=([f"distinct: {card} (index)"] if card and self.shape else []) + self.mem_ev(t.name, c.name),
                     fix="pbz unused --remove --only columns --dry-run, then without --dry-run",
                     identity=_tag(c.node, f"{t.name}[{c.name}]")))
 
@@ -988,7 +984,7 @@ class Audit:
                     ": role-playing copies of one dimension. Keep them only if both roles must filter at once; "
                     "otherwise one table plus USERELATIONSHIP" if role else ": load it once and relate to that table"),
                 severity="low", confidence="high", members=sorted(names),
-                evidence=[f"rows: {self.rows(n)} (index)" for n in names if self.rows(n)][:1] or ["static"],
+                evidence=[f"rows: {self.rows(n)} (index)" for n in names if self.shape and self.rows(n)][:1] or ["static"],
                 identity="|".join(sorted(_tag(self.model.tables[n].node, n) for n in names))))
         if len(dates) > 1:
             roles = []
@@ -1138,7 +1134,7 @@ def run(ws, project, rules: list[str] | None = None, category: str | None = None
     if min_severity and min_severity not in SEVERITY:
         raise PbzError("BAD_REQUEST", f"min severity is one of {', '.join(SEVERITY)}")
     g = usage.build(ws, project)
-    idx = _index(ws)
+    idx = _index(ws, project)
     mem_raw = _memory(ws, project)
     memory_incomplete = mem_raw is _MEMORY_INCOMPLETE
     mem = None if memory_incomplete else mem_raw

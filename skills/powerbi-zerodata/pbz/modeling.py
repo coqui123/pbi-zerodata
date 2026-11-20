@@ -315,7 +315,7 @@ def _fn_decl_span(doc, node) -> tuple[int, int]:
     """From the declaration line to the end of its expression (property lines after it stay)."""
     lines = tmdl._lines(doc.text)
     start = lines[node.line][0]
-    regs = [r for r in doc.regions if r.node is node and r.prop == "expression"]
+    regs = [r for r in doc.regions_for(node) if r.prop == "expression"]
     end = max([r.end for r in regs] + [start + len(lines[node.line][1])])
     nl = doc.text.find("\n", end)
     return start, (len(doc.text) if nl < 0 else nl + 1)
@@ -327,7 +327,7 @@ def function_update(ws, project, name: str, params: str | None, body: str | None
     if node is None:
         raise PbzError("NOT_FOUND", f"function {name}")
     doc = model.docs[node.file]
-    cur = "".join(doc.text[r.start:r.end] for r in doc.regions if r.node is node and r.prop == "expression").strip()
+    cur = "".join(doc.text[r.start:r.end] for r in doc.regions_for(node) if r.prop == "expression").strip()
     m = re.match(r"^\s*(\([^)]*\))\s*=>\s*(.*)$", cur, re.S)
     old_params, old_body = (m.group(1), m.group(2)) if m else ("()", cur)
     params = params if params is not None else old_params
@@ -399,7 +399,7 @@ def function_list(ws, project) -> dict:
     rows = []
     for name, node in sorted(model.functions.items(), key=lambda x: x[0].lower()):
         doc = model.docs[node.file]
-        cur = "".join(doc.text[r.start:r.end] for r in doc.regions if r.node is node and r.prop == "expression").strip()
+        cur = "".join(doc.text[r.start:r.end] for r in doc.regions_for(node) if r.prop == "expression").strip()
         m = re.match(r"^\s*(\([^)]*\))", cur)
         rows.append({"function": name, "params": m.group(1) if m else "?",
                      "calls": sum(len(v) for v in _call_edits(model, name, name).values()), "file": node.file})

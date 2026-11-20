@@ -129,13 +129,22 @@ def cmd_doctor() -> dict:
 
 
 def cmd_status(ws, project, a):
+    from . import index_store
     man = mirror.load_manifest(ws, project)
+    try:
+        indexed = index_store.load(ws.private, project.name) is not None
+        index_error = None
+    except PbzError as err:
+        indexed = False
+        index_error = err.code
     out = {"verb": "status", "workspace": ws.root, "project": project.name,
            "mirror": "present" if man else "missing (run pbz pull)",
            "classification": man.get("classification") if man else None,
-           "index": os.path.exists(os.path.join(ws.private, "index.json")),
+           "index": indexed,
            "policy": os.path.exists(ws.policy_path),
            "engine": "available" if engine_call("ping", {"private_dir": ws.private}).get("ok") else "unavailable"}
+    if index_error:
+        out["index_error"] = index_error
     if man:
         out["pending"] = mirror.mirror_changes(ws, project, man)
         # real files saved behind the mirror's back (Desktop save, another tool): pull --rebase before pushing

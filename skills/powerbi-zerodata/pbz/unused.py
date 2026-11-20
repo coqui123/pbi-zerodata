@@ -18,21 +18,9 @@ TRASH = ".pbz-trash"
 _STAMP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 
-def _index_summary(ws) -> dict:
-    path = os.path.join(ws.private, "index-summary.json")
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return {}
-    except OSError:
-        raise PbzError("REFUSED", "index summary is unreadable") from None
-    try:
-        data = json.loads(read_checked(path, root=ws.private).decode("utf-8"))
-    except PbzError:
-        raise
-    except (OSError, ValueError, UnicodeError):
-        raise PbzError("REFUSED", "index summary is unreadable") from None
-    return {t.get("table"): t for t in data.get("tables", [])}
+def _index_summary(ws, project) -> dict:
+    from .describe import _index_summary as summary
+    return summary(ws, project)
 
 
 def translated(project) -> set[tuple]:
@@ -80,6 +68,8 @@ def _removal(g, k, model) -> tuple[str, str]:
         if t is not None and any(ch.kind == "refreshPolicy" for ch in (t.node.children if t.node else [])):
             return "manual", "table has an incremental refresh policy"
         return "auto", ""
+    if o.kind == "m_query" and any("uncertain M binding" in reason for reason in g.locks.get(k, ())):
+        return "manual", "uncertain M binding: automatic removal disabled"
     if o.kind == "m_query" and o.extra.get("parameter"):
         return "manual", "parameter: deployment pipelines or the service may set it"
     if o.kind == "calc_item":
@@ -93,7 +83,7 @@ def report(ws, project, extra_reports=(), include_all: bool = False, impact: boo
            kinds: list[str] | None = None) -> dict:
     g = usage.build(ws, project, extra_reports)
     g.translated = translated(project)
-    summ = _index_summary(ws) if impact else {}
+    summ = _index_summary(ws, project) if impact else {}
     summary: dict = {}
     objects = []
     auto_date = 0
@@ -311,6 +301,21 @@ def remove(ws, project, extra_reports=(), m_step: str = "remove", cascade: bool 
             rep = []  # report objects go in the first round only
         if not todo and not rep:
             break
+        tables = {g.objects[k].name.lower() for k in todo if k[0] == "table"}
+        for k in todo:
+            o = g.objects[k]
+            if o.kind == "table" or o.table.lower() in tables:
+                continue
+            node = _node_of(g.model, o)
+            if node is not None:
+                try:
+                    tmdl.refuse_out_of_span_description(g.model.docs[node.file], node)
+                except PbzError as e:
+                    if e.code == "REFUSED" and committed:
+                        label = f"{o.kind} {o.label()}" + (f" ({o.table})" if o.kind == "measure" else "")
+                        skipped.append({"object": label, "reason": e.detail})
+                        return _partial(project, removed, skipped, committed, stamp)
+                    raise
         changes = _plan(ws, project, g, todo, rep, m_step, skipped)
         if not changes:
             break
@@ -566,7 +571,7 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
             continue
         doc(p.file).cut(reg.start, reg.end, edit)
     # Power Query editor order lists query names: drop removed tables and queries
-    gone_queries = {g.objects[k].name.lower() for k in todo if k[0] in ("table", "m_query")}
+    gone_queries = {g.objects[k].name for k in todo if k[0] in ("table", "m_query")}
     for rel, d0 in model.docs.items():
         for node in d0.nodes:
             if node.kind == "annotation" and node.name == "PBI_QueryOrder" and node.parent is None and gone_queries:
@@ -575,9 +580,9 @@ def _plan(ws, project, g, todo, rep, m_step, skipped) -> dict[str, str | None]:
                     names = json.loads(d0.text[reg.start:reg.end]) if reg else None
                 except ValueError:
                     names = None
-                if isinstance(names, list) and any(str(n).lower() in gone_queries for n in names):
+                if isinstance(names, list) and any(str(n) in gone_queries for n in names):
                     doc(rel).cut(reg.start, reg.end, json.dumps(
-                        [n for n in names if str(n).lower() not in gone_queries],
+                        [n for n in names if str(n) not in gone_queries],
                         separators=(",", ":"), ensure_ascii=False))
     # perspectives: drop entries of removed objects
     for pname, pnode in model.perspectives.items():

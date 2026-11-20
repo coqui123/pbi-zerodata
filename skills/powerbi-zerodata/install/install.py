@@ -14,10 +14,15 @@ Every settings file it edits is backed up first.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import time
 import datetime as dt
+import tempfile
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -61,7 +66,7 @@ read them only through the consent broker. Real model/report/cache/private paths
 
 
 def stamp() -> str:
-    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 
 def python_exe() -> str:
@@ -87,7 +92,9 @@ def _refuse_spaced_paths() -> None:
 
 def backup(path: str, what_if: bool) -> None:
     if os.path.exists(path) and not what_if:
-        shutil.copy2(path, f"{path}.bak-pbz-{stamp()}")
+        fd, dest = tempfile.mkstemp(prefix=os.path.basename(path) + ".bak-pbz-" + stamp() + "-", dir=os.path.dirname(path))
+        os.close(fd)
+        shutil.copy2(path, dest)
 
 
 def load_json(path: str) -> dict:
@@ -98,50 +105,345 @@ def load_json(path: str) -> dict:
         return {}
 
 
-def save_json(path: str, data: dict, what_if: bool) -> None:
+class InstallConflict(ValueError):
+    """A named conflict leaves the affected file unchanged."""
+
+
+def _remove_created_sidecar(lock, identity, still_absent):
+    """Remove a closed sidecar only if it is still ours and the target is absent."""
+    if not still_absent:
+        return
+    try:
+        current = os.stat(lock)
+        if (current.st_dev, current.st_ino) == identity:
+            os.unlink(lock)
+    except OSError:
+        pass
+
+
+@contextmanager
+def file_lock(path: str, what_if: bool = False):
+    """Serialize a transaction, retaining sidecars except for absent no-op targets."""
+    if what_if:
+        yield
+        return
+    path = os.path.realpath(path)
+    parent = os.path.dirname(path)
+    target_absent = not os.path.exists(path)
+    created_parents = []
+    deferred_identity = None
+    lock = path + '.pbz-lock'
+    deadline = time.monotonic() + 60
+    try:
+        while True:
+            # A no-op holder can remove these directories before we retry.
+            missing = []
+            ancestor = parent
+            while not os.path.exists(ancestor):
+                missing.append(ancestor)
+                ancestor = os.path.dirname(ancestor)
+            for directory in reversed(missing):
+                try:
+                    os.mkdir(directory)
+                    if directory not in created_parents:
+                        created_parents.append(directory)
+                except FileExistsError:
+                    if not os.path.isdir(directory):
+                        raise
+            try:
+                handle = open(lock, 'x+b')
+                lock_created = True
+            except FileExistsError:
+                handle = open(lock, 'a+b')
+                lock_created = False
+            with handle:
+                if os.name == 'nt':
+                    import msvcrt
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b'0')
+                        handle.flush()
+                else:
+                    import fcntl
+                while True:
+                    try:
+                        if os.name == 'nt':
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError as error:
+                        if time.monotonic() >= deadline:
+                            raise InstallConflict(f'{path}: installer lock timeout') from error
+                        time.sleep(0.05)
+                try:
+                    descriptor = os.fstat(handle.fileno())
+                    try:
+                        current = os.stat(lock)
+                    except FileNotFoundError:
+                        current = None
+                    if current is None or (descriptor.st_dev, descriptor.st_ino) != (current.st_dev, current.st_ino):
+                        if time.monotonic() >= deadline:
+                            raise InstallConflict(f'{path}: installer lock timeout')
+                        continue
+                    try:
+                        yield
+                    finally:
+                        if target_absent and not os.path.exists(path) and lock_created:
+                            if os.name == 'nt':
+                                # Windows cannot unlink our open handle. Remember
+                                # its identity for cleanup after closing it.
+                                deferred_identity = (descriptor.st_dev, descriptor.st_ino)
+                            else:
+                                # Unlink while locked so waiters must re-open and
+                                # validate the replacement inode before entering.
+                                try:
+                                    os.unlink(lock)
+                                except OSError:
+                                    pass
+                    return
+                finally:
+                    if os.name == 'nt':
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        if deferred_identity is not None:
+            _remove_created_sidecar(lock, deferred_identity, target_absent and not os.path.exists(path))
+        if target_absent and not os.path.exists(path):
+            for directory in reversed(created_parents):
+                try:
+                    os.rmdir(directory)
+                except OSError:
+                    break
+
+
+def _write_content(handle, text):
+    handle.write(text)
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def atomic_text(path: str, text: str, what_if: bool = False):
     if what_if:
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp-pbz"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    path = os.path.realpath(path)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.tmp-pbz-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+            _write_content(handle, text)
+        if os.path.exists(path):
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def save_json(path: str, data: dict, what_if: bool) -> None:
+    atomic_text(path, json.dumps(data, indent=2, ensure_ascii=False) + '\n', what_if)
+
+
+def update_json(path, merge, what_if=False, expected=None):
+    with file_lock(path, what_if):
+        before = load_json(path)
+        if expected is not None and before != expected:
+            raise InstallConflict(f'{path}: JSON changed since read')
+        new, how = merge(json.loads(json.dumps(before)))
+        if new != before:
+            backup(path, what_if)
+            save_json(path, new, what_if)
+        return how
+
+
+def update_toml(path, uninstall, what_if=False):
+    with file_lock(path, what_if):
+        try:
+            with open(path, encoding='utf-8') as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            text = ''
+        new, how = merge_codex_toml(text, uninstall)
+        if new != text:
+            backup(path, what_if)
+            atomic_text(path, new, what_if)
+        return how
 
 
 def is_ours(entry: dict) -> bool:
-    return any("powerbi-zerodata" in str(h.get("command", "")) and "guard.py" in str(h.get("command", ""))
-               for h in entry.get("hooks", []))
+    guards = {os.path.join(base, "pbz", "guard.py").replace("\\", "/")
+              for base in [CANON, *LINKS]}
+    for hook in entry.get("hooks", []):
+        command = hook.get("command", "")
+        if not isinstance(command, str):
+            continue
+        for agent in ("claude", "codex"):
+            try:
+                if command == hook_cmd(agent):
+                    return True
+            except SystemExit:
+                pass
+        # The installer emits unquoted paths and isolated Python invocations.
+        # Retain recognition of the old trailing --old migration marker.
+        match = re.fullmatch(r"([^\s;&|<>]+) -I -S ([^\s;&|<>]+) --agent (claude|codex)(?: --old)?", command)
+        if (match and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?",
+                                   match[1].replace("\\", "/").rsplit("/", 1)[-1], re.IGNORECASE)
+                and match[2].replace("\\", "/") in guards):
+            return True
+    return False
 
 
-def merge_hooks(data: dict, agent: str, uninstall: bool) -> dict:
+def merge_hooks(data: dict, agent: str, uninstall: bool, owned: dict | None = None) -> dict:
+    owned = owned if owned is not None else {}
+    rec = owned.get("hooks", {})
+    allow_adoption = not rec
+    if uninstall:
+        hooks = data.get("hooks", {})
+        for addition in rec.get("additions", []):
+            event, child = addition["event"], addition["child"]
+            entries = hooks.get(event, [])
+            candidates = [i for i, entry in enumerate(entries)
+                          if entry.get("matcher") == addition["shell"].get("matcher")
+                          and child in entry.get("hooks", [])]
+            # Prefer the recorded shell after removing one matching child.
+            def shell_matches(i):
+                shell = json.loads(json.dumps(entries[i]))
+                shell["hooks"].remove(child)
+                return shell == addition["shell"]
+            if candidates:
+                index = next((i for i in candidates if shell_matches(i)), candidates[0])
+                entry = entries[index]
+                entry["hooks"].remove(child)
+                if not entry["hooks"] and entry == addition["shell"]:
+                    entries.pop(index)
+            if not entries and event in rec.get("events", []):
+                hooks.pop(event, None)
+        if not hooks and rec.get("container"):
+            data.pop("hooks", None)
+        owned.pop("hooks", None)
+        return data
+    if not rec:
+        rec = {"container": "hooks" not in data, "events": [], "additions": []}
+        owned["hooks"] = rec
     hooks = data.setdefault("hooks", {})
     for event, matcher in (("PreToolUse", ".*"), ("SessionStart", None)):
-        entries = [e for e in hooks.get(event, []) if not is_ours(e)]
-        if not uninstall:
-            entry = {"hooks": [{"type": "command", "command": hook_cmd(agent), "timeout": 15}]}
-            if matcher:
-                entry = {"matcher": matcher, **entry}
-            entries.append(entry)
-        if entries:
-            hooks[event] = entries
+        child = {"type": "command", "command": hook_cmd(agent), "timeout": 15}
+        adopted = False
+        entries = hooks.get(event, [])
+        for index in range(len(entries) - 1, -1, -1):
+            entry = entries[index]
+            removed_stale = False
+            for old in list(entry.get("hooks", [])):
+                if not is_ours({"hooks": [old]}):
+                    continue
+                if old == child:
+                    if entry.get("matcher") == matcher:
+                        addition = {"event": event, "child": child,
+                                    "shell": {**entry, "hooks": list(entry["hooks"])}}
+                        addition["shell"]["hooks"].remove(child)
+                        recorded = any(a["event"] == event and a["child"] == child
+                                       and a["shell"] == addition["shell"] for a in rec["additions"])
+                        if not recorded:
+                            for prior in rec["additions"]:
+                                if (prior["event"] == event and prior["child"] == child
+                                        # Sibling edits do not change the group's identity.
+                                        and {k: v for k, v in prior["shell"].items() if k != "hooks"}
+                                        == {k: v for k, v in entry.items() if k != "hooks"}):
+                                    prior["shell"] = addition["shell"]
+                                    recorded = True
+                                    break
+                        if allow_adoption and not recorded:
+                            rec["additions"].append(addition)
+                        adopted = adopted or allow_adoption or recorded
+                elif old.get("command") != child["command"]:
+                    entry["hooks"].remove(old)
+                    removed_stale = True
+                    rec["additions"] = [a for a in rec["additions"]
+                                        if not (a["event"] == event and a["child"] == old)]
+            if removed_stale and not entry.get("hooks") and set(entry) <= {"hooks", "matcher"}:
+                entries.pop(index)
+        if adopted:
+            continue
+        if event not in hooks:
+            rec["events"].append(event)
+        entry = {"hooks": [child]}
+        if matcher:
+            entry["matcher"] = matcher
+        hooks.setdefault(event, []).append(entry)
+        addition = {"event": event, "child": child, "shell": {**entry, "hooks": []}}
+        if addition not in rec["additions"]:
+            rec["additions"].append(addition)
+    if not rec["additions"]:
+        owned.pop("hooks", None)
+    return data
+
+
+def merge_denies(data: dict, uninstall: bool, owned: dict | None = None) -> dict:
+    owned = owned if owned is not None else {}
+    rec = owned.get("denies", {})
+    if uninstall:
+        perms = data.get("permissions", {})
+        deny = perms.get("deny", [])
+        for rule in rec.get("additions", []):
+            if rule in deny:
+                deny.remove(rule)
+        if not deny and rec.get("list"):
+            perms.pop("deny", None)
+        if not perms and rec.get("container"):
+            data.pop("permissions", None)
+        owned.pop("denies", None)
+        return data
+    if not rec:
+        rec = {"container": "permissions" not in data,
+               "list": "deny" not in data.get("permissions", {}), "additions": []}
+        owned["denies"] = rec
+    deny = data.setdefault("permissions", {}).setdefault("deny", [])
+    for rule in DENY_RULES:
+        if rule not in deny:
+            deny.append(rule)
+            rec["additions"].append(rule)
+    if not rec["additions"]:
+        owned.pop("denies", None)
+    return data
+
+
+def _settings_step(path: str, agent: str, what_if: bool, uninstall: bool, denies: bool = False) -> bool:
+    """Ownership covers hook children and deny rules only; absent records remove nothing."""
+    record_path = path + ".pbz-owned.json"
+    existed = os.path.exists(path)
+    before = load_json(path)
+    previous = load_json(record_path)
+    owned = json.loads(json.dumps(previous))
+    new = merge_hooks(json.loads(json.dumps(before)), agent, uninstall, owned)
+    if denies:
+        new = merge_denies(new, uninstall, owned)
+    created_file = previous.get("created_file", False)
+    if uninstall:
+        owned.pop("created_file", None)
+    elif not existed and new != before:
+        owned["created_file"] = True
+    if new != before:
+        backup(path, what_if)
+        if uninstall and created_file and not new:
+            if not what_if:
+                os.remove(path)
         else:
-            hooks.pop(event, None)
-    if not hooks:
-        data.pop("hooks", None)
-    return data
+            save_json(path, new, what_if)
+    if owned != previous and not what_if:
+        if owned:
+            save_json(record_path, owned, False)
+        elif os.path.exists(record_path):
+            os.remove(record_path)
+    return new != before
 
 
-def merge_denies(data: dict, uninstall: bool) -> dict:
-    perms = data.setdefault("permissions", {})
-    deny = [d for d in perms.get("deny", []) if d not in DENY_RULES]
-    if not uninstall:
-        deny += DENY_RULES
-    if deny:
-        perms["deny"] = deny
-    else:
-        perms.pop("deny", None)
-    return data
+def settings_step(path: str, agent: str, what_if: bool, uninstall: bool, denies: bool = False) -> bool:
+    with file_lock(path, what_if):
+        return _settings_step(path, agent, what_if, uninstall, denies)
 
 
 def junction(link: str, what_if: bool, uninstall: bool) -> str:
@@ -163,12 +465,14 @@ def junction(link: str, what_if: bool, uninstall: bool) -> str:
     return f"junction {link} -> {target}"
 
 
-def rule_block(path: str, what_if: bool, uninstall: bool) -> str:
+def _rule_block(path: str, what_if: bool, uninstall: bool) -> str:
     try:
         with open(path, encoding="utf-8") as f:
             text = f.read()
     except FileNotFoundError:
         text = ""
+    if text.count(BEGIN) != text.count(END) or text.count(BEGIN) > 1 or (END in text and text.index(END) < text.index(BEGIN)):
+        raise InstallConflict(f'{path}: conflicting rule block markers')
     if BEGIN in text and END in text:
         head, rest = text.split(BEGIN, 1)
         tail = rest.split(END, 1)[1].lstrip("\n")
@@ -180,10 +484,13 @@ def rule_block(path: str, what_if: bool, uninstall: bool) -> str:
     if new == text:
         return f"ok {path}"
     backup(path, what_if)
-    if not what_if:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(new)
+    atomic_text(path, new, what_if)
     return f"{'removed block from' if uninstall else 'rule block ->'} {path}"
+
+
+def rule_block(path: str, what_if: bool, uninstall: bool) -> str:
+    with file_lock(path, what_if):
+        return _rule_block(path, what_if, uninstall)
 
 
 def mcp_args() -> list[str]:
@@ -222,8 +529,25 @@ def _toml_str(s: str) -> str:
 
 def merge_codex_toml(text: str, uninstall: bool) -> tuple[str, str]:
     """[mcp_servers.pbz] in ~/.codex/config.toml, edited as text (stdlib has no TOML writer)."""
+    import tomllib
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        return text, f'SKIP config.toml parse conflict: {error}'
+    servers = parsed.get('mcp_servers', {})
+    if not isinstance(servers, dict):
+        return text, 'SKIP conflict mcp_servers (not a table)'
+    current = servers.get(MCP_NAME)
+    if current is not None:
+        if not isinstance(current, dict):
+            return text, 'SKIP conflict mcp_servers.pbz (not a table)'
+        if not _ours(current.get('args')):
+            return text, 'SKIP [mcp_servers.pbz] exists and is not ours'
+        extras = sorted(set(current) - {'command', 'args'})
+        if extras:
+            return text, 'SKIP conflict mcp_servers.pbz.' + extras[0] + ' (host-owned key/table)'
     import re
-    header = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*(?:pbz|"pbz")\s*(?:\.[^\]]*)?\]\s*(?:#.*)?$')
+    header = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*(?:pbz|"pbz"|\'pbz\')\s*(?:\s*\.\s*(?:[A-Za-z0-9_-]+|"[^"\n]*"|\'[^\'\n]*\'))*\]\s*(?:#.*)?$')
     lines = text.splitlines(keepends=True)
     keep, section = [], []
     in_ours = False
@@ -258,30 +582,13 @@ def merge_codex_toml(text: str, uninstall: bool) -> tuple[str, str]:
 
 
 def mcp_step(what_if: bool, uninstall: bool) -> list[str]:
-    out = []
-    data = load_json(CLAUDE_JSON)
-    new, how = merge_claude_mcp(json.loads(json.dumps(data)), uninstall)
-    if new != data:
-        backup(CLAUDE_JSON, what_if)
-        save_json(CLAUDE_JSON, new, what_if)
-    out.append(f"{how} mcpServers.{MCP_NAME} -> {CLAUDE_JSON}")
-    try:
-        with open(CODEX_CONFIG, encoding="utf-8") as f:
-            text = f.read()
-    except FileNotFoundError:
-        text = ""
-    new_text, how = merge_codex_toml(text, uninstall)
-    if new_text != text:
-        backup(CODEX_CONFIG, what_if)
-        if not what_if:
-            os.makedirs(os.path.dirname(CODEX_CONFIG), exist_ok=True)
-            with open(CODEX_CONFIG, "w", encoding="utf-8", newline="\n") as f:
-                f.write(new_text)
-    out.append(f"{how} [mcp_servers.{MCP_NAME}] -> {CODEX_CONFIG}")
-    return out
+    how = update_json(CLAUDE_JSON, lambda data: merge_claude_mcp(data, uninstall), what_if)
+    codex_how = update_toml(CODEX_CONFIG, uninstall, what_if)
+    return [f"{how} mcpServers.{MCP_NAME} -> {CLAUDE_JSON}",
+            f"{codex_how} [mcp_servers.{MCP_NAME}] -> {CODEX_CONFIG}"]
 
 
-def main() -> int:
+def _main() -> int:
     what_if = "--what-if" in sys.argv
     uninstall = "--uninstall" in sys.argv
     with_mcp = "--mcp" in sys.argv
@@ -297,35 +604,34 @@ def main() -> int:
     if skipped and not uninstall:
         return 1
 
-    data = load_json(CLAUDE_SETTINGS)
-    new = merge_denies(merge_hooks(json.loads(json.dumps(data)), "claude", uninstall), uninstall)
-    if new != data:
-        backup(CLAUDE_SETTINGS, what_if)
-        save_json(CLAUDE_SETTINGS, new, what_if)
-        print(f"  hooks + deny rules -> {CLAUDE_SETTINGS}")
-    else:
-        print(f"  ok {CLAUDE_SETTINGS}")
-
-    data = load_json(CODEX_HOOKS)
-    new = merge_hooks(json.loads(json.dumps(data)), "codex", uninstall)
-    if new != data:
-        backup(CODEX_HOOKS, what_if)
-        save_json(CODEX_HOOKS, new, what_if)
-        print(f"  hooks -> {CODEX_HOOKS}  (trust them once in Codex with /hooks)")
-    else:
-        print(f"  ok {CODEX_HOOKS}")
+    changed = settings_step(CLAUDE_SETTINGS, "claude", what_if, uninstall, denies=True)
+    print(" ", f"hooks + deny rules -> {CLAUDE_SETTINGS}" if changed else f"ok {CLAUDE_SETTINGS}")
+    changed = settings_step(CODEX_HOOKS, "codex", what_if, uninstall)
+    print(" ", f"hooks -> {CODEX_HOOKS} (trust them once in Codex with /hooks)" if changed else f"ok {CODEX_HOOKS}")
 
     for path in RULE_FILES:
         print(" ", rule_block(path, what_if, uninstall))
     if with_mcp or uninstall:
         for line in mcp_step(what_if, uninstall):
             print(" ", line)
+            if line.startswith("SKIP "):
+                skipped = True
+    if skipped:
+        return 1
     if not uninstall:
         print(f"  hook command: {hook_cmd('claude')}")
         if with_mcp:
             print(f"  mcp server: {python_exe()} {' '.join(mcp_args())}  (Claude Code alternative: "
                   f"claude mcp add --scope user {MCP_NAME} -- {python_exe()} {' '.join(mcp_args())})")
     return 0
+
+
+def main() -> int:
+    try:
+        return _main()
+    except InstallConflict as error:
+        print(f'REFUSE {error}')
+        return 1
 
 
 if __name__ == "__main__":

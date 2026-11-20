@@ -262,17 +262,33 @@ Used by `pbz unused --verify-engine` to cross-check the metadata parser; never t
 ### `synth-query`
 
 Request `{"private_dir", "port", "dax": "EVALUATE ...", "max_rows": 500}`. Response `{"ok": true,
-"verb": "synth-query", "columns": ["..."], "rows": [[...]], "truncated": false}`: the only verb that
+"verb": "synth-query", "verified": true, "columns": ["..."], "rows": [[...]], "truncated": false}`: the only verb that
 returns values, and only for a model built by `pbz synth build` (fake data from the sanitized mirror).
-Before evaluating, the engine requires (a) that every partition of every user table is calculated or a
-calculation group (TMSCHEMA_PARTITIONS `Type` 2 or 7), and (b) that the model annotation `PBZ_SYNTHETIC`
-(TMSCHEMA_ANNOTATIONS, object type Model) equals `hmac("pbz-synthetic:" + ",".join(sorted lineage tags))`
-over the non-private tables (TMSCHEMA_TABLES `LineageTag`; `IsPrivate`, `ShowAsVariationsOnly` and
-`LocalDateTable_*` / `DateTableTemplate_*` excluded), with the key in `private_dir`. Lineage tags are
-regenerated for each synthetic build and `pbz push` refuses the annotation (SYNTHETIC_MARKER_IN_REAL_MODEL),
-so the marker cannot be moved onto a real model. Otherwise `BAD_REQUEST` and no rows. The query must pass
+Build validation with `synthetic_marker` stores a DPAPI-protected, HMAC-signed definition manifest
+in `private_dir`, indexed by the model's ownership marker. It covers every table, including private
+and untagged tables, and full TOM object definitions (columns, measures, partitions, calculated
+expressions, calculation items and format strings), relationships, roles and named expressions.
+Only calculated and calculation-group partition sources are accepted, across all tables.
+`synth-bind` (`private_dir`, `port`, `marker`) pins the verified build to the Desktop catalog selected
+by `pbz synth open` (engine port and catalog ID). A copied marker on another catalog does not authorize queries.
+`synth-query` checks the live definition and catalog against the signed manifest immediately before
+execution, buffers rows, then reads and verifies the live definition and model timestamps again.
+Each definition capture also checks model timestamps on both sides of the metadata read; missing
+timestamps disable verification.
+Any mismatch or unavailable verification refuses with no rows. Successful responses include
+`verified: true`; Python requires this field and a complete row envelope. Refusals can include a
+closed `SYNTH_*` reason (data partition, missing marker, invalid signature, unavailable verification,
+changed definition, wrong catalog, wrong build, or change during execution). Existing builds need
+rebuilding to create their trusted manifest. The query must pass
 the same guard as snapshot / smoke (DEFINE or EVALUATE first, no INFO.* or EVALUATEANDLOG). Rows are capped at
 500; DateTime values are `yyyy-MM-ddTHH:mm:ss` strings.
+
+### `synth-bind`
+
+Request `{"private_dir", "port", "marker"}`. Response `{"ok": true, "verb": "synth-bind",
+"verified": true}`. Verifies the live model against the trusted signed build manifest and pins its
+catalog identity. Called by `pbz synth open` after locating the Desktop instance holding the owned PBIP.
+No rows are evaluated or returned. Missing manifests, changed definitions or a wrong marker refuse.
 
 ## v1.4 addition: `memory`
 
@@ -343,9 +359,11 @@ and `predicates` stay (booleans are allowed in both tiers, as in `probe`). Engin
 
 ### `perf`
 
-Request `{"private_dir", "port", "dax", "runs", "baseline"?, "action"?}`. `dax` must pass the snapshot/smoke
+Request `{"private_dir", "port", "dax", "runs", "baseline"?, "action"?, "project_identity"?}`. `dax` must pass the snapshot/smoke
 guard (`DEFINE` or `EVALUATE` first; no `INFO.*`, no `EVALUATEANDLOG`). `runs` is 1 to 20. `action` is `save`,
 `compare`, or absent. `baseline` is a file name (`^[A-Za-z0-9._-]{1,64}$`) required when `action` is set.
+`project_identity` is required for save/compare and is a hash of the workspace root and project file path,
+supplied by `pbz/perf.py`.
 Each run is a cold XMLA `ClearCache` (`DatabaseID` is the catalog name) followed by the query. Result rows are
 discarded. The median and the run-to-run spread stay in the process. The baseline file is DPAPI in
 `private_dir\perf\<name>.bin` and holds only those two numbers.
@@ -387,3 +405,10 @@ after `action: save`, or `MISSING` when a compare has no saved baseline. A trace
 Implementation clarifications that callers must know (response container names, the blank group
 key, optional `timeout_s`, stricter message scrubbing, query guards) are listed in
 `engine/README.md` under "Contract deviations and clarifications".
+
+Private index readers use the `index-current.json` manifest to select one completed,
+hash-checked `index-<uuid>` generation. Python publishes hardened artifacts and prunes
+older generations after the manifest write. New engine indexes record a SHA256 model
+stamp over sorted table names, column names and data types, partition source kinds,
+and the latest refresh time. The reader compares it with the live connection before
+allowing category reveals. Older indexes without a stamp retain identity-only checks.

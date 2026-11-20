@@ -10,7 +10,7 @@ import os
 import re
 
 from . import mirror, rename as rename_mod, tmdl
-from .common import PbzError, anchor_mirror, commit_bytes, read_text
+from .common import PbzError, anchor_mirror, commit_bytes
 from .mirror_txn import transaction
 from .tokens import TOKEN_RE
 
@@ -110,7 +110,7 @@ def _model(project):
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    return tmdl.load_model(mdef)
+    return tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
 
 
 def _names(model, kind: str):
@@ -192,7 +192,10 @@ def _outside_count(texts, rx) -> int:
     return total
 
 
-def replace(ws, project, pattern: str, repl: str, kind: str = "any", apply: bool = False) -> dict:
+def replace(ws, project, pattern: str, repl: str, kind: str = "any", apply: bool = False, *, _locked: bool = False) -> dict:
+    if apply and not _locked:
+        return transaction(ws.mirror, lambda: replace(ws, project, pattern, repl, kind, apply, _locked=True),
+                           ws=ws, project=project)
     rx = _refuse_token_syntax(pattern, repl)
     model = _model(project)
     jobs = _name_jobs(model, kind, rx, repl)
@@ -210,23 +213,30 @@ def replace(ws, project, pattern: str, repl: str, kind: str = "any", apply: bool
         for obj_kind, old, new, table in jobs:
             rename_mod.rename(ws, project, obj_kind, old, new, table)
         ops = []
+        expected = {}
         if not name_hit:
             for rel, text in mirror.mirror_texts(ws, project).items():
                 new_text = sub_outside(text, rx, repl)
                 if new_text != text:
                     path = os.path.join(ws.mirror, *rel.split("/"))
-                    _old, bom = read_text(path)
+                    old, bom = mirror.read_mirror_text(path, root=ws.mirror)
+                    if old != text:
+                        raise PbzError("RECOVERY_REQUIRED", rel)
+                    expected[path] = bom + text.encode("utf-8")
                     ops.append(("write", path, new_text, bom))
             if ops:
-                commit_bytes(ops, root=anchor_mirror(ws))
+                commit_bytes(ops, root=anchor_mirror(ws), expected=expected)
         return {**out, "dry_run": False, "result": "CHANGED" if planned or ops else "NOTHING_TO_CHANGE"}
 
     if jobs or outside:
-        return transaction(ws.mirror, _apply)
+        return _apply()
     return {**out, "dry_run": False, "result": "NOTHING_TO_CHANGE"}
 
 
-def rename_match(ws, project, kind: str, pattern: str, repl: str, dry_run: bool = False) -> dict:
+def rename_match(ws, project, kind: str, pattern: str, repl: str, dry_run: bool = False, *, _locked: bool = False) -> dict:
+    if not dry_run and not _locked:
+        return transaction(ws.mirror, lambda: rename_match(ws, project, kind, pattern, repl, _locked=True),
+                           ws=ws, project=project)
     rx = _refuse_token_syntax(pattern, repl)
     jobs = _name_jobs(_model(project), kind, rx, repl)
     planned = [{"kind": k, "from": old, "to": new, "table": table} for k, old, new, table in jobs]
@@ -241,4 +251,4 @@ def rename_match(ws, project, kind: str, pattern: str, repl: str, dry_run: bool 
             rename_mod.rename(ws, project, obj_kind, old, new, table)
         return {**out, "result": "CHANGED"}
 
-    return transaction(ws.mirror, _apply)
+    return _apply()

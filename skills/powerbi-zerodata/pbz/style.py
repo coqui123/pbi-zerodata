@@ -399,7 +399,7 @@ def run(ws, project, page: str | None = None, visual: str | None = None, sets: l
     tg = targets(project, page, visual, vtype, all_, strict=mutating)
     if series and len(tg) != 1:
         raise PbzError("BAD_REQUEST", "--series formats one visual: name it")
-    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
     parsed = []
     for s in sets:
         key, eq, raw = s.partition("=")
@@ -540,7 +540,7 @@ def run_canvas(ws, project, page: str | None = None, sets: list[str] | None = No
         parsed.append(("set", *_canvas_key(key), raw.strip()))
     parsed += [("unset", *_canvas_key(k), None) for k in unsets]
     parsed.sort(key=lambda p: p[2] == "scaling")  # an image set in the same call comes first
-    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"))
+    model = tmdl.load_model(os.path.join(project.mirror_model, "definition"), root=os.path.dirname(project.mirror_model))
     changed, files, shown, notes = [], [], [], []
     loaded = []
     for pid, pname in pages:

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import uuid
 
 from . import desktop, policy as policy_mod, tmdl, tokens, validate
@@ -80,9 +81,17 @@ def _scope(base: str, kind: str) -> list[str]:
     out = []
     if _reparse_link(base):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-    if not os.path.isdir(base):
+    try:
+        info = os.stat(base)
+    except FileNotFoundError:
         return out
-    for cur, dirs, files in os.walk(base):
+    except OSError:
+        raise PbzError("REFUSED", os.path.basename(base)) from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise PbzError("REFUSED", os.path.basename(base))
+    def unreadable(_err):
+        raise PbzError("REFUSED", os.path.basename(base)) from None
+    for cur, dirs, files in os.walk(base, onerror=unreadable):
         dirs[:] = [d for d in dirs if not _path_excluded(os.path.join(cur, d), base)]
         relcur = os.path.relpath(cur, base).replace("\\", "/")
         for f in files:
@@ -160,16 +169,16 @@ def _detokenize(rel: str, text: str, tm) -> tuple[str, list[str]]:
 
 def _checked_raw(path: str, root: str) -> bytes | None:
     """Bytes of a present regular file. Missing is None. An alias or hard link is REFUSED, path only."""
-    if not os.path.lexists(path):
-        return None
     rel = os.path.relpath(path, root).replace("\\", "/")
     try:
-        preflight_regular(path, root=root)
+        _contained(path, root)
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return None
         return read_checked(path, root=root)
-    except PbzError as err:
-        if err.code == "UNSAFE_PATH":
-            raise PbzError("REFUSED", rel) from None
-        raise
+    except (OSError, PbzError):
+        raise PbzError("REFUSED", rel) from None
 
 
 def _split_bom(raw: bytes) -> tuple[str, bytes]:
@@ -177,9 +186,23 @@ def _split_bom(raw: bytes) -> tuple[str, bytes]:
     return raw[len(bom):].decode("utf-8"), bom
 
 
-def _post_mirror_hash(ws, rel: str) -> str | None:
-    """Checked hash of a present mirror file. Missing stays None so the caller reports CONFLICT."""
+_ALIAS_HASH = object()
+
+
+def _post_mirror_hash(ws, rel: str) -> str | None | object:
+    """Return None if missing, an alias sentinel if aliased, otherwise the checked hash."""
     path = os.path.join(ws.mirror, *rel.split("/"))
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass
+    else:
+        if (stat.S_ISLNK(info.st_mode)
+                or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)
+                or _reparse_link(path)):
+            return _ALIAS_HASH
     raw = _checked_raw(path, ws.mirror)
     if raw is None:
         return None
@@ -187,10 +210,7 @@ def _post_mirror_hash(ws, rel: str) -> str | None:
 
 
 def mirror_changes(ws: Workspace, project: Project, man: dict, *, checked: bool = False) -> dict:
-    if checked:
-        anchor_mirror(ws)
-    elif _reparse_link(ws.mirror):
-        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    anchor_mirror(ws)
     files = man.get("files", {})
     changed, added, deleted = [], [], []
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
@@ -199,32 +219,15 @@ def mirror_changes(ws: Workspace, project: Project, man: dict, *, checked: bool 
         if _path_outside_project(p, rel, ws, project):
             changed.append(rel)
             continue
-        if checked:
-            # Missing stays deleted. Do not fall through to bare file_sha (TOCTOU / hardlink).
-            if not os.path.lexists(p):
-                h = None
-            else:
-                raw = _checked_raw(p, ws.mirror)
-                h = hashlib.sha256(raw).hexdigest() if raw is not None else None
-        else:
-            h = file_sha(p)
+        raw = _checked_raw(p, ws.mirror)
+        h = hashlib.sha256(raw).hexdigest() if raw is not None else None
         if h is None:
             deleted.append(rel)
         elif h != info.get("mirror"):
             changed.append(rel)
-    for cur, dirs, fs in os.walk(ws.mirror):
-        dirs[:] = [d for d in dirs if not _path_excluded(os.path.join(cur, d), ws.mirror)]
-        for f in fs:
-            full = os.path.join(cur, f)
-            if not _mirrored_name(f):
-                continue
-            rel = os.path.relpath(full, ws.mirror).replace("\\", "/")
-            if not rel.startswith(prefixes):
-                continue
-            if _path_outside_project(full, rel, ws, project):
-                continue
-            if rel not in files and (f.lower().endswith(".tmdl") or f.lower().endswith(JSON_EXT)):
-                added.append(rel)
+    for rel in mirror_texts(ws, project):
+        if rel not in files:
+            added.append(rel)
     return {"changed": sorted(changed), "added": sorted(added), "deleted": sorted(deleted)}
 
 
@@ -240,7 +243,14 @@ def excluded_mirror_additions(ws: Workspace, project: Project) -> list[str]:
     if _reparse_link(ws.mirror):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
-    for cur, dirs, files in os.walk(ws.mirror, followlinks=False):
+    def unreadable(err):
+        if err.filename is None or os.path.realpath(err.filename) == os.path.realpath(ws.mirror):
+            raise PbzError("REFUSED", project.name) from None
+        if err.filename is not None:
+            rel = os.path.relpath(err.filename, ws.mirror).replace("\\", "/").rstrip("/") + "/"
+            if rel.startswith(prefixes):
+                raise PbzError("REFUSED", project.name) from None
+    for cur, dirs, files in os.walk(ws.mirror, followlinks=False, onerror=unreadable):
         blocked = []
         for d in dirs:
             full = os.path.join(cur, d)
@@ -269,7 +279,18 @@ def excluded_mirror_additions(ws: Workspace, project: Project) -> list[str]:
                 continue
             if _path_outside_project(full, rel, ws, project):
                 found.append(rel)
+            else:
+                read_mirror_text(full, root=ws.mirror)
     return sorted(set(found))
+
+
+def read_mirror_text(path: str, *, root: str) -> tuple[str, bytes]:
+    """Current mirror text, with path-only closed errors."""
+    try:
+        return read_text_checked(path, root=root)
+    except (OSError, UnicodeError, PbzError):
+        raise PbzError("UNSAFE_PATH" if _reparse_link(path) else "REFUSED",
+                       os.path.relpath(path, root).replace("\\", "/")) from None
 
 
 def _read_mine(path: str, root: str) -> tuple[str, bytes]:
@@ -341,63 +362,65 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
     model_texts = {rel[len(prefix):]: text for rel, text, _bom, _real_h in captured
                    if rel.startswith(prefix) and rel.lower().endswith(".tmdl")}
     model = tmdl.load_model(os.path.join(project.model_dir, "definition"), model_texts)
-    clf = Classifier(model, ws.private, pol)
-    tm = tokens.TokenMap(ws.private)
-    new_files, lossy, counts = {}, [], {}
-    keep = set(pending["changed"] + pending["added"]) if rebase else set()
-    conflicts = []
-    bdir = base_dir(ws, project)
-    # Phase 1 tokenizes that capture. Nothing is written here, so a later refusal leaves the
-    # published mirror and base untouched. A malformed report file refuses the pull; it is not
-    # published and it is not reported as PULLED.
-    prepared = []
-    for rel, text, bom, real_h in captured:
-        try:
-            mtext = _tokenize(rel, text, model, clf, tm)
-        except PbzError as err:
-            if err.code == "REFUSED":
-                raise PbzError("REFUSED", rel) from None
-            raise
-        back, unknown = _detokenize(rel, mtext, tm)
-        if back != text or unknown:
-            lossy.append(rel)
-            mtext = None
-        old = man.get("files", {}).get(rel, {})
-        item = {"rel": rel, "bom": bom, "mtext": mtext, "real_h": real_h, "old": old}
-        if rel in keep and old.get("real") != real_h:
-            mine = os.path.join(ws.mirror, *rel.split("/"))
-            base = os.path.join(bdir, *rel.split("/"))
-            # Rebase inputs are checked before any content read. An aliased tracked
-            # path must not be opened as merge input.
-            if _path_outside_project(mine, rel, ws, project):
-                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-            _must_stay(mine, ws.mirror)
-            if os.path.lexists(base):
-                _must_stay(base, ws.private)
-            item["mine_text"], item["mine_bom"] = _read_mine(mine, ws.mirror)
-            item["base_text"] = _read_prepared(base, rel)[0] if os.path.exists(base) else None
-        prepared.append(item)
-    # Preflight every planned mirror/base publish and stale-delete path before the first write,
-    # so a later UNSAFE_PATH cannot leave earlier files already changed.
-    planned = {item["rel"] for item in prepared}
-    for item in prepared:
-        rel, mtext = item["rel"], item["mtext"]
-        if rel in keep:
-            continue
-        mpath = os.path.join(ws.mirror, *rel.split("/"))
-        bpath = os.path.join(bdir, *rel.split("/"))
-        if mtext is None:
-            if os.path.exists(mpath):
-                _must_stay(mpath, ws.mirror)
-            continue
-        _must_stay(mpath, ws.mirror)
-        _must_stay(bpath, ws.private)
-    for rel in man.get("files", {}):
-        if rel in planned or rel in keep:
-            continue
-        stale = os.path.join(ws.mirror, *rel.split("/"))
-        if os.path.lexists(stale):
-            _must_stay(stale, ws.mirror)
+    clf = Classifier(model, ws.private, pol, project.name)
+    with tokens.WorkspaceLock(ws.private):
+        tm = tokens.TokenMap(ws.private)
+        new_files, lossy, counts = {}, [], {}
+        keep = set(pending["changed"] + pending["added"]) if rebase else set()
+        conflicts = []
+        bdir = base_dir(ws, project)
+        # Phase 1 tokenizes that capture. Nothing is written here, so a later refusal leaves the
+        # published mirror and base untouched. A malformed report file refuses the pull; it is not
+        # published and it is not reported as PULLED.
+        prepared = []
+        for rel, text, bom, real_h in captured:
+            try:
+                mtext = _tokenize(rel, text, model, clf, tm)
+            except PbzError as err:
+                if err.code == "REFUSED":
+                    raise PbzError("REFUSED", rel) from None
+                raise
+            back, unknown = _detokenize(rel, mtext, tm)
+            if back != text or unknown:
+                lossy.append(rel)
+                mtext = None
+            old = man.get("files", {}).get(rel, {})
+            item = {"rel": rel, "bom": bom, "mtext": mtext, "real_h": real_h, "old": old}
+            if rel in keep and old.get("real") != real_h:
+                mine = os.path.join(ws.mirror, *rel.split("/"))
+                base = os.path.join(bdir, *rel.split("/"))
+                # Rebase inputs are checked before any content read. An aliased tracked
+                # path must not be opened as merge input.
+                if _path_outside_project(mine, rel, ws, project):
+                    raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+                _must_stay(mine, ws.mirror)
+                if os.path.lexists(base):
+                    _must_stay(base, ws.private)
+                item["mine_text"], item["mine_bom"] = _read_mine(mine, ws.mirror)
+                item["base_text"] = _read_prepared(base, rel)[0] if os.path.exists(base) else None
+            prepared.append(item)
+        # Preflight every planned mirror/base publish and stale-delete path before the first write,
+        # so a later UNSAFE_PATH cannot leave earlier files already changed.
+        planned = {item["rel"] for item in prepared}
+        for item in prepared:
+            rel, mtext = item["rel"], item["mtext"]
+            if rel in keep:
+                continue
+            mpath = os.path.join(ws.mirror, *rel.split("/"))
+            bpath = os.path.join(bdir, *rel.split("/"))
+            if mtext is None:
+                if os.path.exists(mpath):
+                    _must_stay(mpath, ws.mirror)
+                continue
+            _must_stay(mpath, ws.mirror)
+            _must_stay(bpath, ws.private)
+        for rel in man.get("files", {}):
+            if rel in planned or rel in keep:
+                continue
+            stale = os.path.join(ws.mirror, *rel.split("/"))
+            if os.path.lexists(stale):
+                _must_stay(stale, ws.mirror)
+        tm.save()  # Persist token definitions durably before publishing any references.
     # Phase 2 reuses those strings. It does not read the same files again.
     for item in prepared:
         rel, bom, mtext = item["rel"], item["bom"], item["mtext"]
@@ -429,7 +452,6 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
             p = os.path.join(ws.mirror, *rel.split("/"))
             if os.path.exists(p):
                 remove_file(p, root=ws.mirror)
-    tm.save()
     man = {"version": 1, "project": project.name, "pulled": dt.datetime.now().isoformat(timespec="seconds"),
            "classification": clf.mode, "files": new_files}
     save_manifest(ws, project, man)
@@ -509,13 +531,19 @@ def _merge3(ws: Workspace, project: Project, rel: str, theirs: str | None,
     mine = os.path.join(ws.mirror, *rel.split("/"))
     base = os.path.join(base_dir(ws, project), *rel.split("/"))
     if mine_text is None:
-        mine_text, mine_bom = read_text(mine)
-        base_text = read_text(base)[0] if os.path.exists(base) else theirs
+        mine_text, mine_bom = read_mirror_text(mine, root=ws.mirror)
+        if os.path.exists(base):
+            try:
+                base_text = read_text_checked(base, root=ws.private)[0]
+            except (OSError, UnicodeError, PbzError):
+                raise PbzError("REFUSED", rel) from None
+        else:
+            base_text = theirs
     elif base_text is None:
         base_text = theirs
     merged, clean = merge3(base_text, mine_text, theirs)
-    write_text(mine, merged, mine_bom or b"")
-    write_text(base, theirs, mine_bom or b"")
+    write_text(mine, merged, mine_bom or b"", root=ws.mirror)
+    write_text(base, theirs, mine_bom or b"", root=ws.private)
     return merged if clean else None
 
 
@@ -552,7 +580,7 @@ def _object_summary(rel: str, old: str, new: str) -> list[str]:
         for node in doc.nodes:
             if node.kind in ("measure", "column", "table", "partition", "relationship", "hierarchy", "expression",
                              "role", "calculationItem"):
-                regs = [text[r.start:r.end] for r in doc.regions if r.node is node]
+                regs = [text[r.start:r.end] for r in doc.regions_for(node)]
                 res[f"{node.kind} {node.name}"] = sha(json.dumps([node.props, regs], sort_keys=True))
         return res
     a, b = objs(old), objs(new)
@@ -619,7 +647,7 @@ def _journal_ok(journal) -> bool:
     if not isinstance(entries, list):
         return False
     for entry in entries:
-        if not isinstance(entry, dict) or entry.get("scope") not in ("workspace", "private"):
+        if not isinstance(entry, dict) or entry.get("scope") not in (("mirror",) if journal.get("kind") == "mirror_edit" else ("workspace", "private")):
             return False
         path = entry.get("path")
         if not isinstance(path, str) or not path or ".." in path.replace("\\", "/").split("/"):
@@ -727,12 +755,26 @@ def _begin_transaction(ws, project, stamp, targets, authorized_before: dict | No
     return directory, journal
 
 
-def _restore_transaction(ws, project, directory, journal):
+def _install_before_image(target, content):
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _restore_transaction(ws, project, directory, journal, *, preserve_external=False, applied=None):
     if not _journal_ok(journal):
         return {"result": "RECOVERY_REQUIRED"}
     conflicts = []
-    # Check all targets before restoring any. Never overwrite a third-party change.
+    # Recovery refuses third-party changes. A live push conflict instead preserves
+    # those bytes while undoing every other push-owned write.
     for entry in journal["entries"]:
+        if preserve_external and applied is not None and (entry["scope"], entry["path"]) not in applied:
+            continue
         target = _transaction_path(ws, project, entry)
         trust = ws.root if entry.get("scope") == "workspace" else ws.private
         _must_stay(target, trust)
@@ -742,26 +784,71 @@ def _restore_transaction(ws, project, directory, journal):
             backup = os.path.realpath(os.path.join(directory, "before", entry["backup"]))
             if not backup.startswith(os.path.realpath(directory) + os.sep) or file_sha(backup) != entry["before"]:
                 raise PbzError("RECOVERY_BACKUP", "transaction backup is missing or invalid")
-    if conflicts:
+    if conflicts and not preserve_external:
         journal["state"] = "RECOVERY_REQUIRED"
         _journal_save(directory, journal)
         return {"result": "RECOVERY_CONFLICT", "conflicts": conflicts}
     for entry in reversed(journal["entries"]):
-        target = _transaction_path(ws, project, entry)
-        if file_sha(target) == entry["before"]:
+        if preserve_external and (entry["path"] in conflicts or
+                (applied is not None and (entry["scope"], entry["path"]) not in applied)):
             continue
-        if entry["before"] is None:
-            if os.path.lexists(target):
-                trust = ws.root if entry.get("scope") == "workspace" else ws.private
-                remove_file(target, root=trust)
+        target = _transaction_path(ws, project, entry)
+        current = file_sha(target)
+        if preserve_external and current not in (entry["before"], entry["after"]):
+            conflicts.append(entry["path"])
+            continue
+        if current == entry["before"]:
+            continue
+        trust = ws.root if entry.get("scope") == "workspace" else ws.private
+        _must_stay(target, trust)
+        quarantine = target + ".pbz-restore-" + uuid.uuid4().hex
+        restored = False
+        try:
+            os.rename(target, quarantine)
+        except FileNotFoundError:
+            if entry["before"] is None:
+                restored = not os.path.lexists(target)
+            else:
+                with open(os.path.join(directory, "before", entry["backup"]), "rb") as f:
+                    content = f.read()
+                try:
+                    _install_before_image(target, content)
+                except FileExistsError:
+                    pass
+                else:
+                    restored = file_sha(target) == entry["before"]
         else:
-            with open(os.path.join(directory, "before", entry["backup"]), "rb") as f:
-                content = f.read()
-            trust = ws.root if entry.get("scope") == "workspace" else ws.private
-            replace_bytes(target, content, root=trust)
+            if file_sha(quarantine) != current:
+                # Preserve a save captured between the ownership read and rename.
+                # Keep the inode named: an editor may still write through an open handle.
+                try:
+                    with open(quarantine, "rb") as f:
+                        captured_bytes = f.read()
+                    _install_before_image(target, captured_bytes)
+                except OSError:
+                    # Keep the captured save if a newer target appears or return fails.
+                    pass
+            elif entry["before"] is None:
+                os.remove(quarantine)
+                restored = not os.path.lexists(target)
+            else:
+                with open(os.path.join(directory, "before", entry["backup"]), "rb") as f:
+                    content = f.read()
+                try:
+                    _install_before_image(target, content)
+                except FileExistsError:
+                    pass
+                else:
+                    os.remove(quarantine)
+                    restored = file_sha(target) == entry["before"]
+        if not restored:
+            conflicts.append(entry["path"])
+            journal["state"] = "RECOVERY_REQUIRED"
+            _journal_save(directory, journal)
+            return {"result": "RECOVERY_CONFLICT", "conflicts": conflicts}
     journal["state"] = "ROLLED_BACK"
     _journal_save(directory, journal)
-    return {"result": "ROLLED_BACK"}
+    return {"result": "ROLLED_BACK", **({"conflicts": conflicts} if conflicts else {})}
 
 
 def _process_alive(pid: int) -> bool:
@@ -794,7 +881,79 @@ def _process_alive(pid: int) -> bool:
 
 
 def recover(ws, project, transaction_id: str | None = None) -> dict:
+    """Hold the project commit lock throughout undo, including recovery after process exit."""
+    parent = _transaction_dir(ws, project)
+    lock = os.path.join(parent, ".commit-lock")
+    owned = False
+    claimed = None
+    guard_fd = -1
+    try:
+        _contained(lock, ws.private)
+        os.makedirs(parent, exist_ok=True)
+        # Keep this inode: all recoverers must share the guard, including across the
+        # rename/create gap. Otherwise a delayed stale-owner read can steal a fresh lock.
+        guard = lock + ".recover"
+        preflight_regular(guard, root=ws.private)
+        guard_fd = os.open(guard, os.O_CREAT | os.O_RDWR, 0o600)
+        info = os.fstat(guard_fd)
+        current = os.lstat(guard)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or _reparse_link(guard)
+                or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        if info.st_size == 0:
+            os.write(guard_fd, b"\0")
+        os.lseek(guard_fd, 0, os.SEEK_SET)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(guard_fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(guard_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {"verb": "recover", "result": "COMMIT_BUSY"}
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                owner = int(read_checked(lock, root=ws.private))
+                if owner <= 0:
+                    raise ValueError()
+            except ValueError:
+                return {"verb": "recover", "result": "RECOVERY_REQUIRED"}
+            if _process_alive(owner):
+                return {"verb": "recover", "result": "COMMIT_BUSY"}
+            claim = lock + ".claim-" + str(os.getpid())
+            try:
+                os.rename(lock, claim)
+            except OSError:
+                return {"verb": "recover", "result": "COMMIT_BUSY"}
+            claimed = claim
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                return {"verb": "recover", "result": "COMMIT_BUSY"}
+        owned = True
+        with os.fdopen(fd, "w") as handle:
+            handle.write(str(os.getpid()))
+        return _recover(ws, project, transaction_id, _owns_lock=True, _claimed_stale=(claimed is not None))
+    except OSError:
+        return {"verb": "recover", "result": "RECOVERY_REQUIRED"}
+    finally:
+        try:
+            if owned:
+                remove_file(lock, root=ws.private)
+            if claimed is not None:
+                remove_file(claimed, root=ws.private)
+        finally:
+            if guard_fd >= 0:
+                os.close(guard_fd)
+
+
+def _recover(ws, project, transaction_id: str | None = None, *, _owns_lock=False,
+             _claimed_stale: bool = False) -> dict:
     """Roll back interrupted, uncommitted pushes. Never resume a half-validated commit."""
+    anchor_mirror(ws)
     if desktop.find_instance(project):
         return {"verb": "recover", "result": "DESKTOP_OPEN"}
     directory = _transaction_dir(ws, project)
@@ -806,7 +965,7 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
         return {"verb": "recover", "result": "RECOVERY_REQUIRED",
                 "transactions": [{"id": project.name, "result": "RECOVERY_REQUIRED"}]}
     stale_lock = False
-    if os.path.exists(lock):
+    if os.path.exists(lock) and not _owns_lock:
         try:
             with open(lock) as f:
                 owner = int(f.read())
@@ -838,6 +997,11 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
                 journal = json.load(f)
             if not _journal_ok(journal):
                 result = {"result": "RECOVERY_REQUIRED"}
+            elif journal.get("kind") == "mirror_edit":
+                from .mirror_txn import restore
+                result = restore(ws, project, directory, journal)
+                if result["result"] == "ROLLED_BACK":
+                    shutil.rmtree(directory, ignore_errors=True)
             else:
                 result = _restore_transaction(ws, project, directory, journal)
         except (OSError, ValueError, KeyError, PbzError):
@@ -847,7 +1011,7 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
     if stale_lock and not failed:
         remove_file(lock, root=ws.private)
     return {"verb": "recover", "result": "RECOVERY_REQUIRED" if failed
-            else "RECOVERED" if results or stale_lock else "NOTHING_TO_RECOVER", "transactions": results}
+            else "RECOVERED" if results or stale_lock or _claimed_stale else "NOTHING_TO_RECOVER", "transactions": results}
 
 
 def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False,
@@ -925,10 +1089,11 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
                 "tokens": sorted(set(unknown_all))}
     # Candidate bytes and the preconditions they were read against, before validation.
     # Added paths were authorized as absent. Do not hash a file that appears later.
-    pre_real = {rel: file_sha(_real_path(ws, rel)) for rel in ch["changed"] + ch["deleted"]}
+    pre_real = {rel: files[rel]["real"] for rel in ch["changed"] + ch["deleted"]}
     pre_real.update({rel: None for rel in ch["added"]})
     pre_mirror = {rel: hashlib.sha256(bom + mtext.encode("utf-8")).hexdigest()
                   for rel, (mtext, bom) in captured_mirror.items()}
+    pre_mirror.update({rel: None for rel in ch["deleted"]})
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     # The staged copy is not the real project. Name a pbz-workspace directory so
     # definition reads trust this tree and still refuse the real model folder.
@@ -1020,6 +1185,7 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
                                          [("private", p, h) for p, h in sorted(private_targets.items())],
                                          pre_real)
         directory, journal = transaction
+        applied = set()
         if any(file_sha(_transaction_path(ws, project, e)) != e["before"] for e in journal["entries"]):
             journal["state"] = "ROLLED_BACK"
             _journal_save(directory, journal)
@@ -1042,10 +1208,18 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             with open(real, "rb") as f:
                 replace_bytes(dst, f.read(), root=ws.private)
+        if any(file_sha(_real_path(ws, rel)) != h for rel, h in pre_real.items()) or \
+                any(_post_mirror_hash(ws, rel) != h for rel, h in pre_mirror.items()):
+            restored = _restore_transaction(ws, project, directory, journal, preserve_external=True, applied=applied)
+            transaction = None
+            return {"verb": "push", "project": project.name, **restored,
+                    "result": "CONFLICT" if restored.get("result") == "ROLLED_BACK" else restored["result"]}
         for rel, (rtext, bom) in new_real.items():
             write_text(_real_path(ws, rel), rtext, bom, root=ws.root)
+            applied.add(("workspace", rel))
         for rel in ch["deleted"]:
             remove_file(_real_path(ws, rel), root=ws.root)
+            applied.add(("workspace", rel))
             _prune_empty(_real_path(ws, rel), os.path.join(ws.root, rel.split("/")[0]))
         # Commit staged resources by atomic file replacement as well; directory replacement
         # could otherwise leave a partially copied package with an unrecognizable hash.
@@ -1055,22 +1229,34 @@ def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool =
             _must_stay(target, ws.root)
             if os.path.isfile(source):
                 _copy_atomic(source, target, root=ws.root)
+                applied.add(("workspace", rel))
             elif os.path.lexists(target):
                 remove_file(target, root=ws.root)
+                applied.add(("workspace", rel))
                 _prune_empty(target, project.report_dir)
+        if any(file_sha(_real_path(ws, rel)) != h for rel, h in real_targets.items()) or \
+                any(_post_mirror_hash(ws, rel) != h for rel, h in pre_mirror.items()):
+            restored = _restore_transaction(ws, project, directory, journal, preserve_external=True, applied=applied)
+            transaction = None
+            return {"verb": "push", "project": project.name, **restored,
+                    "result": "CONFLICT" if restored.get("result") == "ROLLED_BACK" else restored["result"]}
         installed, img_in, img_out = sorted(pkgs), sorted(imgs_new), sorted(imgs_drop)
         for rel in ch["changed"] + ch["added"]:
             mtext, bom = captured_mirror[rel]
             mirror_hash = hashlib.sha256(bom + mtext.encode("utf-8")).hexdigest()
             files[rel] = {"real": real_targets[rel], "mirror": mirror_hash}
-            write_text(os.path.join(base_dir(ws, project), *rel.split("/")), mtext, bom, root=ws.private)
+            bp = os.path.join(base_dir(ws, project), *rel.split("/"))
+            write_text(bp, mtext, bom, root=ws.private)
+            applied.add(("private", os.path.relpath(bp, ws.private).replace("\\", "/")))
         for rel in ch["deleted"]:
             files.pop(rel, None)
             bp = os.path.join(base_dir(ws, project), *rel.split("/"))
             if os.path.exists(bp):
                 remove_file(bp, root=ws.private)
+                applied.add(("private", os.path.relpath(bp, ws.private).replace("\\", "/")))
         man["files"] = files
         save_manifest(ws, project, man)
+        applied.add(("private", os.path.relpath(manifest_path(ws, project), ws.private).replace("\\", "/")))
         journal["state"] = "COMMITTED"
         _journal_save(directory, journal)
         transaction = None  # Project and synchronization metadata have committed together.
@@ -1220,8 +1406,8 @@ def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict
                     return rel, doc, n
         return None
 
-    mine = find(tmdl.load_model(mdef))
-    base = find(tmdl.load_model(bdef)) if os.path.isdir(bdef) else None
+    mine = find(tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model)))
+    base = find(tmdl.load_model(bdef, root=ws.private)) if os.path.isdir(bdef) else None
     if mine is None and base is None:
         raise PbzError("NOT_FOUND", obj)
     if base is None:  # added since the last pull: drop it
@@ -1229,7 +1415,7 @@ def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict
         new = apply_block(doc.text, tmdl.block_span(doc, n), "")
     elif mine is None:  # deleted in the mirror: put the base block back at the end of its table
         rel, bdoc, bn = base
-        mt = tmdl.load_model(mdef)
+        mt = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
         tdoc = next((d for r, d in mt.docs.items() if r == rel), None)
         if tdoc is None:
             raise PbzError("NOT_FOUND", f"table file {rel} (revert the whole file instead)")
@@ -1246,7 +1432,7 @@ def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict
         _brel, bdoc, bn = base
         new = apply_block(doc.text, tmdl.block_span(doc, n), bdoc.text[slice(*tmdl.block_span(bdoc, bn))])
     path = os.path.join(mdef, *rel.split("/"))
-    _text, bom = _read_prepared(path, f"{project.name}.SemanticModel/definition/{rel}")
+    _text, bom = read_mirror_text(path, root=ws.mirror)
     commit_bytes([("write", path, new, bom)], root=anchor_mirror(ws))
     return {"verb": "revert", "project": project.name, "object": f"{kind} {table}[{name}]",
             "result": "REVERTED", "files": [f"{project.name}.SemanticModel/definition/{rel}"]}
@@ -1269,29 +1455,50 @@ def history_dir(ws: Workspace, project: Project) -> str:
 
 def mirror_texts(ws: Workspace, project: Project) -> dict[str, str]:
     """{mirror-relative path: text} of the project's current mirror files (sanitized)."""
+    anchor_mirror(ws)
     out = {}
+    def unreadable(_err):
+        raise PbzError("REFUSED", project.name) from None
     for base in (project.mirror_model, project.mirror_report):
-        # The project tree itself must sit inside the trusted mirror; an aliased project root
-        # must not become the canonical boundary for history.
-        if _path_excluded(base, ws.mirror) or _reparse_link(base):
+        try:
+            _contained(base, ws.mirror)
+        except PbzError:
+            raise PbzError("UNSAFE_PATH", os.path.basename(base)) from None
+        if _reparse_link(base):
+            raise PbzError("UNSAFE_PATH", os.path.basename(base))
+        try:
+            info = os.stat(base)
+        except FileNotFoundError:
             continue
+        except OSError:
+            unreadable(None)
+        if not stat.S_ISDIR(info.st_mode):
+            unreadable(None)
         top = os.path.basename(base)
-        for cur, dirs, files in os.walk(base, followlinks=False):
-            dirs[:] = [d for d in dirs if not _path_excluded(os.path.join(cur, d), base)
-                        and not _path_excluded(os.path.join(cur, d), ws.mirror)]
-            for f in files:
-                full = os.path.join(cur, f)
-                if _path_excluded(full, base) or _path_excluded(full, ws.mirror):
+        for cur, dirs, files in os.walk(base, followlinks=False, onerror=unreadable):
+            kept = []
+            for d in dirs:
+                if d.lower() in SKIP_DIRS:
                     continue
-                low = f.lower()
-                if low.endswith(".tmdl") or low.endswith(JSON_EXT):
+                full = os.path.join(cur, d)
+                if _reparse_link(full):
+                    raise PbzError("UNSAFE_PATH", os.path.relpath(full, ws.mirror).replace("\\", "/"))
+                kept.append(d)
+            dirs[:] = kept
+            for f in files:
+                if _mirrored_name(f):
+                    full = os.path.join(cur, f)
                     rel = f"{top}/" + os.path.relpath(full, base).replace("\\", "/")
-                    out[rel] = read_text(full)[0]
+                    out[rel] = read_mirror_text(full, root=ws.mirror)[0]
     return out
 
 
 def snapshot(ws: Workspace, project: Project, event: str) -> str:
-    """Record the mirror as a history snapshot (content-addressed, deduplicated, last HISTORY_KEEP kept)."""
+    """Record a checked current mirror (content-addressed, last HISTORY_KEEP kept).
+
+    This validates new snapshots only; previously stored history is not reclassified as clean.
+    """
+    texts = mirror_texts(ws, project)
     hdir = history_dir(ws, project)
     # A junction at mirror-history would make makedirs create the snapshot outside the store.
     _contained(hdir, ws.private)
@@ -1303,7 +1510,7 @@ def snapshot(ws: Workspace, project: Project, event: str) -> str:
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         _contained(child, ws.private)
     files = {}
-    for rel, text in mirror_texts(ws, project).items():
+    for rel, text in texts.items():
         h = sha(text)
         bp = os.path.join(blobs, h + ".txt")
         if not os.path.exists(bp):

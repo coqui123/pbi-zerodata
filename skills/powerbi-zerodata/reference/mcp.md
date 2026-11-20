@@ -145,3 +145,15 @@ malformed JSON `-32700`; batches `-32600`.
 - Tool names avoid words the guard treats as file access (read, open, file, view) and never contain
   "powerbi", so the guard hook lets `mcp__pbz__*` through while still denying other Power BI MCP
   servers.
+
+MCP tool output has three budgets: 4 MiB of raw stdout bytes, 4 Mi decoded Unicode
+code points, and a binding limit of 8 MiB of UTF-8 JSON-RPC wire bytes (including
+escaping, the response envelope, and the trailing newline). stderr is discarded.
+A generated 10,000-column describe report measured 1,079,082 raw bytes and
+1,239,198 wire bytes; tools/list measured 74,130 wire bytes. These measurements
+informed the defaults; larger reports should be narrowed using tool arguments.
+
+Exceeding a budget returns `OUTPUT_LIMIT` without partial output and terminates
+the subprocess tree. Both `OUTPUT_LIMIT` and `TIMEOUT` report `outcome: UNKNOWN`
+for a tool that can write, with a hint to inspect its journal using `recover`
+before retrying. A killed writer may already have changed files.

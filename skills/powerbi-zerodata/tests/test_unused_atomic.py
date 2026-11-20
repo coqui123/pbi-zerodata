@@ -83,6 +83,77 @@ class UnusedAtomicTests(unittest.TestCase):
     def _sales(self, ws, project) -> str:
         return os.path.join(project.mirror_model, "definition", "tables", "Sales.tmdl")
 
+    def test_m_tracker_graph_and_query_removal(self):
+        ws, project = self._project()
+        mdef = os.path.join(project.mirror_model, "definition")
+        queries = {
+            "Query": "1", "Other": "1", "Dead": "1", "UnusedSafe": "1", "Risk": "1",
+            "Comparison": "if Query = Other then Query else Other",
+            "Nested": "let x = (let Query = 1 in Query), y = Query in y",
+            "Record": "let r = [Query = 1, x = Query], y = Query in y",
+            "Case": "let query = 1 in Query",
+            "NoEdge": "let Dead = 1 in Dead",
+            "Uncertain": "try let Risk = 1 in Risk otherwise Risk",  # no consumer
+        }
+        _write(os.path.join(mdef, "expressions.tmdl"),
+               "".join(f"expression {name} = {expr}\n\n" for name, expr in queries.items()))
+        _write(self._sales(ws, project), SALES +
+               "\tpartition Sales = m\n\t\tsource = {Comparison, Nested, Record, Case, NoEdge}\n")
+        graph = usage.build(ws, project)
+        query_key = lambda n: usage.key("m_query", "", n)
+        self.assertEqual(graph.state[query_key("Query")], "used")
+        for name in ("Comparison", "Nested", "Record", "Case"):
+            self.assertIn(query_key("Query"), [e.dst for e in graph.out[query_key(name)]])
+        self.assertNotIn(query_key("Dead"), [e.dst for e in graph.out.get(query_key("NoEdge"), [])])
+        self.assertEqual(graph.state[query_key("UnusedSafe")], "unused")
+        self.assertIn("uncertain M binding", " ".join(graph.locks[query_key("Risk")]))
+        self.assertEqual(unused._removal(graph, query_key("Risk"), graph.model)[0], "manual")
+        result = unused.remove(ws, project, only=["m_query"])
+        self.assertEqual(result["result"], "REMOVED")
+        from pbz import tmdl
+        remaining = tmdl.load_model(mdef).expressions
+        self.assertIn("Query", remaining)
+        self.assertIn("Other", remaining)
+        self.assertIn("Risk", remaining)
+        self.assertNotIn("Dead", remaining)
+        self.assertNotIn("UnusedSafe", remaining)
+
+    def test_shared_bracket_only_query_survives_remove(self):
+        ws, project = self._project()
+        mdef = os.path.join(project.mirror_model, "definition")
+        _write(os.path.join(mdef, "expressions.tmdl"),
+               "expression SharedOnly = 1\n\nexpression GenuinelyUnused = 1\n")
+        _write(self._sales(ws, project), SALES +
+               "\tpartition Sales = m\n\t\tsource = #shared[SharedOnly]\n")
+        graph = usage.build(ws, project)
+        self.assertEqual(graph.state[usage.key("m_query", "", "SharedOnly")], "used")
+        self.assertEqual(graph.state[usage.key("m_query", "", "GenuinelyUnused")], "unused")
+        result = unused.remove(ws, project, only=["m_query"])
+        self.assertEqual(result["result"], "REMOVED")
+        from pbz import tmdl
+        remaining = tmdl.load_model(mdef).expressions
+        self.assertIn("SharedOnly", remaining)
+        self.assertNotIn("GenuinelyUnused", remaining)
+
+    def test_query_order_removal_is_case_exact(self):
+        ws, project = self._project()
+        mdef = Path(project.mirror_model, 'definition')
+        queries = mdef / 'expressions.tmdl'
+        queries.write_text('expression Source = 1\n\nexpression source = 2\n')
+        model_path = mdef / 'model.tmdl'
+        model_path.write_text(MODEL + '\nannotation PBI_QueryOrder = ["Source","source"]\n')
+        _write(self._sales(ws, project), SALES +
+               '\tpartition Sales = m\n\t\tsource = Source\n')
+        graph = usage.build(ws, project)
+        self.assertEqual(graph.state[usage.key('m_query', '', 'Source')], 'used')
+        self.assertEqual(graph.state[usage.key('m_query', '', 'source')], 'unused')
+        self.assertEqual(unused.remove(ws, project, only=['m_query'])['result'], 'REMOVED')
+        from pbz import tmdl
+        self.assertEqual(set(tmdl.load_model(str(mdef)).expressions), {'Source'})
+        self.assertIn('expression Source = 1', queries.read_text())
+        order = model_path.read_text().split('annotation PBI_QueryOrder = ', 1)[1].strip()
+        self.assertEqual(json.loads(order), ['Source'])
+
     def test_failed_outcome_is_exit_1(self):
         out, rc = envelope({"ok": False, "error": "FAILED",
                             "detail": "write failed; mirror rolled back, no file changed"})

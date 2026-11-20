@@ -18,6 +18,9 @@ import os
 import re
 import stat
 import unicodedata
+from contextlib import contextmanager
+from functools import wraps
+from types import SimpleNamespace
 
 from . import dpapi
 from .common import (
@@ -50,6 +53,96 @@ _RREV = re.compile(r"^r[0-9a-f]{12}$")
 _SYNTH_RESULTS = {"SAME", "DIFF", "ERROR", "NOT_COMPARABLE"}
 _VALIDATION = {"PASS", "FAIL", "NOT_RUN"}
 _LOOSE = 256
+
+
+@contextmanager
+def _workspace_lock(ws):
+    from .checks import _StateLock
+    # This lock belongs to the ledger, not to a particular private cache or project.
+    try:
+        path = pbz_state_path(ws, "evidence.lock")
+        with _StateLock(SimpleNamespace(private=os.path.dirname(path)), "evidence.lock"):
+            yield
+    except OSError:
+        raise PbzError("REFUSED", UNUSABLE) from None
+
+
+def _prune_index(ws):
+    doc = json.loads(read_checked(_index_path(ws), root=_workspace_root(ws), max_bytes=256 * 1024))
+    if (not isinstance(doc, dict) or not isinstance(doc.get("anchor"), str)
+            or not _CHAIN_RE.fullmatch(doc["anchor"])):
+        raise ValueError("anchor")
+    pending = doc.get("pending", [])
+    if (not isinstance(pending, list)
+            or any(not isinstance(n, str) or not re.fullmatch(r"\d{4}\.jsonl", n) for n in pending)
+            or len(set(pending)) != len(pending) or pending != sorted(pending)):
+        raise ValueError("pending")
+    if "cutoff" in doc:
+        cutoff = doc["cutoff"]
+        if (not isinstance(cutoff, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", cutoff)):
+            raise ValueError("cutoff")
+        dt.date.fromisoformat(cutoff)
+    return doc
+
+
+def _recover_prune(ws):
+    path = _index_path(ws)
+    if not os.path.lexists(path):
+        return
+    try:
+        doc = _prune_index(ws)
+        pending = doc.get("pending", [])
+        from .checks import LEDGER_DAYS
+        cutoff = doc.get("cutoff") or (dt.date.today() - dt.timedelta(days=LEDGER_DAYS)).isoformat()
+        if pending and any(os.path.basename(p) not in pending and os.path.basename(p) < pending[-1]
+                           for p in _segment_paths(ws)):
+            return
+        segments = []
+        prev = None
+        key = _chain_key(ws)
+        for name in pending:
+            segment = pbz_state_path(ws, "evidence.d/" + name)
+            text = _read_log(ws, segment)
+            if text is None:  # A previous recovery may have deleted a prefix.
+                if segments:
+                    return
+                continue
+            newest = _newest_day(text)
+            if newest is None or newest >= cutoff:
+                return
+            first = next((json.loads(line) for line in text.split("\n") if line.strip()), None)
+            if not isinstance(first, dict):
+                return
+            if prev is None:
+                prev = first.get("chain_prev")
+                if not isinstance(prev, str) or not _CHAIN_RE.fullmatch(prev):
+                    return
+            prev = _verified_tip(key, prev, text)
+            if prev is None:
+                return
+            segments.append(segment)
+        if segments and prev != doc["anchor"]:
+            return
+    except (ValueError, TypeError, UnicodeError, RecursionError, OSError, PbzError):
+        return
+    for segment in segments:
+        try:
+            os.remove(segment)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return
+    if pending:
+        write_text(path, json.dumps({"anchor": doc["anchor"]}) + "\n", root=_workspace_root(ws))
+
+
+def _locked(fn):
+    @wraps(fn)
+    def run(ws, *args, **kwargs):
+        with _workspace_lock(ws):
+            _recover_prune(ws)
+            return fn(ws, *args, **kwargs)
+    return run
 
 
 # ---------------------------------------------------------------- revisions
@@ -159,6 +252,7 @@ def _chain_key(ws):
         return None
 
 
+@_locked
 def _accepted_macs(ws) -> set[str]:
     """chain_mac values verify_chain would count before the first break."""
     key = _chain_key(ws)
@@ -236,20 +330,35 @@ def _last_mac(text: str | None) -> str | None:
 
 
 def _tip(ws) -> str:
-    """MAC the next record must cite. An already-over-cap active file is refused here.
+    """Authenticate every chained record before choosing the next tip.
 
-    A MAC in the active log wins. An active log with none yields the newest rotated
-    segment's last MAC, then the anchor. Prune order is unchanged.
+    Legacy unchained lines stay on disk and remain visibly BROKEN to readers.
+    They cannot supply a tip; any invalid authenticated link refuses further writes.
     """
-    active = _log_path(ws)
-    if os.path.lexists(active):
-        mac = _last_mac(_read_log(ws, active))
-        if mac:
-            return mac
-    segs = _segment_paths(ws)
-    if segs:
-        return _last_mac(_read_log(ws, segs[-1])) or _anchor(ws)
-    return _anchor(ws)
+    key = _chain_key(ws)
+    if os.path.lexists(_index_path(ws)):
+        try:
+            _prune_index(ws)
+        except (ValueError, TypeError, UnicodeError, RecursionError, OSError, PbzError):
+            raise PbzError("REFUSED", UNUSABLE) from None
+    prev = _anchor(ws)
+    files = _log_files(ws)
+    for path in files:
+        for line in (_read_log(ws, path) or "").split("\n"):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, RecursionError):
+                if path == _log_path(ws):
+                    raise PbzError("REFUSED", UNUSABLE) from None
+                continue  # Preserve legacy segment junk; readers still mark it BROKEN.
+            if not isinstance(obj, dict) or "chain_mac" not in obj:
+                continue
+            if not _chain_ok(key, prev, obj):
+                raise PbzError("REFUSED", UNUSABLE)
+            prev = obj["chain_mac"]
+    return prev
 
 
 def _stamp(ws, entries: list[dict]) -> None:
@@ -310,7 +419,7 @@ def _newest_day(text: str) -> str | None:
     return newest
 
 
-def prune(ws, today: dt.date | None = None) -> dict:
+def _prune(ws, today: dt.date | None = None) -> dict:
     """Drop a prefix of rotated segments whose newest record is outside the ledger window.
 
     The anchor is written before any segment is deleted. A crash after that write leaves an
@@ -335,19 +444,29 @@ def prune(ws, today: dt.date | None = None) -> dict:
         anchor = verified
         doomed.append(path)
     if doomed:
-        write_text(_index_path(ws), json.dumps({"anchor": anchor}) + "\n", root=_workspace_root(ws))
+        write_text(_index_path(ws), json.dumps({"anchor": anchor, "pending": [os.path.basename(p) for p in doomed], "cutoff": cutoff}) + "\n", root=_workspace_root(ws))
         for path in doomed:
             try:
                 os.remove(path)
             except OSError:
                 raise PbzError("REFUSED", UNUSABLE) from None
+        _recover_prune(ws)
     return {"verb": "evidence", "pruned_segments": len(doomed), "anchor_kept": bool(doomed)}
 
 
+@_locked
+def prune(ws, today: dt.date | None = None) -> dict:
+    return _prune(ws, today)
+
+
+@_locked
 def verify_chain(ws) -> dict:
     """Recompute the HMAC chain across rotated segments and the active log."""
     key = _chain_key(ws)
-    prev = _anchor(ws)
+    try:
+        prev = _prune_index(ws)["anchor"] if os.path.lexists(_index_path(ws)) else GENESIS
+    except (ValueError, TypeError, UnicodeError, RecursionError, OSError, PbzError):
+        return {"verb": "evidence", "chain": "BROKEN", "reason": "MISMATCH", "records": 0}
     chained = 0
     files = _log_files(ws)
     for path in files:
@@ -369,6 +488,7 @@ def verify_chain(ws) -> dict:
     return {"verb": "evidence", "chain": "OK", "records": chained, "files": len(files)}
 
 
+@_locked
 def _append_lines(ws, entries: list[dict]) -> None:
     """One checked append for the whole batch. A file already over 1 MiB is refused.
 
@@ -404,8 +524,8 @@ def _append_lines(ws, entries: list[dict]) -> None:
     except OSError:
         raise PbzError("REFUSED", UNUSABLE) from None
     try:
-        prune(ws)
-    except PbzError:
+        _prune(ws)
+    except (PbzError, OSError):
         # The batch is already durable. A prune problem must not look like a lost append.
         pass
 
@@ -650,6 +770,7 @@ def _validate_record(obj: dict, project_name: str) -> dict | None:
             "real_rev": obj["real_rev"], "stage": stage, "scope": scope, "summary": summary}
 
 
+@_locked
 def _load_entries(ws, project) -> tuple[list[dict], int]:
     files = _log_files(ws)
     if not files:

@@ -83,6 +83,37 @@ class ConsolidateAtomicTests(unittest.TestCase):
         os.makedirs(project.model_dir, exist_ok=True)
         return ws, project
 
+    def test_exact_numeric_literals(self):
+        for left, right in (("9007199254740993", "9007199254740992"),
+                            ("0.1", "0.10000000000000001")):
+            with self.subTest(left=left):
+                ws, project = self._project()
+                path = os.path.join(project.mirror_model, "definition", "tables", "Sales.tmdl")
+                _write(path, f"table Sales\n\tmeasure Keep = {left}\n\tmeasure Copy = {right}\n")
+                before = _bytes(ws.mirror)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(ws, project, "Copy", "Keep")
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+                self.assertEqual(before, _bytes(ws.mirror))
+
+    def test_equivalent_numeric_duplicate_and_calculate_alias(self):
+        for expression, equivalent in (("1.0", "identical"), ("1", "identical"),
+                                       ("CALCULATE([Keep])", "alias")):
+            with self.subTest(expression=expression):
+                ws, project = self._project()
+                path = os.path.join(project.mirror_model, "definition", "tables", "Sales.tmdl")
+                _write(path, f"table Sales\n\tmeasure Keep = 1\n\tmeasure Copy = {expression}\n")
+                out = consolidate.merge(ws, project, "Copy", "Keep", keep_alias=False)
+                self.assertEqual(out["equivalence"], equivalent)
+                self.assertNotIn("measure Copy", Path(path).read_text())
+
+    def test_literal_hash_collision_cannot_decide(self):
+        from pbz import deps, similar, tmdl
+        model = tmdl.load_model("", texts={"tables/T.tmdl": "table T\n"})
+        with patch("pbz.similar._h", return_value="collision"):
+            self.assertNotEqual(similar.canon("1", "T", deps.Resolver(model)).words(),
+                                similar.canon("2", "T", deps.Resolver(model)).words())
+
     def test_merge_write_failure_rolls_back(self):
         ws, project = self._project()
         before = _bytes(ws.mirror)

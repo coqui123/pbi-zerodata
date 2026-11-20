@@ -340,6 +340,30 @@ public sealed class Conn : IDisposable
         });
     }
 
+    /// <summary>Consume every row under the query guard, retaining only the current row.</summary>
+    public void VisitRows(string text, Action<object?[]> visit)
+    {
+        var c = Raw;
+        _ctx.Guard(() =>
+        {
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = text;
+            cmd.CommandTimeout = _ctx.TimeoutSec;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var row = new object?[r.FieldCount];
+                for (int i = 0; i < r.FieldCount; i++)
+                {
+                    object? v = r.GetValue(i);
+                    row[i] = v is DBNull ? null : v;
+                }
+                visit(row);
+            }
+            return true;
+        });
+    }
+
     /// <summary>Runs a query and returns column names plus rows.</summary>
     public (List<string> Columns, List<object?[]> Rows) Table(string text, int maxRows = int.MaxValue)
     {

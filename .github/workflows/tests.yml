@@ -1,7 +1,8 @@
 # Offline test suites on every push and pull request. Power BI Desktop is not available on hosted
 # runners, so the Desktop suites (test_e2e.py, test_engine.py live mode, test_synth.py --live,
 # test_synthtest.py --live, test_synthedge.py --live, test_memory.py --live, test_consolidate.py --live)
-# stay local. The engine is built so TOM validation runs in push tests.
+# run locally or in the opt-in live-synth job on a dedicated Desktop runner.
+# The engine is built so TOM validation and provenance fixtures run in push tests.
 name: tests
 
 on:
@@ -9,16 +10,22 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      live_synth:
+        description: Run synth acceptance on the dedicated Windows Desktop runner
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
   group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  offline:
+  serial:
+    if: vars.PBZ_OFFLINE_MODE != 'sharded'
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
@@ -42,41 +49,147 @@ jobs:
       - name: Build the engine
         run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
 
-      - name: Offline suites
+      - name: Offline suites (single executor)
+        if: always()
+        env:
+          PYTHONIOENCODING: utf-8
+          PBZ_CI_CONTROLS: ${{ vars.PBZ_CI_CONTROLS }}
+        run: python tests/run_offline.py --report ci-results/serial.json --output-root "${{ runner.temp }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: serial
+          path: skills/powerbi-zerodata/ci-results/*.json
+          if-no-files-found: error
+
+
+
+  rollout-gate:
+    if: vars.PBZ_OFFLINE_MODE == 'sharded'
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python skills/powerbi-zerodata/tests/ci_equivalence.py --rollout .github/offline-rollout-evidence.json
+  shard:
+    if: vars.PBZ_OFFLINE_MODE == 'sharded'
+    needs: rollout-gate
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skills/powerbi-zerodata
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: python -m pip install --disable-pip-version-check jsonschema
+      - run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+      - if: always()
+        env:
+          PYTHONIOENCODING: utf-8
+          PBZ_CI_CONTROLS: ${{ vars.PBZ_CI_CONTROLS }}
+        run: python tests/run_offline.py --shard ${{ matrix.shard }} --report ci-results/shard-${{ matrix.shard }}.json --output-root "${{ runner.temp }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shard-${{ matrix.shard }}
+          path: skills/powerbi-zerodata/ci-results/*.json
+          if-no-files-found: error
+  offline:
+    if: always()
+    needs: [serial, rollout-gate, shard]
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ vars.PBZ_OFFLINE_MODE == 'sharded' && 'shard-*' || 'serial' }}
+          path: evidence
+      - if: vars.PBZ_OFFLINE_MODE == 'sharded'
+        env:
+          PBZ_CI_CONTROLS: ${{ vars.PBZ_CI_CONTROLS }}
+        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --shards-only evidence
+      - if: vars.PBZ_OFFLINE_MODE != 'sharded'
+        env:
+          PBZ_CI_CONTROLS: ${{ vars.PBZ_CI_CONTROLS }}
+        run: python skills/powerbi-zerodata/tests/ci_equivalence.py --inventory-only evidence
+      - name: Stable required check (rollback selects serial with no protection gap)
+        shell: pwsh
+        run: |
+          if ('${{ vars.PBZ_OFFLINE_MODE }}' -eq 'sharded') {
+            if ('${{ needs.rollout-gate.result }}' -ne 'success' -or '${{ needs.shard.result }}' -ne 'success') { throw 'shards failed or incomplete' }
+          } elseif ('${{ needs.serial.result }}' -ne 'success') { throw 'serial failed or incomplete' }
+
+  vendor-validator:
+    # Required on every PR/push. Configure this job as a required branch check.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skills/powerbi-zerodata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Build engine for mirror push validation
+        run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install locked vendor validator
+        run: npm ci --prefix tools
+      - name: Copy parity and invalid control (validator required)
+        run: |
+          python tests/test_components.py --require-validator
+          if ($LASTEXITCODE -ne 0) { throw "required vendor validator acceptance failed" }
+
+  live-synth:
+    if: github.event_name == 'workflow_dispatch' && inputs.live_synth
+    runs-on: [self-hosted, Windows, pbz-desktop]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skills/powerbi-zerodata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - run: python -m pip install --disable-pip-version-check jsonschema
+      - run: dotnet publish engine/PbzEngine.csproj -c Release -r win-x64 --self-contained false -o engine/bin
+      - name: Provenance and live synth acceptance (no skips)
         env:
           PYTHONIOENCODING: utf-8
         run: |
-          $suites = "guard", "mirror", "parity", "bpa", "tools", "refactor", "authoring", "selfcontained",
-                    "governance", "mcp", "synth", "consumers", "visuals", "style", "reportedit", "synthtest",
-                    "props", "modeling", "workflow", "components", "a11y", "synthedge", "audit",
-                    "consolidate", "consolidate_atomic", "memory", "images", "improvement_core", "desktop_evidence",
-                    "preview", "session_features", "consent", "smoke_honesty", "disclosure_gate",
-                    "atomic_refactor", "unused_atomic", "governance_atomic", "edit_refusals",
-                    "repair_props_atomic", "bookmarks_atomic", "a11y_atomic", "style_atomic",
-                    "author_atomic", "components_atomic",
-                    "consumers_refusals", "images_atomic", "edit_dryrun", "scaffold_atomic",
-                    "modeling_atomic", "recipe_rollback", "writers_atomic",
-                    "capabilities", "daxfmt", "cli_mcp_parity", "freshness_offline",
-                    "writers_tmp_cleanup", "consumers_atomic", "synth_atomic", "handoff_atomic",
-                    "preview_atomic", "memscrub_atomic", "synthtest_honesty",
-                    "outcomes_mapping", "revert_atomic", "bpafix_atomic", "pull_refusal",
-                    "mirror_recovery_honesty", "push_boundary_honesty", "history_honesty",
-                    "synthtest_atomic", "memory_disclosure", "docs_changelog", "ci_registration",
-                    "policy_atomic", "pbz_state_atomic", "mirror_writers_root",
-                    "spec_input_gate", "requirements_honesty",
-                    "evidence_honesty", "synthtest_state_paths", "policy_failclosed",
-                    "mirror_alias_disclosure", "recipe_paths",
-                    "mirror_reader_links", "interactions_static", "interactions_boundary",
-                    "guard_protected_mutations", "guard_tree_operations", "guard_false_positives",
-                    "evidence_rotation", "contract_verbs", "plan_pure", "plan_cli",
-                    "followup_graph", "followup_state", "followup_engine", "followup_author"
-          $failed = @()
-          foreach ($t in $suites) {
-            Write-Host "::group::test_$t"
-            python "tests/test_$t.py"
-            if ($LASTEXITCODE -ne 0) { $failed += $t }
-            Write-Host "::endgroup::"
+          python tests/test_synth.py --provenance
+          if ($LASTEXITCODE -ne 0) { throw "provenance fixtures failed" }
+          foreach ($suite in @("synth", "synthedge", "synthtest")) {
+            python "tests/test_$suite.py" --live
+            if ($LASTEXITCODE -ne 0) { throw "live $suite failed" }
           }
-          python tests/test_engine.py --offline
-          if ($LASTEXITCODE -ne 0) { $failed += "engine-offline" }
-          if ($failed.Count) { throw "failed: $($failed -join ', ')" }

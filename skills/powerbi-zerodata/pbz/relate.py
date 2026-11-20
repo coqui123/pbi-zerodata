@@ -7,8 +7,8 @@ import os
 import re
 import uuid
 
-from . import lexers, tmdl
-from .common import PbzError, commit_bytes, read_text
+from . import lexers, mirror, tmdl
+from .common import PbzError, commit_bytes
 from .tokens import apply_edits
 
 REF = (re.compile(r"^\s*'((?:[^']|'')+)'\s*\[(.+)\]\s*$"), re.compile(r"^\s*([^\[\]']+?)\s*\[(.+)\]\s*$"))
@@ -18,13 +18,7 @@ def _model(project):
     mdef = os.path.join(project.mirror_model, "definition")
     if not os.path.isdir(mdef):
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    for path in tmdl.tmdl_files(mdef):
-        rel = os.path.relpath(path, project.ws.mirror).replace("\\", "/")
-        try:
-            read_text(path)
-        except (OSError, UnicodeError):
-            raise PbzError("REFUSED", rel) from None
-    return mdef, tmdl.load_model(mdef)
+    return mdef, tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
 
 
 def _col(model, ref: str):
@@ -67,10 +61,10 @@ def _active_path(model, t1: str, t2: str, skip=None) -> bool:
     return False
 
 
-def _rel_path(mdef: str) -> tuple[str, str, bytes]:
+def _rel_path(mdef: str, *, root: str) -> tuple[str, str, bytes]:
     path = os.path.join(mdef, "relationships.tmdl")
     if os.path.exists(path):
-        text, bom = read_text(path)
+        text, bom = mirror.read_mirror_text(path, root=root)
         return path, text, bom
     return path, "", b""
 
@@ -126,7 +120,7 @@ def _apply(path: str, bom: bytes, body: str, dry_run: bool, out: dict, rel: str)
 def add(ws, project, from_ref: str, to_ref: str, inactive: bool = False, both: bool = False,
         many_to_many: bool = False, force: bool = False, dry_run: bool = False) -> dict:
     mdef, model = _model(project)
-    path, text, bom = _rel_path(mdef)
+    path, text, bom = _rel_path(mdef, root=ws.mirror)
     new, info = plan_add(model, text, from_ref, to_ref, inactive, both, many_to_many, force)
     out = {"verb": "relationship", "action": "added", "relationship": info["relationship"], "name": info["name"],
            "checks": info["checks"], "verify": info["verify"], "next": "pbz diff, pbz push"}
@@ -143,7 +137,7 @@ def remove(ws, project, from_ref: str, to_ref: str, dry_run: bool = False) -> di
     doc = model.docs[r.node.file]
     s, e = tmdl.block_span(doc, r.node)
     path = os.path.join(mdef, *r.node.file.split("/"))
-    _t, bom = read_text(path)
+    _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
     out = {"verb": "relationship", "action": "removed", "relationship": f"{a.table}[{a.name}] -> {b.table}[{b.name}]",
            "next": "pbz unused / pbz validate (measures using USERELATIONSHIP on it break), pbz diff, pbz push"}
     return _apply(path, bom, apply_edits(doc.text, [(s, e, "")]), dry_run, out, _mirror_rel(ws, path))
@@ -183,7 +177,7 @@ def set_(ws, project, from_ref: str, to_ref: str, active: bool | None = None, bo
         return {"verb": "relationship", "action": "unchanged",
                 "relationship": f"{a.table}[{a.name}] -> {b.table}[{b.name}]", "files": []}
     path = os.path.join(mdef, *r.node.file.split("/"))
-    _t, bom = read_text(path)
+    _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
     out = {"verb": "relationship", "action": "updated", "relationship": f"{a.table}[{a.name}] -> {b.table}[{b.name}]",
            "active": active if active is not None else r.active,
            "cross_filter": ("both" if both else "single") if both is not None else ("both" if r.both else "single"),

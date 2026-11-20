@@ -19,7 +19,7 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.join(SKILL, "tests"))
 
 import test_parity  # noqa: E402
-from pbz import cli, common, mcp, mirror, synth, synthtest  # noqa: E402
+from pbz import cli, common, consumers, mcp, mirror, synth, synthtest  # noqa: E402
 
 SECRET = "SECRET_EXC_TEXT_9f3a"
 PNG = b"\x89PNG-BYTES-NOT-A-PATH"
@@ -110,46 +110,61 @@ class SynthtestHonestyTests(unittest.TestCase):
         self.assertTrue(str(compared["result"]).startswith("ERROR"))
 
     def test_private_recovery_cli_and_mcp_redact(self):
-        reg = os.path.join(self.ws.pbz_dir, "consumers.json")
+        reg = consumers._reg_path(self.ws)
+        cache = consumers._cache_path(self.ws, "c1")
         os.makedirs(self.ws.pbz_dir, exist_ok=True)
-        with open(reg, "w", encoding="utf-8") as f:
-            f.write('{"version": 1, "consumers": []}\n')
+        real_write = common.write_text
+        real_replace = common.replace_bytes
         argv = ["--workspace", self.ws.root, "--project", "Parity", "consumers", "add",
                 "--label", "notes", "--object", "[Total Sales]"]
+        for via_mcp in (False, True):
+            with self.subTest(via_mcp=via_mcp):
+                with open(reg, "w", encoding="utf-8") as f:
+                    f.write('{"version": 1, "consumers": []}\n')
+                calls = []
 
-        def bad_restore(path, data, *, root=None, **_kw):
-            raise OSError(SECRET)
+                def boom(path, text, bom=b"", *, root=None, **kw):
+                    calls.append(("write_text", path))
+                    if path == reg:
+                        # write_text uses replace_bytes for the forward write too.
+                        with patch("pbz.common.replace_bytes", real_replace):
+                            return real_write(path, text, bom, root=root, **kw)
+                    self.assertEqual(path, cache)
+                    raise OSError(SECRET)
 
-        def boom(path, text, bom=b"", *, root=None, **_kw):
-            raise OSError(SECRET)
+                def bad_restore(path, data, *, root=None, **_kw):
+                    calls.append(("replace_bytes", path))
+                    raise OSError(SECRET)
 
-        with patch("pbz.common.write_text", boom), patch("pbz.common.replace_bytes", bad_restore):
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                rc = cli.main(argv)
-            text = buf.getvalue()
+                def fake_bounded(command, cwd=None, env=None, timeout=None, mid=0):
+                    fake_bounded.calls.append(command)
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        code = cli.main(command[3:])
+                    return code, out.getvalue().encode("utf-8"), None
+                fake_bounded.calls = []
 
-            def fake_run(cmd, **kwargs):
-                out = io.StringIO()
-                with redirect_stdout(out):
-                    code = cli.main(cmd[3:])
-                class Proc:
-                    returncode = code
-                    stdout = out.getvalue().encode("utf-8")
-                    stderr = (SECRET + self.ws.private + PNG.decode("latin1")).encode("latin1", "replace")
-                return Proc()
-
-            with patch("pbz.mcp.subprocess.run", fake_run):
-                mcp_out = mcp.call_tool("consumers", {"action": "add", "objects": ["[Total Sales]"],
-                                                      "label": "notes", "workspace": self.ws.root,
-                                                      "project": "Parity"}, self.ws.root, None)
-        blob = text + json.dumps(mcp_out)
-        self.assertNotEqual(rc, 0)
-        self.assertTrue(mcp_out["isError"])
-        self.assertIn("RECOVERY_REQUIRED", text)
-        self.assertIn("RECOVERY_REQUIRED", blob)
-        for banned in (SECRET, self.ws.private, self.ws.root, "OSError", ".pbz-restore", PNG.decode("latin1")):
-            self.assertNotIn(banned, blob)
+                with patch("pbz.cli.find_workspace", return_value=self.ws), \
+                        patch("pbz.common.write_text", boom), patch("pbz.common.replace_bytes", bad_restore):
+                    if via_mcp:
+                        with patch("pbz.mcp._bounded_output", fake_bounded):
+                            mcp_out = mcp.call_tool("consumers", {"action": "add", "objects": ["[Total Sales]"],
+                                                          "label": "notes", "workspace": self.ws.root,
+                                                          "project": "Parity"}, self.ws.root, None)
+                        self.assertTrue(fake_bounded.calls)
+                        self.assertTrue(mcp_out["isError"])
+                        text = json.dumps(mcp_out)
+                    else:
+                        buf = io.StringIO()
+                        with redirect_stdout(buf):
+                            rc = cli.main(argv)
+                        self.assertNotEqual(rc, 0)
+                        text = buf.getvalue()
+                self.assertIn(("write_text", cache), calls)
+                self.assertIn(("replace_bytes", reg), calls)
+                self.assertIn("RECOVERY_REQUIRED", text)
+                for banned in (SECRET, self.ws.private, self.ws.root, "OSError", ".pbz-restore", PNG.decode("latin1")):
+                    self.assertNotIn(banned, text)
 
 
 if __name__ == "__main__":

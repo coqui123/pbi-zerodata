@@ -51,16 +51,7 @@ BLANK = "∅blank"
 # --------------------------------------------------------------------------- canaries
 
 
-def load_canaries() -> dict[str, list[str]]:
-    text = (FIXTURE / "CANARIES.md").read_text("utf-8")
-    blocks: dict[str, list[str]] = {}
-    for m in re.finditer(r"```(canary-[a-z-]+)\r?\n(.*?)```", text, re.S):
-        blocks[m.group(1)] = [ln.strip() for ln in m.group(2).splitlines() if ln.strip()]
-    return blocks
-
-
-CAN = load_canaries()
-
+from canary_scan import CAN, scan, scan_patterns
 
 def pick(block: str, pattern: str) -> list[str]:
     rx = re.compile(pattern)
@@ -78,22 +69,6 @@ INT_CANARIES = sorted(int(n) for n in CAN["canary-numbers"] if re.fullmatch(r"\d
 DERIVED = CAN["canary-derived-numbers"]
 
 
-def scan_patterns(for_files: bool) -> list[re.Pattern]:
-    pats: list[re.Pattern] = []
-    for s in CAN["canary-strings"] + CAN["canary-blob-strings"] + CAN["canary-request-strings"] + CAN["canary-stems"]:
-        pats.append(re.compile(re.escape(s), re.I))
-    pats.append(re.compile(r"(?<![0-9a-fA-F])(?:7f3a[1-49]|5b9d[12])(?![0-9a-fA-F])"))
-    for n in CAN["canary-numbers"]:
-        core = n.lstrip("-")
-        if for_files and re.fullmatch(r"\d+", core) and int(core) == INT_CANARIES[2]:
-            continue  # bare value shared with tests/test_mirror.py synthetic data (see CANARIES.md)
-        tail = r"(?![0-9A-Za-z])" if re.fullmatch(r"\d+", core) else r"(?![0-9])"
-        pats.append(re.compile(r"(?<![0-9A-Za-z.])" + re.escape(core) + tail))
-    for n in DERIVED:
-        ip = n.split(".")[0]
-        pats.append(re.compile(r"(?<![0-9A-Za-z.])" + re.escape(ip) + r"(?![0-9])"))
-        pats.append(re.compile(re.escape(ip[:-3] + "," + ip[-3:])))
-    return pats
 
 
 OUT_PATTERNS = scan_patterns(for_files=False)
@@ -160,17 +135,22 @@ class DATA_BLOB(ctypes.Structure):
     _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
 
-_crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_crypt32.CryptUnprotectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.POINTER(DATA_BLOB),
-                                        ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(DATA_BLOB)]
-_crypt32.CryptUnprotectData.restype = wt.BOOL
-_kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-_kernel32.LocalFree.restype = ctypes.c_void_p
+def _dpapi_libraries():
+    _crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _crypt32.CryptUnprotectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.POINTER(DATA_BLOB),
+                                            ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(DATA_BLOB)]
+    _crypt32.CryptUnprotectData.restype = wt.BOOL
+    _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    _kernel32.LocalFree.restype = ctypes.c_void_p
+    return _crypt32, _kernel32
+
+
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 
 def dpapi_unprotect(blob: bytes) -> bytes:
+    _crypt32, _kernel32 = _dpapi_libraries()
     buf = ctypes.create_string_buffer(blob, len(blob))
     inp = DATA_BLOB(len(blob), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
     out = DATA_BLOB()
@@ -344,7 +324,199 @@ class Env:
         return d
 
 
+def _tree_manifest(root: Path) -> dict[str, str]:
+    """Fingerprint every file in a source tree, including existing build outputs."""
+    return {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob("*") if path.is_file()}
+
+
+def _manifest_changes(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    changes = []
+    for path in sorted(before.keys() | after.keys()):
+        if path not in before:
+            changes.append(f"added: {path}")
+        elif path not in after:
+            changes.append(f"removed: {path}")
+        elif before[path] != after[path]:
+            changes.append(f"content-changed: {path}")
+    return sorted(changes)
+
+
+def test_grouped_streaming(tmp: Path) -> None:
+    """Offline .NET acceptance: execute the production aggregators with a lazy row source.
+
+    Requires the Windows .NET SDK; no Desktop connection or pre-materialized fixture rows.
+    """
+    import xml.etree.ElementTree as ET
+    helper = tmp / "grouped-streaming"
+    helper.mkdir()
+    artifacts = tmp / "grouped-streaming-artifacts"
+    project = ET.Element("Project", Sdk="Microsoft.NET.Sdk")
+    properties = ET.SubElement(project, "PropertyGroup")
+    for key, value in {"OutputType": "Exe", "TargetFramework": "net10.0",
+                       "RuntimeIdentifier": "win-x64", "ImplicitUsings": "enable", "Nullable": "enable"}.items():
+        ET.SubElement(properties, key).text = value
+    refs = ET.SubElement(project, "ItemGroup")
+    ET.SubElement(refs, "ProjectReference", Include=str(S / "engine" / "PbzEngine.csproj"))
+    ET.ElementTree(project).write(helper / "Grouped.csproj", encoding="unicode")
+    (helper / "Program.cs").write_text(r'''
+using System.Text.Json.Nodes;
+using PbzEngine;
+using System.Reflection;
+static string Normalize(string query) => (string)typeof(Perf).GetMethod("NormalizeQuery", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, new object[] { query })!;
+static void Assert(bool ok, string label) { if (!ok) throw new Exception(label); }
+static JsonObject Result(Checks.EqualAggregate a) { var r = new JsonObject(); a.Write(r); return r; }
+static IEnumerable<object?[]> Rows(int count, int bad) {
+    // All failures arrive after the passing prefix, smallest serialized keys last.
+    for (int i = 0; i < count; i++)
+        yield return new object?[] { "g" + (count - i - 1).ToString("D8"), 1, i >= count - bad ? 0 : 1 };
+}
+// Exercise the production normalizer, including literal and comment extents.
+foreach (var pair in new[] {
+    ("EVALUATE {1+2}", "EVALUATE {1 + 2}", true),
+    ("EVALUATE {1=1||2=3}", "EVALUATE {1=1 || 2=3}", true),
+    ("EVALUATE {1 -- note\n+2}", "EVALUATE {1 -- note +2}", false),
+    ("EVALUATE {1 // note\n+2}", "EVALUATE {1 // note +2}", false),
+    ("EVALUATE {1 /* note */+2}", "EVALUATE {1 /* note */ + 2}", true),
+    ("EVALUATE {1 /* note +2 */}", "EVALUATE {1 /* note */+2}", false),
+    ("EVALUATE {\"a b\"}", "EVALUATE {\"ab\"}", false),
+    ("EVALUATE {'a b'[x]}", "EVALUATE {'ab'[x]}", false)
+}) Assert((Normalize(pair.Item1) == Normalize(pair.Item2)) == pair.Item3, "query normalization: " + pair.Item1);
+string directory = Path.Combine(Path.GetTempPath(), "pbz-grouped-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(directory);
+try {
+    var vault = Vault.Open(directory);
+    var table = new TableMeta { Name = "T" };
+    var columns = new List<ColumnMeta> { new() { Table = table, Name = "Key", DataType = 2 } };
+    var by = new List<string> { "T[Key]" };
+    var reveal = new HashSet<string> { "T[Key]" };
+    var allow = new HashSet<string> { "T[Key]" };
+    int loads = 0;
+    var snapshot = new Checks.RequestSnapshot(() => { loads++; return null; });
+    Func<object?[], JsonObject> Factory() => Checks.GroupFactory(snapshot, by, columns, reveal, allow, vault);
+    Assert(loads == 0, "fresh holder has not loaded");
+    var firstFactory = Factory();
+    Assert(loads == 1, "first factory build loads snapshot");
+    var secondFactory = Factory();
+    Assert(loads == 1, "second factory build reuses snapshot");
+    firstFactory(new object?[] { "first" });
+    secondFactory(new object?[] { "second" });
+    Assert(loads == 1, "one production holder load across two factories and group calls");
+    snapshot.Invalidate();
+    firstFactory(new object?[] { "after invalidation" });
+    secondFactory(new object?[] { "after invalidation" });
+    Assert(loads == 1, "pre-existing factories leave invalidated holder alone");
+    var newFactory = Factory();
+    Assert(loads == 2, "new factory build reloads invalidated snapshot");
+    newFactory(new object?[] { "new snapshot" });
+    Assert(loads == 2, "new factory group call does not reload");
+    foreach (var test in new[] { (0, 0, "EMPTY", "NONE"), (23, 0, "PASS", "NONE"),
+                                 (23, 1, "FAIL", "ONE"), (23, 4, "FAIL", "FEW"),
+                                 (23, 20, "FAIL", "MANY"), (1000000, 20, "FAIL", "MANY") }) {
+        var a = new Checks.EqualAggregate(1, 1e-9, Factory());
+        foreach (var row in Rows(test.Item1, test.Item2)) a.Accept(row);
+        var result = Result(a);
+        Assert((string?)result["status"] == test.Item3 && (string?)result["mismatch"] == test.Item4, "expected verdict/bucket");
+        Assert(a.RowsConsumed == test.Item1 && a.Failures == test.Item2, "actual consumed and failures");
+        Assert(a.RetainedGroups == Math.Min(10, test.Item2) && a.PeakRetainedGroups <= 10, "bounded retained objects");
+        if (test.Item2 == 0) Assert(result["groups"] == null, "no groups on pass/empty");
+        else {
+            var expected = new JsonArray();
+            for (int i = 0; i < Math.Min(10, test.Item2); i++)
+                expected.Add(new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "g" + i.ToString("D8") } });
+            Assert(JsonNode.DeepEquals(result["groups"], expected), "independently expected exact sample");
+        }
+        Assert(loads == 2, "no further request snapshot loads across checks");
+    }
+    // Shuffling supplements independently expected results; duplicates must survive sampling.
+    var input = Rows(23, 20).ToArray();
+    var random = new Random(7);
+    for (int iteration = 0; iteration < 4; iteration++) {
+        random.Shuffle(input);
+        var a = new Checks.EqualAggregate(1, 1e-9, Factory());
+        foreach (var row in input) a.Accept(row);
+        var expected = new JsonArray();
+        for (int i = 0; i < 10; i++) expected.Add(new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "g" + i.ToString("D8") } });
+        Assert((string?)Result(a)["status"] == "FAIL" && JsonNode.DeepEquals(Result(a)["groups"], expected), "shuffled exact sample");
+    }
+    var duplicate = new Checks.EqualAggregate(1, 1e-9, Factory());
+    for (int i = 0; i < 15; i++) duplicate.Accept(new object?[] { "same", 1, 0 });
+    Assert(((JsonArray)Result(duplicate)["groups"]!).Count == 10, "duplicate groups retained");
+    var strict = new Checks.EqualAggregate(1, 1e-9, null);
+    foreach (var row in Rows(1000000, 20)) strict.Accept(row);
+    Assert(Result(strict).ToJsonString() == "{\"status\":\"FAIL\"}" && strict.RowsConsumed == 1000000 && strict.RetainedGroups == 0, "strict traverses without groups");
+    // Permissions are snapshots per column, with exact category membership.
+    var index = JsonNode.Parse("{\"columns\":{\"T[Key]\":{\"class\":\"category\"}},\"categories\":{\"T[Key]\":[\"known\"]}}")!.AsObject();
+    int categoryLoads = 0;
+    var categorySnapshot = new Checks.RequestSnapshot(() => { categoryLoads++; return index; });
+    var category = Checks.GroupFactory(categorySnapshot, by, columns, reveal, new(), vault);
+    Assert((string?)category(new object?[] { "known" })["T[Key]"]?["reveal"] == "known", "member reveals");
+    index["categories"]!["T[Key]"] = new JsonArray("new");
+    Assert(category(new object?[] { "new" })["T[Key]"]?["hmac"] != null, "new value hidden, cached permissions");
+    var categorySecond = Checks.GroupFactory(categorySnapshot, by, columns, reveal, new(), vault);
+    Assert(categorySecond(new object?[] { "new" })["T[Key]"]?["hmac"] != null, "permissions cached across factories");
+    Assert(categoryLoads == 1, "one index load across category factories");
+    var alias = Checks.GroupFactory(categorySnapshot, new() { "'T'[Key]" }, columns, reveal, new(), vault);
+    Assert(alias(new object?[] { "known" })["'T'[Key]"]?["hmac"] != null, "cached column still requires exact reveal spelling");
+    Assert(category(new object?[] { null })["T[Key]"]?["blank"]?.GetValue<bool>() == true, "blank group");
+    categorySnapshot.Invalidate();
+    var reloaded = Checks.GroupFactory(categorySnapshot, by, columns, reveal, new(), vault);
+    Assert(categoryLoads == 2 && (string?)reloaded(new object?[] { "new" })["T[Key]"]?["reveal"] == "new",
+        "invalidation reloads snapshot and permissions");
+    var multiIndex = JsonNode.Parse("{\"columns\":{\"T[Key]\":{\"class\":\"category\"},\"T[Second]\":{\"class\":\"category\"}},\"categories\":{\"T[Key]\":[\"known\"],\"T[Second]\":[\"other\"]}}")!.AsObject();
+    var multiSnapshot = new Checks.RequestSnapshot(() => multiIndex);
+    var multiBy = new List<string> { "T[Key]", "T[Second]" };
+    var multiColumns = new List<ColumnMeta> { columns[0], new() { Table = table, Name = "Second", DataType = 2 } };
+    var multiFactory = Checks.GroupFactory(multiSnapshot, multiBy, multiColumns, new(multiBy), new(), vault);
+    var multi = new Checks.EqualAggregate(2, 1e-9, multiFactory);
+    multi.Accept(new object?[] { "known", "other", 1, 1 });
+    multi.Accept(new object?[] { "known", "other", 1, 0 });
+    multi.Accept(new object?[] { "known", null, 2, 0 });
+    var multiExpected = new JsonArray(
+        new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "known" }, ["T[Second]"] = new JsonObject { ["blank"] = true } },
+        new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "known" }, ["T[Second]"] = new JsonObject { ["reveal"] = "other" } });
+    Assert(multi.RowsConsumed == 3 && multi.Failures == 2 && JsonNode.DeepEquals(Result(multi)["groups"], multiExpected),
+        "two grouping columns: exact permissions, offsets and groups");
+    // Additive expectations use the actual input order (floating point is order sensitive).
+    foreach (var test in new[] { (new double?[] {}, (object?)null, "EMPTY"),
+                                 (new double?[] { null, null }, (object?)null, "EMPTY"),
+                                 (new double?[] { 2, 3 }, (object?)5, "PASS"),
+                                 (new double?[] { 2, 3 }, (object?)6, "FAIL"),
+                                 (new double?[] { 1e16, 1, -1e16 }, (object?)0, "PASS"),
+                                 (new double?[] { 1e16, -1e16, 1 }, (object?)1, "PASS") }) {
+        var a = new Checks.AdditiveAggregate(0);
+        foreach (var value in test.Item1) a.Accept(new object?[] { value });
+        var result = new JsonObject(); a.Write(result, test.Item2, 1e-9);
+        Assert((string?)result["status"] == test.Item3 && a.RowsConsumed == test.Item1.Length, "additive fixed-order expectation");
+    }
+    Console.WriteLine("grouped streaming acceptance passed");
+} finally { Directory.Delete(directory, true); }
+''', "utf-8")
+    label = "offline grouped streaming: exact verdicts, samples, consumption, retention and index loads"
+    # Global settings also apply to implicit restore and referenced projects. The engine
+    # sets BaseOutputPath itself, so override it along with the SDK artifacts layout.
+    source_manifests = {source: _tree_manifest(source) for source in (helper, S / "engine")}
+    for attempt in range(2):
+        try:
+            proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Grouped.csproj"),
+                                   "--artifacts-path", str(artifacts),
+                                   f"-p:BaseOutputPath={artifacts / 'bin'}/"],
+                                  capture_output=True, timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            expect(label, False, {"reason": f"{type(exc).__name__}: {exc}"})
+            return
+        expect(f"{label} (build {attempt + 1})",
+               proc.returncode == 0 and b"grouped streaming acceptance passed" in proc.stdout,
+               {"exit": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace"),
+                "stderr": proc.stderr.decode("utf-8", "replace")})
+        source_changes = {str(source): changes for source, before in source_manifests.items()
+                          if (changes := _manifest_changes(before, _tree_manifest(source)))}
+        expect(f"grouped streaming build {attempt + 1}: source trees unchanged",
+               not source_changes, {"paths": source_changes})
+
+
 def test_offline(env: Env, tmp: Path) -> None:
+    test_grouped_streaming(tmp)
     r = engine("ping", None, "ping-empty", raw=b"")
     expect("ping without private_dir", r and r.get("ok") is True and r.get("version") == "1", r)
     r = engine("ping", {"private_dir": str(env.pd)}, "ping")
@@ -466,7 +638,7 @@ def test_offline(env: Env, tmp: Path) -> None:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     r = mod.call("ping", {"private_dir": str(env.pd)})
-    expect("engine.py call(ping) returns only ok and verb", r == {"ok": True, "verb": "ping"}, r)
+    expect("engine.py call(ping) returns ok, verb, and version", r == {"ok": True, "verb": "ping", "version": "1"}, r)
     saved = mod.ENGINE_EXE
     try:
         mod.ENGINE_EXE = S / "engine" / "bin" / "missing-engine.exe"
@@ -503,6 +675,243 @@ def ensure_desktop(env: Env) -> bool:
     ok = expect("connect: TMSCHEMA tables are exactly the fixture's (safety gate)",
                 r and r.get("ok") and set(r.get("tables", [])) == FIXTURE_TABLES and int(r.get("compat_level", 0)) >= 1500, r)
     return bool(ok)
+
+
+def publish_index(env: Env, summary: dict, project: str) -> None:
+    """Use the production hardener and publisher for live reader tests."""
+    sys.path.insert(0, str(S))
+    from types import SimpleNamespace
+    from pbz import checks, index_store
+    checks.harden_index(SimpleNamespace(private=str(env.pd)), {})
+    summary["tables"] = checks._rebuild_summary(str(env.pd), summary.get("tables", []))
+    index_store.publish(str(env.pd), project, summary)
+
+
+def test_live_index_binding(env: Env, tmp: Path) -> None:
+    """Real A/B Desktop models sharing a private store; index A LAST, then check B."""
+    global PBIP
+    sys.path.insert(0, str(S))
+    from pbz import dpapi, index_store
+    original_pbip = PBIP
+    b = Env()
+    b.pd = env.pd
+    directory = tmp / "index-project-b"
+    shutil.copytree(FIXTURE, directory, ignore=shutil.ignore_patterns(".pbi"))
+    table_file = directory / "Canary.SemanticModel" / "definition" / "tables" / "Project.tmdl"
+    table = table_file.read_text("utf-8")
+    # Keep Closed in both A and B: a raw reveal in B would pass a membership-only gate.
+    # Add enough distinct Status values to cross the policy's default category_max.
+    start = table.index("DATATABLE(")
+    table = table[:start] + ('DATATABLE("ProjectID", INTEGER, "Title", STRING, "Status", STRING, '
+        '"PlannedEnd", DATETIME, {' + ",".join(
+            '{' + str(1000 + i) + ',"fixture","' + ("Closed" if i == 0 else f"Status-{i}")
+            + '","2026-01-01"}' for i in range(60)) + '})\n')
+    table_file.write_text(table, "utf-8")
+    try:
+        PBIP = directory / "Canary.pbip"
+        if not expect("binding fixture Desktop is available", ensure_desktop(b)):
+            return
+        engine("refresh", b.req(), "binding-b-refresh")
+        rb = engine("index", b.req(), "binding-index-b")
+        publish_index(b, rb, "B")
+        expect("binding B: Status exceeds category_max", any(
+            t["table"] == "Project" and any(c["column"] == "Status" and c.get("class") == "high"
+                                             for c in t["columns"]) for t in rb["tables"]), rb)
+        ra = engine("index", env.req(), "binding-index-a-LAST")
+        publish_index(env, ra, "A")
+
+        def grouped(target, label, where=None):
+            return engine("check", target.req(reveal=["Project[Status]"], checks=[{
+                "id": "binding", "kind": "equal", "left": "1", "right": "0",
+                "by": ["Project[Status]"], "where": where or ["NOT ISBLANK(Project[Status])"]}]), label)
+
+        shared = ['Project[Status] = "Closed"']
+        raw_b = grouped(b, "binding-check-b-shared", shared)
+        groups = raw_b.get("checks", raw_b.get("results", []))[0].get("groups", [])
+        expect("B never reveals even a member of A's list", groups and all(
+            "hmac" in g["Project[Status]"] for g in groups), raw_b)
+        raw_a = grouped(env, "binding-check-a-member", shared)
+        groups = raw_a.get("checks", raw_a.get("results", []))[0].get("groups", [])
+        expect("A genuine category member still reveals", groups == [
+            {"Project[Status]": {"reveal": "Closed"}}], raw_a)
+        # A complete, hash-valid generation still needs the live model stamp.
+        manifest_path = env.pd / "index-current.json"
+        stamped_manifest = manifest_path.read_bytes()
+        manifest = json.loads(stamped_manifest)
+        unstamped = "index-" + os.urandom(16).hex()
+        unstamped_dir = env.pd / unstamped
+        shutil.copytree(env.pd / manifest["generation"], unstamped_dir)
+        index_path = unstamped_dir / "index.json"
+        idx = json.loads(index_path.read_bytes())
+        expect("binding source generation has a model stamp", bool(idx.get("model_stamp")))
+        idx.pop("model_stamp", None)
+        index_path.write_bytes(json.dumps(idx).encode("utf-8"))
+        manifest["generation"] = unstamped
+        manifest["sha256"] = {name: hashlib.sha256((unstamped_dir / name).read_bytes()).hexdigest()
+                              for name in index_store.FILES}
+        try:
+            manifest_path.write_text(json.dumps(manifest), "utf-8")
+            expect("unstamped generation is complete and hash-valid", index_store.load(str(env.pd), "A") is not None)
+            unstamped_result = grouped(env, "binding-check-a-unstamped", shared)
+            groups = unstamped_result.get("checks", unstamped_result.get("results", []))[0].get("groups", [])
+            expect("missing model stamp prevents category reveal", groups and all(
+                set(g["Project[Status]"]) == {"hmac"} for g in groups), unstamped_result)
+        finally:
+            manifest_path.write_bytes(stamped_manifest)
+
+        many = grouped(b, "binding-check-b-max-ten")
+        groups = many.get("checks", many.get("results", []))[0].get("groups", [])
+        expect("failing grouped equal returns at most ten HMAC groups", len(groups) == 10 and all(
+            "hmac" in g["Project[Status]"] for g in groups), many)
+
+        # Change only the disposable B model through TOM. Index it at low cardinality,
+        # then add a real row on the same database/port without reindexing.
+        helper = tmp / "index-row-mutation"
+        helper.mkdir()
+        import xml.etree.ElementTree as ET
+        project_xml = ET.Element("Project", Sdk="Microsoft.NET.Sdk")
+        props = ET.SubElement(project_xml, "PropertyGroup")
+        ET.SubElement(props, "OutputType").text = "Exe"
+        ET.SubElement(props, "TargetFramework").text = "net10.0"
+        refs = ET.SubElement(project_xml, "ItemGroup")
+        for dll in EXE.parent.glob("Microsoft.AnalysisServices*.dll"):
+            ref = ET.SubElement(refs, "Reference", Include=dll.stem)
+            ET.SubElement(ref, "HintPath").text = str(dll)
+        ET.ElementTree(project_xml).write(helper / "Mutation.csproj", encoding="unicode")
+        (helper / "Program.cs").write_text(r"""
+using System;
+using System.IO;
+using System.Linq;
+using Microsoft.AnalysisServices.Tabular;
+using var server = new Server();
+server.Connect("Data Source=localhost:" + args[0] + ";");
+if (server.Databases.Count != 1) throw new Exception("fixture database count");
+var database = server.Databases[0];
+if (database.ID != args[1]) throw new Exception("fixture identity mismatch");
+if (!database.Model.Tables.Select(t => t.Name).ToHashSet().SetEquals(
+    new[] { "Person", "Project", "Hours", "DimDate", "ExceptionType", "Notes" }))
+    throw new Exception("fixture table mismatch");
+var table = database.Model.Tables["Project"];
+((CalculatedPartitionSource)table.Partitions[0].Source).Expression = File.ReadAllText(args[2]);
+table.RequestRefresh(RefreshType.Full);
+database.Model.SaveChanges();
+""", "utf-8")
+        connection = engine("connect", b.req(), "row-add-identity")
+        database_id = connection["database_id"]
+
+        def change_rows(statuses):
+            expression = ('DATATABLE("ProjectID", INTEGER, "Title", STRING, "Status", STRING, '
+                '"PlannedEnd", DATETIME, {' + ",".join(
+                    '{' + str(1000 + i) + ',"fixture","' + status + '","2026-01-01"}'
+                    for i, status in enumerate(statuses)) + '})')
+            expression_file = helper / "partition.dax"
+            expression_file.write_text(expression, "utf-8")
+            proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Mutation.csproj"),
+                                   "--", str(b.port), database_id, str(expression_file)],
+                                  capture_output=True, timeout=300)
+            return expect("disposable B row mutation succeeds", proc.returncode == 0,
+                          {"exit": proc.returncode, "stderr_bytes": len(proc.stderr)})
+
+        if not change_rows(["Closed", "Active"]):
+            return
+        rb = engine("index", b.req(), "index-before-row-add")
+        publish_index(b, rb, "B")
+        control = grouped(b, "binding-b-before-row-add", shared)
+        groups = control.get("checks", control.get("results", []))[0].get("groups", [])
+        expect("B category member reveals before mutation", groups == [
+            {"Project[Status]": {"reveal": "Closed"}}], control)
+        if not change_rows(["Closed", "Active", "NewStatus"]):
+            return
+        stale = grouped(b, "binding-new-live-value", ['Project[Status] IN {"Closed", "NewStatus"}'])
+        groups = stale.get("checks", stale.get("results", []))[0].get("groups", [])
+        key = dpapi.load_key(str(env.pd), create=False)
+        expect("refresh invalidates all grouped reveals without reindex", len(groups) == 2
+            and all(set(g["Project[Status]"]) == {"hmac"} for g in groups)
+            and {g["Project[Status]"]["hmac"] for g in groups}
+                == {dpapi.hmac_hex(key, value) for value in ("Closed", "NewStatus")}, stale)
+    finally:
+        PBIP = original_pbip
+        if b.pid and b.opened_here:
+            print("INFO closing binding fixture Desktop:", close_desktop(b.pid), flush=True)
+
+
+def digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
+
+
+def perf_workload_digest(query):
+    # Match the production token boundaries, including exact strings/identifiers
+    # and line/block comment extents. Comment whitespace is normalized only inside
+    # the token, so a newline ending a line comment cannot swallow executable DAX.
+    tokens = re.findall(
+        r'//[^\r\n]*|--[^\r\n]*|/\*[\s\S]*?(?:\*/|$)|'
+        r'"(?:[^"]|"")*"|\'(?:[^\']|\'\')*\'|\[(?:[^\]]|\]\])*\]|'
+        r'[+\-*/^&=<>(),{}.:;!|]|[^\s"\'\[+*/^&=<>(),{}.:;!|\-]+', query)
+    tokens = [re.sub(r"\s+", " ", token) if token.startswith(("//", "--", "/*"))
+              else token for token in tokens]
+    return digest("\x1f".join(tokens))
+
+
+def perf_result_private(value, query, project):
+    workload = perf_workload_digest(query)
+
+    def private(node):
+        if isinstance(node, str):
+            return query not in node and project not in node and workload not in node
+        if isinstance(node, dict):
+            return all("fingerprint" not in key.lower() and "workload" not in key.lower()
+                       and private(child) for key, child in node.items())
+        if isinstance(node, list):
+            return all(private(child) for child in node)
+        return True
+
+    return private(value)
+
+
+def test_perf_baseline_workloads(env: Env) -> None:
+    """Windows/Desktop acceptance: actual protected baseline save/read, never a mocked save."""
+    query_a = 'EVALUATE ROW("workload", "a b", "probe", SUMX(GENERATESERIES(1, 1000000), SIN([Value])))'
+    query_b = query_a.replace('"a b"', '"ab"')
+
+    def call(project, check, query, action):
+        result = engine("perf", env.req(project_identity=project, baseline=check,
+                                        dax=query, runs=20, action=action), "perf-workload") or {}
+        expect("perf workload identity stays private", perf_result_private(result, query, project), result)
+        return result
+
+    saved = call("project-one", "check:one", query_a, "save")
+    expect("perf same-query control save succeeded", saved.get("baseline") == "SAVED", saved)
+    control = call("project-one", "check:one", query_a, "compare")
+    expect("perf same-query PASS control", control.get("verdict") in ("SAME", "FASTER")
+           and control.get("ratio_verdict") == "WITHIN_LIMIT", control)
+    mismatch = call("project-one", "check:one", query_b, "compare")
+    expect("perf literal-only different query has no comparable baseline",
+           mismatch.get("baseline") == "MISSING" and "verdict" not in mismatch, mismatch)
+    for project, check, query in (("project-one", "check:two", query_b),
+                                  ("project-two", "check:one", query_b),
+                                  ("project-two", "check:two", query_a)):
+        result = call(project, check, query, "save")
+        expect("perf interleaved save succeeds", result.get("baseline") == "SAVED", result)
+    for project, check, query in (("project-one", "check:one", query_a),
+                                  ("project-one", "check:two", query_b),
+                                  ("project-two", "check:one", query_b),
+                                  ("project-two", "check:two", query_a)):
+        result = call(project, check, query, "compare")
+        expect("perf project/check baseline remains comparable", "verdict" in result, result)
+        other = query_b if query == query_a else query_a
+        result = call(project, check, other, "compare")
+        expect("perf project/check isolation", result.get("baseline") == "MISSING" and "verdict" not in result, result)
+    # Replace the matching file with a protected legacy body, to prove version and
+    # workload checks reject it even if a legacy file reaches the new storage path.
+    sys.path.insert(0, str(S))
+    from pbz import dpapi
+    workload = perf_workload_digest(query_a)
+    key = digest("project-one\ncheck:one\n" + workload)
+    path = env.pd / "perf" / (digest(key) + ".bin")
+    expect("perf legacy test reaches saved baseline", path.exists())
+    path.write_bytes(dpapi.protect(json.dumps({"median": 1, "spread": 0}).encode("utf-8")))
+    result = call("project-one", "check:one", query_a, "compare")
+    expect("perf legacy unbound baseline ignored", result.get("baseline") == "MISSING" and "verdict" not in result, result)
 
 
 def test_live(env: Env, key_holder: dict) -> None:
@@ -573,6 +982,14 @@ def test_live(env: Env, key_holder: dict) -> None:
     flat = [c for t in (r or {}).get("tables", []) for c in t["columns"]]
     expect("index strict: no buckets or years", r and r.get("ok") and all(not ({"card_bucket", "blank_bucket", "year_min", "year_max"} & set(c)) for c in flat)
            and all("rows_bucket" not in t for t in r["tables"]), r)
+
+    partial = engine("check", env.req(reveal=["Person[Name]"], checks=[{
+        "id": "partial", "kind": "equal", "left": "1", "right": "0", "by": ["Person[Name]"],
+        "where": ["NOT ISBLANK(Person[Name])"]}]), "index-unpublished-personal")
+    groups = partial.get("checks", partial.get("results", []))[0].get("groups", [])
+    expect("unpublished low-cardinality personal index is never accepted", groups and all(
+        "hmac" in g["Person[Name]"] for g in groups), partial)
+    publish_index(env, r, "Canary")
 
     # probe
     r = engine("probe", env.req(table="Hours"), "probe-hours")
@@ -822,21 +1239,8 @@ def scan_all(env: Env) -> None:
         b = p.read_bytes()
         return [b.decode("latin-1"), b.decode("utf-16-le", "ignore")]
 
-    bad = []
-    count = 0
-    fixture_root = os.path.normcase(str(FIXTURE))
-    for root, _dirs, files in os.walk(S):
-        if os.path.normcase(root).startswith(fixture_root):
-            continue
-        for f in files:
-            p = Path(root) / f
-            count += 1
-            try:
-                if any(canary_hits(t, FILE_PATTERNS) for t in file_texts(p)):
-                    bad.append(str(p.relative_to(S)))
-            except OSError:
-                pass
-    expect(f"canary scan: {count} files under the skill folder (fixture sources excluded) are clean", not bad, {"files": bad[:10]})
+    result = scan([S])
+    expect(f"canary scan: {result['files']} files read", result['ok'], result['failures'][:10])
 
     bad = []
     blobs = 0
@@ -860,6 +1264,241 @@ def scan_all(env: Env) -> None:
     expect(f"canary scan: private_dir clean outside {blobs} DPAPI blobs", not bad, {"files": bad[:10]})
 
 
+# Scanner fixtures run without a Windows engine; no existing engine checks are skipped.
+import unittest
+from unittest.mock import patch
+
+
+class PerfPrivacyTests(unittest.TestCase):
+    def test_workload_digest_spacing_and_comment_extents(self):
+        for left, right, equal in (
+            ("EVALUATE {1+2}", "EVALUATE {1 + 2}", True),
+            ("EVALUATE {1=1||2=3}", "EVALUATE {1=1 || 2=3}", True),
+            ("EVALUATE {1 -- note\n+2}", "EVALUATE {1 -- note +2}", False),
+            ("EVALUATE {1 // note\n+2}", "EVALUATE {1 // note +2}", False),
+            ("EVALUATE {1 /* note */+2}", "EVALUATE {1 /* note */ + 2}", True),
+            ("EVALUATE {1 /* note +2 */}", "EVALUATE {1 /* note */+2}", False),
+        ):
+            with self.subTest(query=left):
+                if equal:
+                    self.assertEqual(perf_workload_digest(left), perf_workload_digest(right))
+                else:
+                    self.assertNotEqual(perf_workload_digest(left), perf_workload_digest(right))
+
+    def test_nested_workload_digest_value_is_private(self):
+        query = 'EVALUATE ROW("workload", "a b")'
+        workload = perf_workload_digest(query)
+        self.assertEqual(workload, digest("\x1f".join([
+            "EVALUATE", "ROW", "(", '\"workload\"', ",", '\"a b\"', ")"])))
+        self.assertFalse(perf_result_private(
+            {"safe": [{"detail": "prefix " + workload + " suffix"}]}, query, "project-one"))
+
+    def test_legitimate_results_stay_private(self):
+        query = 'EVALUATE ROW("workload", "a b")'
+        for result in ({"baseline": "SAVED"}, {"verdict": "SAME", "ratio_verdict": "WITHIN_LIMIT"},
+                       {"baseline": "MISSING"}, {"detail": [{"status": "PASS", "count": 1}]}):
+            self.assertTrue(perf_result_private(result, query, "project-one"))
+
+
+class GroupedStreamingLauncherTests(unittest.TestCase):
+    def test_source_tree_manifest_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "engine" / "bin" / "pbz-engine.exe"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"original")
+            before = _tree_manifest(root)
+            self.assertEqual(set(before), {"engine/bin/pbz-engine.exe"})
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)), [])
+
+            added = executable.parent / "new.dll"
+            added.write_bytes(b"new")
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)),
+                             ["added: engine/bin/new.dll"])
+            before = _tree_manifest(root)
+            executable.write_bytes(b"modified")  # Same size; content must be compared.
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)),
+                             ["content-changed: engine/bin/pbz-engine.exe"])
+            before = _tree_manifest(root)
+            added.unlink()
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)),
+                             ["removed: engine/bin/new.dll"])
+
+            before = _tree_manifest(root)
+            build_output = root / "engine" / "build" / "output.dll"
+            build_output.parent.mkdir()
+            build_output.write_bytes(b"output")
+            executable.unlink()
+            self.assertEqual(_manifest_changes(before, _tree_manifest(root)),
+                             ["added: engine/build/output.dll", "removed: engine/bin/pbz-engine.exe"])
+
+    def assert_launch_failure(self, error):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(subprocess, "run", side_effect=error) as run, \
+             patch.object(sys.modules[__name__], "expect") as record:
+            test_grouped_streaming(Path(directory))
+            record.assert_called_once()
+            name, ok, detail = record.call_args.args
+            self.assertIn("offline grouped streaming", name)
+            self.assertFalse(ok)
+            self.assertIn(type(error).__name__, detail["reason"])
+            self.assertIn(str(error), detail["reason"])
+            command = run.call_args.args[0]
+            artifacts = Path(directory) / "grouped-streaming-artifacts"
+            self.assertEqual(command[command.index("--artifacts-path") + 1], str(artifacts))
+            self.assertIn(f"-p:BaseOutputPath={artifacts / 'bin'}/", command)
+
+    def test_missing_sdk_is_recorded(self):
+        self.assert_launch_failure(FileNotFoundError("dotnet SDK missing"))
+
+    def test_timeout_is_recorded(self):
+        self.assert_launch_failure(subprocess.TimeoutExpired(["dotnet", "run"], 300))
+
+
+class ProjectionTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(S))
+        from pbz import engine
+        self.engine = engine
+
+    def test_check_identity_and_hard_ratio_fail_closed(self):
+        from pbz import common, perf
+        with tempfile.TemporaryDirectory() as root:
+            ws = common.Workspace(root)
+            project = common.Project(ws, "One")
+            with patch("pbz.perf.desktop.require_port", return_value=1), \
+                 patch("pbz.perf.checks.spend", return_value=True), \
+                 patch("pbz.perf.engine_call") as call:
+                for verdict, ratio, status in (("NOISY", "WITHIN_LIMIT", "PASS"),
+                                               ("NOISY", "OVER_LIMIT", "FAIL")):
+                    call.return_value = {"ok": True, "verb": "perf", "timing": "BANDED", "trace": "CAPTURED",
+                                         "verdict": verdict, "ratio_verdict": ratio}
+                    self.assertEqual(perf.expect(ws, project, "EVALUATE {1}")["status"], status)
+
+    def test_probe_requires_verb(self):
+        request = {"table": "Sales", "columns": ["Amount"], "disclosure": "shape"}
+        response = {"ok": True, "table": "Sales", "columns": []}
+        for verb in (None, "health"):
+            obj = {**response, **({"verb": verb} if verb else {})}
+            self.assertEqual(self.engine._project("probe", obj, request)["class"], "ENGINE_UNAVAILABLE")
+        self.assertTrue(self.engine._project("probe", {**response, "verb": "probe"}, request)["ok"])
+
+    def test_failure_verb_must_match(self):
+        self.assertEqual(self.engine._project("deps", {"ok": False, "verb": "health", "class": "TIMEOUT"}),
+                         {"ok": False, "verb": "deps", "class": "ENGINE_UNAVAILABLE"})
+        self.assertEqual(self.engine._project("deps", {"ok": False, "verb": "deps", "class": "TIMEOUT"})["class"], "TIMEOUT")
+
+    def test_deps_positions(self):
+        edge = ["MEASURE", "Sales", "Total", "COLUMN", "Sales", "Amount"]
+        good = {"ok": True, "verb": "deps", "edges": [edge]}
+        self.assertEqual(self.engine._project("deps", good), good)
+        for i in range(6):
+            wrong = edge[:]
+            wrong[i] = 12
+            self.assertEqual(self.engine._project("deps", {**good, "edges": [wrong]})["class"], "ENGINE_UNAVAILABLE")
+
+    def test_unusable_contract(self):
+        for error in (FileNotFoundError("missing"), PermissionError("unreadable")):
+            with patch.object(Path, "read_text", side_effect=error):
+                self.assertEqual(self.engine._project("deps", {"ok": True})["class"], "ENGINE_UNAVAILABLE")
+        for schema in ({}, [], {"$defs": []}, {"$defs": {"bad": []}}):
+            with self.subTest(schema=schema), patch.object(Path, "read_text", return_value=json.dumps(schema)):
+                self.assertEqual(self.engine._project("deps", {"ok": True})["class"], "ENGINE_UNAVAILABLE")
+
+    def test_non_object_group_key_union_fails_closed(self):
+        contract = json.loads((S / "engine" / "contract.schema.json").read_text())
+        response = {"ok": True, "verb": "check", "checks": [
+            {"id": "fixture", "status": "FAIL", "groups": [{"Region": {"reveal": "public"}}]}]}
+        self.assertEqual(self.engine._project("check", response), response)
+        contract["$defs"]["groupKey"]["oneOf"] = [None]
+        with patch.object(Path, "read_text", return_value=json.dumps(contract)):
+            self.assertEqual(self.engine._project("check", response),
+                             {"ok": False, "verb": "check", "class": "ENGINE_UNAVAILABLE"})
+
+
+class CanaryScanTests(unittest.TestCase):
+    def test_clean_positive_control(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'clean.txt').write_text('safe metadata')
+            result = scan([tmp], excluded=[])
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['files'], 1)
+
+    def test_fixture_prefix_sibling_is_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp, 'fixture')
+            sibling = Path(tmp, 'fixture-output')
+            fixture.mkdir()
+            sibling.mkdir()
+            for folder in (fixture, sibling):
+                (folder / 'value.txt').write_text(CAN['canary-strings'][0])
+            result = scan([tmp], excluded=[fixture])
+            self.assertFalse(result['ok'])
+            self.assertTrue(result['completed'])
+            self.assertEqual(len(result['failures']), 1)
+            self.assertIn('fixture-output', result['failures'][0]['path'])
+
+    def test_read_error_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'blocked').touch()
+            def denied(path):
+                raise OSError('injected')
+            result = scan([tmp], read=denied)
+            self.assertFalse(result['ok'])
+            self.assertTrue(result['completed'])
+            self.assertEqual(result['files'], 0)
+            self.assertEqual(result['failures'][0]['reason'], 'read error')
+
+    def test_missing_root_and_enumeration_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = scan([Path(tmp, 'absent')])
+            self.assertFalse(missing['ok'])
+            self.assertFalse(missing['completed'])
+            def broken(root, onerror):
+                onerror(OSError(5, 'injected', str(root)))
+                return []
+            result = scan([tmp], walk=broken)
+            self.assertFalse(result['ok'])
+            self.assertFalse(result['completed'])
+            def raised(root, onerror):
+                raise OSError('enumeration failed')
+            self.assertFalse(scan([tmp], walk=raised)['completed'])
+
+    def test_canary_fails_shard_without_engine_and_aggregate(self):
+        import copy
+        import ci_equivalence
+        import run_offline
+        from ci_manifest import MANIFEST, allocate
+        entries = json.loads(MANIFEST.read_text())
+        groups = allocate(entries, 2)
+        identity = {k: 'fixture' for k in ('python', 'os', 'image', 'dotnet', 'dependencies',
+                                         'nuget', 'source', 'project', 'payload')}
+        base = dict(sha='fixture', identity=identity, ok=True, scan=dict(completed=True, ok=True))
+        def rows(entries):
+            return [dict(e, exit_code=0, skip_reasons=[], error=None, failure_reason=None) for e in entries]
+        reference = dict(copy.deepcopy(base), shard='serial', executed=rows(entries))
+        shards = [dict(copy.deepcopy(base), shard=i, executed=rows(group)) for i, group in enumerate(groups)]
+        planted_index = next(i for i, group in enumerate(groups) if all(e['id'] != 'engine-offline' for e in group))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(run_offline, 'identity', return_value=identity), patch.object(run_offline.subprocess, 'check_output', return_value='fixture'):
+            output = Path(tmp, 'output')
+            output.mkdir()
+            def child(argv, **kwargs):
+                (output / 'leak.txt').write_text(CAN['canary-strings'][0])
+                return subprocess.CompletedProcess(argv, 0)
+            report = run_offline.execute(groups[planted_index], shard=planted_index, output=output,
+                                         run=child, scanner=lambda roots: scan([output]))
+            self.assertFalse(report['ok'])
+            self.assertTrue(report['scan']['completed'])
+            shards[planted_index] = report
+            evidence = Path(tmp, 'reports')
+            evidence.mkdir()
+            for i, data in enumerate([reference, *shards]):
+                (evidence / f'{i}.json').write_text(json.dumps(data))
+            with patch.object(sys, 'argv', ['ci_equivalence.py', str(evidence)]), self.assertRaisesRegex(ValueError, 'incomplete or failed scan'):
+                ci_equivalence.main()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--offline", action="store_true", help="skip verbs that need Power BI Desktop")
@@ -867,6 +1506,9 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true", help="keep the temporary private_dir")
     args = ap.parse_args()
 
+    scanner_tests = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromNames(["CanaryScanTests", "ProjectionTests", "GroupedStreamingLauncherTests", "PerfPrivacyTests"], module=sys.modules[__name__]))
+    if not scanner_tests.wasSuccessful():
+        return 1
     if not EXE.is_file():
         print("FAIL engine not built: run dotnet publish (see engine/README.md)")
         return 2
@@ -881,8 +1523,9 @@ def main() -> int:
         test_norm_reference()
         test_offline(env, tmp)
         if not args.offline and ensure_desktop(env):
+            test_perf_baseline_workloads(env)
             test_live(env, key_holder)
-        shutil.rmtree(tmp, ignore_errors=True)
+            test_live_index_binding(env, tmp)
         scan_all(env)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -896,4 +1539,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--launcher-tests" in sys.argv:
+        unittest.main(argv=[sys.argv[0]], defaultTest="GroupedStreamingLauncherTests")
+    if "--projection-tests" in sys.argv:
+        unittest.main(argv=[sys.argv[0]], defaultTest="ProjectionTests")
+    if "--scan-tests" in sys.argv:
+        unittest.main(argv=[sys.argv[0]], defaultTest="CanaryScanTests")
     sys.exit(main())
