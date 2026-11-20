@@ -806,6 +806,7 @@ def _restore_transaction(ws, project, directory, journal, *, preserve_external=F
         else:
             if file_sha(quarantine) != current:
                 # Preserve a save captured between the ownership read and rename.
+                # Keep the inode named: an editor may still write through an open handle.
                 try:
                     with open(quarantine, "rb") as f:
                         captured_bytes = f.read()
@@ -813,8 +814,6 @@ def _restore_transaction(ws, project, directory, journal, *, preserve_external=F
                 except OSError:
                     # Keep the captured save if a newer target appears or return fails.
                     pass
-                else:
-                    os.remove(quarantine)
             elif entry["before"] is None:
                 os.remove(quarantine)
                 restored = not os.path.lexists(target)

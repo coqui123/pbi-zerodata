@@ -121,7 +121,11 @@ class RecoveryHonestyTests(unittest.TestCase):
         remaining = [os.path.join(os.path.dirname(target), name)
                      for name in os.listdir(os.path.dirname(target))
                      if name.startswith(os.path.basename(target) + ".pbz-restore-")]
-        if after_rename and before is not None:
+        if not after_rename:
+            self.assertEqual(remaining, quarantines)
+            with open(quarantines[0], "rb") as handle:
+                self.assertEqual(handle.read(), editor)
+        elif before is not None:
             self.assertEqual(remaining, quarantines)
             with open(quarantines[0], "rb") as handle:
                 self.assertEqual(handle.read(), after)
@@ -180,6 +184,53 @@ class RecoveryHonestyTests(unittest.TestCase):
         self.assertEqual(len(remaining), 1)
         with open(remaining[0], "rb") as handle:
             self.assertEqual(handle.read(), first_editor)
+
+    @unittest.skipUnless(os.name == "posix", "open editor handle follows renamed inode")
+    def test_open_editor_save_during_successful_quarantine_return_is_preserved(self):
+        rel = self.project.name + ".Report/definition/restore.json"
+        target = mirror._real_path(self.ws, rel)
+        after = b"push bytes"
+        first_editor = b"first editor version\n"
+        newest_editor = b"newest editor version through held handle\n"
+        common.replace_bytes(target, b"before bytes", root=self.ws.root)
+        directory, journal = mirror._begin_transaction(
+            self.ws, self.project, "restore-open-handle-race",
+            [("workspace", rel, common.sha(after))])
+        common.replace_bytes(target, after, root=self.ws.root)
+        real_rename = os.rename
+        real_install = mirror._install_before_image
+
+        def rename(source, destination, *args, **kwargs):
+            if source == target and destination.startswith(target + ".pbz-restore-"):
+                with open(target, "wb") as handle:
+                    handle.write(first_editor)
+            return real_rename(source, destination, *args, **kwargs)
+
+        with open(target, "r+b") as editor_handle:
+            def install_with_open_editor_save(path, content):
+                editor_handle.seek(0)
+                editor_handle.write(newest_editor)
+                editor_handle.truncate()
+                editor_handle.flush()
+                editor_handle.close()
+                return real_install(path, content)
+
+            with patch.object(os, "rename", rename), patch.object(
+                    mirror, "_install_before_image",
+                    side_effect=install_with_open_editor_save) as attempted:
+                out = mirror._restore_transaction(self.ws, self.project, directory, journal)
+        self.assertEqual(out, {"result": "RECOVERY_CONFLICT", "conflicts": [rel]})
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "RECOVERY_REQUIRED")
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), first_editor)
+        attempted.assert_called_once_with(target, first_editor)
+        remaining = [os.path.join(os.path.dirname(target), name)
+                     for name in os.listdir(os.path.dirname(target))
+                     if name.startswith(os.path.basename(target) + ".pbz-restore-")]
+        self.assertEqual(len(remaining), 1)
+        with open(remaining[0], "rb") as handle:
+            self.assertEqual(handle.read(), newest_editor)
 
     def test_restore_transaction_deleted_target_uses_no_clobber_install(self):
         rel = self.project.name + ".Report/definition/restore.json"
