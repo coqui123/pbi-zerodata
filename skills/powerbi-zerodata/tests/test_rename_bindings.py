@@ -328,6 +328,22 @@ class RenameBindingsTests(unittest.TestCase):
                 self.assertEqual(renamed, expected_bytes)
                 self.assertIn(expected.splitlines()[0], renamed.decode())
 
+        ws, project, mdef = self._project()
+        path = Path(mdef, 'tables', 'Sales.tmdl')
+        expr = '#shared[Sales Total]'
+        path.write_text("table 'Sales Total'\n\tpartition 'Sales Total' = m\n\t\tsource = " + expr + '\n')
+        model_path = Path(mdef, 'model.tmdl')
+        model_path.write_text(model_path.read_text().replace('ref table Sales', "ref table 'Sales Total'"))
+        res = deps.Resolver(tmdl.load_model(mdef))
+        res.expressions.update({name: name for name in res.model.tables})
+        bindings = deps.m_bindings(expr, res, base=7)
+        self.assertEqual([b.ref for b in bindings], [deps.Ref('m_query', '', 'Sales Total', 'm')])
+        self.assertFalse(bindings[0].uncertain)
+        start = 7 + expr.index('Sales Total')
+        self.assertEqual((bindings[0].start, bindings[0].end), (start, start + len('Sales Total')))
+        rename.rename(ws, project, 'table', 'Sales Total', 'Revenue')
+        self.assertIn('source = #shared[Revenue]', path.read_text())
+
     def test_m_shared_selector_only_dependency_is_used(self):
         from test_unused_atomic import UnusedAtomicTests, SALES
 
@@ -347,6 +363,58 @@ class RenameBindingsTests(unittest.TestCase):
                 self.assertEqual(graph.state[dead], 'unused')
                 self.assertEqual(unused.remove(ws, project, only=['m_query'])['result'], 'REMOVED')
                 self.assertEqual(set(tmdl.load_model(str(mdef)).expressions), {'Sales'})
+
+        ws, project = UnusedAtomicTests._project(self)
+        mdef = Path(project.mirror_model, 'definition')
+        (mdef / 'expressions.tmdl').write_text(
+            "expression 'Sales Total' = 1\n\nexpression GenuinelyUnused = 1\n")
+        (mdef / 'tables' / 'Sales.tmdl').write_text(
+            SALES + '\tpartition Sales = m\n\t\tsource = #shared[Sales Total]\n')
+        graph = usage.build(ws, project)
+        used = usage.key('m_query', '', 'Sales Total')
+        dead = usage.key('m_query', '', 'GenuinelyUnused')
+        self.assertIn(used, [e.dst for e in graph.out.get(usage.key('table', '', 'Sales'), [])])
+        self.assertEqual(graph.state[used], 'used')
+        self.assertEqual(graph.state[dead], 'unused')
+        self.assertEqual(unused.remove(ws, project, only=['m_query'])['result'], 'REMOVED')
+        self.assertEqual(set(tmdl.load_model(str(mdef)).expressions), {'Sales Total'})
+
+    def test_m_shared_selector_non_ident_is_uncertain(self):
+        model = tmdl.Model()
+        model.expressions = dict.fromkeys(('Sales + Total', 'Other'))
+        bindings = deps.m_bindings('{#shared[Sales + Total], Other}', deps.Resolver(model))
+        self.assertTrue(all(b.uncertain for b in bindings))
+        self.assertEqual({b.ref.name for b in bindings}, {'Sales + Total', 'Other'})
+
+    def test_m_shared_selector_fallback_merges_decoded_binding(self):
+        from test_unused_atomic import UnusedAtomicTests, SALES
+
+        expr = 'try #shared[/* note */ Sales] otherwise 0'
+        ws, project = UnusedAtomicTests._project(self)
+        mdef = Path(project.mirror_model, 'definition')
+        (mdef / 'tables' / 'Sales.tmdl').write_text(
+            SALES + '\tpartition Sales = m\n\t\tsource = ' + expr + '\n')
+        res = deps.Resolver(tmdl.load_model(str(mdef)))
+        res.expressions.update({name: name for name in res.model.tables})
+        bindings = deps.m_bindings(expr, res, base=7)
+        self.assertEqual([b.ref for b in bindings], [deps.Ref('m_query', '', 'Sales', 'm')])
+        self.assertTrue(bindings[0].uncertain)
+        start = 7 + expr.index('Sales')
+        self.assertEqual((bindings[0].start, bindings[0].end), (start, start + len('Sales')))
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, 'table', 'Sales', 'Revenue')
+        self.assertEqual(caught.exception.code, 'AMBIGUOUS')
+        self.assertEqual(_bytes(ws.mirror), before)
+        (mdef / 'expressions.tmdl').write_text(
+            'expression Sales = 1\n\nexpression GenuinelyUnused = 1\n')
+        graph = usage.build(ws, project)
+        used = usage.key('m_query', '', 'Sales')
+        dead = usage.key('m_query', '', 'GenuinelyUnused')
+        self.assertIn(used, [e.dst for e in graph.out[usage.key('table', '', 'Sales')]])
+        self.assertEqual(graph.state[dead], 'unused')
+        self.assertEqual(unused.remove(ws, project, only=['m_query'])['result'], 'REMOVED')
+        self.assertEqual(set(tmdl.load_model(str(mdef)).expressions), {'Sales'})
 
     def test_m_type_scan_stops_before_expression_operators(self):
         expressions = ['(Value.Type(1) = type number and Sales)',

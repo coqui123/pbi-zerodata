@@ -420,11 +420,13 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0,
                         # Lex the inner text to strip only surrounding M trivia;
                         # the edit span must leave comments and whitespace intact.
                         inner = lexers.significant(lexers.lex_m(selector.text[1:-1], selector.start + 1))
-                        if len(inner) == 1 and inner[0].kind == "ident":
-                            ident = inner[0]
-                            nm = ident.text
+                        if inner and all(tok.kind == "ident" for tok in inner):
+                            start, end = inner[0].start, inner[-1].end
+                            nm = expr[start - base:end - base]
                             if nm in res.expressions and nm != own:
-                                found.append((i + 2, nm, False, (ident.start, ident.end)))
+                                found.append((i + 2, nm, False, (start, end)))
+                        elif inner:
+                            uncertain = True
                         i += 3
                         continue
                     if (i + 4 < hi and selector.text == "[" and pairs.get(i + 2) == i + 4
@@ -466,10 +468,15 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0,
 
     walk(0, len(sig), set())
     if uncertain:
-        # Include tokens skipped as declarations or selectors too: uncertainty must
-        # never make the graph less conservative than a plain identifier scan.
-        found = [(i, possible_name(i), False, None) for i in range(len(sig))
-                 if possible_name(i) in res.expressions and possible_name(i) != own]
+        # Merge a plain scan for skipped declarations/selectors with decoded
+        # bindings, preserving their explicit spans and local flags on duplicates.
+        seen = {(nm, explicit_span or span(i)) for i, nm, local, explicit_span in found}
+        for i in range(len(sig)):
+            nm = possible_name(i)
+            key = (nm, span(i))
+            if nm in res.expressions and nm != own and key not in seen:
+                found.append((i, nm, False, None))
+                seen.add(key)
     return [Binding(Ref("m_query", "", nm, "m"), *(explicit_span or span(i)),
                     uncertain=uncertain) for i, nm, local, explicit_span in found if not local]
 
