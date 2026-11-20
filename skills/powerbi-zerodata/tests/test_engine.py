@@ -356,6 +356,7 @@ static IEnumerable<object?[]> Rows(int count, int bad) {
 // Exercise the production normalizer, including literal and comment extents.
 foreach (var pair in new[] {
     ("EVALUATE {1+2}", "EVALUATE {1 + 2}", true),
+    ("EVALUATE {1=1||2=3}", "EVALUATE {1=1 || 2=3}", true),
     ("EVALUATE {1 -- note\n+2}", "EVALUATE {1 -- note +2}", false),
     ("EVALUATE {1 // note\n+2}", "EVALUATE {1 // note +2}", false),
     ("EVALUATE {1 /* note */+2}", "EVALUATE {1 /* note */ + 2}", true),
@@ -826,7 +827,7 @@ def perf_workload_digest(query):
     tokens = re.findall(
         r'//[^\r\n]*|--[^\r\n]*|/\*[\s\S]*?(?:\*/|$)|'
         r'"(?:[^"]|"")*"|\'(?:[^\']|\'\')*\'|\[(?:[^\]]|\]\])*\]|'
-        r'[+\-*/^&=<>(),{}.:;!]|[^\s"\'\[+*/^&=<>(),{}.:;!\-]+', query)
+        r'[+\-*/^&=<>(),{}.:;!|]|[^\s"\'\[+*/^&=<>(),{}.:;!|\-]+', query)
     tokens = [re.sub(r"\s+", " ", token) if token.startswith(("//", "--", "/*"))
               else token for token in tokens]
     return digest("\x1f".join(tokens))
@@ -1250,6 +1251,21 @@ from unittest.mock import patch
 
 
 class PerfPrivacyTests(unittest.TestCase):
+    def test_workload_digest_spacing_and_comment_extents(self):
+        for left, right, equal in (
+            ("EVALUATE {1+2}", "EVALUATE {1 + 2}", True),
+            ("EVALUATE {1=1||2=3}", "EVALUATE {1=1 || 2=3}", True),
+            ("EVALUATE {1 -- note\n+2}", "EVALUATE {1 -- note +2}", False),
+            ("EVALUATE {1 // note\n+2}", "EVALUATE {1 // note +2}", False),
+            ("EVALUATE {1 /* note */+2}", "EVALUATE {1 /* note */ + 2}", True),
+            ("EVALUATE {1 /* note +2 */}", "EVALUATE {1 /* note */+2}", False),
+        ):
+            with self.subTest(query=left):
+                if equal:
+                    self.assertEqual(perf_workload_digest(left), perf_workload_digest(right))
+                else:
+                    self.assertNotEqual(perf_workload_digest(left), perf_workload_digest(right))
+
     def test_nested_workload_digest_value_is_private(self):
         query = 'EVALUATE ROW("workload", "a b")'
         workload = perf_workload_digest(query)

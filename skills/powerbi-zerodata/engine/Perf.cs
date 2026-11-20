@@ -341,7 +341,7 @@ public static class Perf
                     break;
                 }
             }
-            else if ("+-*/^&=<>(),{}.:;!".Contains(text[i]))
+            else if ("+-*/^&=<>(),{}.:;!|".Contains(text[i]))
             {
                 i++;
             }
@@ -349,7 +349,7 @@ public static class Perf
             {
                 i++;
                 while (i < text.Length && !char.IsWhiteSpace(text[i])
-                    && !"+-*/^&=<>(),{}.:;!".Contains(text[i])
+                    && !"+-*/^&=<>(),{}.:;!|".Contains(text[i])
                     && text[i] != '"' && text[i] != '\'' && text[i] != '['
                     && !(i + 1 < text.Length && text[i] == '/' && (text[i + 1] == '/' || text[i + 1] == '*'))) i++;
             }
