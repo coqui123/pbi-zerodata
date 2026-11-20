@@ -223,6 +223,62 @@ class PushBoundaryTests(unittest.TestCase):
         self.assertIn(other_real, writes)
         self.assertNotEqual(writes[other_real], before[other_rel])
 
+    def test_late_conflict_rolls_back_copied_and_removed_resources(self):
+        rel, _ = self._touch_mirror(".SemanticModel/")
+        target = mirror._real_path(self.ws, rel)
+        resources = Path(self.project.report_dir, "StaticResources", "RegisteredResources")
+        resources.mkdir(parents=True, exist_ok=True)
+        copied = resources / "copied.png"
+        removed = resources / "removed.png"
+        before_removed = b"original resource bytes\x00\xff"
+        removed.write_bytes(before_removed)
+        source = Path(self.ws.private, "pending-resource.png")
+        source.write_bytes(b"new resource bytes")
+        editor = b"EDITOR-AFTER-PUSH-WRITE\n"
+        original_write = mirror.write_text
+        original_journal = mirror._journal_save
+        journals = []
+        applied_writes = []
+
+        def write(path, *args, **kwargs):
+            result = original_write(path, *args, **kwargs)
+            if path == target:
+                applied_writes.append(Path(path).read_bytes())
+                Path(path).write_bytes(editor)
+            return result
+
+        def journal(directory, body):
+            result = original_journal(directory, body)
+            if body["state"] == "ROLLED_BACK":
+                journals.append(os.path.join(directory, "journal.json"))
+            return result
+
+        original_restore = mirror._restore_transaction
+
+        def restore(*args, **kwargs):
+            # Prove both resource operations landed before the late conflict rollback.
+            self.assertEqual(copied.read_bytes(), source.read_bytes())
+            self.assertFalse(removed.exists())
+            return original_restore(*args, **kwargs)
+
+        with patch("pbz.images.staged", return_value={"copied.png": str(source)}), \
+                patch("pbz.images.dropped", return_value=["removed.png"]), \
+                patch("pbz.mirror.write_text", write), \
+                patch("pbz.mirror._journal_save", journal), \
+                patch("pbz.mirror._restore_transaction", restore), \
+                patch("pbz.mirror.validate.run_stage", return_value=[]), \
+                patch("pbz.mirror.desktop.find_instance", return_value=None):
+            out = mirror.push(self.ws, self.project)
+        self.assertEqual(out["result"], "CONFLICT")
+        self.assertEqual(len(applied_writes), 1)
+        self.assertNotEqual(applied_writes[0], editor)
+        self.assertEqual(len(journals), 1)
+        with open(journals[0]) as handle:
+            self.assertEqual(json.load(handle)["state"], "ROLLED_BACK")
+        self.assertFalse(copied.exists())
+        self.assertEqual(removed.read_bytes(), before_removed)
+        self.assertEqual(Path(target).read_bytes(), editor)
+
     def test_untouched_candidate_bytes_survive_staging_conflict(self):
         trigger, _ = self._touch_mirror(".SemanticModel/")
         candidate, candidate_path = self._touch_mirror(".Report/")

@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
@@ -48,6 +49,40 @@ class RecoveryHonestyTests(unittest.TestCase):
         os.makedirs(directory)
         with open(os.path.join(directory, "journal.json"), "w", encoding="utf-8") as f:
             json.dump(body, f)
+
+    def _restore_with_editor_after_mutation(self, before):
+        rel = self.project.name + ".Report/definition/restore.json"
+        target = mirror._real_path(self.ws, rel)
+        after = b"push bytes"
+        editor = b"editor bytes"
+        if before is not None:
+            common.replace_bytes(target, before, root=self.ws.root)
+        directory, journal = mirror._begin_transaction(
+            self.ws, self.project, "restore-race", [("workspace", rel, common.sha(after))])
+        common.replace_bytes(target, after, root=self.ws.root)
+        operation = "remove_file" if before is None else "replace_bytes"
+        real = getattr(mirror, operation)
+
+        def mutate(path, *args, **kwargs):
+            result = real(path, *args, **kwargs)
+            if path == target:
+                with open(target, "wb") as handle:
+                    handle.write(editor)
+            return result
+
+        with patch.object(mirror, operation, mutate):
+            out = mirror._restore_transaction(self.ws, self.project, directory, journal)
+        self.assertEqual(out, {"result": "RECOVERY_CONFLICT", "conflicts": [rel]})
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "RECOVERY_REQUIRED")
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), editor)
+
+    def test_editor_after_restore_replace_requires_recovery(self):
+        self._restore_with_editor_after_mutation(b"before bytes")
+
+    def test_editor_after_restore_remove_requires_recovery(self):
+        self._restore_with_editor_after_mutation(None)
 
     def test_pending_recovery_blocks_every_pull(self):
         self._journal({"version": 1, "state": "APPLYING", "entries": []})

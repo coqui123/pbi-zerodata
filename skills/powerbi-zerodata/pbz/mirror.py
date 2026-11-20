@@ -783,6 +783,12 @@ def _restore_transaction(ws, project, directory, journal, *, preserve_external=F
                 content = f.read()
             trust = ws.root if entry.get("scope") == "workspace" else ws.private
             replace_bytes(target, content, root=trust)
+        restored = not os.path.lexists(target) if entry["before"] is None else file_sha(target) == entry["before"]
+        if not restored:
+            conflicts.append(entry["path"])
+            journal["state"] = "RECOVERY_REQUIRED"
+            _journal_save(directory, journal)
+            return {"result": "RECOVERY_CONFLICT", "conflicts": conflicts}
     journal["state"] = "ROLLED_BACK"
     _journal_save(directory, journal)
     return {"result": "ROLLED_BACK", **({"conflicts": conflicts} if conflicts else {})}

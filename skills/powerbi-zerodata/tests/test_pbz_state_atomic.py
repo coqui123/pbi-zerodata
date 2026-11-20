@@ -282,13 +282,18 @@ class StateAtomicTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "UNSAFE_PATH")
         self.assertEqual(source.read_bytes(), b"canary")
 
+    @unittest.skipIf(os.name == "nt", "cannot rename an open lock on Windows")
     def test_allocator_replaced_path_refused(self):
         original_open = os.open
 
         def swap(path, *args, **kwargs):
             fd = original_open(path, *args, **kwargs)
             if str(path).endswith("tokens.lock"):
-                os.rename(path, str(path) + ".old")
+                try:
+                    os.rename(path, str(path) + ".old")
+                except PermissionError:
+                    os.close(fd)
+                    self.skipTest("cannot rename an open lock")
                 Path(path).write_bytes(b"replacement")
             return fd
 
@@ -296,6 +301,66 @@ class StateAtomicTests(unittest.TestCase):
             with tokens.WorkspaceLock(self.ws.private):
                 self.fail("replaced path accepted")
         self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+
+    def test_allocator_stat_identity_mismatch_refused(self):
+        real_stat = os.stat
+        path = os.path.join(self.ws.private, "tokens.lock")
+
+        def changed(target, *args, **kwargs):
+            result = real_stat(target, *args, **kwargs)
+            if str(target) == path:
+                values = list(result)
+                values[1] += 1
+                return os.stat_result(values)
+            return result
+
+        with patch.object(tokens.os, "stat", changed), self.assertRaises(PbzError) as caught:
+            with tokens.WorkspaceLock(self.ws.private):
+                self.fail("mismatched identity accepted")
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+
+    @unittest.skipIf(os.name == "nt", "POSIX flock only")
+    def test_allocator_path_swapped_during_acquisition_refused(self):
+        import fcntl
+        real_flock = fcntl.flock
+        path = os.path.join(self.ws.private, "tokens.lock")
+        calls = []
+
+        def swapped(fd, operation):
+            if not calls:
+                os.rename(path, path + ".old")
+                with open(path, "wb") as handle:
+                    handle.write(b"replacement")
+            calls.append(operation)
+            return real_flock(fd, operation)
+
+        lock = tokens.WorkspaceLock(self.ws.private)
+        with patch.object(fcntl, "flock", swapped), self.assertRaises(PbzError) as caught:
+            with lock:
+                self.fail("post-acquisition swap accepted")
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+        self.assertEqual(lock.fd, -1)
+        self.assertEqual(len(calls), 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX flock only")
+    def test_allocator_posix_deadline(self):
+        import fcntl
+        with tokens.WorkspaceLock(self.ws.private):
+            # The old blocking implementation must fail promptly too, rather than hang the suite.
+            real_flock = fcntl.flock
+
+            def nonblocking(fd, operation):
+                self.assertTrue(operation & fcntl.LOCK_NB)
+                return real_flock(fd, operation)
+
+            with patch.object(fcntl, "flock", nonblocking), \
+                    patch.object(tokens.time, "monotonic", side_effect=[0, 120]), \
+                    patch.object(tokens.time, "sleep") as sleep:
+                with self.assertRaises(PbzError) as caught:
+                    with tokens.WorkspaceLock(self.ws.private):
+                        self.fail("busy lock accepted")
+            self.assertEqual(caught.exception.code, "COMMIT_BUSY")
+            sleep.assert_not_called()
 
     def test_windows_allocator_retry_classification_and_deadline(self):
         for errors, clock, expected in (
@@ -363,6 +428,54 @@ class StateAtomicTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "REFUSED")
             self.assertTrue(tm.dirty)
             self.assertEqual(kernel.CloseHandle.call_count, int(opened == 123))
+
+    def _assert_token_marker_matches(self, tm):
+        with open(os.path.join(self.ws.private, "tokens.durable"), "rb") as marker, open(tm.path, "rb") as payload:
+            self.assertEqual(marker.read(), tokens.sha(payload.read()).encode("ascii"))
+
+    def test_token_durability_failure_retried_by_fresh_map(self):
+        tm = tokens.TokenMap(self.ws.private)
+        tm.raw("pii", "first", "tmdl")
+        # Exercise the Windows-style flush hook portably, as the existing save tests do.
+        with patch.object(tokens.os, "name", "nt"), \
+                patch.object(tokens, "_flush_windows_directory") as flush:
+            tm.save()
+            self._assert_token_marker_matches(tm)
+            tm.raw("pii", "second", "tmdl")
+            flush.side_effect = PbzError("REFUSED", "directory flush failed")
+            with self.assertRaises(PbzError) as caught:
+                tm.save()
+            self.assertEqual(caught.exception.code, "REFUSED")
+            self.assertTrue(tm.dirty)
+            self.assertTrue(tm._unconfirmed)
+            fresh = tokens.TokenMap(self.ws.private)
+            self.assertFalse(fresh.dirty)
+            with self.assertRaises(PbzError) as caught:
+                fresh.save()
+            self.assertEqual(caught.exception.code, "REFUSED")
+            self.assertTrue(fresh._unconfirmed)
+            flush.side_effect = None
+            fresh.save()
+            self.assertFalse(fresh._unconfirmed)
+            flush.reset_mock()
+            tokens.TokenMap(self.ws.private).save()
+            flush.assert_not_called()
+            self._assert_token_marker_matches(tm)
+
+    def test_deleted_durability_marker_retries_clean_save(self):
+        tm = tokens.TokenMap(self.ws.private)
+        tm.raw("pii", "first", "tmdl")
+        with patch.object(tokens.os, "name", "nt"), \
+                patch.object(tokens, "_flush_windows_directory") as flush:
+            tm.save()
+            marker = os.path.join(self.ws.private, "tokens.durable")
+            os.remove(marker)
+            fresh = tokens.TokenMap(self.ws.private)
+            self.assertFalse(fresh.dirty)
+            flush.reset_mock()
+            fresh.save()
+            flush.assert_called_once()
+            self._assert_token_marker_matches(tm)
 
     def _junction(self, link: str, target: str) -> None:
         from _junction import make_junction

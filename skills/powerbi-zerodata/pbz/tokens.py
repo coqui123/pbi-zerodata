@@ -16,7 +16,7 @@ import time
 
 from . import dpapi, lexers, pbir, tmdl
 from .classify import PII_IN_TEXT, looks_like_long_digits, looks_like_phone
-from .common import PbzError, _reparse_link, sha
+from .common import PbzError, _reparse_link, read_checked, sha
 
 TOKEN_RE = re.compile(r"«[^«»\r\n]{1,300}»")
 FULL_JSON_TOKEN_RE = re.compile(r'"(«[^«»"\r\n]{1,300}»)"')
@@ -61,15 +61,7 @@ class WorkspaceLock:
         os.makedirs(self.directory, exist_ok=True)
         self.fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            opened = os.fstat(self.fd)
-            try:
-                live = os.stat(path)
-            except FileNotFoundError:
-                raise PbzError("UNSAFE_PATH", "lock path changed while opening") from None
-            if (_reparse_link(path) or not stat.S_ISREG(opened.st_mode)
-                    or getattr(opened, "st_nlink", 1) > 1
-                    or (opened.st_dev, opened.st_ino) != (live.st_dev, live.st_ino)):
-                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            self._verify_identity(path)
             if os.fstat(self.fd).st_size == 0:
                 try:
                     os.write(self.fd, b"\0")
@@ -92,7 +84,18 @@ class WorkspaceLock:
                         time.sleep(0.02)
             else:
                 import fcntl
-                fcntl.flock(self.fd, fcntl.LOCK_EX)
+                deadline = time.monotonic() + 120
+                while True:
+                    try:
+                        fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                            raise
+                        if time.monotonic() >= deadline:
+                            raise PbzError("COMMIT_BUSY", "workspace allocator lock timed out") from None
+                        time.sleep(0.02)
+            self._verify_identity(path)
             if os.fstat(self.fd).st_size == 0:
                 os.lseek(self.fd, 0, os.SEEK_SET)
                 os.write(self.fd, b"\0")
@@ -101,6 +104,17 @@ class WorkspaceLock:
             self.fd = -1
             raise
         return self
+
+    def _verify_identity(self, path):
+        opened = os.fstat(self.fd)
+        try:
+            live = os.stat(path)
+        except FileNotFoundError:
+            raise PbzError("UNSAFE_PATH", "lock path changed while opening") from None
+        if (_reparse_link(path) or not stat.S_ISREG(opened.st_mode)
+                or getattr(opened, "st_nlink", 1) > 1
+                or (opened.st_dev, opened.st_ino) != (live.st_dev, live.st_ino)):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
 
     def __exit__(self, *exc):
         # Closing releases the OS lock, including on process death. Never unlink.
@@ -143,9 +157,15 @@ class TokenMap:
         raw = dpapi.read_protected(self.path)
         self.data = json.loads(raw.decode("utf-8")) if raw else {"version": 1, "next": {}, "tokens": {}, "keys": {}}
         self.dirty = False
+        self.marker_path = os.path.join(private_dir, "tokens.durable")
+        self._unconfirmed = False
+        if os.path.exists(self.path):
+            digest = sha(read_checked(self.path, root=private_dir)).encode("ascii")
+            self._unconfirmed = (not os.path.exists(self.marker_path) or
+                                 read_checked(self.marker_path, root=private_dir) != digest)
 
     def save(self) -> None:
-        if not self.dirty:
+        if not (self.dirty or self._unconfirmed):
             return
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         if _reparse_link(directory) or _reparse_link(self.path):
@@ -158,6 +178,7 @@ class TokenMap:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
+            self._unconfirmed = True
             os.replace(tmp, self.path)
             tmp = ""
             if os.name != "nt":
@@ -168,6 +189,15 @@ class TokenMap:
                     os.close(dir_fd)
             else:
                 _flush_windows_directory(directory)
+            if _reparse_link(self.marker_path):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            fd, tmp = tempfile.mkstemp(prefix=".tokens-", suffix=".tmp", dir=directory)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(sha(payload).encode("ascii"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.marker_path)
+            tmp = ""
         finally:
             if tmp:
                 try:
@@ -175,6 +205,7 @@ class TokenMap:
                 except OSError:
                     pass
         self.dirty = False
+        self._unconfirmed = False
 
     def _new(self, label: str, key: str, rec: dict) -> str:
         existing = self.data["keys"].get(key)
