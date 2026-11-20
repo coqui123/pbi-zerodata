@@ -286,7 +286,7 @@ class Fixtures
         }
     }
 
-    static void Main(string[] args)
+    static int Main(string[] args)
     {
         if (args.Length > 1 && args[1] == "child-validate")
             Environment.Exit(ChildValidate(args));
@@ -297,16 +297,40 @@ class Fixtures
         P.Save(ctx, marker, definition, "catalog-A");
         var good = new P.Snapshot(marker, "catalog-A", definition, "v1");
         int passed = 0;
+        int failed = 0;
         void Check(string name, Action action, string? expectedReason)
         {
-            try { action(); if (expectedReason != null) throw new Exception(name + ": accepted"); }
-            catch (BadRequestException ex)
+            Exception? caught = null;
+            try { action(); }
+            catch (Exception ex) { caught = ex; }
+            string? failure = null;
+            if (expectedReason == null)
             {
-                if (expectedReason == null || !ex.Message.StartsWith(expectedReason + ":", StringComparison.Ordinal))
-                    throw new Exception(name + ": unexpected refusal reason", ex);
+                if (caught != null)
+                    failure = "unexpected " + caught.GetType().Name + ": " + caught.Message;
             }
-            passed++;
-            Console.WriteLine("PASS " + name);
+            else if (caught == null)
+            {
+                failure = "accepted, expected refusal " + expectedReason;
+            }
+            else if (caught is not BadRequestException)
+            {
+                failure = "unexpected " + caught.GetType().Name + ", expected refusal " + expectedReason + ": " + caught.Message;
+            }
+            else if (!caught.Message.StartsWith(expectedReason + ":", StringComparison.Ordinal))
+            {
+                failure = "unexpected refusal reason: " + caught.Message;
+            }
+            if (failure == null)
+            {
+                passed++;
+                Console.WriteLine("PASS " + name);
+            }
+            else
+            {
+                failed++;
+                Console.WriteLine("FAIL " + name + ": " + failure);
+            }
         }
         Check("passing manifest", () => P.Verify(ctx, good), null);
         // Counts-less definitions cover both offline and engine-maintained RowNumber shapes.
@@ -331,10 +355,12 @@ class Fixtures
             var model = Build();
             var baseline = good with { DefinitionValue = P.Definition(model) };
             Check(name + " baseline", () => P.Verify(ctx, baseline), null);
-            mutate(model);
-            Check(name, () => P.Buffered<int>(
-                () => baseline with { DefinitionValue = P.Definition(model) }, s => P.Verify(ctx, s),
-                () => throw new Exception("query ran on changed model")), expectedReason);
+            Check(name, () => {
+                mutate(model);
+                P.Buffered<int>(
+                    () => baseline with { DefinitionValue = P.Definition(model) }, s => P.Verify(ctx, s),
+                    () => throw new Exception("query ran on changed model"));
+            }, expectedReason);
         }
         Mutation("changed measure", m => m.Tables["T"].Measures["M"].Expression = "42");
         Mutation("changed calculated table", m => ((CalculatedPartitionSource)m.Tables["T"].Partitions[0].Source).Expression = "ROW(\"X\", 1)");
@@ -350,15 +376,17 @@ class Fixtures
         Mutation("private-prefixed table", m => m.Tables.Add(Extra("LocalDateTable_secret")));
         Mutation("private table with data partition", m => m.Tables["Private"].Partitions[0].Source = new MPartitionSource { Expression = "secret" }, "SYNTH_DATA_PARTITION");
         // Verify private and untagged tables present at signing remain covered, not just additions.
-        var privateModel = Build(); var hidden = Extra("LocalDateTable_signed"); hidden.IsPrivate = true;
-        privateModel.Tables.Add(hidden);
-        var privateDefinition = P.Definition(privateModel);
-        var signedPrivateTable = JsonNode.Parse(privateDefinition)!["tables"]!.AsArray()
-            .SingleOrDefault(t => t?["name"]?.GetValue<string>() == "LocalDateTable_signed");
-        if (signedPrivateTable == null) throw new Exception("private table omitted");
-        if (signedPrivateTable["partitions"]![0]!["source"]!["expression"]!.GetValue<string>()
-            != ((CalculatedPartitionSource)hidden.Partitions[0].Source).Expression)
-            throw new Exception("private table partition definition omitted");
+        Check("signed private table definition preserved", () => {
+            var privateModel = Build(); var hidden = Extra("LocalDateTable_signed"); hidden.IsPrivate = true;
+            privateModel.Tables.Add(hidden);
+            var privateDefinition = P.Definition(privateModel);
+            var signedPrivateTable = JsonNode.Parse(privateDefinition)!["tables"]!.AsArray()
+                .SingleOrDefault(t => t?["name"]?.GetValue<string>() == "LocalDateTable_signed");
+            if (signedPrivateTable == null) throw new Exception("private table omitted");
+            if (signedPrivateTable["partitions"]![0]!["source"]!["expression"]!.GetValue<string>()
+                != ((CalculatedPartitionSource)hidden.Partitions[0].Source).Expression)
+                throw new Exception("private table partition definition omitted");
+        }, null);
         Mutation("removed table", m => m.Tables.Remove("Other"));
         Mutation("calculated column expression", m => ((CalculatedColumn)m.Tables["T"].Columns["C"]).Expression = "42");
         Mutation("calculation item expression", m => m.Tables["CG"].CalculationGroup.CalculationItems["Item"].Expression = "42");
@@ -374,18 +402,46 @@ class Fixtures
         Check("invalid manifest signature", () => P.Verify(ctx, good), "SYNTH_MANIFEST_SIGNATURE");
         P.Save(ctx, marker, definition, "catalog-A");
         int queries = 0;
-        Check("verification unavailable", () => P.Buffered(
-            () => good with { MarkerValue = new string('b', 64) }, s => P.Verify(ctx, s), () => ++queries), "SYNTH_VERIFICATION_UNAVAILABLE");
-        if (queries != 0) throw new Exception("query ran without verification");
-        Check("live verification unavailable before query", () => P.Buffered<int>(
-            () => throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: live definition unavailable"),
-            s => P.Verify(ctx, s), () => ++queries), "SYNTH_VERIFICATION_UNAVAILABLE");
-        if (queries != 0) throw new Exception("query ran without live verification");
+        Check("verification unavailable", () => {
+            queries = 0;
+            try
+            {
+                P.Buffered(
+                    () => good with { MarkerValue = new string('b', 64) }, s => P.Verify(ctx, s), () => ++queries);
+            }
+            finally
+            {
+                if (queries != 0) throw new Exception("query ran without verification");
+            }
+        }, "SYNTH_VERIFICATION_UNAVAILABLE");
+        Check("live verification unavailable before query", () => {
+            queries = 0;
+            try
+            {
+                P.Buffered<int>(
+                    () => throw new BadRequestException("SYNTH_VERIFICATION_UNAVAILABLE: live definition unavailable"),
+                    s => P.Verify(ctx, s), () => ++queries);
+            }
+            finally
+            {
+                if (queries != 0) throw new Exception("query ran without live verification");
+            }
+        }, "SYNTH_VERIFICATION_UNAVAILABLE");
         int captures = 0;
-        Check("edit between verification and execution", () => P.Buffered(
-            () => ++captures == 1 ? good : good with { DefinitionValue = "edited" },
-            s => P.Verify(ctx, s), () => ++queries), "SYNTH_DEFINITION_CHANGED");
-        if (queries != 1 || captures != 2) throw new Exception("race fixture did not execute both checks");
+        Check("edit between verification and execution", () => {
+            queries = 0;
+            captures = 0;
+            try
+            {
+                P.Buffered(
+                    () => ++captures == 1 ? good : good with { DefinitionValue = "edited" },
+                    s => P.Verify(ctx, s), () => ++queries);
+            }
+            finally
+            {
+                if (queries != 1 || captures != 2) throw new Exception("race fixture did not execute both checks");
+            }
+        }, "SYNTH_DEFINITION_CHANGED");
         captures = 0;
         Check("version changed while definition restored", () => P.Buffered(
             () => ++captures == 1 ? good : good with { Version = "v2" },
@@ -528,17 +584,17 @@ class Fixtures
             string? copiedFile = null;
             string? snapshot = null;
             int copies = 0;
-            afterCopy.SetValue(null, (Action<string>)(target => {
-                if (Interlocked.Increment(ref copies) != 1) return;
-                copiedFile = target;
-                paused.Set();
-                if (!resume.Wait(TimeSpan.FromSeconds(120))) throw new Exception("copy timeout fixture was not released");
-            }));
-            afterCleanup.SetValue(null, (Action<string>)(path => {
-                if (path == snapshot) cleaned.Set();
-            }));
             try
             {
+                afterCopy.SetValue(null, (Action<string>)(target => {
+                    if (Interlocked.Increment(ref copies) != 1) return;
+                    copiedFile = target;
+                    paused.Set();
+                    if (!resume.Wait(TimeSpan.FromSeconds(120))) throw new Exception("copy timeout fixture was not released");
+                }));
+                afterCleanup.SetValue(null, (Action<string>)(path => {
+                    if (path == snapshot) cleaned.Set();
+                }));
                 validation = Task.Run(() => {
                     try { return TmdlValidate.Run(request, timeoutCtx); }
                     finally { returned.Set(); }
@@ -807,7 +863,8 @@ class Fixtures
                 finally { DisposeChild(recovery, pausedD, resumeD); }
             }
         }, null);
-        Console.WriteLine($"{passed} passed, 0 failed");
+        Console.WriteLine($"{passed} passed, {failed} failed");
+        return failed == 0 ? 0 : 1;
     }
 }
 '''
