@@ -612,7 +612,7 @@ class EquivalenceTests(unittest.TestCase):
 
     def test_platform_scoped_mcp_skips(self):
         allowed = json.loads((BASELINE.parent / 'offline_skips.json').read_text())['windows']['mcp']
-        self.assertEqual(len(allowed), 6)
+        self.assertEqual(len(allowed), 7)
         for platform, extra, passes in [('Windows-2025', False, True), ('Windows-2025', True, False), ('Linux', False, False)]:
             ref, shards = self.reports()
             for report in [ref, *shards]:
