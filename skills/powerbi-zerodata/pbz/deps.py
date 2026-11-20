@@ -470,7 +470,7 @@ def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0,
     if uncertain:
         # Merge a plain scan for skipped declarations/selectors with decoded
         # bindings, preserving their explicit spans and local flags on duplicates.
-        seen = {(nm, explicit_span or span(i)) for i, nm, local, explicit_span in found}
+        seen = {(nm, explicit_span or span(i)) for i, nm, local, explicit_span in found if not local}
         for i in range(len(sig)):
             nm = possible_name(i)
             key = (nm, span(i))
