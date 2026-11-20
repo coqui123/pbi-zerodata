@@ -334,6 +334,9 @@ def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tu
     nl = doc.text.find("\n", after)
     line_index = bisect_right(doc.line_offsets, after) - 1
     line_end = doc.line_offsets[line_index] + len(lines[line_index][1])
+    if line_end == len(doc.text) and line_index > 0:
+        # An unterminated final line inherits the preceding line's ending.
+        line_end = doc.line_offsets[line_index - 1] + len(lines[line_index - 1][1])
     eol = "\r\n" if doc.text[line_end:line_end + 2] == "\r\n" else "\n"
     line = "\t" * (node.indent + 1) + prop + (f": {value}" if value is not None else "") + eol
     if nl < 0:

@@ -176,6 +176,18 @@ class EditRefusalTests(unittest.TestCase):
                         if r.prop == "description"]
         self.assertEqual(descriptions, [" After description"])
 
+    def test_property_insert_at_unterminated_eof_preserves_eol(self):
+        from pbz.tokens import apply_edits
+        for prefix, eol in (("table T\r\n", "\r\n"), ("table T\n", "\n"),
+                            ("table T\n\r\n", "\r\n"), ("table T\r\n\n", "\n"), ("", "\n")):
+            with self.subTest(prefix=repr(prefix)):
+                text = prefix + "\tmeasure M = 7"
+                doc = tmdl.parse("tables/T.tmdl", text)
+                node = next(n for n in doc.nodes if n.kind == "measure")
+                result = apply_edits(text, tmdl.prop_edit(doc, node, "displayFolder", "KPIs"))
+                self.assertEqual(result.encode(),
+                                 (text + eol + "\t\tdisplayFolder: KPIs" + eol).encode())
+
     def test_pending_description_before_sibling_property_does_not_expand_target_span(self):
         for eol in ("\n", "\r\n"):
             for action in ("move", "delete"):

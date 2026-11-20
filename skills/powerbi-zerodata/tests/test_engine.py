@@ -332,16 +332,14 @@ def test_grouped_streaming(tmp: Path) -> None:
     import xml.etree.ElementTree as ET
     helper = tmp / "grouped-streaming"
     helper.mkdir()
+    artifacts = tmp / "grouped-streaming-artifacts"
     project = ET.Element("Project", Sdk="Microsoft.NET.Sdk")
     properties = ET.SubElement(project, "PropertyGroup")
     for key, value in {"OutputType": "Exe", "TargetFramework": "net10.0",
                        "RuntimeIdentifier": "win-x64", "ImplicitUsings": "enable", "Nullable": "enable"}.items():
         ET.SubElement(properties, key).text = value
     refs = ET.SubElement(project, "ItemGroup")
-    ET.SubElement(refs, "ProjectReference", Include=str(S / "engine" / "PbzEngine.csproj"),
-                  GlobalPropertiesToRemove="BaseIntermediateOutputPath;BaseOutputPath",
-                  AdditionalProperties=(f"BaseIntermediateOutputPath={helper / 'engine-obj'}/;"
-                                        f"BaseOutputPath={helper / 'engine-bin'}/"))
+    ET.SubElement(refs, "ProjectReference", Include=str(S / "engine" / "PbzEngine.csproj"))
     ET.ElementTree(project).write(helper / "Grouped.csproj", encoding="unicode")
     (helper / "Program.cs").write_text(r'''
 using System.Text.Json.Nodes;
@@ -377,12 +375,22 @@ try {
     int loads = 0;
     var snapshot = new Checks.RequestSnapshot(() => { loads++; return null; });
     Func<object?[], JsonObject> Factory() => Checks.GroupFactory(snapshot, by, columns, reveal, allow, vault);
-    snapshot.Snapshot();
+    Assert(loads == 0, "fresh holder has not loaded");
     var firstFactory = Factory();
+    Assert(loads == 1, "first factory build loads snapshot");
     var secondFactory = Factory();
+    Assert(loads == 1, "second factory build reuses snapshot");
     firstFactory(new object?[] { "first" });
     secondFactory(new object?[] { "second" });
     Assert(loads == 1, "one production holder load across two factories and group calls");
+    snapshot.Invalidate();
+    firstFactory(new object?[] { "after invalidation" });
+    secondFactory(new object?[] { "after invalidation" });
+    Assert(loads == 1, "pre-existing factories leave invalidated holder alone");
+    var newFactory = Factory();
+    Assert(loads == 2, "new factory build reloads invalidated snapshot");
+    newFactory(new object?[] { "new snapshot" });
+    Assert(loads == 2, "new factory group call does not reload");
     foreach (var test in new[] { (0, 0, "EMPTY", "NONE"), (23, 0, "PASS", "NONE"),
                                  (23, 1, "FAIL", "ONE"), (23, 4, "FAIL", "FEW"),
                                  (23, 20, "FAIL", "MANY"), (1000000, 20, "FAIL", "MANY") }) {
@@ -399,7 +407,7 @@ try {
                 expected.Add(new JsonObject { ["T[Key]"] = new JsonObject { ["reveal"] = "g" + i.ToString("D8") } });
             Assert(JsonNode.DeepEquals(result["groups"], expected), "independently expected exact sample");
         }
-        Assert(loads == 1, "one actual request snapshot load across checks");
+        Assert(loads == 2, "no further request snapshot loads across checks");
     }
     // Shuffling supplements independently expected results; duplicates must survive sampling.
     var input = Rows(23, 20).ToArray();
@@ -466,17 +474,25 @@ try {
 } finally { Directory.Delete(directory, true); }
 ''', "utf-8")
     label = "offline grouped streaming: exact verdicts, samples, consumption, retention and index loads"
-    try:
-        proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Grouped.csproj"),
-                               f"-p:BaseIntermediateOutputPath={helper / 'obj'}/",
-                               f"-p:BaseOutputPath={helper / 'bin'}/"],
-                              capture_output=True, timeout=300)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        expect(label, False, {"reason": f"{type(exc).__name__}: {exc}"})
-        return
-    expect(label, proc.returncode == 0 and b"grouped streaming acceptance passed" in proc.stdout,
-           {"exit": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace"),
-            "stderr": proc.stderr.decode("utf-8", "replace")})
+    # Global settings also apply to implicit restore and referenced projects. The engine
+    # sets BaseOutputPath itself, so override it along with the SDK artifacts layout.
+    for attempt in range(2):
+        try:
+            proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Grouped.csproj"),
+                                   "--artifacts-path", str(artifacts),
+                                   f"-p:BaseOutputPath={artifacts / 'bin'}/"],
+                                  capture_output=True, timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            expect(label, False, {"reason": f"{type(exc).__name__}: {exc}"})
+            return
+        expect(f"{label} (build {attempt + 1})",
+               proc.returncode == 0 and b"grouped streaming acceptance passed" in proc.stdout,
+               {"exit": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace"),
+                "stderr": proc.stderr.decode("utf-8", "replace")})
+        source_artifacts = [str(path) for source in (helper, S / "engine")
+                            for name in ("obj", "bin") for path in source.rglob(name) if path.is_dir()]
+        expect(f"grouped streaming build {attempt + 1}: no source obj/bin directories",
+               not source_artifacts, {"paths": source_artifacts})
 
 
 def test_offline(env: Env, tmp: Path) -> None:
@@ -1238,8 +1254,9 @@ class GroupedStreamingLauncherTests(unittest.TestCase):
             self.assertIn(type(error).__name__, detail["reason"])
             self.assertIn(str(error), detail["reason"])
             command = run.call_args.args[0]
-            self.assertIn(f"-p:BaseIntermediateOutputPath={Path(directory) / 'grouped-streaming' / 'obj'}/", command)
-            self.assertIn(f"-p:BaseOutputPath={Path(directory) / 'grouped-streaming' / 'bin'}/", command)
+            artifacts = Path(directory) / "grouped-streaming-artifacts"
+            self.assertEqual(command[command.index("--artifacts-path") + 1], str(artifacts))
+            self.assertIn(f"-p:BaseOutputPath={artifacts / 'bin'}/", command)
 
     def test_missing_sdk_is_recorded(self):
         self.assert_launch_failure(FileNotFoundError("dotnet SDK missing"))
