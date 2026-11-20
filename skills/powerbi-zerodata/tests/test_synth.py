@@ -204,6 +204,24 @@ using P = PbzEngine.SyntheticProvenance;
 
 class Fixtures
 {
+    // TOM creates RowNumber columns internally and the pinned AMO 19.118.3 exposes no
+    // public RowNumberColumn constructor, so the fixture builds one through the
+    // non-public constructor to exercise Provenance.Verify's RowNumber counting.
+    static RowNumberColumn MakeRowNumber(string name)
+    {
+        try
+        {
+            var column = (RowNumberColumn)Activator.CreateInstance(typeof(RowNumberColumn),
+                BindingFlags.Instance | BindingFlags.NonPublic, null, null, null)!;
+            column.Name = name;
+            return column;
+        }
+        catch (Exception ex)
+        {
+            throw new Exception("MakeRowNumber: RowNumberColumn has no usable non-public constructor in the pinned AMO 19.118.3", ex);
+        }
+    }
+
     static Model Build()
     {
         var database = new Database { Name = "Fixture", CompatibilityLevel = 1600 };
@@ -218,7 +236,7 @@ class Fixtures
                 Expression = "DATATABLE(\"X\", INTEGER, {{1}})" } });
             model.Tables.Add(table);
         }
-        model.Tables["T"].Columns.Add(new RowNumberColumn { Name = "RowNumber" });
+        model.Tables["T"].Columns.Add(MakeRowNumber("RowNumber"));
         model.Tables["T"].Measures.Add(new Measure { Name = "M", Expression = "SUM('T'[X])", FormatString = "0" });
         model.Tables["T"].Columns.Add(new CalculatedColumn { Name = "C", Expression = "[X] + 1", DataType = DataType.Int64 });
         var group = new Table { Name = "CG", CalculationGroup = new CalculationGroup() };
@@ -322,7 +340,7 @@ class Fixtures
         Mutation("changed calculated table", m => ((CalculatedPartitionSource)m.Tables["T"].Partitions[0].Source).Expression = "ROW(\"X\", 1)");
         Mutation("edited DATATABLE row", m => ((CalculatedPartitionSource)m.Tables["T"].Partitions[0].Source).Expression = "DATATABLE(\"X\", INTEGER, {{123456}})");
         Mutation("added column", m => m.Tables["T"].Columns.Add(new CalculatedColumn { Name = "Added", Expression = "1", DataType = DataType.Int64 }));
-        Mutation("second RowNumber column", m => m.Tables["T"].Columns.Add(new RowNumberColumn { Name = "SecondRowNumber" }));
+        Mutation("second RowNumber column", m => m.Tables["T"].Columns.Add(MakeRowNumber("SecondRowNumber")));
         Table Extra(string name, bool data = false) {
             var t = new Table { Name = name };
             t.Partitions.Add(new Partition { Name = "P", Source = data ? new MPartitionSource { Expression = "secret" } : new CalculatedPartitionSource { Expression = "ROW(\"X\", 1)" } });
@@ -397,7 +415,7 @@ class Fixtures
         var beforeInventory = typeof(TmdlValidate).GetField("BeforeInventoryForTests", BindingFlags.Static | BindingFlags.NonPublic)!;
         Check("validation copies only TMDL and cleans read-only snapshot", () => {
             var source = Path.Combine(args[0], "readonly-source");
-            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(Build().Database, source);
+            Microsoft.AnalysisServices.Tabular.TmdlSerializer.SerializeDatabaseToFolder((Microsoft.AnalysisServices.Tabular.Database)Build().Database, source);
             var readOnlyFile = Path.Combine(source, "tables", "T.tmdl");
             var originalAttributes = File.GetAttributes(readOnlyFile);
             File.SetAttributes(readOnlyFile, originalAttributes | FileAttributes.ReadOnly);
@@ -453,8 +471,8 @@ class Fixtures
             var raceMarker = new string('d', 64);
             candidate.Annotations.Add(new Annotation { Name = "PBZ_SYNTHETIC", Value = raceMarker });
             var source = Path.Combine(args[0], "race-source");
-            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(candidate.Database, source);
-            var expected = P.Definition(Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer
+            Microsoft.AnalysisServices.Tabular.TmdlSerializer.SerializeDatabaseToFolder((Microsoft.AnalysisServices.Tabular.Database)candidate.Database, source);
+            var expected = P.Definition(Microsoft.AnalysisServices.Tabular.TmdlSerializer
                 .DeserializeDatabaseFromFolder(source).Model);
             var racePrivate = Path.Combine(args[0], "race-private");
             var raceCtx = new Ctx("tmdl-validate");
@@ -494,7 +512,7 @@ class Fixtures
         }, null);
         Check("copy timeout retains ownership until worker finishes and recovers stale snapshots", () => {
             var source = Path.Combine(args[0], "timeout-source");
-            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(Build().Database, source);
+            Microsoft.AnalysisServices.Tabular.TmdlSerializer.SerializeDatabaseToFolder((Microsoft.AnalysisServices.Tabular.Database)Build().Database, source);
             var scratch = Path.Combine(args[0], "timeout-private");
             var timeoutCtx = new Ctx("tmdl-validate");
             var request = Req.Parse(new JsonObject { ["private_dir"] = scratch,
@@ -604,7 +622,7 @@ class Fixtures
             File.WriteAllText(liveMarker, "");
             using var lease = new FileStream(liveMarker, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
             var source = Path.Combine(scratch, "tmdl-validate-source");
-            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(Build().Database, source);
+            Microsoft.AnalysisServices.Tabular.TmdlSerializer.SerializeDatabaseToFolder((Microsoft.AnalysisServices.Tabular.Database)Build().Database, source);
             var sourceBytes = Directory.GetFiles(source, "*", SearchOption.AllDirectories)
                 .ToDictionary(f => Path.GetRelativePath(source, f), File.ReadAllBytes);
             // Even an unleased marker must not override candidate protection (invariant 4).
@@ -661,7 +679,7 @@ class Fixtures
             var privateDir = Path.Combine(args[0], "two-process-private");
             var source = Path.Combine(args[0], "two-process-source");
             Directory.CreateDirectory(privateDir);
-            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(Build().Database, source);
+            Microsoft.AnalysisServices.Tabular.TmdlSerializer.SerializeDatabaseToFolder((Microsoft.AnalysisServices.Tabular.Database)Build().Database, source);
             System.Collections.Generic.Dictionary<string, byte[]> SnapshotBytes(string dir) =>
                 Directory.GetFiles(dir, "*", SearchOption.AllDirectories)
                     .ToDictionary(f => Path.GetRelativePath(dir, f), File.ReadAllBytes);
