@@ -595,7 +595,9 @@ class Fixtures
                     if (!resume.Wait(TimeSpan.FromSeconds(120))) throw new Exception("copy timeout fixture was not released");
                 }));
                 afterCleanup.SetValue(null, (Action<string>)(path => {
-                    if (path == snapshot) cleaned.Set();
+                    var snap = snapshot;
+                    if (snap == null || string.IsNullOrEmpty(path)) return;
+                    if (string.Equals(Path.GetFullPath(path), Path.GetFullPath(snap), StringComparison.OrdinalIgnoreCase)) cleaned.Set();
                 }));
                 validation = Task.Run(() => {
                     try { return TmdlValidate.Run(request, timeoutCtx); }
