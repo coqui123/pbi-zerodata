@@ -714,6 +714,31 @@ def test_live_index_binding(env: Env, tmp: Path) -> None:
         groups = raw_a.get("checks", raw_a.get("results", []))[0].get("groups", [])
         expect("A genuine category member still reveals", groups == [
             {"Project[Status]": {"reveal": "Closed"}}], raw_a)
+        # A complete, hash-valid generation still needs the live model stamp.
+        manifest_path = env.pd / "index-current.json"
+        stamped_manifest = manifest_path.read_bytes()
+        manifest = json.loads(stamped_manifest)
+        unstamped = "index-" + os.urandom(16).hex()
+        unstamped_dir = env.pd / unstamped
+        shutil.copytree(env.pd / manifest["generation"], unstamped_dir)
+        index_path = unstamped_dir / "index.json"
+        idx = json.loads(index_path.read_bytes())
+        expect("binding source generation has a model stamp", bool(idx.get("model_stamp")))
+        idx.pop("model_stamp", None)
+        index_path.write_bytes(json.dumps(idx).encode("utf-8"))
+        manifest["generation"] = unstamped
+        manifest["sha256"] = {name: hashlib.sha256((unstamped_dir / name).read_bytes()).hexdigest()
+                              for name in index_store.FILES}
+        try:
+            manifest_path.write_text(json.dumps(manifest), "utf-8")
+            expect("unstamped generation is complete and hash-valid", index_store.load(str(env.pd), "A") is not None)
+            unstamped_result = grouped(env, "binding-check-a-unstamped", shared)
+            groups = unstamped_result.get("checks", unstamped_result.get("results", []))[0].get("groups", [])
+            expect("missing model stamp prevents category reveal", groups and all(
+                set(g["Project[Status]"]) == {"hmac"} for g in groups), unstamped_result)
+        finally:
+            manifest_path.write_bytes(stamped_manifest)
+
         many = grouped(b, "binding-check-b-max-ten")
         groups = many.get("checks", many.get("results", []))[0].get("groups", [])
         expect("failing grouped equal returns at most ten HMAC groups", len(groups) == 10 and all(

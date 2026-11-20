@@ -220,6 +220,15 @@ def main() -> int:
     check(r["evidence"] == {"static": True, "index": False, "memory": "none"}, f"evidence: {r['evidence']}")
     it = find(r, "ITERATOR_MEASURE_CALL", "[Iter Call]")[0]
     check(it["severity"] == "low" and "rows unknown" in it["evidence"][0], f"no buckets, low severity: {it}")
+    no_index_policy = policy.load(ws)
+    policy.save(ws, dict(no_index_policy, disclosure="strict"))
+    try:
+        no_index_strict = audit.run(ws, project, rules=["ITERATOR_MEASURE_CALL", "NESTED_ITERATOR"])
+        for finding in no_index_strict["findings"]:
+            check(finding["evidence"] == ["static (rows unknown: run pbz index)"],
+                  f"strict iterator without an index reports unknown rows: {finding}")
+    finally:
+        policy.save(ws, no_index_policy)
     nest = find(r, "NESTED_ITERATOR", "[Nested Iter]")[0]
     check("via [Inner X]" in nest["message"], f"nested through a measure: {nest}")
     calc = find(r, "CALC_COLUMN_AS_MEASURE")[0]
@@ -272,10 +281,20 @@ def main() -> int:
           "same populated generation has identical severity under shape and strict")
     for rule in ("ITERATOR_MEASURE_CALL", "HIGH_CARDINALITY_BIDIRECTIONAL", "UNUSED_HIGH_CARDINALITY"):
         check(bool(find(strict, rule)), f"strict retains band-driven rule {rule}")
+    band_rules = ("NESTED_ITERATOR", "ITERATOR_MEASURE_CALL", "HIGH_CARDINALITY_BIDIRECTIONAL",
+                  "UNUSED_HIGH_CARDINALITY")
+    for rule in band_rules:
+        for finding in find(strict, rule):
+            rendered = json.dumps({key: finding.get(key) for key in ("message", "evidence", "fix", "verify")})
+            check(all(band not in rendered for band in ("10k+", "1k-9k", "(index)")),
+                  f"strict complete finding withholds stored bands: {rendered}")
+            if rule in ("NESTED_ITERATOR", "ITERATOR_MEASURE_CALL"):
+                check("run pbz index" not in rendered and "rows withheld: strict disclosure" in rendered,
+                      f"indexed strict iterator explains withheld rows: {rendered}")
+    check("10k+" in json.dumps(find(r, "HIGH_CARDINALITY_BIDIRECTIONAL")),
+          "shape bidirectional finding retains band text")
     check("10k+" not in json.dumps([f["evidence"] for f in strict["findings"]]),
           "strict evidence withholds index bands")
-    check(find(strict, "ITERATOR_MEASURE_CALL", "[Iter Call]")[0]["evidence"] == ["static (rows unknown: run pbz index)"],
-          "strict iterator uses existing no-band evidence")
     pol["disclosure"] = original_disclosure
     policy.save(ws, pol)
 

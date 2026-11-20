@@ -818,8 +818,9 @@ def _index(ws, project) -> dict:
                                 "value_cap": 50000, "disclosure": pol.get("disclosure", "shape")}, timeout=1800)
     if not res.get("ok"):
         raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
-    moved = harden_index(ws, pol)
-    blobs = {name: read_checked(os.path.join(ws.private, name), root=ws.private)
+    moved, pinned = harden_index(ws, pol)
+    blobs = {name: pinned[name] if pinned[name] is not None else
+             read_checked(os.path.join(ws.private, name), root=ws.private)
              for name in ("index.json", "categories.bin")}
     expected = {name: hashlib.sha256(raw).hexdigest() for name, raw in blobs.items()}
     res["tables"] = _rebuild_summary(ws.private, res.get("tables", []), idx=json.loads(blobs["index.json"]))
@@ -845,7 +846,7 @@ def _rebuild_summary(private_dir, tables, idx=None):
     return tables
 
 
-def harden_index(ws, pol: dict) -> int:
+def harden_index(ws, pol: dict) -> tuple[int, dict[str, bytes | None]]:
     """Low-cardinality columns with personal or ID names are sensitive whatever their size: move their
     values out of categories.bin into HMAC sets (whole values + name words) so free text can be checked."""
     from .classify import is_id_column, is_pii_column
@@ -858,12 +859,15 @@ def harden_index(ws, pol: dict) -> int:
     except OSError:
         raise PbzError("REFUSED", "index is missing or unreadable") from None
     try:
-        idx = json.loads(read_checked(idx_path, root=ws.private).decode("utf-8"))
+        idx_raw = read_checked(idx_path, root=ws.private)
+        idx = json.loads(idx_raw.decode("utf-8"))
     except PbzError:
         raise
     except ValueError:
         raise PbzError("REFUSED", "index is missing or unreadable") from None
-    raw = dpapi.read_protected(cat_path)
+    cat_raw = read_checked(cat_path, root=ws.private) if os.path.lexists(cat_path) else None
+    raw = dpapi.unprotect(cat_raw) if cat_raw is not None else None
+    pinned = {"index.json": idx_raw, "categories.bin": cat_raw}
     cats = json.loads(raw.decode("utf-8")) if raw else {}
     key = dpapi.load_key(ws.private)
     forced = {c.lower() for c in pol.get("sensitive_columns", [])}
@@ -893,8 +897,9 @@ def harden_index(ws, pol: dict) -> int:
         directory = os.path.dirname(idx_path) or "."
         fd, tmp = tempfile.mkstemp(prefix="index.", suffix=".tmp", dir=directory)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(idx, handle)
+            data = json.dumps(idx).encode("utf-8")
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
             if _reparse_link(idx_path):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")
             os.replace(tmp, idx_path)
@@ -905,8 +910,10 @@ def harden_index(ws, pol: dict) -> int:
                     os.remove(tmp)
                 except OSError:
                     pass
-        dpapi.write_protected(cat_path, json.dumps(cats, ensure_ascii=False).encode("utf-8"))
-    return moved
+        pinned["index.json"] = data
+        pinned["categories.bin"] = dpapi.write_protected(
+            cat_path, json.dumps(cats, ensure_ascii=False).encode("utf-8"))
+    return moved, pinned
 
 
 def _snapshot_spec_path(ws, name: str) -> str:

@@ -388,10 +388,59 @@ class IndexGenerationTests(unittest.TestCase):
                 self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Owner]"]["class"], "high")
                 self.assertNotIn("T[Owner]", json.loads(dpapi.unprotect(stored["categories.bin"])))
 
+    def test_index_publishes_hardener_bytes_after_staging_replacement(self):
+        harden = checks.harden_index
+        snapshot = {}
+
+        def replace_staging(ws, pol):
+            result = harden(ws, pol)
+            snapshot.update(result[1])
+            path = Path(ws.private) / "index.json"
+            idx = json.loads(path.read_bytes())
+            idx["columns"]["T[Owner]"]["class"] = "category"
+            path.write_bytes(json.dumps(idx).encode("utf-8"))
+            return result
+
+        with patch("pbz.checks.harden_index", replace_staging):
+            self.run_index(self.a)
+        stored = index_store.load(self.ws.private, "A")
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["index.json"], snapshot["index.json"])
+        self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Owner]"]["class"], "high")
+        manifest = json.loads((Path(self.ws.private) / "index-current.json").read_bytes())
+        self.assertEqual((Path(self.ws.private) / manifest["generation"] / "index.json").read_bytes(),
+                         snapshot["index.json"])
+
+    def test_prune_enumeration_failure_keeps_committed_publication(self):
+        for mid_iteration in (False, True):
+            with self.subTest(mid_iteration=mid_iteration):
+                self.cls = "category"
+                self.run_index(self.a)
+                path = Path(self.ws.private) / "index-current.json"
+                first = json.loads(path.read_bytes())["generation"]
+                self.cls = "high"
+
+                def broken_scan(*args):
+                    if mid_iteration:
+                        yield SimpleNamespace(name="unrelated")
+                    raise OSError("enumeration failed")
+
+                kwargs = ({"side_effect": broken_scan} if mid_iteration else
+                          {"side_effect": OSError("enumeration failed")})
+                with patch("pbz.index_store.os.scandir", **kwargs):
+                    self.run_index(self.a)
+                manifest = json.loads(path.read_bytes())
+                self.assertNotEqual(manifest["generation"], first)
+                stored = index_store.load(self.ws.private, "A")
+                self.assertIsNotNone(stored)
+                self.assertEqual(json.loads(stored["index.json"])["columns"]["T[Status]"]["class"], "high")
+                for name, raw in stored.items():
+                    self.assertEqual((Path(self.ws.private) / manifest["generation"] / name).read_bytes(), raw)
+
     def test_category_values_require_matching_known_type(self):
         self.run_index(self.a)
         col = self.model.column("T", "Status")
-        for dtype, expected in (("STRING", ["Shared", "Member"]), ("boolean", None),
+        for dtype, expected in (("STRING", ["Shared", "Member"]), ("binary", None),
                                 ("", ["Shared", "Member"])):
             with self.subTest(dtype=dtype):
                 col.data_type = dtype

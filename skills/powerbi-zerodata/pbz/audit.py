@@ -474,7 +474,9 @@ class Audit:
                         f"{c.name}('{dom}') iterates {', '.join(sorted(set(inner))[:4])} for every row: reduce the "
                         "outer grain (iterate VALUES of the needed columns) or hoist the inner part into a VAR when it "
                         "does not depend on the row",
-                        severity=sev, confidence="medium", evidence=ev or ["static (rows unknown: run pbz index)"],
+                        severity=sev, confidence="medium",
+                        evidence=ev or (["static (rows withheld: strict disclosure)"] if rows is not None else
+                                         ["static (rows unknown: run pbz index)"]),
                         fix="rewrite, then compare old and new with pbz synth check (equal) before pbz check",
                         identity=f"{_tag(m.node, m.name)}|{c.name}|{dom}"))
                     continue
@@ -491,7 +493,8 @@ class Audit:
                     "per row). Iterate the distinct values that matter (VALUES or SUMMARIZE of the grouping columns) or "
                     "aggregate the column directly when the measure is a plain aggregation",
                     severity="medium" if big else "low", confidence="medium" if fact else "low",
-                    evidence=ev or ["static (rows unknown: run pbz index)"],
+                    evidence=ev or (["static (rows withheld: strict disclosure)"] if rows is not None else
+                                     ["static (rows unknown: run pbz index)"]),
                     fix="rewrite, then compare old and new with pbz synth check (equal) before pbz check",
                     identity=f"{_tag(m.node, m.name)}|{c.name}|{dom}"))
 
@@ -637,9 +640,12 @@ class Audit:
                 if card == HIGH_COUNT:
                     self.add(Finding(
                         "HIGH_CARDINALITY_BIDIRECTIONAL", f"{r.from_table}[{r.from_column}] <-> {r.to_table}[{r.to_column}]",
-                        "relationship", "filters both directions on a key with 10k+ distinct values (Microsoft's rule "
+                        "relationship", ("filters both directions on a key with 10k+ distinct values (Microsoft's rule "
                         "flags above 100k; the index bucket cannot tell): single direction plus CROSSFILTER in the "
-                        "measures that need it", severity="medium", confidence="low",
+                        "measures that need it" if self.shape else
+                        "filters both directions on a high-cardinality key (cardinality band withheld under strict "
+                        "disclosure): single direction plus CROSSFILTER in the measures that need it"),
+                        severity="medium", confidence="low",
                         evidence=[f"distinct: {card} (index)"] if self.shape else [],
                         fix=f"pbz relationship set \"'{r.from_table}'[{r.from_column}]\" \"'{r.to_table}'[{r.to_column}]\" "
                             "(single direction), CROSSFILTER(..., Both) where needed",

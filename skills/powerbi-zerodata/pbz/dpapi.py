@@ -191,7 +191,7 @@ def hmac_hex(key: bytes, value) -> str:
     return _hmac.new(key, normalize(value).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def write_protected(path: str, data: bytes) -> None:
+def write_protected(path: str, data: bytes) -> bytes:
     parent = os.path.dirname(path)
     _refuse_link(parent)
     _refuse_link(path)
@@ -199,8 +199,10 @@ def write_protected(path: str, data: bytes) -> None:
     tmp = path + ".tmp"
     _refuse_link(tmp)
     with open(tmp, "wb") as f:
-        f.write(protect(data))
+        protected = protect(data)
+        f.write(protected)
     os.replace(tmp, path)
+    return protected
 
 
 def read_protected(path: str) -> bytes | None:

@@ -115,13 +115,16 @@ def publish(private_dir, project, summary, expected=None, blobs=None):
     except Exception:
         shutil.rmtree(directory)
         raise
-    for entry in os.scandir(private_dir):
-        if entry.name == generation or not re.fullmatch(r"index-[0-9a-f]{32}", entry.name):
-            continue
-        try:
-            if _reparse_link(entry.path):
-                os.unlink(entry.path)
-            elif entry.is_dir(follow_symlinks=False):
-                shutil.rmtree(entry.path)
-        except OSError:
-            pass
+    try:
+        for entry in os.scandir(private_dir):
+            if entry.name == generation or not re.fullmatch(r"index-[0-9a-f]{32}", entry.name):
+                continue
+            try:
+                if _reparse_link(entry.path):
+                    os.unlink(entry.path)
+                elif entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path)
+            except OSError:
+                pass
+    except OSError:
+        pass
