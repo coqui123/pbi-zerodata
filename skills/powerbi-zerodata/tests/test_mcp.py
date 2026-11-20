@@ -40,6 +40,40 @@ class InstallerTransactionTests(unittest.TestCase):
     def setUp(self):
         self.inst = load_installer()
 
+    def test_reinstall_reconciles_repeated_host_sibling_edits(self):
+        inst = self.inst
+        child = {"type": "command", "command": inst.hook_cmd("claude"), "timeout": 15}
+        sibling_a = {"type": "command", "command": "host-a"}
+        sibling_b = {"type": "command", "command": "host-b"}
+        for event in ("PreToolUse", "SessionStart"):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as tmp:
+                path = str(Path(tmp, "settings.json"))
+                sidecar = Path(path + ".pbz-owned.json")
+                inst.settings_step(path, "claude", False, False)
+                stages = ([sibling_a], [sibling_a, sibling_b], [sibling_b],
+                          [{**sibling_b, "command": "host-b-edited", "timeout": 30}])
+                for siblings in stages:
+                    installed = inst.load_json(path)
+                    installed["hooks"][event][0]["hooks"] = [child, *siblings]
+                    inst.save_json(path, installed, False)
+                    inst.settings_step(path, "claude", False, False)
+                    groups = inst.load_json(path)["hooks"][event]
+                    self.assertEqual(sum(h == child for g in groups for h in g["hooks"]), 1,
+                                     f"duplicate guard after siblings became {siblings}")
+                    self.assertEqual(len(groups), 1)
+                    self.assertEqual(groups[0]["hooks"], [child, *siblings])
+                    recorded = [a for a in inst.load_json(str(sidecar))["hooks"]["additions"]
+                                if a["event"] == event]
+                    self.assertEqual(len(recorded), 1)
+                    self.assertEqual(recorded[0]["shell"], {**groups[0], "hooks": siblings})
+                inst.settings_step(path, "claude", False, True)
+                shell = {"hooks": stages[-1]}
+                if event == "PreToolUse":
+                    shell["matcher"] = ".*"
+                # Exact equality also excludes guards and orphaned empty groups in either event.
+                self.assertEqual(inst.load_json(path), {"hooks": {event: [shell]}})
+                self.assertFalse(sidecar.exists())
+
     def test_reinstall_preserves_later_identical_host_hook(self):
         inst = self.inst
         child = {"type": "command", "command": inst.hook_cmd("claude"), "timeout": 15}

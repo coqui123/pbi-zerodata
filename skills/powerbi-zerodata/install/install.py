@@ -350,7 +350,9 @@ def merge_hooks(data: dict, agent: str, uninstall: bool, owned: dict | None = No
                         if not recorded:
                             for prior in rec["additions"]:
                                 if (prior["event"] == event and prior["child"] == child
-                                        and prior["shell"] == {**entry, "hooks": []}):
+                                        # Sibling edits do not change the group's identity.
+                                        and {k: v for k, v in prior["shell"].items() if k != "hooks"}
+                                        == {k: v for k, v in entry.items() if k != "hooks"}):
                                     prior["shell"] = addition["shell"]
                                     recorded = True
                                     break
