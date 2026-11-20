@@ -584,6 +584,8 @@ class Fixtures
             string? copiedFile = null;
             string? snapshot = null;
             int copies = 0;
+            Exception? primary = null;
+            string? teardownNote = null;
             try
             {
                 afterCopy.SetValue(null, (Action<string>)(target => {
@@ -646,25 +648,42 @@ class Fixtures
                     || Directory.EnumerateFiles(scratch, "tmdl-validate-*.pbz-owner").Any())
                     throw new Exception("copy timeout left unaccounted validation snapshots");
             }
+            catch (Exception ex) { primary = ex; }
             finally
             {
-                resume.Set();
                 try
                 {
-                    if (validation != null)
+                    try
                     {
-                        try { validation.GetAwaiter().GetResult(); }
-                        catch (TimeoutException) { }
+                        resume.Set();
+                        if (validation != null)
+                        {
+                            try { validation.GetAwaiter().GetResult(); }
+                            catch (TimeoutException) { }
+                            catch (Exception ex) { teardownNote = ex.GetType().Name + ": " + ex.Message; }
+                        }
                         if (snapshot != null && !cleaned.Wait(TimeSpan.FromSeconds(120)))
-                            throw new Exception("copy cleanup did not finish before resetting hooks");
+                            teardownNote = (teardownNote == null ? "" : teardownNote + "; ")
+                                + "copy cleanup did not finish before resetting hooks (worker completion unconfirmed)";
+                    }
+                    finally
+                    {
+                        afterCopy.SetValue(null, null);
+                        afterCleanup.SetValue(null, null);
                     }
                 }
-                finally
+                catch (Exception ex)
                 {
-                    afterCopy.SetValue(null, null);
-                    afterCleanup.SetValue(null, null);
+                    teardownNote = (teardownNote == null ? "" : teardownNote + "; ")
+                        + ex.GetType().Name + ": " + ex.Message;
                 }
             }
+            if (primary != null)
+            {
+                if (teardownNote == null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primary).Throw();
+                throw new Exception(primary.GetType().Name + ": " + primary.Message + " [teardown: " + teardownNote + "]", primary);
+            }
+            if (teardownNote != null) throw new Exception(teardownNote);
         }, null);
         Check("validation preserves cross-process leases and matching candidate folders", () => {
             var scratch = Path.Combine(args[0], "cross-process-private");
