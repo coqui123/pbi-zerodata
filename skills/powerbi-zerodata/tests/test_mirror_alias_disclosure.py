@@ -329,7 +329,7 @@ class MirrorAliasDisclosureTests(unittest.TestCase):
              patch("pbz.mirror.desktop.find_instance", return_value=None), \
              patch("builtins.open", side_effect=watch):
             result = mirror._push(self.ws, self.project, dry_run=True)
-        self.assertNotEqual(result.get("result"), "PUSHED")
+        self.assertEqual(result.get("result"), "CONFLICT")
         self.assertEqual(reads["n"], 0)
         self.assertNotIn(CANARY, json.dumps(result))
         self.assertEqual(open(secret, "rb").read(), CANARY.encode())

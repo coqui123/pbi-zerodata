@@ -186,9 +186,23 @@ def _split_bom(raw: bytes) -> tuple[str, bytes]:
     return raw[len(bom):].decode("utf-8"), bom
 
 
-def _post_mirror_hash(ws, rel: str) -> str | None:
-    """Checked hash of a present mirror file. Missing stays None so the caller reports CONFLICT."""
+_ALIAS_HASH = object()
+
+
+def _post_mirror_hash(ws, rel: str) -> str | None | object:
+    """Return None if missing, an alias sentinel if aliased, otherwise the checked hash."""
     path = os.path.join(ws.mirror, *rel.split("/"))
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass
+    else:
+        if (stat.S_ISLNK(info.st_mode)
+                or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)
+                or _reparse_link(path)):
+            return _ALIAS_HASH
     raw = _checked_raw(path, ws.mirror)
     if raw is None:
         return None
@@ -922,7 +936,7 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
         owned = True
         with os.fdopen(fd, "w") as handle:
             handle.write(str(os.getpid()))
-        return _recover(ws, project, transaction_id, _owns_lock=True)
+        return _recover(ws, project, transaction_id, _owns_lock=True, _claimed_stale=(claimed is not None))
     except OSError:
         return {"verb": "recover", "result": "RECOVERY_REQUIRED"}
     finally:
@@ -936,7 +950,8 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
                 os.close(guard_fd)
 
 
-def _recover(ws, project, transaction_id: str | None = None, *, _owns_lock=False) -> dict:
+def _recover(ws, project, transaction_id: str | None = None, *, _owns_lock=False,
+             _claimed_stale: bool = False) -> dict:
     """Roll back interrupted, uncommitted pushes. Never resume a half-validated commit."""
     anchor_mirror(ws)
     if desktop.find_instance(project):
@@ -996,7 +1011,7 @@ def _recover(ws, project, transaction_id: str | None = None, *, _owns_lock=False
     if stale_lock and not failed:
         remove_file(lock, root=ws.private)
     return {"verb": "recover", "result": "RECOVERY_REQUIRED" if failed
-            else "RECOVERED" if results or stale_lock else "NOTHING_TO_RECOVER", "transactions": results}
+            else "RECOVERED" if results or stale_lock or _claimed_stale else "NOTHING_TO_RECOVER", "transactions": results}
 
 
 def _push(ws: Workspace, project: Project, reload: bool = False, dry_run: bool = False,

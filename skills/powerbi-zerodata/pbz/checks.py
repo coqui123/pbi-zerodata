@@ -331,6 +331,8 @@ class _StateLock:
         if _reparse_link(self.ws.private):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         os.makedirs(self.ws.private, exist_ok=True)
+        if _reparse_link(self.ws.private):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         self.path = os.path.join(self.ws.private, self.name) if self.name else _state_path(self.ws) + ".lock"
         if _reparse_link(self.path):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
