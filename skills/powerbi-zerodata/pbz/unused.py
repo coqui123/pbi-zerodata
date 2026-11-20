@@ -301,6 +301,11 @@ def remove(ws, project, extra_reports=(), m_step: str = "remove", cascade: bool 
             rep = []  # report objects go in the first round only
         if not todo and not rep:
             break
+        for k in todo:
+            o = g.objects[k]
+            node = g.model.table(o.name).node if o.kind == "table" else _node_of(g.model, o)
+            if node is not None:
+                tmdl.refuse_out_of_span_description(g.model.docs[node.file], node)
         changes = _plan(ws, project, g, todo, rep, m_step, skipped)
         if not changes:
             break

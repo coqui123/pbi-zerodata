@@ -202,17 +202,20 @@ class EditRefusalTests(unittest.TestCase):
                     node = next(n for n in doc.nodes if n.name == "Target")
                     self.assertEqual([doc.text[r.start:r.end] for r in doc.regions_for(node)
                                       if r.prop == "description"], [" Target description"])
+                    s, e = tmdl.block_span(doc, node)
+                    self.assertEqual(doc.text[s:e], target)
+                    self.before = _bytes(self.ws.mirror)
                     if action == "move":
-                        move.move_measure(self.ws, self.project, "Target", "Destination")
-                        dest = os.path.join(os.path.dirname(path), "Destination.tmdl")
-                        self.assertEqual(common.read_checked(dest, root=self.ws.mirror),
-                                         ("table Destination" + eol + eol + "\n" + target).encode())
+                        err = self._refuse(lambda: move.move_measure(self.ws, self.project, "Target", "Destination"))
                     else:
-                        result = unused.remove(self.ws, self.project, only=["measure"])
-                        self.assertEqual(result["removed"], ["measure [Target]"])
-                        shutil.rmtree(os.path.join(self.ws.mirror, unused.TRASH))
+                        err = self._refuse(lambda: unused.remove(self.ws, self.project, only=["measure"]))
+                    self.assertEqual(err.code, "REFUSED")
+                    self.assertEqual(err.detail, "TMDL description outside node block span")
+                    dest = os.path.join(os.path.dirname(path), "Destination.tmdl")
+                    self.assertEqual(common.read_checked(dest, root=self.ws.mirror),
+                                     ("table Destination" + eol + eol).encode())
                     self.assertEqual(common.read_checked(path, root=self.ws.mirror),
-                                     (prefix + after).encode())
+                                     (prefix + target + after).encode())
 
     def test_move_refuses_unclosed_fence_in_third_file_without_writes(self):
         path, *_ = self._fenced_fixture("\n", target_fenced=False)

@@ -146,6 +146,7 @@ def move_measure(ws, project, name: str, target: str) -> dict:
         raise PbzError("UNSUPPORTED", "cultures not in this mirror: run pbz pull")
     sdoc, ddoc = model.docs[src.file], model.docs[dst.file]
     s, e = tmdl.block_span(sdoc, m.node)
+    tmdl.refuse_out_of_span_description(sdoc, m.node)
     block = sdoc.text[s:e]
     eol = "\r\n" if "\r\n" in block else "\n"
     if not block.endswith(eol):

@@ -311,6 +311,13 @@ def block_span(doc: TmdlDoc, node: Node) -> tuple[int, int]:
     return node.block_start, node.block_end
 
 
+def refuse_out_of_span_description(doc: TmdlDoc, node: Node) -> None:
+    """Refuse block removal when it would leave an owned description behind."""
+    if any(r.prop == "description" and (r.start < node.block_start or r.end > node.block_end)
+           for r in doc.regions_for(node)):
+        raise PbzError("REFUSED", "TMDL description outside node block span")
+
+
 def prop_edit(doc: TmdlDoc, node: Node, prop: str, value: str | None) -> list[tuple[int, int, str]]:
     """Edits that set `prop: value` on a node (value None: a bare flag line such as isHidden).
     Replaces an existing value in place, else inserts a line right after the declaration and its
