@@ -413,6 +413,24 @@ class IndexGenerationTests(unittest.TestCase):
         self.assertEqual((Path(self.ws.private) / manifest["generation"] / "index.json").read_bytes(),
                          stored["index.json"])
 
+    def test_prune_reparse_point_is_unlinked_and_unlink_failure_is_harmless(self):
+        self.run_index(self.a)
+        path = Path(self.ws.private) / "index-current.json"
+        first = json.loads(path.read_bytes())["generation"]
+        old = Path(self.ws.private) / first
+        real_reparse = index_store._reparse_link
+
+        def reparse(filename):
+            return Path(filename) == old or real_reparse(filename)
+
+        with patch("pbz.index_store._reparse_link", reparse), \
+                patch("pbz.index_store.os.unlink", side_effect=OSError("open junction")) as unlink, \
+                patch("pbz.index_store.shutil.rmtree", side_effect=AssertionError("must not traverse junction")):
+            self.run_index(self.a)
+        unlink.assert_called_once_with(str(old))
+        self.assertNotEqual(json.loads(path.read_bytes())["generation"], first)
+        self.assertIsNotNone(index_store.load(self.ws.private, "A"))
+
     def test_load_retries_if_manifest_generation_was_pruned(self):
         self.run_index(self.a)
         path = Path(self.ws.private) / "index-current.json"
