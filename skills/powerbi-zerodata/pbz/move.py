@@ -164,6 +164,9 @@ def move_measure(ws, project, name: str, target: str) -> dict:
     edits.setdefault(src.file, []).append((s, e, ""))
     at, sep = _insert_point(ddoc, dst.node)
     edits.setdefault(dst.file, []).append((at, at, sep + block))
+    for rel, eds in edits.items():
+        if eds and model.docs[rel].unclosed_fence:
+            raise PbzError("REFUSED", "unclosed TMDL expression fence")
     planned = dict(texts)
     for rel, eds in edits.items():
         planned[rel] = apply_edits(texts[rel], sorted(eds))

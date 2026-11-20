@@ -97,10 +97,10 @@ class EditRefusalTests(unittest.TestCase):
                 declaration = f"\tmeasure {name} = 1\n"
             elif fence_style == "property":
                 declaration = (f"\tmeasure {name}\n"
-                               "\t\texpression = ```\n\t\t\t1\n\t\t```\n")
+                               "\t\tfilterExpression = ```\n\t\t\t1\n\t\t```\n")
             else:
                 expr = ("```\n1\n```suffix\n\t```" if fence_style == "flat"
-                        else "```\n\t\t1\n\t\t```suffix\n\t```")
+                        else "```\n\t\t1\n\t\t```")
                 declaration = f"\tmeasure {name} = {expr}\n"
             return (f"\t/// {name} description\n{description_gap}{declaration}"
                     f"\t\tformatString: {name}\n"
@@ -143,6 +143,12 @@ class EditRefusalTests(unittest.TestCase):
         doc = model.docs["tables/Sales.tmdl"]
         self.assertFalse(doc.unclosed_fence)
         node = model.measure("Target").node
+        if fenced and fence_style == "property":
+            self.assertTrue(any(r.prop == "filterExpression" and r.node is node
+                                for r in doc.regions_for(node)))
+        if fenced and fence_style == "indented":
+            closing = [line for line in target.decode().splitlines() if line.strip() == "```"]
+            self.assertEqual(closing, ["\t\t```"])
         self.assertEqual(doc.text[slice(*tmdl.block_span(doc, node))].encode(), target)
         if action == "move":
             move.move_measure(self.ws, self.project, "Target", "Destination")
@@ -169,6 +175,55 @@ class EditRefusalTests(unittest.TestCase):
         descriptions = [updated_doc.text[r.start:r.end] for r in updated_doc.regions_for(after_node)
                         if r.prop == "description"]
         self.assertEqual(descriptions, [" After description"])
+
+    def test_pending_description_before_sibling_property_does_not_expand_target_span(self):
+        for eol in ("\n", "\r\n"):
+            for action in ("move", "delete"):
+                with self.subTest(eol=repr(eol), action=action):
+                    path, *_ = self._fenced_fixture(eol)
+                    prefix = ("table Sales\n\n\t/// Before description\n\tmeasure Before = 1\n"
+                              "\t/// Target description\n\t\tformatString: Before\n").replace("\n", eol)
+                    target = ("\tmeasure Target = 1\n\t\tformatString: Target\n\n").replace("\n", eol)
+                    after = ("\t/// After description\n\tmeasure After = 1\n\n").replace("\n", eol)
+                    _write(path, prefix + target + after)
+                    doc = tmdl.parse("tables/Sales.tmdl", prefix + target + after)
+                    node = next(n for n in doc.nodes if n.name == "Target")
+                    self.assertEqual([doc.text[r.start:r.end] for r in doc.regions_for(node)
+                                      if r.prop == "description"], [" Target description"])
+                    if action == "move":
+                        move.move_measure(self.ws, self.project, "Target", "Destination")
+                        dest = os.path.join(os.path.dirname(path), "Destination.tmdl")
+                        self.assertEqual(common.read_checked(dest, root=self.ws.mirror),
+                                         ("table Destination" + eol + eol + "\n" + target).encode())
+                    else:
+                        result = unused.remove(self.ws, self.project, only=["measure"])
+                        self.assertEqual(result["removed"], ["measure [Target]"])
+                        shutil.rmtree(os.path.join(self.ws.mirror, unused.TRASH))
+                    self.assertEqual(common.read_checked(path, root=self.ws.mirror),
+                                     (prefix + after).encode())
+
+    def test_move_refuses_unclosed_fence_in_third_file_without_writes(self):
+        path, *_ = self._fenced_fixture("\n", target_fenced=False)
+        third = os.path.join(os.path.dirname(path), "References.tmdl")
+        _write(third, "table References\n\tmeasure Ref = ```\n\t\t'Sales'[Target]\n")
+        doc = tmdl.parse("tables/References.tmdl", common.read_checked(third, root=self.ws.mirror).decode())
+        self.assertTrue(doc.unclosed_fence)
+        self.assertTrue(any(move.dax_qualifier_edits(doc.text, r.start, r.end,
+                                                   "Target", "Sales", "Destination")
+                            for r in doc.regions if r.kind == "dax"))
+        self.before = _bytes(self.ws.mirror)
+        err = self._refuse(lambda: move.move_measure(self.ws, self.project, "Target", "Destination"))
+        self.assertEqual(err.code, "REFUSED")
+        self.assertEqual(err.detail, "unclosed TMDL expression fence")
+
+    def test_block_span_requires_parser_span_but_accepts_first_parsed_node(self):
+        text = "function F = 1\n"
+        doc = tmdl.parse("functions.tmdl", text)
+        self.assertEqual(tmdl.block_span(doc, doc.nodes[0]), (0, len(text)))
+        with self.assertRaises(PbzError) as caught:
+            tmdl.block_span(doc, tmdl.Node("function", "F", 0, 0))
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(caught.exception.detail, "node has no parser span")
 
     def test_unclosed_fence_allows_parse_and_load_but_refuses_block_span(self):
         path, *_ = self._fenced_fixture("\r\n")

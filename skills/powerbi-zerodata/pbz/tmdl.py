@@ -241,7 +241,9 @@ def parse(path: str, text: str) -> TmdlDoc:
             node.block_start = lines[first][0]
             if pending_desc:
                 desc_line = bisect_right(line_offsets, pending_desc[0][0]) - 1
-                node.block_start = min(node.block_start, lines[desc_line][0])
+                if all(not ln.strip() or ln.strip().startswith("///")
+                       for _, ln in lines[desc_line + 1:i]):
+                    node.block_start = min(node.block_start, lines[desc_line][0])
             node.block_end = len(text)
             blocks.append(node)
             nodes.append(node)
@@ -304,6 +306,8 @@ def block_span(doc: TmdlDoc, node: Node) -> tuple[int, int]:
     """Parser-owned span, including descendants and trailing blanks, excluding sibling descriptions."""
     if doc.unclosed_fence:
         raise PbzError("REFUSED", "unclosed TMDL expression fence")
+    if doc.text and node.block_start == 0 and node.block_end == 0:
+        raise PbzError("REFUSED", "node has no parser span")
     return node.block_start, node.block_end
 
 
