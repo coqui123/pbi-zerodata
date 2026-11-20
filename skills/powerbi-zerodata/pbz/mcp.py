@@ -68,7 +68,7 @@ def _bounded_output(command, cwd, env, timeout, mid=0):
         started = False
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         envelope = len(_encode({"jsonrpc": "2.0", "id": mid, "result": {
-            "content": [{"type": "text", "text": ""}], "isError": True}}))
+            "content": [{"type": "text", "text": ""}], "isError": False}}))
 
         def account(fragment):
             nonlocal decoded_total, wire_text, pending, started

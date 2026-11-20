@@ -112,11 +112,43 @@ class RenameBindingsTests(unittest.TestCase):
         model = tmdl.load_model(mdef)
         renamed = json.dumps(field).replace('"Amount"', '"Value"').replace('"Column"', '"Measure"')
         before = _bytes(ws.mirror)
+        model_ops = []
+        for rel, old, new in (("tables/Sales.tmdl", "Amount", "Value"),
+                              ("tables/Other.tmdl", "Sales.Amount", "Sales.Value"),
+                              ("roles/Reader.tmdl", "columnPermission Amount", "columnPermission Value")):
+            model_path = Path(mdef, rel)
+            model_ops.append(("write", str(model_path), model_path.read_text().replace(old, new, 1)
+                              if rel.startswith("roles/") else model_path.read_text().replace(old, new), b""))
+        correct = json.dumps(field).replace('"Amount"', '"Value"')
+        rename._verify_plan(ws, project, model, mdef,
+                            model_ops + [("write", str(path), correct, b"")],
+                            "column", "Sales", "Amount", "Value")
         with self.assertRaises(PbzError) as caught:
-            rename._verify_plan(ws, project, model, mdef, [("write", str(path), renamed, b"")],
+            rename._verify_plan(ws, project, model, mdef, model_ops + [("write", str(path), renamed, b"")],
                                 "column", "Sales", "Amount", "Value")
         self.assertEqual(caught.exception.code, "REFUSED")
         self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_missed_metadata_and_query_name_refuse(self):
+        for kind, key, old, new in (("column", "metadata", "Amount", "Value"),
+                                    ("table", "metadata", "Sales", "Revenue"),
+                                    ("table", "queryName", "Sales", "Revenue")):
+            with self.subTest(kind=kind, key=key):
+                ws, project, _mdef, path = self._report_project({key: "Sales.Amount"})
+                before = _bytes(ws.mirror)
+                with patch("pbz.move.plan_pbir", return_value=[]):
+                    with self.assertRaises(PbzError) as caught:
+                        rename.rename(ws, project, kind, old, new, table="Sales")
+                self.assertEqual(caught.exception.code, "REFUSED")
+                self.assertEqual(_bytes(ws.mirror), before)
+                rename.rename(ws, project, kind, old, new, table="Sales")
+                self.assertEqual(json.loads(path.read_text())[key],
+                                 "Sales.Value" if kind == "column" else "Revenue.Amount")
+
+    def test_column_query_name_is_outside_planner_scope(self):
+        ws, project, _mdef, path = self._report_project({"queryName": "Sales.Amount"})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["queryName"], "Sales.Amount")
 
     def test_standalone_report_strings_verified(self):
         for kind, old, new, strings in (

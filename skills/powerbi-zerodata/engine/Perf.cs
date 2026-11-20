@@ -316,7 +316,8 @@ public static class Perf
             if (char.IsWhiteSpace(text[i])) { i++; continue; }
             int start = i;
             bool comment = false;
-            if (i + 1 < text.Length && text[i] == '/' && text[i + 1] == '/')
+            if (i + 1 < text.Length && ((text[i] == '/' && text[i + 1] == '/')
+                || (text[i] == '-' && text[i + 1] == '-')))
             {
                 comment = true;
                 i += 2;
@@ -340,10 +341,15 @@ public static class Perf
                     break;
                 }
             }
+            else if ("+-*/^&=<>(),{}.:;!".Contains(text[i]))
+            {
+                i++;
+            }
             else
             {
                 i++;
                 while (i < text.Length && !char.IsWhiteSpace(text[i])
+                    && !"+-*/^&=<>(),{}.:;!".Contains(text[i])
                     && text[i] != '"' && text[i] != '\'' && text[i] != '['
                     && !(i + 1 < text.Length && text[i] == '/' && (text[i + 1] == '/' || text[i + 1] == '*'))) i++;
             }

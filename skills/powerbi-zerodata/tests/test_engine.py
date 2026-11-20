@@ -346,6 +346,8 @@ def test_grouped_streaming(tmp: Path) -> None:
     (helper / "Program.cs").write_text(r'''
 using System.Text.Json.Nodes;
 using PbzEngine;
+using System.Reflection;
+static string Normalize(string query) => (string)typeof(Perf).GetMethod("NormalizeQuery", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, new object[] { query })!;
 static void Assert(bool ok, string label) { if (!ok) throw new Exception(label); }
 static JsonObject Result(Checks.EqualAggregate a) { var r = new JsonObject(); a.Write(r); return r; }
 static IEnumerable<object?[]> Rows(int count, int bad) {
@@ -353,6 +355,16 @@ static IEnumerable<object?[]> Rows(int count, int bad) {
     for (int i = 0; i < count; i++)
         yield return new object?[] { "g" + (count - i - 1).ToString("D8"), 1, i >= count - bad ? 0 : 1 };
 }
+// Exercise the production normalizer, including literal and comment extents.
+foreach (var pair in new[] {
+    ("EVALUATE {1+2}", "EVALUATE {1 + 2}", true),
+    ("EVALUATE {1 -- note\n+2}", "EVALUATE {1 -- note +2}", false),
+    ("EVALUATE {1 // note\n+2}", "EVALUATE {1 // note +2}", false),
+    ("EVALUATE {1 /* note */+2}", "EVALUATE {1 /* note */ + 2}", true),
+    ("EVALUATE {1 /* note +2 */}", "EVALUATE {1 /* note */+2}", false),
+    ("EVALUATE {\"a b\"}", "EVALUATE {\"ab\"}", false),
+    ("EVALUATE {'a b'[x]}", "EVALUATE {'ab'[x]}", false)
+}) Assert((Normalize(pair.Item1) == Normalize(pair.Item2)) == pair.Item3, "query normalization: " + pair.Item1);
 string directory = Path.Combine(Path.GetTempPath(), "pbz-grouped-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
 try {
@@ -762,6 +774,39 @@ database.Model.SaveChanges();
             print("INFO closing binding fixture Desktop:", close_desktop(b.pid), flush=True)
 
 
+def digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
+
+
+def perf_workload_digest(query):
+    # Match the production token boundaries, including exact strings/identifiers
+    # and line/block comment extents. Comment whitespace is normalized only inside
+    # the token, so a newline ending a line comment cannot swallow executable DAX.
+    tokens = re.findall(
+        r'//[^\r\n]*|--[^\r\n]*|/\*[\s\S]*?(?:\*/|$)|'
+        r'"(?:[^"]|"")*"|\'(?:[^\']|\'\')*\'|\[(?:[^\]]|\]\])*\]|'
+        r'[+\-*/^&=<>(),{}.:;!]|[^\s"\'\[+*/^&=<>(),{}.:;!\-]+', query)
+    tokens = [re.sub(r"\s+", " ", token) if token.startswith(("//", "--", "/*"))
+              else token for token in tokens]
+    return digest("\x1f".join(tokens))
+
+
+def perf_result_private(value, query, project):
+    workload = perf_workload_digest(query)
+
+    def private(node):
+        if isinstance(node, str):
+            return query not in node and project not in node and workload not in node
+        if isinstance(node, dict):
+            return all("fingerprint" not in key.lower() and "workload" not in key.lower()
+                       and private(child) for key, child in node.items())
+        if isinstance(node, list):
+            return all(private(child) for child in node)
+        return True
+
+    return private(value)
+
+
 def test_perf_baseline_workloads(env: Env) -> None:
     """Windows/Desktop acceptance: actual protected baseline save/read, never a mocked save."""
     query_a = 'EVALUATE ROW("workload", "a b", "probe", SUMX(GENERATESERIES(1, 1000000), SIN([Value])))'
@@ -770,16 +815,7 @@ def test_perf_baseline_workloads(env: Env) -> None:
     def call(project, check, query, action):
         result = engine("perf", env.req(project_identity=project, baseline=check,
                                         dax=query, runs=20, action=action), "perf-workload") or {}
-        def private(value):
-            if isinstance(value, str):
-                return query not in value and project not in value
-            if isinstance(value, dict):
-                return all("fingerprint" not in key.lower() and "workload" not in key.lower()
-                           and private(child) for key, child in value.items())
-            if isinstance(value, list):
-                return all(private(child) for child in value)
-            return True
-        expect("perf workload identity stays private", private(result), result)
+        expect("perf workload identity stays private", perf_result_private(result, query, project), result)
         return result
 
     saved = call("project-one", "check:one", query_a, "save")
@@ -808,10 +844,7 @@ def test_perf_baseline_workloads(env: Env) -> None:
     # workload checks reject it even if a legacy file reaches the new storage path.
     sys.path.insert(0, str(S))
     from pbz import dpapi
-    def digest(text):
-        return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
-    tokens = re.findall(r'"(?:[^"]|"")*"|\'(?:[^\']|\'\')*\'|\[(?:[^\]]|\]\])*\]|[^\s\"\'\[]+', query_a)
-    workload = digest("\x1f".join(tokens))
+    workload = perf_workload_digest(query_a)
     key = digest("project-one\ncheck:one\n" + workload)
     path = env.pd / "perf" / (digest(key) + ".bin")
     expect("perf legacy test reaches saved baseline", path.exists())
@@ -1175,6 +1208,22 @@ import unittest
 from unittest.mock import patch
 
 
+class PerfPrivacyTests(unittest.TestCase):
+    def test_nested_workload_digest_value_is_private(self):
+        query = 'EVALUATE ROW("workload", "a b")'
+        workload = perf_workload_digest(query)
+        self.assertEqual(workload, digest("\x1f".join([
+            "EVALUATE", "ROW", "(", '\"workload\"', ",", '\"a b\"', ")"])))
+        self.assertFalse(perf_result_private(
+            {"safe": [{"detail": "prefix " + workload + " suffix"}]}, query, "project-one"))
+
+    def test_legitimate_results_stay_private(self):
+        query = 'EVALUATE ROW("workload", "a b")'
+        for result in ({"baseline": "SAVED"}, {"verdict": "SAME", "ratio_verdict": "WITHIN_LIMIT"},
+                       {"baseline": "MISSING"}, {"detail": [{"status": "PASS", "count": 1}]}):
+            self.assertTrue(perf_result_private(result, query, "project-one"))
+
+
 class GroupedStreamingLauncherTests(unittest.TestCase):
     def assert_launch_failure(self, error):
         from unittest.mock import patch
@@ -1339,7 +1388,7 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true", help="keep the temporary private_dir")
     args = ap.parse_args()
 
-    scanner_tests = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromNames(["CanaryScanTests", "ProjectionTests", "GroupedStreamingLauncherTests"], module=sys.modules[__name__]))
+    scanner_tests = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromNames(["CanaryScanTests", "ProjectionTests", "GroupedStreamingLauncherTests", "PerfPrivacyTests"], module=sys.modules[__name__]))
     if not scanner_tests.wasSuccessful():
         return 1
     if not EXE.is_file():

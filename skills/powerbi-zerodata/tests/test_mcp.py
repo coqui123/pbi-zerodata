@@ -310,16 +310,23 @@ class OutputBudgetTests(unittest.TestCase):
             self.assertEqual((raw, error), (b"", "OUTPUT_LIMIT"))
 
     def test_stderr_is_discarded(self):
-        try:
-            import resource
-        except ImportError:
-            resource = None
-        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource and sys.platform.startswith("linux") else None
-        with patch.object(mcp, "RAW_LIMIT", 1024):
-            code, raw, error = self.run_child("import os; os.write(2,b'x'*10000000); os.write(1,b'ok')")
-            self.assertEqual((code, raw, error), (0, b"ok", None))
-        if before is not None:
-            self.assertLess(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before, 32 * 1024)
+        # A fresh interpreter avoids inherited RSS high-water marks. tracemalloc
+        # detects even a fully released stderr buffer, independently of stdout.
+        code = """
+import os, sys, tracemalloc
+sys.path.insert(0, sys.argv[1])
+from pbz import mcp
+tracemalloc.start()
+result = mcp._bounded_output(
+    [sys.executable, "-c", "import os; os.write(2,b'x'*10000000); os.write(1,b'ok')"],
+    os.getcwd(), os.environ.copy(), 10)
+_, peak = tracemalloc.get_traced_memory()
+assert result == (0, b"ok", None), result
+assert peak < 2000000, peak
+"""
+        result = subprocess.run([sys.executable, "-c", code, SKILL],
+                                capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
 
     def test_wire_exact_limit_and_escaping(self):
         response = {"jsonrpc": "2.0", "id": 1, "result": mcp._result({"value": "x"*1000}, False)}
@@ -411,11 +418,25 @@ class OutputBudgetTests(unittest.TestCase):
     def test_production_budget_uses_real_request_id(self):
         mid = "id" * 100
         envelope = {"jsonrpc": "2.0", "id": mid, "result": {
-            "content": [{"type": "text", "text": "x" * 20}], "isError": True}}
+            "content": [{"type": "text", "text": "x" * 20}], "isError": False}}
         with patch.object(mcp, "WIRE_LIMIT", len(mcp._encode(envelope))):
             self.assertEqual(self.run_child("import os; os.write(1,b'x'*20)", mid=mid), (0, b"x"*20, None))
             _code, raw, error = self.run_child("import os; os.write(1,b'x'*21)", mid=mid)
             self.assertEqual((raw, error), (b"", "OUTPUT_LIMIT"))
+            bounded = mcp._bounded_output
+            for count in (20, 21):
+                def child(*args):
+                    return bounded([sys.executable, "-c", f"import os; os.write(1,b'x'*{count})"],
+                                   *args[1:])
+                with patch.object(mcp, "_bounded_output", side_effect=child):
+                    response = mcp.handle(rpc(mid, "tools/call", {"name": "status", "arguments": {}}),
+                                          os.getcwd(), None)
+                if count == 20:
+                    self.assertEqual(response, envelope)
+                    self.assertEqual(len(mcp._encode(response)), mcp.WIRE_LIMIT)
+                else:
+                    self.assertTrue(response["result"]["isError"])
+                    self.assertEqual(json.loads(response["result"]["content"][0]["text"])["error"], "OUTPUT_LIMIT")
         with patch.object(mcp, "_bounded_output", return_value=(0, b"ok", None)) as bounded:
             mcp.handle(rpc(mid, "tools/call", {"name": "status", "arguments": {}}), os.getcwd(), None)
         self.assertEqual(bounded.call_args.args[-1], mid)
@@ -610,6 +631,7 @@ class GitHookTests(unittest.TestCase):
         host = self.hooks / "pre-commit"
         host.write_bytes(b"#!/bin/sh\nexit 0\n")
         host.chmod(0o640)
+        before_mode = host.stat().st_mode & 0o777
         before = self.snapshot()
         replace = self.inst.os.replace
         calls = 0
@@ -623,7 +645,8 @@ class GitHookTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.install(chain=True)
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual(host.stat().st_mode & 0o777, 0o640)
+        if os.name == "posix":
+            self.assertEqual(host.stat().st_mode & 0o777, before_mode)
         self.install(chain=True)
 
     def test_shared_hooks_path_requires_opt_in(self):

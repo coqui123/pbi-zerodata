@@ -239,7 +239,7 @@ def _report_strings(node, path=()):
     if isinstance(node, pbir.JObj):
         for key, value in node.pairs:
             here = path + (key.value,)
-            if key.value in ("queryRef", "nativeQueryRef") and isinstance(value, pbir.JStr):
+            if key.value in ("queryRef", "nativeQueryRef", "metadata", "queryName") and isinstance(value, pbir.JStr):
                 yield here, value.value
             yield from _report_strings(value, here)
     elif isinstance(node, pbir.JArr):
@@ -251,6 +251,8 @@ def _report_string_rename(key, value, kind, home, old, new):
     if kind == "table":
         if key in ("queryRef", "metadata", "queryName") and value.lower().startswith(old.lower() + "."):
             return new + value[len(old):]
+        return value
+    if key == "queryName":
         return value
     rewritten = re.sub(rf"(?i)(?<![\w]){re.escape(home)}\.{re.escape(old)}(?![\w])", f"{home}.{new}", value)
     if key == "nativeQueryRef" and value.lower() == old.lower():

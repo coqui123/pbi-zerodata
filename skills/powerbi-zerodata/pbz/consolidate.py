@@ -620,8 +620,8 @@ def _pick_family(model, family: str | None, measures: list[str] | None) -> dict:
     if not family and not measures:
         raise PbzError("BAD_REQUEST", "name a family id (pbz consolidate families) or member measures")
     want = {_find_measure(model, m).name.lower() for m in measures or []}
-    matches = []
     for mb in (3, 2):
+        matches = []
         for f in families(model, min_bases=mb):
             if family and f["id"] != family:
                 continue
@@ -629,10 +629,10 @@ def _pick_family(model, family: str | None, measures: list[str] | None) -> dict:
                 continue
             if f not in matches:
                 matches.append(f)
-    if len(matches) > 1:
-        raise PbzError("AMBIGUOUS", "multiple calculation-group families match; select member measures")
-    if matches:
-        return matches[0]
+        if len(matches) > 1:
+            raise PbzError("AMBIGUOUS", "multiple calculation-group families match; select member measures")
+        if matches:
+            return matches[0]
     raise PbzError("NOT_FOUND", f"no calculation-group family {family}" if family else
                    "no calculation-group family covers those measures")
 
