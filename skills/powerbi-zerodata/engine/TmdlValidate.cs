@@ -36,6 +36,43 @@ public static class TmdlValidate
         LinkGuard.Refuse(folder);
         if (!Directory.Exists(folder)) throw new BadRequestException("folder not found");
 
+        string snapshot = Path.Combine(ctx.RequirePrivateDir(), "tmdl-validate-" + Guid.NewGuid().ToString("N"));
+        if (snapshot.StartsWith(Path.TrimEndingDirectorySeparator(folder) + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase))
+            throw new BadRequestException("validation scratch directory must be outside the candidate folder");
+        LinkGuard.Refuse(snapshot);
+        try
+        {
+            CopyTree(folder, snapshot);
+            return RunSnapshot(req, ctx, snapshot);
+        }
+        finally
+        {
+            // Best effort: a leftover scratch directory must not fail a completed validation.
+            try { if (Directory.Exists(snapshot)) Directory.Delete(snapshot, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    // Copy failures propagate: no validation or signing may fall back to the live folder.
+    static void CopyTree(string source, string destination)
+    {
+        LinkGuard.Refuse(source);
+        Directory.CreateDirectory(destination);
+        foreach (var entry in Directory.EnumerateFileSystemEntries(source))
+        {
+            LinkGuard.Refuse(entry);
+            string target = Path.Combine(destination, Path.GetFileName(entry));
+            if (File.GetAttributes(entry).HasFlag(FileAttributes.Directory))
+                CopyTree(entry, target);
+            else
+                File.Copy(entry, target);
+        }
+    }
+
+    static JsonObject RunSnapshot(Req req, Ctx ctx, string folder)
+    {
         var scrub = new Scrubber(CollectNames(folder));
         var errors = new JsonArray();
         Database? db = null;

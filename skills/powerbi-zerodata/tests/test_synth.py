@@ -192,6 +192,9 @@ def live(fails: list) -> None:
 PROVENANCE_FIXTURES = r'''
 using System;
 using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Text.Json.Nodes;
 using Microsoft.AnalysisServices.Tabular;
 using PbzEngine;
@@ -244,21 +247,23 @@ class Fixtures
             Console.WriteLine("PASS " + name);
         }
         Check("passing manifest", () => P.Verify(ctx, good), null);
-        var legacyDefinition = JsonNode.Parse(definition)!.AsObject();
-        var counts = legacyDefinition["rowNumberCounts"]!.AsObject();
-        if (counts.Count != Build().Tables.Count || counts["T"]!.GetValue<int>() != 1
-            || counts["Other"]!.GetValue<int>() != 0) throw new Exception("incomplete RowNumber counts");
-        legacyDefinition.Remove("rowNumberCounts");
-        var legacyText = legacyDefinition.ToJsonString();
-        Check("new manifest requires counts", () => P.Verify(ctx,
-            good with { DefinitionValue = legacyText }), "SYNTH_DEFINITION_CHANGED");
-        // Simulate a manifest signed by the previous build, without changing the main fixture.
-        var legacyMarker = new string('c', 64);
-        P.Save(ctx, legacyMarker, legacyText, "catalog-A");
-        Check("legacy manifest remains readable", () => P.Verify(ctx,
-            good with { MarkerValue = legacyMarker }), null);
-        Check("legacy manifest still covers definitions", () => P.Verify(ctx,
-            good with { MarkerValue = legacyMarker, DefinitionValue = "edited" }), "SYNTH_DEFINITION_CHANGED");
+        // Counts-less definitions cover both offline and engine-maintained RowNumber shapes.
+        var withoutRowNumber = Build();
+        withoutRowNumber.Tables["T"].Columns.Remove("RowNumber");
+        var withoutRowNumberDefinition = P.Definition(withoutRowNumber);
+        Check("single RowNumber absent on live side", () => P.Verify(ctx,
+            good with { DefinitionValue = withoutRowNumberDefinition }), null);
+        var builtMarker = new string('c', 64);
+        P.Save(ctx, builtMarker, withoutRowNumberDefinition);
+        var builtLive = good with { MarkerValue = builtMarker };
+        Check("single RowNumber present only on live side", () => P.Verify(ctx,
+            builtLive, requireCatalog: false), null);
+        Check("counts-less manifest binds", () => {
+            // The same verify/save sequence used by Bind, without requiring a live Desktop.
+            P.Verify(ctx, builtLive, requireCatalog: false);
+            P.Save(ctx, builtMarker, builtLive.DefinitionValue, builtLive.Catalog);
+            P.Verify(ctx, builtLive);
+        }, null);
         void Mutation(string name, Action<Model> mutate, string expectedReason = "SYNTH_DEFINITION_CHANGED")
         {
             var model = Build();
@@ -273,8 +278,7 @@ class Fixtures
         Mutation("changed calculated table", m => ((CalculatedPartitionSource)m.Tables["T"].Partitions[0].Source).Expression = "ROW(\"X\", 1)");
         Mutation("edited DATATABLE row", m => ((CalculatedPartitionSource)m.Tables["T"].Partitions[0].Source).Expression = "DATATABLE(\"X\", INTEGER, {{123456}})");
         Mutation("added column", m => m.Tables["T"].Columns.Add(new CalculatedColumn { Name = "Added", Expression = "1", DataType = DataType.Int64 }));
-        Mutation("removed RowNumber column", m => m.Tables["T"].Columns.Remove("RowNumber"));
-        Mutation("added RowNumber column", m => m.Tables["Other"].Columns.Add(new RowNumberColumn { Name = "RowNumber" }));
+        Mutation("second RowNumber column", m => m.Tables["T"].Columns.Add(new RowNumberColumn { Name = "SecondRowNumber" }));
         Table Extra(string name, bool data = false) {
             var t = new Table { Name = name };
             t.Partitions.Add(new Partition { Name = "P", Source = data ? new MPartitionSource { Expression = "secret" } : new CalculatedPartitionSource { Expression = "ROW(\"X\", 1)" } });
@@ -287,7 +291,12 @@ class Fixtures
         var privateModel = Build(); var hidden = Extra("LocalDateTable_signed"); hidden.IsPrivate = true;
         privateModel.Tables.Add(hidden);
         var privateDefinition = P.Definition(privateModel);
-        if (!privateDefinition.Contains("LocalDateTable_signed")) throw new Exception("private table omitted");
+        var signedPrivateTable = JsonNode.Parse(privateDefinition)!["tables"]!.AsArray()
+            .SingleOrDefault(t => t?["name"]?.GetValue<string>() == "LocalDateTable_signed");
+        if (signedPrivateTable == null) throw new Exception("private table omitted");
+        if (signedPrivateTable["partitions"]![0]!["source"]!["expression"]!.GetValue<string>()
+            != ((CalculatedPartitionSource)hidden.Partitions[0].Source).Expression)
+            throw new Exception("private table partition definition omitted");
         Mutation("removed table", m => m.Tables.Remove("Other"));
         Mutation("calculated column expression", m => ((CalculatedColumn)m.Tables["T"].Columns["C"]).Expression = "42");
         Mutation("calculation item expression", m => m.Tables["CG"].CalculationGroup.CalculationItems["Item"].Expression = "42");
@@ -325,6 +334,58 @@ class Fixtures
             s => P.Verify(ctx, s), () => ++queries), "SYNTH_VERIFICATION_UNAVAILABLE");
         Check("verified rows released", () => {
             if (P.Buffered(() => good, s => P.Verify(ctx, s), () => 7) != 7) throw new Exception("lost rows");
+        }, null);
+        Check("validation inventories and signs its snapshot", () => {
+            var candidate = Build();
+            var raceMarker = new string('d', 64);
+            candidate.Annotations.Add(new Annotation { Name = "PBZ_SYNTHETIC", Value = raceMarker });
+            // Many TOM objects keep deserialization in flight after the small source file is read.
+            // The timing margin must be confirmed on Windows with the actual TOM build.
+            for (int i = 0; i < 50000; i++)
+                candidate.Tables["Other"].Measures.Add(new Measure { Name = "Slow" + i, Expression = "1" });
+            var source = Path.Combine(args[0], "race-source");
+            Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer.SerializeDatabaseToFolder(candidate.Database, source);
+            var expected = P.Definition(Microsoft.AnalysisServices.Tabular.Tmdl.TmdlSerializer
+                .DeserializeDatabaseFromFolder(source).Model);
+            var racePrivate = Path.Combine(args[0], "race-private");
+            var raceCtx = new Ctx("tmdl-validate");
+            var request = Req.Parse(new JsonObject { ["private_dir"] = racePrivate,
+                ["folder"] = source, ["synthetic_marker"] = raceMarker, ["timeout_s"] = 120 }.ToJsonString());
+            raceCtx.Init(request);
+            var validation = Task.Run(() => TmdlValidate.Run(request, raceCtx));
+            // Wait for the frozen tree, then give deserialization a short head start.
+            // With the old implementation there is no scratch tree; the same delay exposes
+            // the later live inventory after TOM has read T but is still building the model.
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            bool copied = false;
+            bool sawSnapshot = false;
+            while (!validation.IsCompleted && DateTime.UtcNow < deadline)
+            {
+                foreach (var scratch in Directory.EnumerateDirectories(racePrivate, "tmdl-validate-*"))
+                {
+                    sawSnapshot = true;
+                    var files = Directory.GetFiles(source, "*", SearchOption.AllDirectories);
+                    copied = files.All(f => {
+                        var copy = Path.Combine(scratch, Path.GetRelativePath(source, f));
+                        return File.Exists(copy) && new FileInfo(copy).Length == new FileInfo(f).Length;
+                    });
+                    if (copied) break;
+                }
+                if (copied || (!sawSnapshot && DateTime.UtcNow > deadline.AddSeconds(-9.9))) break;
+                Thread.Sleep(1);
+            }
+            if (sawSnapshot && !copied) throw new Exception("snapshot copy did not finish within the fixture deadline");
+            Thread.Sleep(100);
+            if (validation.IsCompleted) throw new Exception("validation finished before source edit; increase race fixture size");
+            File.Delete(Path.Combine(source, "tables", "T.tmdl"));
+            var result = validation.GetAwaiter().GetResult();
+            if (result["valid"]?.GetValue<bool>() != true || result["missing_refs"]!.AsArray().Count != 0
+                || result["orphan_files"]!.AsArray().Count != 0)
+                throw new Exception("source mutation changed snapshot validation: " + result.ToJsonString());
+            if (P.Load(raceCtx, raceMarker)["definition"]!.GetValue<string>() != expected)
+                throw new Exception("validation did not sign the complete original model");
+            if (Directory.EnumerateDirectories(racePrivate, "tmdl-validate-*").Any())
+                throw new Exception("validation snapshot was not cleaned up");
         }, null);
         Console.WriteLine($"{passed} passed, 0 failed");
     }

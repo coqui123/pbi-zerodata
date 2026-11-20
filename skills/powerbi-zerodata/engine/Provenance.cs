@@ -77,10 +77,14 @@ public static class SyntheticProvenance
     public static string Definition(Microsoft.AnalysisServices.Tabular.Model model)
     {
         foreach (var table in model.Tables) // Includes private, private-prefixed and untagged tables.
+        {
+            if (table.Columns.Count(c => c.Type == Microsoft.AnalysisServices.Tabular.ColumnType.RowNumber) > 1)
+                throw new BadRequestException("SYNTH_DEFINITION_CHANGED: more than one RowNumber column in a table");
             if (table.Partitions.Count == 0 || table.Partitions.Any(p =>
                 p.Source is not Microsoft.AnalysisServices.Tabular.CalculatedPartitionSource
                 && p.Source is not Microsoft.AnalysisServices.Tabular.CalculationGroupSource))
                 throw new BadRequestException("SYNTH_DATA_PARTITION: every table must have only calculated partitions");
+        }
         var json = JsonNode.Parse(Microsoft.AnalysisServices.Tabular.JsonSerializer.SerializeObject(model,
             new Microsoft.AnalysisServices.Tabular.SerializeOptions {
                 IncludeRestrictedInformation = true, IgnoreChildren = false,
@@ -93,13 +97,6 @@ public static class SyntheticProvenance
         var definition = new JsonObject { ["version"] = 2 };
         foreach (var name in new[] { "tables", "relationships", "roles", "expressions", "functions", "cultures", "perspectives" })
             definition[name] = Canonical(json[name]);
-        // RowNumber identities are engine-maintained and stripped above, but every column
-        // must still be covered. Count them from TOM, even if JSON omits inferred columns.
-        var rowNumberCounts = new JsonObject();
-        foreach (var table in model.Tables.OrderBy(t => t.Name, StringComparer.Ordinal))
-            rowNumberCounts[table.Name] = table.Columns.Count(c =>
-                c.Type == Microsoft.AnalysisServices.Tabular.ColumnType.RowNumber);
-        definition["rowNumberCounts"] = rowNumberCounts;
         return definition.ToJsonString();
     }
 
@@ -196,23 +193,7 @@ public static class SyntheticProvenance
     {
         var trusted = Load(ctx, snapshot.MarkerValue);
         var definition = trusted["definition"]!.GetValue<string>();
-        var liveDefinition = snapshot.DefinitionValue;
-        // Legacy signatures cover definitions without counts. Only that signed format may
-        // omit the new field; new manifests always compare the per-table counts as well.
-        if (definition != liveDefinition && JsonNode.Parse(definition) is JsonObject oldDefinition
-            && !oldDefinition.ContainsKey("rowNumberCounts"))
-        {
-            try
-            {
-                if (JsonNode.Parse(liveDefinition) is JsonObject live)
-                {
-                    live.Remove("rowNumberCounts");
-                    liveDefinition = live.ToJsonString();
-                }
-            }
-            catch (System.Text.Json.JsonException) { }
-        }
-        if (definition != liveDefinition)
+        if (definition != snapshot.DefinitionValue)
             throw new BadRequestException("SYNTH_DEFINITION_CHANGED: live model differs from signed build");
         if (requireCatalog && trusted["catalog"]?.GetValue<string>() != snapshot.Catalog)
             throw new BadRequestException("SYNTH_CATALOG_MISMATCH: model is not the registered Desktop catalog");
