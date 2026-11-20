@@ -109,6 +109,18 @@ class InstallConflict(ValueError):
     """A named conflict leaves the affected file unchanged."""
 
 
+def _remove_created_sidecar(lock, identity, still_absent):
+    """Remove a closed sidecar only if it is still ours and the target is absent."""
+    if not still_absent:
+        return
+    try:
+        current = os.stat(lock)
+        if (current.st_dev, current.st_ino) == identity:
+            os.unlink(lock)
+    except OSError:
+        pass
+
+
 @contextmanager
 def file_lock(path: str, what_if: bool = False):
     """Serialize a transaction, retaining sidecars except for absent no-op targets."""
@@ -119,22 +131,25 @@ def file_lock(path: str, what_if: bool = False):
     parent = os.path.dirname(path)
     target_absent = not os.path.exists(path)
     created_parents = []
-    missing = []
-    ancestor = parent
-    while not os.path.exists(ancestor):
-        missing.append(ancestor)
-        ancestor = os.path.dirname(ancestor)
+    deferred_identity = None
     lock = path + '.pbz-lock'
     deadline = time.monotonic() + 60
     try:
-        for directory in reversed(missing):
-            try:
-                os.mkdir(directory)
-                created_parents.append(directory)
-            except FileExistsError:
-                if not os.path.isdir(directory):
-                    raise
         while True:
+            # A no-op holder can remove these directories before we retry.
+            missing = []
+            ancestor = parent
+            while not os.path.exists(ancestor):
+                missing.append(ancestor)
+                ancestor = os.path.dirname(ancestor)
+            for directory in reversed(missing):
+                try:
+                    os.mkdir(directory)
+                    if directory not in created_parents:
+                        created_parents.append(directory)
+                except FileExistsError:
+                    if not os.path.isdir(directory):
+                        raise
             try:
                 handle = open(lock, 'x+b')
                 lock_created = True
@@ -175,13 +190,18 @@ def file_lock(path: str, what_if: bool = False):
                     try:
                         yield
                     finally:
-                        # Unlink while locked so waiters must re-open and validate
-                        # the replacement inode before entering their transaction.
                         if target_absent and not os.path.exists(path) and lock_created:
-                            try:
-                                os.unlink(lock)
-                            except OSError:
-                                pass
+                            if os.name == 'nt':
+                                # Windows cannot unlink our open handle. Remember
+                                # its identity for cleanup after closing it.
+                                deferred_identity = (descriptor.st_dev, descriptor.st_ino)
+                            else:
+                                # Unlink while locked so waiters must re-open and
+                                # validate the replacement inode before entering.
+                                try:
+                                    os.unlink(lock)
+                                except OSError:
+                                    pass
                     return
                 finally:
                     if os.name == 'nt':
@@ -190,6 +210,8 @@ def file_lock(path: str, what_if: bool = False):
                     else:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
+        if deferred_identity is not None:
+            _remove_created_sidecar(lock, deferred_identity, target_absent and not os.path.exists(path))
         if target_absent and not os.path.exists(path):
             for directory in reversed(created_parents):
                 try:

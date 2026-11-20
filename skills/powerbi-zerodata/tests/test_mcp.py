@@ -200,6 +200,35 @@ class InstallerTransactionTests(unittest.TestCase):
                     pass
             self.assertTrue(Path(str(path) + '.pbz-lock').exists())
 
+    def test_deferred_sidecar_cleanup_requires_identity_and_absent_target(self):
+        inst = self.inst
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'settings.json')
+            lock = str(path) + '.pbz-lock'
+            with open(lock, 'x+b') as handle:
+                descriptor = os.fstat(handle.fileno())
+                identity = (descriptor.st_dev, descriptor.st_ino)
+            # Exercise the Windows cleanup helper with the handle already closed.
+            path.write_text('writer content', encoding='utf-8')
+            with patch.object(inst.os, 'unlink', wraps=os.unlink) as unlink:
+                inst._remove_created_sidecar(lock, identity, not path.exists())
+                unlink.assert_not_called()
+            self.assertTrue(Path(lock).exists())
+            path.unlink()
+            # Keep the old inode alive so the replacement cannot reuse it.
+            os.rename(lock, lock + '.old')
+            Path(lock).write_bytes(b'host lock')
+            replacement = os.stat(lock)
+            self.assertNotEqual(identity, (replacement.st_dev, replacement.st_ino))
+            with patch.object(inst.os, 'unlink', wraps=os.unlink) as unlink:
+                inst._remove_created_sidecar(lock, identity, not path.exists())
+                unlink.assert_not_called()
+            self.assertEqual(Path(lock).read_bytes(), b'host lock')
+            with patch.object(inst.os, 'unlink', wraps=os.unlink) as unlink:
+                inst._remove_created_sidecar(lock, (replacement.st_dev, replacement.st_ino), not path.exists())
+                unlink.assert_called_once_with(lock)
+            self.assertFalse(Path(lock).exists())
+
     @unittest.skipIf(os.name == 'nt', 'POSIX flock and unlink of open file')
     def test_absent_noop_lock_unlinks_before_unlocking(self):
         import fcntl
@@ -268,6 +297,59 @@ class InstallerTransactionTests(unittest.TestCase):
             self.assertFalse(third.is_alive())
             self.assertTrue(entered.is_set())
             self.assertEqual(errors, [])
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX flock')
+    def test_absent_noop_holder_removes_parents_before_waiter_retries(self):
+        import fcntl
+        inst = self.inst
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'first', 'second', 'settings.json')
+            self.assertFalse(path.parent.exists())
+            entered, opened, holder_finished = (threading.Event() for _ in range(3))
+            errors = []
+            flock = fcntl.flock
+            def gated_flock(fd, operation):
+                if threading.current_thread() is waiter and operation & fcntl.LOCK_EX and not opened.is_set():
+                    # The waiter has opened the holder's sidecar, but must not
+                    # validate its inode until the real holder finishes cleanup.
+                    opened.set()
+                    if not holder_finished.wait(5):
+                        raise RuntimeError('holder cleanup timeout')
+                    if path.parent.exists():
+                        raise RuntimeError('holder did not remove created parents')
+                return flock(fd, operation)
+            def noop_holder():
+                try:
+                    with inst.file_lock(str(path)):
+                        entered.set()
+                        if not opened.wait(5):
+                            raise RuntimeError('waiter open timeout')
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    holder_finished.set()
+            def writer():
+                try:
+                    with inst.file_lock(str(path)):
+                        path.write_text('waiting writer', encoding='utf-8')
+                except BaseException as error:
+                    errors.append(error)
+            holder = threading.Thread(target=noop_holder)
+            waiter = threading.Thread(target=writer)
+            with patch.object(fcntl, 'flock', side_effect=gated_flock):
+                holder.start()
+                try:
+                    self.assertTrue(entered.wait(5))
+                    waiter.start()
+                    self.assertTrue(opened.wait(5))
+                finally:
+                    holder.join(5)
+                    if waiter.ident is not None: waiter.join(5)
+            self.assertFalse(holder.is_alive())
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(path.exists())
+            self.assertEqual(path.read_text(encoding='utf-8'), 'waiting writer')
 
     @unittest.skipIf(os.name == 'nt', 'POSIX flock')
     def test_posix_lock_timeout_is_named_conflict(self):
