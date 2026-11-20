@@ -120,10 +120,8 @@ def controls(entries, path=None, check_scripts=True):
             if (not re.fullmatch(r'[0-9a-fA-F]{40}', revision) or script.is_absolute()
                     or '..' in script.parts or not script.parts):
                 raise ValueError('invalid historical revision/script')
-            data = None
-            if check_scripts or not record.get('sha256'):
-                data = subprocess.check_output(['git', 'show', f'{revision}:{script.as_posix()}'], cwd=ROOT)
-            digest = hashlib.sha256(data).hexdigest() if data is not None else record['sha256']
+            data = subprocess.check_output(['git', 'show', f'{revision}:{script.as_posix()}'], cwd=ROOT)
+            digest = hashlib.sha256(data).hexdigest()
             if (not re.fullmatch(r'[0-9a-f]{64}', digest) or
                     record.get('sha256', digest) != digest):
                 raise ValueError('historical content identity mismatch')

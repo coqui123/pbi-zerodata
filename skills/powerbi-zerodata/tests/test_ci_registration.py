@@ -1,5 +1,7 @@
 """Registration, executed-set and shadow gate acceptance."""
 from __future__ import annotations
+import ast
+import hashlib
 import copy
 import json
 from pathlib import Path
@@ -187,13 +189,25 @@ class CiRegistrationTests(unittest.TestCase):
                 def execute(group, shard):
                     return run_offline.execute(group, shard=shard, output=root / str(shard), run=child,
                                               expected_failures=expected, scanner=lambda roots: {'completed': True, 'ok': True})
-                reference = execute(entries, 'serial')
-                shards = [execute(group, i) for i, group in enumerate(allocate(entries, 2))]
+                with patch.dict(os.environ, GITHUB_RUN_ID='serial-fixture', GITHUB_RUN_ATTEMPT='1'):
+                    reference = execute(entries, 'serial')
+                with patch.dict(os.environ, GITHUB_RUN_ID='sharded-fixture', GITHUB_RUN_ATTEMPT='1'):
+                    shards = [execute(group, i) for i, group in enumerate(allocate(entries, 2))]
                 self.assertTrue(compare(reference, shards, control_path=[record]))
             source = next(row for row in reference['executed'] if row['id'] == 'guard')['source']
             self.assertEqual(source['revision'], revision)
             self.assertEqual(source['path'], 'suite.py')
             self.assertEqual(len(source['sha256']), 64)
+            wrong_record = dict(record, sha256='0' * 64)
+            agreeing = copy.deepcopy([reference, *shards])
+            for report in agreeing:
+                for row in report['executed']:
+                    if row['id'] == 'guard':
+                        row['source']['sha256'] = wrong_record['sha256']
+            with self.assertRaisesRegex(ValueError, 'historical content identity mismatch'):
+                controls(self.entries, [wrong_record], check_scripts=False)
+            with self.assertRaisesRegex(ValueError, 'historical content identity mismatch'):
+                compare(agreeing[0], agreeing[1:], control_path=[wrong_record])
             next(row for row in shards[0]['executed'] + shards[1]['executed'] if row['id'] == 'guard')['source']['sha256'] = '0' * 64
             with self.assertRaisesRegex(ValueError, 'source identity'):
                 compare(reference, shards, control_path=[record])
@@ -209,6 +223,55 @@ class CiRegistrationTests(unittest.TestCase):
             self.assertEqual(len(row['skip_reasons']), 1)
             self.assertIn('injected reason', row['skip_reasons'][0])
             self.assertTrue(report['scan']['completed'])
+
+    def test_default_scanner_roots_and_production_shard_aggregate(self):
+        from canary_scan import CAN, redact
+        groups = allocate(self.entries, 2)
+        planted_shard = next(i for i, group in enumerate(groups)
+                             if not any(e['id'] == 'engine-offline' for e in group))
+        fixed = {k: 'fixed' for k in ('python', 'os', 'image', 'dotnet', 'dependencies',
+                                     'nuget', 'source', 'project', 'payload')}
+        def child(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0)
+        for kind in (None, 'checkout', 'logs', 'output-root'):
+            with self.subTest(root=kind), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                evidence = base / 'evidence'
+                evidence.mkdir()
+                planted_path = None
+                for i, group in enumerate(groups):
+                    roots = {name: base / str(i) / name for name in ('checkout', 'logs', 'output-root')}
+                    for root in roots.values():
+                        root.mkdir(parents=True)
+                    failed = kind is not None and i == planted_shard
+                    if failed:
+                        planted_path = roots[kind] / 'planted.txt'
+                        planted_path.write_text(CAN['canary-strings'][0], encoding='utf-8')
+                    with patch.object(run_offline, 'ROOT', roots['checkout']), patch.object(run_offline, 'identity', return_value=fixed), patch.dict(os.environ, GITHUB_SHA='fixture', GITHUB_RUN_ID='sharded-fixture', GITHUB_RUN_ATTEMPT='1'), contextlib.redirect_stdout(io.StringIO()):
+                        report = run_offline.execute(group, shard=i, output=roots['logs'],
+                                                     roots=[roots['output-root']], run=child)
+                    self.assertTrue(report['scan']['completed'])
+                    self.assertEqual(report['scan']['ok'], not failed)
+                    self.assertEqual(report['ok'], not failed)
+                    self.assertEqual(report['scan']['failures'],
+                                     [{'path': str(planted_path), 'reason': 'canary'}] if failed else [])
+                    (evidence / f'shard-{i}.json').write_text(redact(json.dumps(report)), encoding='utf-8')
+                aggregate = subprocess.run([sys.executable, str(BASELINE.parent / 'ci_equivalence.py'),
+                                            '--shards-only', str(evidence)],
+                                           env=dict(os.environ, PBZ_CI_CONTROLS=''), capture_output=True, text=True)
+                if kind is None:
+                    self.assertEqual(aggregate.returncode, 0, aggregate.stderr)
+                    self.assertIn('shard aggregate passed', aggregate.stdout)
+                else:
+                    self.assertNotEqual(aggregate.returncode, 0)
+                    # The synthesized reference inherits the first discovered scan.
+                    self.assertRegex(aggregate.stderr,
+                                     r'ValueError: (incomplete or failed scan|inconsistent final verdict)')
+                    self.assertNotIn('shard aggregate passed', aggregate.stdout)
+                    failed_report = json.loads((evidence / f'shard-{planted_shard}.json').read_text())
+                    self.assertFalse(failed_report['ok'])
+                    self.assertEqual(failed_report['scan']['failures'],
+                                     [{'path': str(planted_path), 'reason': 'canary'}])
 
     def test_injected_control_records_specific_failure_reason(self):
         record = dict(id='injected-control', argv=['tests/test_ci_registration.py', '--injected-failure'], purpose='injected',
@@ -286,6 +349,26 @@ with tempfile.TemporaryDirectory() as tmp:
 
 
 class EquivalenceTests(unittest.TestCase):
+    def setUp(self):
+        import ci_manifest
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        def git(*args):
+            return subprocess.check_output(['git', *args], cwd=root)
+        git('init', '-q')
+        git('config', 'user.name', 'Fixture')
+        git('config', 'user.email', 'fixture@example.test')
+        (root / 'tests').mkdir()
+        (root / 'tests/test_guard.py').write_text('raise SystemExit(91)\n')
+        git('add', '.')
+        git('commit', '-qm', 'historical fixture')
+        self.revision = git('rev-parse', 'HEAD').decode().strip()
+        self.historical_digest = hashlib.sha256(git('show', f'{self.revision}:tests/test_guard.py')).hexdigest()
+        patcher = patch.object(ci_manifest, 'ROOT', root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def reports(self):
         entries = json.loads(MANIFEST.read_text())
         rows = [dict(e, exit_code=0, skip_reasons=[], error=None) for e in entries]
@@ -382,7 +465,7 @@ class EquivalenceTests(unittest.TestCase):
                            argv=['tests/test_guard.py'] if purpose == 'historical' else ['tests/test_ci_registration.py', '--injected-failure'],
                            exit_code=91, reason='specific failure reason', purpose=purpose)
             if purpose == 'historical':
-                control.update(revision='a' * 40, script='tests/test_guard.py', sha256='b' * 64)
+                control.update(revision=self.revision, script='tests/test_guard.py', sha256=self.historical_digest)
             if purpose == 'injected':
                 row = dict(id=control['id'], argv=control['argv'], exit_code=91, error=None,
                            skip_reasons=[], failure_reason=control['reason'])
@@ -400,7 +483,7 @@ class EquivalenceTests(unittest.TestCase):
             for r in [ref, *shards]:
                 r['ok'] = all(e['exit_code'] == 0 for e in r['executed'])
             result[key] = dict(run_id='control-' + purpose, controls=[control], reference=ref, shards=shards,
-                               historical_revision='a' * 40)
+                               historical_revision=self.revision)
         ref, shards = self.reports()
         planted = next(r for r in shards if not any(e['id'] == 'engine-offline' for e in r['executed']))
         planted['ok'] = False
@@ -499,9 +582,37 @@ class EquivalenceTests(unittest.TestCase):
             with patch.object(ci_equivalence, 'MANIFEST', manifest), self.assertRaisesRegex(ValueError, 'membership'):
                 compare(ref, shards)
 
+    def test_windows_mcp_skip_inventory_matches_source(self):
+        source = ast.parse((BASELINE.parent / 'test_mcp.py').read_text(encoding='utf-8'))
+        expected = []
+        for cls in (node for node in ast.walk(source) if isinstance(node, ast.ClassDef)):
+            for method in cls.body:
+                if not isinstance(method, ast.FunctionDef) or not method.name.startswith('test_'):
+                    continue
+                for decorator in method.decorator_list:
+                    if (isinstance(decorator, ast.Call) and
+                            ast.unparse(decorator.func) == 'unittest.skipIf' and
+                            len(decorator.args) == 2 and
+                            ast.unparse(decorator.args[0]) == "os.name == 'nt'"):
+                        expected.append('PBZ_SKIP ' + json.dumps({
+                            'test': f'__main__.{cls.name}.{method.name}',
+                            'reason': ast.literal_eval(decorator.args[1])}))
+        declared = json.loads((BASELINE.parent / 'offline_skips.json').read_text())['windows']['mcp']
+        self.assertEqual(sorted(declared), sorted(expected))
+
+    def test_run_identity_canonicalization(self):
+        from ci_equivalence import run_id
+        for value in (123, '123', '0123', '123 ', ' 00123 '):
+            with self.subTest(value=value):
+                self.assertEqual(run_id(value), '123')
+        self.assertEqual(run_id(' canary-control '), 'canary-control')
+        for value in ('', '   ', None, True):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'invalid run identity'):
+                run_id(value)
+
     def test_platform_scoped_mcp_skips(self):
         allowed = json.loads((BASELINE.parent / 'offline_skips.json').read_text())['windows']['mcp']
-        self.assertEqual(len(allowed), 4)
+        self.assertEqual(len(allowed), 6)
         for platform, extra, passes in [('Windows-2025', False, True), ('Windows-2025', True, False), ('Linux', False, False)]:
             ref, shards = self.reports()
             for report in [ref, *shards]:
@@ -528,13 +639,17 @@ class EquivalenceTests(unittest.TestCase):
                 rollout(evidence)
 
     def test_canonical_run_attempt_and_control_bindings(self):
-        for variant in ('mixed-duplicate', 'shard-attempt', 'metric-attempt', 'missing-attempt',
+        for variant in ('mixed-duplicate', 'leading-zero-duplicate', 'whitespace-duplicate', 'shard-attempt', 'metric-attempt', 'missing-attempt',
                         'control-unbound', 'control-mismatch', 'control-attempt', 'control-cancelled', 'control-reused', 'canary-unbound'):
             evidence = self.evidence()
             pair = evidence['pairs'][0]
-            if variant == 'mixed-duplicate':
-                pair['serial_run'] = 123
-                evidence['pairs'][1]['serial_run'] = '123'
+            if variant in ('mixed-duplicate', 'leading-zero-duplicate', 'whitespace-duplicate'):
+                second_id = {'mixed-duplicate': '123', 'leading-zero-duplicate': '0123',
+                             'whitespace-duplicate': '123 '}[variant]
+                for duplicate, identity in zip(evidence['pairs'][:2], (123, second_id)):
+                    duplicate['serial_run'] = identity
+                    duplicate['reference']['run']['id'] = identity
+                    duplicate['serial_metrics']['run_id'] = identity
             elif variant == 'shard-attempt':
                 pair['shards'][0]['run']['attempt'] = '2'
             elif variant == 'metric-attempt':
@@ -553,7 +668,8 @@ class EquivalenceTests(unittest.TestCase):
                 evidence['injected_failure']['shards'][0]['run']['attempt'] = '2'
             else:
                 evidence['canary_without_engine']['run_id'] = 'wrong'
-            with self.subTest(variant=variant), self.assertRaisesRegex(ValueError, 'run binding|runs reused|metric identity'):
+            reason = 'hosted runs reused across pairs' if variant.endswith('duplicate') else 'run binding|runs reused|metric identity'
+            with self.subTest(variant=variant), self.assertRaisesRegex(ValueError, reason):
                 rollout(evidence)
 
     def test_hosted_metrics_include_setup_and_final_aggregate(self):

@@ -22,7 +22,8 @@ def inventory():
 def run_id(value):
     if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip():
         raise ValueError('run binding: invalid run identity')
-    return str(value)
+    value = str(value).strip()
+    return str(int(value)) if value.isdigit() else value
 
 
 def attempt(value):
