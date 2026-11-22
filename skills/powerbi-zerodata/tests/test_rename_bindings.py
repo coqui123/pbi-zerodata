@@ -96,6 +96,82 @@ class RenameBindingsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "REFUSED")
         self.assertEqual(_bytes(ws.mirror), before)
 
+    def test_standalone_report_string_substrings_unchanged(self):
+        for value in ("Sales.Amount Margin", "Other Sales.Amount", "Sales.Amount-1"):
+            with self.subTest(value=value):
+                ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": value}]})
+                before = path.read_bytes()
+                rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_other_projection_native_query_ref_unchanged(self):
+        obj = {"projections": [{
+            "Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"},
+            "nativeQueryRef": "Amount",
+        }]}
+        ws, project, mdef, path = self._report_project(obj)
+        model = tmdl.load_model(mdef)
+        self.assertIsNotNone(model.column("Other", "Amount"))
+        fields = pbir.walk_fields_with_path(pbir.parse_json(path.read_text()), model)
+        self.assertEqual([(ref.kind, ref.table, ref.name, site) for ref, site in fields],
+                         [("column", "Other", "Amount", ("projections", 0))])
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        projection = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(projection["Column"]["Property"], "Amount")
+        self.assertEqual(projection["nativeQueryRef"], "Amount")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_report_scope_violation_planned_write_refuses(self):
+        for case, obj in (
+            ("substring", {"refs": [{"queryRef": "Sales.Amount Margin"}]}),
+            ("other_projection", {"projections": [{
+                "Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"},
+                "nativeQueryRef": "Amount",
+            }]}),
+        ):
+            with self.subTest(case=case):
+                ws, project, mdef, path = self._report_project({})
+                model = tmdl.load_model(mdef)
+                model_ops = []
+                for rel, old, new in (("tables/Sales.tmdl", "Amount", "Value"),
+                                      ("tables/Other.tmdl", "Sales.Amount", "Sales.Value"),
+                                      ("roles/Reader.tmdl", "columnPermission Amount", "columnPermission Value")):
+                    model_path = Path(mdef, rel)
+                    text = model_path.read_text()
+                    changed = text.replace(old, new, 1) if rel.startswith("roles/") else text.replace(old, new)
+                    model_ops.append(("write", str(model_path), changed, b""))
+                # Prove the model plan is valid before adding a report scope violation.
+                rename._verify_plan(ws, project, model, mdef, model_ops,
+                                    "column", "Sales", "Amount", "Value")
+                original = json.dumps(obj)
+                path.write_text(original)
+                if case == "other_projection":
+                    self.assertIsNotNone(model.column("Other", "Amount"))
+                    fields = pbir.walk_fields_with_path(pbir.parse_json(original), model)
+                    self.assertEqual([(ref.kind, ref.table, ref.name, site) for ref, site in fields],
+                                     [("column", "Other", "Amount", ("projections", 0))])
+                    changed = original.replace('"nativeQueryRef": "Amount"', '"nativeQueryRef": "Value"')
+                else:
+                    changed = original.replace("Sales.Amount Margin", "Sales.Value Margin")
+                before = _bytes(ws.mirror)
+                with self.assertRaises(PbzError) as caught:
+                    rename._verify_plan(ws, project, model, mdef,
+                                        model_ops + [("write", str(path), changed, b"")],
+                                        "column", "Sales", "Amount", "Value")
+                self.assertEqual(caught.exception.code, "REFUSED")
+                self.assertIn("report string", str(caught.exception))
+                self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_exact_standalone_report_strings_follow_column_rename(self):
+        ws, project, _mdef, path = self._report_project({"refs": [
+            {"queryRef": "Sales.Amount"}, {"nativeQueryRef": "Amount"}, {"queryRef": "Other.Amount"},
+        ]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text()), {"refs": [
+            {"queryRef": "Sales.Value"}, {"nativeQueryRef": "Value"}, {"queryRef": "Other.Amount"},
+        ]})
+
     def test_malformed_planned_report_refuses(self):
         ws, project, mdef, path = self._report_project({})
         model = tmdl.load_model(mdef)
