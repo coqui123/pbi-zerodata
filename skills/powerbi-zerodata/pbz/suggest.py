@@ -12,10 +12,10 @@ TEXT_VISUALS = {"textbox", "image", "shape", "basicShape", "actionButton", "page
 
 
 def _ends_expression(tok) -> bool:
-    if tok.kind in ("bracket", "num", "str"):
+    if tok.kind in ("bracket", "num", "str", "table", "qident", "pbztok"):
         return True
     if tok.kind == "ident":
-        return tok.text.upper() not in ("VAR", "RETURN")
+        return tok.text.upper() not in ("VAR", "RETURN", "NOT", "IN")
     return tok.kind == "op" and tok.text in (")", "}")
 
 

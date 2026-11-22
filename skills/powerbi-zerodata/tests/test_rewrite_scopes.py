@@ -78,6 +78,18 @@ class RewriteScopeTests(unittest.TestCase):
         expr = 'VAR a = VAR b = 1 RETURN VAR c = b RETURN c VAR keep = 2 RETURN keep'
         self.assertEqual(rewrite._unused(expr), 'VAR keep = 2 RETURN keep')
 
+    def test_quoted_table_name_ends_an_initializer(self):
+        expr = "VAR a = VAR t = 'Sales' VAR n = COUNTROWS(t) RETURN n RETURN a"
+        self.assertIsNone(rewrite._unused(expr))
+
+    def test_nested_block_after_an_operator_is_consumed(self):
+        expr = 'VAR a = 1 + VAR b = 2 RETURN b VAR c = 3 RETURN c'
+        self.assertEqual(rewrite._unused(expr), 'VAR c = 3 RETURN c')
+
+    def test_nested_block_after_a_word_operator_is_consumed(self):
+        expr = 'VAR a = NOT VAR b = 1 RETURN b VAR c = 2 RETURN c'
+        self.assertEqual(rewrite._unused(expr), 'VAR c = 2 RETURN c')
+
     def test_parenthesized_block_as_whole_expression_is_unchanged(self):
         self.assertIsNone(rewrite._unused('(VAR a = VAR b = 1 RETURN b) + 1'))
 
