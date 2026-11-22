@@ -185,6 +185,10 @@ SALES = (
     "\tmeasure AddColB = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), Sales[Price]))\n\n"
     "\tmeasure ProjCapA = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"Price\", 1), [Price]))\n\n"
     "\tmeasure ProjCapB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure SumzCapA = SUMX(Sales, SUMX(SUMMARIZE(Dates, Dates[Day], \"Price\", 1), [Price]))\n\n"
+    "\tmeasure SumzCapB = SUMX(Sales, SUMX(SUMMARIZE(Dates, Dates[Day], \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure SumzColA = SUMX(Sales, SUMX(SUMMARIZECOLUMNS(Dates[Day], Dates, \"Price\", 1), [Price]))\n\n"
+    "\tmeasure SumzColB = SUMX(Sales, SUMX(SUMMARIZECOLUMNS(Dates[Day], Dates, \"Price\", 1), Sales[Price]))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -271,7 +275,8 @@ class SimilarScopeTests(unittest.TestCase):
               "XnpvThirdA", "XnpvThirdB", "XnpvUnionA", "XnpvUnionB",
               "XnpvProjA", "XnpvProjB", "WrapProjA", "WrapProjB",
               "PlainProjA", "PlainProjB", "ValuesColA", "ValuesColB",
-              "AddColA", "AddColB", "ProjCapA", "ProjCapB")},
+              "AddColA", "AddColB", "ProjCapA", "ProjCapB",
+              "SumzCapA", "SumzCapB", "SumzColA", "SumzColB")},
         )
 
     def _canon(self, name):
@@ -495,7 +500,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("XnpvThirdB", "XnpvThirdA"), ("XnpvUnionB", "XnpvUnionA"),
                           ("XnpvProjB", "XnpvProjA"), ("WrapProjB", "WrapProjA"),
                           ("PlainProjB", "PlainProjA"), ("ValuesColB", "ValuesColA"),
-                          ("AddColB", "AddColA"), ("ProjCapB", "ProjCapA")):
+                          ("AddColB", "AddColA"), ("ProjCapB", "ProjCapA"),
+                          ("SumzCapB", "SumzCapA"), ("SumzColB", "SumzColA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

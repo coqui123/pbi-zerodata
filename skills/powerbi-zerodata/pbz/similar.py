@@ -439,9 +439,19 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     and stack[-1].get("x_table") is None:
                 stack[-1]["x_table"] = _span_table(stack[-1]["x_span"])
             stack[-1]["arg"] += 1
-        if stack and stack[-1]["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS") \
-                and stack[-1]["arg"] % 2 == 1 and t.kind == "str":
-            stack[-1].setdefault("names", set()).add(t.value.lower())
+        if stack and t.kind == "str" and stack[-1]["fn"] in (
+                "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "SUMMARIZE", "GROUPBY"):
+            fr0 = stack[-1]
+            if fr0.get("ext_parity") is None:
+                if fr0["fn"] in ("SELECTCOLUMNS", "ADDCOLUMNS"):
+                    if fr0["arg"] % 2 == 1:
+                        fr0["ext_parity"] = fr0["arg"]
+                        fr0.setdefault("names", set()).add(t.value.lower())
+                else:
+                    fr0["ext_parity"] = fr0["arg"]
+                    fr0.setdefault("names", set()).add(t.value.lower())
+            elif (fr0["arg"] - fr0["ext_parity"]) % 2 == 0:
+                fr0.setdefault("names", set()).add(t.value.lower())
         if t.kind in LIT_KINDS:
             val = _num(t.text) if t.kind == "num" else ("T" + t.text if t.kind == "pbztok" else "S" + t.value)
             toks.append(("LIT", "lit", val))
