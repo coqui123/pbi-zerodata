@@ -49,6 +49,7 @@ def execute(entries, *, shard='serial', output=None, roots=None, run=None, scann
         report['run'] = {key: os.environ[env] for key, env in
                          (('id', 'GITHUB_RUN_ID'), ('attempt', 'GITHUB_RUN_ATTEMPT'),
                           ('workflow', 'GITHUB_WORKFLOW')) if env in os.environ}
+    injected = run is not None
     run = subprocess.run if run is None else run
     logs = []
     try:
@@ -59,15 +60,36 @@ def execute(entries, *, shard='serial', output=None, roots=None, run=None, scann
         for entry in entries:
             started = time.monotonic()
             log = output / (entry['id'] + '.log')
+            sidecar = output / (entry['id'] + '.skips.jsonl')
             logs.append(log)
             code, skips, error, reason, launched = -1, [], None, None, False
             try:
+                sidecar.unlink(missing_ok=True)
+                env = {**os.environ, 'PBZ_SKIP_SIDECAR': str(sidecar), 'PBZ_SKIP_SUITE': entry['id']}
                 with log.open('wb') as handle:
-                    result = run([sys.executable, str(SKILL / 'tests/ci_suite.py'), *entry.get('execution_argv', entry['argv'])], cwd=SKILL, stdout=handle, stderr=subprocess.STDOUT)
+                    result = run([sys.executable, str(SKILL / 'tests/ci_suite.py'), *entry.get('execution_argv', entry['argv'])], cwd=SKILL, stdout=handle, stderr=subprocess.STDOUT, env=env)
                 launched = True
                 code = result.returncode
                 text = log.read_text(encoding='utf-8', errors='replace')
-                skips = [line.strip() for line in text.splitlines() if re.match(r'^(?:PBZ_SKIP |SKIP\b)', line)]
+                skips = [line.strip() for line in text.splitlines() if re.match(r'^SKIP\b', line)]
+                if sidecar.exists():
+                    for line in sidecar.read_text(encoding='utf-8').splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except ValueError:
+                            record = None
+                        if (not isinstance(record, dict) or
+                                not {'suite', 'test', 'reason'} <= record.keys() or
+                                record['suite'] != entry['id'] or
+                                not isinstance(record['test'], str) or
+                                not isinstance(record['reason'], str)):
+                            error = error or 'invalid skip sidecar record'
+                            continue
+                        skips.append('PBZ_SKIP ' + json.dumps({'test': record['test'], 'reason': record['reason']}))
+                elif not injected:
+                    error = error or 'skip sidecar missing'
                 control = (expected_failures or {}).get(entry['id'])
                 if control and control[1] in text:
                     reason = control[1]
