@@ -405,7 +405,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             or (ref.kind == "column" and parent["row_table"] != ref.table):
                         uncertain = True
             for c_idx, fr in enumerate(stack):
-                if fr["fn"] == "RANKX" and fr["arg"] >= 2 and ref.kind == "column":
+                if fr["fn"] in ("RANKX", "PERCENTILEX.INC", "PERCENTILEX.EXC", "CONCATENATEX") \
+                        and fr["arg"] >= 2 and ref.kind == "column":
                     caller = home
                     for below in reversed(stack[:c_idx]):
                         if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:

@@ -149,6 +149,10 @@ SALES = (
     "\tmeasure TreatFirstB = SUMX(FILTER(Sales, Sales[Price] = 1), SUMX(UNION(TREATAS(Sales, Sales[Price]), Sales), Sales[Price]))\n\n"
     "\tmeasure RankxA = SUMX(Other, SUMX(Sales, RANKX(Other, Other[Price], [Price])))\n\n"
     "\tmeasure RankxB = SUMX(Other, SUMX(Sales, RANKX(Other, Other[Price], Other[Price])))\n\n"
+    "\tmeasure PercxA = SUMX(Other, SUMX(Sales, PERCENTILEX.INC(Other, Other[Price], [Price] / 100)))\n\n"
+    "\tmeasure PercxB = SUMX(Other, SUMX(Sales, PERCENTILEX.INC(Other, Other[Price], Other[Price] / 100)))\n\n"
+    "\tmeasure ConcatxA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], [Price] & \"\"))))\n\n"
+    "\tmeasure ConcatxB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], Other[Price] & \"\"))))\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -213,7 +217,7 @@ class SimilarScopeTests(unittest.TestCase):
               "UnionWrapA", "UnionWrapB", "UnionAllA", "UnionAllB", "YearCtrlA", "YearCtrlB",
               "TopnExcA", "TopnExcB", "NestUnionA", "NestUnionB", "SelColA", "SelColB",
               "AllExcA", "AllExcB", "TreatA", "TreatB", "TreatFirstA", "TreatFirstB",
-              "RankxA", "RankxB")},
+              "RankxA", "RankxB", "PercxA", "PercxB", "ConcatxA", "ConcatxB")},
         )
 
     def _canon(self, name):
@@ -415,7 +419,7 @@ class SimilarScopeTests(unittest.TestCase):
                           ("TopnExcB", "TopnExcA"), ("NestUnionB", "NestUnionA"),
                           ("SelColB", "SelColA"), ("AllExcB", "AllExcA"),
                           ("TreatB", "TreatA"), ("TreatFirstB", "TreatFirstA"),
-                          ("RankxB", "RankxA")):
+                          ("RankxB", "RankxA"), ("PercxB", "PercxA"), ("ConcatxB", "ConcatxA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
