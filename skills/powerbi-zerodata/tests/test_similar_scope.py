@@ -171,6 +171,10 @@ SALES = (
     "\tmeasure XnpvDateB = SUMX(Sales, XNPV(Other, Other[Price], Sales[Price], 0))\n\n"
     "\tmeasure XnpvThirdA = SUMX(Sales, XNPV(Other, SUMX(Dates, [Price]), DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure XnpvThirdB = SUMX(Sales, XNPV(Other, SUMX(Dates, Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvUnionA = SUMX(Sales, XNPV(UNION(VALUES(Sales[Price]), VALUES(Sales[Price])), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvUnionB = SUMX(Sales, XNPV(UNION(VALUES(Sales[Price]), VALUES(Sales[Price])), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvProjA = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), [Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvProjB = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
 )
@@ -247,7 +251,8 @@ class SimilarScopeTests(unittest.TestCase):
               "XnpvTopA", "XnpvTopB", "XnpvNestCtrlA", "XnpvNestCtrlB",
               "XnpvExcA", "XnpvExcB", "XnpvSelA", "XnpvSelB", "XnpvRankA", "XnpvRankB",
               "XnpvRateCtrlA", "XnpvRateCtrlB", "XnpvDateA", "XnpvDateB",
-              "XnpvThirdA", "XnpvThirdB")},
+              "XnpvThirdA", "XnpvThirdB", "XnpvUnionA", "XnpvUnionB",
+              "XnpvProjA", "XnpvProjB")},
         )
 
     def _canon(self, name):
@@ -468,7 +473,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("XnpvB", "XnpvA"), ("XnpvTopB", "XnpvTopA"),
                           ("XnpvExcB", "XnpvExcA"), ("XnpvSelB", "XnpvSelA"),
                           ("XnpvRankB", "XnpvRankA"), ("XnpvDateB", "XnpvDateA"),
-                          ("XnpvThirdB", "XnpvThirdA")):
+                          ("XnpvThirdB", "XnpvThirdA"), ("XnpvUnionB", "XnpvUnionA"),
+                          ("XnpvProjB", "XnpvProjA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

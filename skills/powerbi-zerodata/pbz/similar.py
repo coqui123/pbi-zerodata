@@ -279,6 +279,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     eff_bare = bare and trusted
                     if fr["row_table"] is None:
                         fr["row_table"] = table
+                        src_fr = _source_frame(idx)
+                        if src_fr is not None and src_fr["fn"] in (
+                                "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY"):
+                            fr["projected"] = True
                         if not eff_bare:
                             g = _source_frame(idx)
                             exempt = trusted and g is not None and stack[-1] is g \
@@ -345,7 +349,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 return _span_table(a, seen)
             if fn in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
                 return _span_table(args[1], seen) if len(args) > 1 else None
-            if fn in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN", "NATURALINNERJOIN",
+            if fn in ("INTERSECT", "EXCEPT", "CROSSJOIN", "NATURALINNERJOIN",
                       "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
                 vals = {_span_table(a, seen) for a in args}
                 return vals.pop() if len(vals) == 1 else None
@@ -487,6 +491,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         and fr.get("x_table") != ref.table \
                         and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
                                     and not _in_caller_args(g) and g["row_table"] == ref.table
+                                    and not g.get("projected")
                                     for g in stack[c_idx + 1:]):
                     uncertain = True
                 caller_args = CALLER_ARGS.get(fr["fn"])
