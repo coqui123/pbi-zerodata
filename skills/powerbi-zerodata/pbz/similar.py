@@ -259,7 +259,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     d = path[k + 1]["parent_arg"] if k + 1 < len(path) else stack[-1]["arg"]
                     if q["fn"] in CONDITIONALS or q["fn"] == "":
                         continue
-                    if q["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY"):
+                    if q["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY",
+                                   "ALLEXCEPT"):
                         return False
                     if not _is_table_frame(q):
                         return False
