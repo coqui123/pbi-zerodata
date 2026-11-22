@@ -295,6 +295,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             and _taint_cleared(fr, idx):
                         fr["taint"] = None
 
+    def _note_x(tab) -> None:
+        if tab:
+            for fr in stack:
+                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] == 0 and fr.get("x_table") is None:
+                    fr["x_table"] = tab
+
     def poison_qualified(tab) -> None:
         if not tab:
             return
@@ -373,6 +379,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     lab = f"{tab}[{col}]"
                     toks.append((lab.lower(), "col", lab))
                     learn(tab)
+                    _note_x(tab)
                     poison_qualified(tab)
                 elif res.measure(nxt.value):
                     lab = f"[{res.measure(nxt.value)[1]}]"
@@ -405,9 +412,15 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             or (ref.kind == "column" and parent["row_table"] != ref.table):
                         uncertain = True
             for c_idx, fr in enumerate(stack):
-                if fr["fn"] in ("RANKX", "PERCENTILEX.INC", "PERCENTILEX.EXC", "CONCATENATEX") \
-                        and fr["arg"] >= 2 and ref.kind == "column":
-                    caller = home
+                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] >= 1 and ref.kind == "column" \
+                        and fr.get("x_table") != ref.table:
+                    uncertain = True
+                caller_args = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
+                               "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}.get(fr["fn"])
+                if caller_args is not None and ref.kind == "column" \
+                        and fr["arg"] >= caller_args[0] \
+                        and (caller_args[1] is None or fr["arg"] <= caller_args[1]):
+                    caller = None
                     for below in reversed(stack[:c_idx]):
                         if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:
                             caller = below["row_table"]
@@ -431,6 +444,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             tab = res.table(t.value) or t.value
             toks.append(("t:" + tab.lower(), "", ""))
             learn(res.table(t.value), bare=True)
+            _note_x(res.table(t.value))
         elif t.kind == "ident":
             low = t.text.lower()
             if nxt is not None and nxt.kind == "op" and nxt.text == "(":
@@ -448,6 +462,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
                 learn(res.table(t.text), bare=True)
+                _note_x(res.table(t.text))
             else:
                 if t.text.upper() not in ("ASC", "DESC", "DENSE", "SKIP", "AND", "OR", "NOT",
                                           "IN", "TRUE", "FALSE", "BLANK", "ABS", "REL",

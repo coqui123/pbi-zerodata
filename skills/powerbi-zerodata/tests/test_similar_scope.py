@@ -153,6 +153,10 @@ SALES = (
     "\tmeasure PercxB = SUMX(Other, SUMX(Sales, PERCENTILEX.INC(Other, Other[Price], Other[Price] / 100)))\n\n"
     "\tmeasure ConcatxA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], [Price] & \"\"))))\n\n"
     "\tmeasure ConcatxB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], Other[Price] & \"\"))))\n\n"
+    "\tmeasure XnpvA = SUMX(Sales, XNPV(Other, [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvB = SUMX(Sales, XNPV(Other, Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
+    "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -217,7 +221,8 @@ class SimilarScopeTests(unittest.TestCase):
               "UnionWrapA", "UnionWrapB", "UnionAllA", "UnionAllB", "YearCtrlA", "YearCtrlB",
               "TopnExcA", "TopnExcB", "NestUnionA", "NestUnionB", "SelColA", "SelColB",
               "AllExcA", "AllExcB", "TreatA", "TreatB", "TreatFirstA", "TreatFirstB",
-              "RankxA", "RankxB", "PercxA", "PercxB", "ConcatxA", "ConcatxB")},
+              "RankxA", "RankxB", "PercxA", "PercxB", "ConcatxA", "ConcatxB",
+              "XnpvA", "XnpvB", "ConcatxSortCtrlA", "ConcatxSortCtrlB")},
         )
 
     def _canon(self, name):
@@ -391,6 +396,11 @@ class SimilarScopeTests(unittest.TestCase):
                     consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
+    def test_concatx_sort_argument_stays_certain(self):
+        self.assertFalse(self._canon("ConcatxSortCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "ConcatxSortCtrlB", "ConcatxSortCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
     def test_interval_keyword_argument_stays_certain(self):
         self.assertFalse(self._canon("YearCtrlA").uncertain)
         result = consolidate.merge(self.ws, self.project, "YearCtrlB", "YearCtrlA", dry_run=True)
@@ -419,7 +429,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("TopnExcB", "TopnExcA"), ("NestUnionB", "NestUnionA"),
                           ("SelColB", "SelColA"), ("AllExcB", "AllExcA"),
                           ("TreatB", "TreatA"), ("TreatFirstB", "TreatFirstA"),
-                          ("RankxB", "RankxA"), ("PercxB", "PercxA"), ("ConcatxB", "ConcatxA")):
+                          ("RankxB", "RankxA"), ("PercxB", "PercxA"), ("ConcatxB", "ConcatxA"),
+                          ("XnpvB", "XnpvA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
