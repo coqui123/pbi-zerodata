@@ -331,6 +331,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     eff_bare = bare and trusted
                     if fr["row_table"] is None:
                         fr["row_table"] = table
+                        if bare:
+                            fr["only_columns"] = None
                         if any(g["fn"] in PROJECTING for g in stack[idx + 1:]):
                             fr["projected"] = True
                         src_fr = _source_frame(idx)
@@ -363,7 +365,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     if not bare and column and fr.get("only_src") is not None \
                             and fr["row_table"] == table:
                         _sf = _source_frame(idx)
-                        _si = next((j for j, g in enumerate(stack) if g is _sf), None)
+                        if _sf is None or _sf["fn"] not in NARROWING:
+                            _sf = None
+                        _si = next((j for j, g in enumerate(stack) if g is _sf), None) \
+                            if _sf is not None else None
                         _par = stack[_si - 1] if _si else None
                         if _par is not None:
                             _applies, _val = _combine(fr, _par, _sf["parent_arg"],
