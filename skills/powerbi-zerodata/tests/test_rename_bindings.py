@@ -759,6 +759,26 @@ class RenameBindingsTests(unittest.TestCase):
         twice = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
         self.assertEqual(twice, "2 * 'Plan'[Amount]")
 
+    def test_table_rename_extension_table_ref_not_shadowed_by_measure_name(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Sales", "expression": "1"},
+                                            {"name": "Rows", "expression": "COUNTROWS('Sales')"}]}]}))
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        rows = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(rows, "COUNTROWS('Revenue')")
+
+    def test_column_rename_extension_row_context_ref_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"},
+                                            {"name": "Total", "expression": "SUMX('Sales', [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        tot = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(tot, "SUMX('Sales', [Net])")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

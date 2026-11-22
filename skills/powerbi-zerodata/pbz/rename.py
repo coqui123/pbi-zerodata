@@ -828,6 +828,11 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
         ent = _qualifier_entity(binding)
         if ent is not None:
             return _fold(binding.ref.name) in ext_measures.get(_fold(ent), set())
+        if binding.ref.kind == "table" or not (binding.uncertain or binding.ref.kind == "unresolved"):
+            # A firm binding (a table reference, or a row-context column)
+            # is the resolver's answer and is honored; only an unresolved
+            # or uncertain bare reference can be the extension measure.
+            return False
         return _fold(binding.ref.name) in ext_names
 
     bindings = deps.dax_bindings(text, cur, res).bindings
