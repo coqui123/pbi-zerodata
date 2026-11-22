@@ -138,7 +138,8 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             lambda root, _text: (pbir_ref_edits(root, model, kind, home, old, new,
                                                 extra_owned=ext_owned,
                                                 extra_extending=ext_ext,
-                                                extra_tables=ext_tables), False)):
+                                                extra_tables=ext_tables,
+                                                ext_bare=_extension_bare_names(project.mirror_report)), False)):
         ops.append(("write", path, text, bom))
         changed.append(rel)
     from .governance import culture_rename_texts
@@ -276,7 +277,8 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
                                              dest_owned=(ext_owned if kind == "table" else None),
                                              dest_extending=(_extension_owned_dest(project.mirror_report, old, new)
                                                              if kind == "table" else None),
-                                             anchored=_doc_anchored(original_root, kind, home, old))
+                                             anchored=_doc_anchored(original_root, kind, home, old),
+                                             ext_bare=_extension_bare_names(project.mirror_report))
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         def _kind_of(r):
@@ -486,7 +488,7 @@ def _head_swap(value, table, new):
 
 def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
                       extensions_any=False, extra_tables=(), head=None, dest_tables=None,
-                      bare_fields=False):
+                      bare_fields=False, ext_bare=()):
     """True when an unbound string is owned by another table: exactly a
     qualified path of any other table (Sales.Region.Amount beside the Sales
     column 'Region.Amount'), or an owned extension of a longer-named
@@ -526,19 +528,18 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
         # document (a bare nativeQueryRef) is owned by any other table
         # with a field of that whole name, not only by a qualified path:
         # model fields of any other table, and report-extension measures
-        # of any entity (their qualified paths arrive in extra_owned and
-        # extra_extending, and only the name segment is bare here). The
-        # value is the whole field name by construction at these call
-        # sites, dots included.
+        # of any entity (their true names arrive in ext_bare, since the
+        # flattened extra_owned paths cannot be split back reliably).
+        # The value is the whole field name by construction at these
+        # call sites, dots included.
         for t in model.tables.values():
             if _fold(t.name) == _fold(home):
                 continue
             if any(_fold(o.name) == low
                    for o in list(t.columns.values()) + list(t.measures.values())):
                 return True
-        for p in tuple(extra_owned) + tuple(extra_extending):
-            if _fold(p.rsplit(".", 1)[-1]) == low:
-                return True
+        if low in ext_bare:
+            return True
     for t in model.tables.values():
         if _fold(t.name) == _fold(home):
             continue
@@ -689,6 +690,14 @@ def _extension_owned(report_dir, home):
             if _fold(name).startswith(_fold(home) + ".") for m in measures}
 
 
+def _extension_bare_names(report_dir):
+    """Folded names of every report-extension measure on every entity:
+    the bare-name ownership universe for an unanchored bare reference,
+    which the flattened qualified paths cannot be split back into."""
+    return {_fold(m) for _name, measures in _extension_entities(report_dir)
+            for m in measures}
+
+
 def _extension_owned_dest(report_dir, old, new):
     """Qualified paths of report-extension measures on entities extending
     the destination name, excluding the renamed entity itself: ownership
@@ -729,10 +738,10 @@ def _doc_anchored(root, kind, home, old):
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
                           extra_qualified=(), extra_owned=(), extra_extending=(),
                           extra_tables=(), dest_owned=None, dest_extending=None,
-                          anchored=True):
+                          anchored=True, ext_bare=()):
     nv, wrapped_used = _report_string_rename_inner(key, value, kind, home, old, new, field, model,
                                                    extra_qualified, extra_owned, extra_extending,
-                                                   extra_tables, anchored)
+                                                   extra_tables, anchored, ext_bare)
     if nv != value and model is not None:
         # The emitted string, exactly as produced (extensions retained from
         # the source string, wrapper text included), must not be owned by
@@ -764,7 +773,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         for text in produced:
             if _other_table_owns(model, anchor, text, owned, extending,
                                  extensions_any=bare, extra_tables=dest_extra, head=head,
-                                 dest_tables=dest_tables, bare_fields=not anchored):
+                                 dest_tables=dest_tables):
                 raise PbzError("NAME_TAKEN", nv)
         if kind == "table":
             # The emitted path must stay recognizable as its own field's
@@ -823,7 +832,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
 
 def _report_string_rename_inner(key, value, kind, home, old, new, field=None, model=None,
                                 extra_qualified=(), extra_owned=(), extra_extending=(),
-                                extra_tables=(), anchored=True):
+                                extra_tables=(), anchored=True, ext_bare=()):
     if kind == "table":
         if field is _AMBIGUOUS:
             return value, False
@@ -930,7 +939,7 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
     if key == "nativeQueryRef" and _fold(value) == _fold(old) \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending,
                                       extensions_any=True, extra_tables=extra_tables,
-                                      bare_fields=not anchored):
+                                      bare_fields=not anchored, ext_bare=ext_bare):
         return new, False
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef") \
             and _other_table_owns(model, home, value, extra_owned, extra_extending,
@@ -1172,7 +1181,8 @@ def _measure_expression_edits(root, model, kind, home, old, new):
 
 
 def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
-                   extra_owned=(), extra_extending=(), extra_tables=()) -> list[tuple[int, int, str]]:
+                   extra_owned=(), extra_extending=(), extra_tables=(),
+                   ext_bare=()) -> list[tuple[int, int, str]]:
     """Edits renaming measure / column `old` of table `home` in one parsed PBIR document: every field
     reference's Property, and queryRef / nativeQueryRef / metadata strings."""
     edits = []
@@ -1216,7 +1226,8 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
     for site, (node, field) in _report_string_sites(root, model, fields).items():
         nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
                                    extra_owned=extra_owned, extra_extending=extra_extending,
-                                   extra_tables=extra_tables, anchored=anchored)
+                                   extra_tables=extra_tables, anchored=anchored,
+                                   ext_bare=ext_bare)
         if nv != node.value:
             edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
     edits.extend(_measure_expression_edits(root, model, kind, home, old, new))

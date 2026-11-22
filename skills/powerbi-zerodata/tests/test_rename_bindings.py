@@ -1244,6 +1244,42 @@ class RenameBindingsTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()),
                          {"projections": [{"nativeQueryRef": "Net.Amount"}]})
 
+    def test_unanchored_bare_ref_dotted_extension_measure_blocks_plain_does_not(self):
+        ws, project, mdef, path = self._report_project({"projections": [{"nativeQueryRef": "Net.Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Net.Amount'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Net.Amount", "expression": "7"}]}]}))
+        rename.rename(ws, project, "column", "Net.Amount", "Revised", table="Sales")
+        self.assertEqual(json.loads(path.read_text()),
+                         {"projections": [{"nativeQueryRef": "Net.Amount"}]})
+
+        ws, project, mdef, path = self._report_project({"projections": [{"nativeQueryRef": "Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Net.Amount", "expression": "7"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Revised", table="Sales")
+        self.assertEqual(json.loads(path.read_text()),
+                         {"projections": [{"nativeQueryRef": "Revised"}]})
+
+    def test_wrapped_query_ref_emission_ignores_bare_name_collision(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sum(Sales.Amount)"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn 'Sum(Sales.Total)'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "Total", table="Sales")
+        self.assertEqual(json.loads(path.read_text()), {"refs": [{"queryRef": "Sum(Sales.Total)"}]})
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
