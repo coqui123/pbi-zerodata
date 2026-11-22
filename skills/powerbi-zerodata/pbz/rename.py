@@ -1005,19 +1005,22 @@ def _pvs_property_node(node):
     return None
 
 
-# The DAX reserved words, plus the bare enum values that appear as
-# standalone arguments (ASC, DESC, SKIP, DENSE, the date interval units
-# SECOND through YEAR, and the CROSSFILTER directions): an unquoted
-# token with one of these texts is the keyword, never a table
-# reference, since DAX itself requires such table names to be quoted.
+# The DAX reserved words, plus the bare enum values and type names
+# that appear as standalone arguments (ASC, DESC, SKIP, DENSE, BLANKS,
+# FIRST, LAST, DEFAULT, ABS, REL, the date interval units SECOND
+# through YEAR, the CROSSFILTER directions, and the CONVERT types):
+# an unquoted token with one of these texts is the keyword, never a
+# table reference, since DAX itself requires such table names to be
+# quoted.
 _DAX_KEYWORDS = {_fold(w) for w in (
-    "abs", "and", "asc", "both", "break", "by", "column", "day", "default",
-    "define", "densify", "dense", "desc", "else", "evaluate", "false",
-    "first", "group", "hour", "in", "index", "last", "matchby", "measure",
-    "minute", "month", "mparameter", "none", "not", "oneway",
+    "abs", "and", "asc", "blanks", "boolean", "both", "break", "by",
+    "column", "currency", "datetime", "day", "default", "define",
+    "densify", "dense", "desc", "double", "else", "evaluate", "false",
+    "first", "group", "hour", "in", "index", "integer", "last", "matchby",
+    "measure", "minute", "month", "mparameter", "none", "not", "oneway",
     "oneway_leftfiltersright",
     "oneway_rightfiltersleft", "or", "order", "quarter", "rel", "return",
-    "row",
+    "row", "string", "variant",
     "second", "skip", "table", "then", "total", "true", "var", "week",
     "window", "year")}
 
