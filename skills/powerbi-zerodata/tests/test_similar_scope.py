@@ -195,6 +195,12 @@ SALES = (
     "\tmeasure RollupB = SUMX(Sales, SUMX(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"Price\")), Sales[Price] + 0))\n\n"
     "\tmeasure SelMidA = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"K\", 1, Dates[Day], \"Price\", 1), [Price]))\n\n"
     "\tmeasure SelMidB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"K\", 1, Dates[Day], \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure SelStrA = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, Dates[Day] & \"\", \"Price\", 1), [Price]))\n\n"
+    "\tmeasure SelStrB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, Dates[Day] & \"\", \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure ShadowA = SUMX(ADDCOLUMNS(Dates, \"CtrlA\", 1), [CtrlA])\n\n"
+    "\tmeasure ShadowB = SUMX(ADDCOLUMNS(Dates, \"CtrlA\", 1), Sales[CtrlA])\n\n"
+    "\tmeasure TopnCapA = COUNTROWS(TOPN(1, Sales, IF(Sales[Price] = 10, COUNTROWS(TOPN(1, SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), [Price], DESC)), 1), DESC))\n\n"
+    "\tmeasure TopnCapB = COUNTROWS(TOPN(1, Sales, IF(Sales[Price] = 10, COUNTROWS(TOPN(1, SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), Sales[Price], DESC)), 1), DESC))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -283,7 +289,8 @@ class SimilarScopeTests(unittest.TestCase):
               "PlainProjA", "PlainProjB", "ValuesColA", "ValuesColB",
               "AddColA", "AddColB", "ProjCapA", "ProjCapB",
               "SumzCapA", "SumzCapB", "SumzColA", "SumzColB",
-              "SelOptA", "SelOptB", "RollupA", "RollupB", "SelMidA", "SelMidB")},
+              "SelOptA", "SelOptB", "RollupA", "RollupB", "SelMidA", "SelMidB",
+              "SelStrA", "SelStrB", "ShadowA", "ShadowB", "TopnCapA", "TopnCapB")},
         )
 
     def _canon(self, name):
@@ -510,7 +517,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("AddColB", "AddColA"), ("ProjCapB", "ProjCapA"),
                           ("SumzCapB", "SumzCapA"), ("SumzColB", "SumzColA"),
                           ("SelOptB", "SelOptA"), ("RollupB", "RollupA"),
-                          ("SelMidB", "SelMidA")):
+                          ("SelMidB", "SelMidA"), ("SelStrB", "SelStrA"),
+                          ("ShadowB", "ShadowA"), ("TopnCapB", "TopnCapA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

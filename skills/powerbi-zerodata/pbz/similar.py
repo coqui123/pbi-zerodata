@@ -447,7 +447,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             top["arg"] += 1
         if stack and t.kind == "str" and stack[-1]["fn"] in (
                 "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "SUMMARIZE", "GROUPBY",
-                "ROLLUPADDISSUBTOTAL"):
+                "ROLLUPADDISSUBTOTAL") \
+                and (i == 0 or (sig[i - 1].kind == "op" and sig[i - 1].text in (",", "("))) \
+                and (nxt is not None and nxt.kind == "op" and nxt.text in (",", ")")):
             fr0 = stack[-1]
             if fr0["fn"] == "ROLLUPADDISSUBTOTAL":
                 fr0.setdefault("names", set()).add(t.value.lower())
@@ -502,13 +504,17 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             if ref.kind == "column" and any(
                     fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
                     and (fr.get("projected") and fr["row_table"] == ref.table
-                         or fr.get("only_column") not in (None, ref.name.lower())
-                         or ref.name.lower() in fr.get("captured", ()))
+                         or fr.get("only_column") not in (None, ref.name.lower()))
                     for fr in stack):
+                uncertain = True
+            if any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
+                   and t.value.lower() in fr.get("captured", ())
+                   for fr in stack):
                 uncertain = True
             if any(fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and fr["arg"] >= 2
                    and (fr["row_table"] is None
-                        or (ref.kind == "column" and fr["row_table"] != ref.table))
+                        or (ref.kind == "column" and fr["row_table"] != ref.table)
+                        or t.value.lower() in fr.get("captured", ()))
                    for fr in stack):
                 uncertain = True
             for c_idx, fr in enumerate(stack):
