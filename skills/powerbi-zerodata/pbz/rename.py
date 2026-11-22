@@ -409,18 +409,8 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None):
 
     A value rewrites when it is exactly a qualified object path of the old
     table, or a longer operator-free path extending one (hierarchy levels,
-    variations)."""
-    low = value.lower()
-    if model is not None:
-        for other in model.tables.values():
-            if other.name.lower().startswith(old.lower() + ".") \
-                    and low.startswith(other.name.lower() + "."):
-                return value
-        _wrapped0 = _wrapped_inner(value)
-        if _wrapped0 and any(other.name.lower().startswith(old.lower() + ".")
-                              and _wrapped0[1].lower().startswith(other.name.lower() + ".")
-                              for other in model.tables.values()):
-            return value
+    variations). A string owned by a longer-named table, exactly or by
+    extension, never rewrites: the longer table's reading wins."""
     dots = table.name.count(".") if table is not None else old.count(".")
 
     def _swap(text):
@@ -430,19 +420,36 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None):
         return new + text[at:]
 
     _tables = [t.name for t in model.tables.values()] if model is not None else ()
+    other_q = set()
+    if model is not None:
+        for other in model.tables.values():
+            if other.name.lower().startswith(old.lower() + "."):
+                other_q |= _table_qualified(model, other.name)[1]
 
-    def _extends(text):
-        for q in qualified:
+    def _extends(text, qset):
+        for q in qset:
             rest = _rest_after(text, q)
             if rest is not None and _path_extension(rest, old, _tables):
                 return True
         return False
 
-    if low in qualified or _extends(value):
-        return _swap(value)
+    def _rewrite(text):
+        if text.lower() in other_q:
+            return None
+        if text.lower() in qualified or _extends(text, qualified):
+            if _extends(text, other_q):
+                return None
+            return _swap(text)
+        return None
+
+    out = _rewrite(value)
+    if out is not None:
+        return out
     wrapped = _wrapped_inner(value)
-    if wrapped and (wrapped[1].lower() in qualified or _extends(wrapped[1])):
-        return f"{wrapped[0]}({_swap(wrapped[1])})"
+    if wrapped:
+        inner = _rewrite(wrapped[1])
+        if inner is not None:
+            return f"{wrapped[0]}({inner})"
     return value
 
 
@@ -569,7 +576,8 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
     if key in ("queryRef", "metadata", "nativeQueryRef") and value.lower() == f"{home}.{old}".lower() \
             and not _other_table_owns(model, home, value, extra_owned):
         return f"{home}.{new}"
-    if key == "nativeQueryRef" and value.lower() == old.lower():
+    if key == "nativeQueryRef" and value.lower() == old.lower() \
+            and not _other_table_owns(model, home, value, extra_owned):
         return new
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
         wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)

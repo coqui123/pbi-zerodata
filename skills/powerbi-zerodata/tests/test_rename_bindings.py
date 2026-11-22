@@ -412,9 +412,11 @@ class RenameBindingsTests(unittest.TestCase):
     def test_table_rewrite_unicode_equal_length_guard(self):
         from types import SimpleNamespace as NS
         t1, other = "i̇i̇", "İİ.X"
-        model = NS(tables={t1: NS(name=t1), other: NS(name=other)})
+        tables = {t1: NS(name=t1, columns={"X.Amount": NS(name="X.Amount")}, measures={}, hierarchies={}),
+                  other: NS(name=other, columns={"Amount": NS(name="Amount")}, measures={}, hierarchies={})}
+        model = NS(tables=tables, table=lambda name: tables.get(name))
         qualified = {f"{t1}.X.Amount".lower(), f"{other}.Amount".lower()}
-        out = rename._table_rewrite("İİ.X.Amount", t1, "Revenue", qualified, NS(name=t1), model)
+        out = rename._table_rewrite("İİ.X.Amount", t1, "Revenue", qualified, tables[t1], model)
         self.assertEqual(out, "İİ.X.Amount")
 
     def test_table_rename_longer_table_not_blocked_by_prefix_table(self):
@@ -423,6 +425,21 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "Sales.Region", "Territory")
         refs = [r["queryRef"] for r in json.loads(path.read_text())["refs"]]
         self.assertEqual(refs, ["Territory.Amount", "Sum(Territory.Amount)"])
+
+    def test_table_rename_own_column_under_longer_prefix(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Budget"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Budget'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Revenue.Region.Budget")
+
+    def test_column_rename_bare_native_query_ref_owned_by_other_table(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"nativeQueryRef": "Sales.Region.Amount"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Sales.Region.Amount'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Sales.Region.Amount", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
 
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
