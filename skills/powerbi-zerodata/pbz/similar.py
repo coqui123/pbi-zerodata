@@ -84,7 +84,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     def learn(table) -> None:
         if table:
             for fr in stack:
-                if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and fr["row_table"] is None:
+                if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and fr["row_table"] is None \
+                        and not fr["poisoned"]:
                     fr["row_table"] = table
 
     i, n = 0, len(sig)
@@ -94,7 +95,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         if t.kind == "op" and t.text == "(":
             prev = sig[i - 1] if i else None
             fn = prev.text.upper() if prev is not None and prev.kind == "ident" else ""
-            stack.append({"fn": fn, "arg": 0, "row_table": None})
+            stack.append({"fn": fn, "arg": 0, "row_table": None, "poisoned": False})
         elif t.kind == "op" and t.text == ")":
             if stack:
                 stack.pop()
@@ -150,6 +151,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             else:
                 toks.append((f"[{t.value.lower()}]", "", ""))
         elif t.kind == "table":
+            binding = by_span.get((t.start, t.end))
+            if binding is not None:
+                uncertain |= binding.uncertain
             tab = res.table(t.value) or t.value
             toks.append(("t:" + tab.lower(), "", ""))
             learn(res.table(t.value))
@@ -159,6 +163,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 toks.append(("fn:" + low if low in res.functions else t.text.upper(), "", ""))
             elif low in var_names:
                 toks.append((var_names[low], "", ""))
+                for fr in stack:
+                    if fr["fn"] in deps.ITERATORS and fr["arg"] == 0:
+                        fr["poisoned"] = True
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
                 learn(res.table(t.text))

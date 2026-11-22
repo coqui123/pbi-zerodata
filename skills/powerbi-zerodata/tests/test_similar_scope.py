@@ -33,6 +33,12 @@ SALES = (
     "\tmeasure VarB = VAR v = Other RETURN SUMX(v, Sales[Price])\n\n"
     "\tmeasure AliasUnres = 'Missing'[CtrlA]\n\n"
     "\tmeasure AliasOk = [CtrlA]\n\n"
+    "\tmeasure WrapA = VAR v = Other RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure WrapB = VAR v = Other RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure TabA = COUNTROWS('Missing')\n\n"
+    "\tmeasure TabB = COUNTROWS('Missing')\n\n"
+    "\tmeasure TabCtrlA = COUNTROWS(Sales)\n\n"
+    "\tmeasure TabCtrlB = COUNTROWS(Sales)\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -76,7 +82,8 @@ class SimilarScopeTests(unittest.TestCase):
             {(m.table, m.name) for m in self.model.all_measures()},
             {("Sales", name) for name in
              ("IterA", "IterB", "IterC", "IterD", "UnresA", "UnresB", "CtrlA", "CtrlB",
-              "VarA", "VarB", "AliasUnres", "AliasOk")},
+              "VarA", "VarB", "AliasUnres", "AliasOk", "WrapA", "WrapB",
+              "TabA", "TabB", "TabCtrlA", "TabCtrlB")},
         )
 
     def _canon(self, name):
@@ -141,6 +148,22 @@ class SimilarScopeTests(unittest.TestCase):
         result = consolidate.merge(self.ws, self.project, "AliasOk", "CtrlA", dry_run=True)
         self.assertEqual(result["equivalence"], "alias")
         self.assertEqual(result["result"], "DRY_RUN")
+
+    def test_wrapped_var_source_stays_uncertain(self):
+        self.assertEqual(self._key("WrapA"), self._key("WrapB"))
+        self.assertTrue(self._canon("WrapA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "WrapB", "WrapA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_unresolved_table_token_blocks_identical_merge(self):
+        self.assertEqual(self._key("TabA"), self._key("TabB"))
+        self.assertTrue(self._canon("TabA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "TabB", "TabA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+        result = consolidate.merge(self.ws, self.project, "TabCtrlB", "TabCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
 
     def test_similar_run_does_not_group_scoped_pair(self):
         groups = similar.run(self.ws, self.project)["identical"]
