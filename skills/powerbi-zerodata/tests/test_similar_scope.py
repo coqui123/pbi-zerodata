@@ -148,8 +148,8 @@ SALES = (
     "\tmeasure VarRefPadB = VAR WholeRows = Wide VAR QtyRows = VALUES(Wide[Qty]) RETURN SUMX(Wide, SUMX(Sales, SUMX(NATURALINNERJOIN(VALUES(Wide[Qty]), VAR UnusedRows = WholeRows RETURN QtyRows), Wide[Price])))\n\n"
     "\tmeasure VarSeqA = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = VAR Dummy = 1 RETURN VAR Dummy2 = 2 RETURN Wide RETURN QtyRows, [Price])))\n\n"
     "\tmeasure VarSeqB = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = VAR Dummy = 1 RETURN VAR Dummy2 = 2 RETURN Wide RETURN QtyRows, Wide[Price])))\n\n"
-    "\tmeasure IterStaleA = SUMX(CROSSJOIN(Sales, VAR a = ABS(1) VAR b = 2 RETURN Other), [Price])\n\n"
-    "\tmeasure IterStaleB = SUMX(CROSSJOIN(Sales, VAR a = ABS(1) VAR b = 2 RETURN Other), Sales[Price])\n\n"
+    "\tmeasure IterStaleA = SUMX(CROSSJOIN(Sales, VAR a = ABS(1) VAR b = 2 RETURN ShadowOnly), [ShadowM])\n\n"
+    "\tmeasure IterStaleB = SUMX(CROSSJOIN(Sales, VAR a = ABS(1) VAR b = 2 RETURN ShadowOnly), Sales[ShadowM])\n\n"
     "\tmeasure VarParenSeqA = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), VAR A = (1) VAR B = 2 RETURN Other), [ShadowM]))\n\n"
     "\tmeasure VarParenSeqB = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), VAR A = (1) VAR B = 2 RETURN Other), Sales[ShadowM]))\n\n"
     "\tmeasure IterStale2A = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), VAR A = (VAR C = 1 RETURN C) VAR B = 2 RETURN Other), [ShadowM]))\n\n"
@@ -364,11 +364,15 @@ WIDE = (
     "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
     "\tcolumn Qty\n\t\tdataType: int64\n\t\tsourceColumn: Qty\n\n"
 )
+SHADOWONLY = (
+    "table ShadowOnly\n\n"
+    "\tcolumn ShadowM\n\t\tdataType: int64\n\t\tsourceColumn: ShadowM\n\n"
+)
 DATES = (
     "table Dates\n\n"
     "\tcolumn Day\n\t\tdataType: dateTime\n\t\tsourceColumn: Day\n\n"
 )
-MODEL = "model Model\n\tculture: en-US\n\nref table Sales\nref table Other\nref table Dates\nref table Wide\n"
+MODEL = "model Model\n\tculture: en-US\n\nref table Sales\nref table Other\nref table Dates\nref table Wide\nref table ShadowOnly\n"
 DATABASE = "database\n\tcompatibilityLevel: 1400\n"
 
 
@@ -393,12 +397,13 @@ class SimilarScopeTests(unittest.TestCase):
         _write(os.path.join(mdef, "tables", "Other.tmdl"), OTHER)
         _write(os.path.join(mdef, "tables", "Dates.tmdl"), DATES)
         _write(os.path.join(mdef, "tables", "Wide.tmdl"), WIDE)
+        _write(os.path.join(mdef, "tables", "ShadowOnly.tmdl"), SHADOWONLY)
         _write(os.path.join(mdef, "model.tmdl"), MODEL)
         _write(os.path.join(mdef, "database.tmdl"), DATABASE)
         os.makedirs(self.project.model_dir, exist_ok=True)
         self.model = tmdl.load_model(mdef)
         self.resolver = deps.Resolver(self.model)
-        self.assertEqual(set(self.model.tables), {"Sales", "Other", "Dates", "Wide"})
+        self.assertEqual(set(self.model.tables), {"Sales", "Other", "Dates", "Wide", "ShadowOnly"})
         for table in ("Sales", "Other"):
             self.assertIsNotNone(self.model.column(table, "Price"))
             self.assertIsNone(self.model.column(table, "Nope"))
