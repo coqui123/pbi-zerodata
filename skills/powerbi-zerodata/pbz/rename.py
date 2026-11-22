@@ -271,11 +271,11 @@ def _report_string_sites(root, model, fields=None):
             field = owners.get(site[:length])
             if field is not None:
                 break
-        if field is None:
-            field = siblings.get(site[:-1])
         if field is None and any(site[:length] in ambiguous
                                  for length in range(len(site) - 1, -1, -1)):
             field = _AMBIGUOUS
+        if field is None:
+            field = siblings.get(site[:-1])
         sites[site] = (node, field)
     return sites
 
@@ -301,8 +301,13 @@ def _canonical_target(model, kind, home, old):
 
 def _report_string_rename(key, value, kind, home, old, new, field=None):
     if kind == "table":
-        if key in ("queryRef", "metadata", "queryName") and value.lower().startswith(old.lower() + "."):
-            return new + value[len(old):]
+        if key in ("queryRef", "metadata", "queryName"):
+            if value.lower().startswith(old.lower() + "."):
+                return new + value[len(old):]
+            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
+            if wrapped and wrapped.group(2).lower().startswith(old.lower() + "."):
+                inner = wrapped.group(2)
+                return f"{wrapped.group(1)}({new}{inner[len(old):]})"
         return value
     if key == "queryName":
         return value
@@ -326,6 +331,10 @@ def _report_string_rename(key, value, kind, home, old, new, field=None):
         return f"{home}.{new}"
     if key == "nativeQueryRef" and value.lower() == old.lower():
         return new
+    if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
+        wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
+        if wrapped and wrapped.group(2).lower() == f"{home}.{old}".lower():
+            return f"{wrapped.group(1)}({home}.{new})"
     return value
 
 
@@ -530,8 +539,15 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
 
         visit(root)
         for key, node in pbir.string_nodes(root):
-            if key in ("queryRef", "metadata", "queryName") and node.value.lower().startswith(low + "."):
-                edits.append((node.start, node.end, json.dumps(new + node.value[len(old):], ensure_ascii=False)))
+            if key in ("queryRef", "metadata", "queryName"):
+                if node.value.lower().startswith(low + "."):
+                    edits.append((node.start, node.end, json.dumps(new + node.value[len(old):], ensure_ascii=False)))
+                else:
+                    wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", node.value)
+                    if wrapped and wrapped.group(2).lower().startswith(low + "."):
+                        inner = wrapped.group(2)
+                        edits.append((node.start, node.end, json.dumps(
+                            f"{wrapped.group(1)}({new}{inner[len(old):]})", ensure_ascii=False)))
         return edits, False
 
     from .move import plan_pbir
