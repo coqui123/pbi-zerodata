@@ -324,12 +324,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else stack[-1]["arg"]
                             if p["fn"] in CONDITIONALS or p["fn"] == "":
                                 continue
-                            if p["fn"] in ("INTERSECT", "EXCEPT"):
+                            if p["fn"] in ("INTERSECT", "EXCEPT", "UNION"):
                                 if d != 0:
                                     widens = False
                                     break
                                 continue
-                            if p["fn"] in ("UNION", "CROSSJOIN", "NATURALINNERJOIN",
+                            if p["fn"] in ("CROSSJOIN", "NATURALINNERJOIN",
                                             "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
                                 continue
                             if not _crossing_ok(p, d):
@@ -598,6 +598,13 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             i += 2
             continue
         elif t.kind == "bracket":
+            CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
+                           "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}
+
+            def _in_caller_args(g) -> bool:
+                ca = CALLER_ARGS.get(g["fn"])
+                return ca is not None and g["arg"] >= ca[0] and (ca[1] is None or g["arg"] <= ca[1])
+
             binding = by_span.get((t.start, t.end))
             if binding is not None:
                 ref = binding.ref
@@ -610,6 +617,13 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 uncertain = True
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] == "{":
+                    governed = ref.kind == "column" and any(
+                        g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
+                        and not _in_caller_args(g) and g["row_table"] == ref.table
+                        and not g.get("projected") and _only_has(g, ref.name.lower())
+                        for g in stack[c_idx + 1:])
+                    if governed:
+                        continue
                     ctx = None
                     found = False
                     for below in reversed(stack[:c_idx]):
@@ -619,6 +633,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             break
                     if found and (ctx is None
                                   or (ref.kind == "column" and ctx != ref.table)):
+                        uncertain = True
+                    elif not found and ref.kind == "column":
                         uncertain = True
             if ref.kind == "column" and any(
                     fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
@@ -639,13 +655,6 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         or t.value.lower() in fr.get("captured", ()))
                    for fr in stack):
                 uncertain = True
-            CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
-                           "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}
-
-            def _in_caller_args(g) -> bool:
-                ca = CALLER_ARGS.get(g["fn"])
-                return ca is not None and g["arg"] >= ca[0] and (ca[1] is None or g["arg"] <= ca[1])
-
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] in ("ORDERBY", "PARTITIONBY", "MATCHBY") and c_idx > 0:
                     parent = stack[c_idx - 1]

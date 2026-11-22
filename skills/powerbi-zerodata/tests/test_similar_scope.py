@@ -267,6 +267,12 @@ SALES = (
     "\tmeasure PadB = SUMX(Sales, SUMX(INTERSECT(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), Wide), Wide[Price]))\n\n"
     "\tmeasure CtorCommaA = SUMX(Sales, SUMX(Other, COUNTROWS(DISTINCT(FILTER({ Sales[Price], [Price] }, TRUE())))))\n\n"
     "\tmeasure CtorCommaB = SUMX(Sales, SUMX(Other, COUNTROWS(DISTINCT(FILTER({ Sales[Price], Sales[Price] }, TRUE())))))\n\n"
+    "\tmeasure UnionPadA = SUMX(Wide, SUMX(Sales, SUMX(UNION(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), Wide), [Price])))\n\n"
+    "\tmeasure UnionPadB = SUMX(Wide, SUMX(Sales, SUMX(UNION(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), Wide), Wide[Price])))\n\n"
+    "\tmeasure ShadowCtorA = COUNTROWS(FILTER({ MAX(Other[Price]), [ShadowM] }, TRUE()))\n\n"
+    "\tmeasure ShadowCtorB = COUNTROWS(FILTER({ MAX(Other[Price]), Other[ShadowM] }, TRUE()))\n\n"
+    "\tmeasure CtorNestCtrlA = SUMX(Sales, COUNTROWS({ SUMX(Other, [Price]) }))\n\n"
+    "\tmeasure CtorNestCtrlB = SUMX(Sales, COUNTROWS({ SUMX(Other, Other[Price]) }))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -374,7 +380,8 @@ class SimilarScopeTests(unittest.TestCase):
               "NarrowMeasCtrlA", "NarrowMeasCtrlB", "AllNbA", "AllNbB",
               "AllExcDirectA", "AllExcDirectB", "TopnAllA", "TopnAllB",
               "JoinShadowA", "JoinShadowB", "PadA", "PadB",
-              "CtorCommaA", "CtorCommaB")} | {("Other", "OtherRows")},
+              "CtorCommaA", "CtorCommaB", "UnionPadA", "UnionPadB",
+              "ShadowCtorA", "ShadowCtorB", "CtorNestCtrlA", "CtorNestCtrlB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -575,7 +582,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("AllExcSpanB", "AllExcSpanA"), ("AllNbB", "AllNbA"),
                           ("AllExcDirectB", "AllExcDirectA"), ("TopnAllB", "TopnAllA"),
                           ("JoinShadowB", "JoinShadowA"), ("PadB", "PadA"),
-                          ("CtorCommaB", "CtorCommaA")):
+                          ("CtorCommaB", "CtorCommaA"), ("UnionPadB", "UnionPadA"),
+                          ("ShadowCtorB", "ShadowCtorA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
@@ -595,6 +603,11 @@ class SimilarScopeTests(unittest.TestCase):
                 self.assertFalse(self._canon(name).uncertain)
                 result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
                 self.assertEqual(result["equivalence"], "identical")
+
+    def test_constructor_nested_iterator_stays_certain(self):
+        self.assertFalse(self._canon("CtorNestCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "CtorNestCtrlB", "CtorNestCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
 
     def test_identity_dependent_format_is_refused(self):
         with self.assertRaises(PbzError) as caught:
