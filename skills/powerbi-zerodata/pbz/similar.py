@@ -260,7 +260,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     if q["fn"] in CONDITIONALS or q["fn"] == "":
                         continue
                     if q["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY",
-                                   "ALLEXCEPT"):
+                                   "ALLEXCEPT", "TREATAS"):
                         return False
                     if not _is_table_frame(q):
                         return False
