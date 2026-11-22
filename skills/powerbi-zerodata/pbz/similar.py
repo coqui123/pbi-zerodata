@@ -352,50 +352,48 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 and _call_span(span, 0) == len(span) - 1:
             span = span[1:-1]
         if not span:
-            return None
+            return None, None
         if len(span) == 1:
             u = span[0]
             if u.kind == "table":
-                return res.table(u.value) or u.value
+                return (res.table(u.value) or u.value), None
             if u.kind == "ident":
                 if res.table(u.text):
-                    return res.table(u.text)
+                    return res.table(u.text), None
                 low = u.text.lower()
                 if low in seen:
-                    return None
+                    return None, None
                 if low in _span_memo:
                     return _span_memo[low]
                 rhss = var_rhs.get(low)
                 if rhss:
                     vals = {_span_table(r, seen | {low}) for r in rhss}
-                    result = vals.pop() if len(vals) == 1 else None
+                    result = vals.pop() if len(vals) == 1 else (None, None)
                     if low not in _cyclic_vars:
                         _span_memo[low] = result
                     return result
-            return None
+            return None, None
         if span[0].kind == "ident" and span[1].kind == "op" and span[1].text == "(" \
                 and _call_span(span, 1) == len(span) - 1:
             fn = span[0].text.upper()
             args = _span_args(span[2:-1])
             if fn in ("FILTER", "CALCULATETABLE", "ALL", "ALLEXCEPT", "ALLNOBLANKROW",
                       "ALLSELECTED", "DISTINCT", "KEEPFILTERS", "FILTERS"):
-                return _span_table(args[0], seen) if args else None
+                return _span_table(args[0], seen) if args else (None, None)
             if fn == "VALUES":
-                a = args[0] if args else []
-                if len(a) == 2 and a[1].kind == "bracket":
-                    return res.table(a[0].value if a[0].kind == "table" else a[0].text)
-                return _span_table(a, seen)
+                return _span_table(args[0], seen) if args else (None, None)
             if fn in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
-                return _span_table(args[1], seen) if len(args) > 1 else None
+                return _span_table(args[1], seen) if len(args) > 1 else (None, None)
             if fn in ("INTERSECT", "EXCEPT", "CROSSJOIN", "NATURALINNERJOIN",
                       "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
                 vals = {_span_table(a, seen) for a in args}
-                return vals.pop() if len(vals) == 1 else None
-            return None
+                return vals.pop() if len(vals) == 1 else (None, None)
+            return None, None
         if len(span) == 2 and span[1].kind == "bracket" \
                 and (span[0].kind == "table" or (span[0].kind == "ident" and res.table(span[0].text))):
-            return res.table(span[0].value if span[0].kind == "table" else span[0].text)
-        return None
+            tab = res.table(span[0].value if span[0].kind == "table" else span[0].text)
+            return tab, span[1].value.lower()
+        return None, None
 
     def poison_qualified(tab) -> None:
         if not tab:
@@ -472,7 +470,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         var_names_defined.setdefault(pending_vars[-1][0], set()).update(closed["names"])
                 if closed.get("x_span") is not None and closed["arg"] == closed.get("span_arg", 0) \
                         and closed.get("x_table") is None:
-                    closed["x_table"] = _span_table(closed["x_span"])
+                    closed["x_table"], closed["x_only"] = _span_table(closed["x_span"])
                 for fr in stack:
                     if fr.get("taint") is closed:
                         fr["taint"] = None
@@ -494,7 +492,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     top["expect"] = "item"
             if top.get("x_span") is not None and top["arg"] == top.get("span_arg", 0) \
                     and top.get("x_table") is None:
-                top["x_table"] = _span_table(top["x_span"])
+                top["x_table"], top["x_only"] = _span_table(top["x_span"])
             top["arg"] += 1
         if stack and t.kind == "str" and stack[-1]["fn"] in (
                 "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "SUMMARIZE", "GROUPBY",
@@ -540,6 +538,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 else:
                     lab = f"{qual}[{nxt.value}]"
                     toks.append((lab.lower(), "col", lab))
+            for fr in stack:
+                if fr.get("x_span") is not None and fr["arg"] == fr.get("span_arg", 0):
+                    fr["x_span"].append(nxt)
             i += 2
             continue
         elif t.kind == "bracket":
@@ -589,7 +590,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         uncertain = True
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] == "SUBSTITUTEWITHINDEX" and fr["arg"] >= 3 and fr["arg"] % 2 == 1 \
-                        and ((ref.kind == "column" and fr.get("x_table") != ref.table)
+                        and ((ref.kind == "column" and fr.get("x_table") != ref.table
+                              and (fr.get("x_only") is None or fr.get("x_only") == ref.name.lower()))
                              or (ref.kind == "measure" and (fr.get("x_table") is None
                                  or res.column(fr.get("x_table"), t.value) is not None))
                              or t.value.lower() in fr.get("captured", ())) \
@@ -603,7 +605,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
 
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] in (1, 2) \
-                        and ((ref.kind == "column" and fr.get("x_table") != ref.table)
+                        and ((ref.kind == "column" and fr.get("x_table") != ref.table
+                              and (fr.get("x_only") is None or fr.get("x_only") == ref.name.lower()))
                              or (ref.kind == "measure" and (fr.get("x_table") is None
                                  or res.column(fr.get("x_table"), t.value) is not None))
                              or t.value.lower() in fr.get("captured", ())) \
@@ -617,15 +620,31 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 caller_args = CALLER_ARGS.get(fr["fn"])
                 if caller_args is not None and ref.kind == "column" \
                         and fr["arg"] >= caller_args[0] \
-                        and (caller_args[1] is None or fr["arg"] <= caller_args[1]):
+                        and (caller_args[1] is None or fr["arg"] <= caller_args[1]) \
+                        and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
+                                    and not _in_caller_args(g) and g["row_table"] == ref.table
+                                    and not g.get("projected")
+                                    and g.get("only_column") in (None, ref.name.lower())
+                                    for g in stack[c_idx + 1:]):
                     caller = None
                     for below in reversed(stack[:c_idx]):
                         if below["fn"] in ("XNPV", "XIRR") and below["arg"] in (1, 2):
+                            if below.get("x_only") is not None \
+                                    and below.get("x_only") != t.value.lower():
+                                continue
                             caller = below.get("x_table")
                             break
                         if below["fn"] == "SUBSTITUTEWITHINDEX" and below["arg"] >= 3 \
                                 and below["arg"] % 2 == 1:
+                            if below.get("x_only") is not None \
+                                    and below.get("x_only") != t.value.lower():
+                                continue
                             caller = below.get("x_table")
+                            break
+                        if below["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") \
+                                and below["arg"] >= 2 and not below.get("projected") \
+                                and below.get("only_column") in (None, t.value.lower()):
+                            caller = below["row_table"]
                             break
                         if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:
                             caller = below["row_table"]

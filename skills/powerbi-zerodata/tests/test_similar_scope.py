@@ -243,6 +243,12 @@ SALES = (
     "\tmeasure SubstNestCtrlB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, Other[Price] + SUMX(Sales, Sales[Price]), ASC))\n\n"
     "\tmeasure SubstRankCtrlA = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], [Price]), ASC))\n\n"
     "\tmeasure SubstRankCtrlB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], Other[Price]), ASC))\n\n"
+    "\tmeasure SwiNarrowA = SUMX(Other, SUMX(Sales, TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", VALUES(Other[ShadowM]), RANKX(Other, Other[Price], [Price]), ASC))))\n\n"
+    "\tmeasure SwiNarrowB = SUMX(Other, SUMX(Sales, TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", VALUES(Other[ShadowM]), RANKX(Other, Other[Price], Other[Price]), ASC))))\n\n"
+    "\tmeasure RankNestCtrlA = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], SUMX(Sales, [Price])), ASC))\n\n"
+    "\tmeasure RankNestCtrlB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], SUMX(Sales, Sales[Price])), ASC))\n\n"
+    "\tmeasure TopnCallerCtrlA = SUMX(Sales, COUNTROWS(TOPN(1, Other, RANKX(Other, Other[Price], [Price]))))\n\n"
+    "\tmeasure TopnCallerCtrlB = SUMX(Sales, COUNTROWS(TOPN(1, Other, RANKX(Other, Other[Price], Other[Price]))))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -344,7 +350,8 @@ class SimilarScopeTests(unittest.TestCase):
               "HomeCountA", "FmtShadowA", "FmtShadowB", "FmtNameA", "FmtNameB",
               "SubstA", "SubstB", "SubstLateA", "SubstLateB", "SubstUnkA", "SubstUnkB",
               "SubstNestCtrlA", "SubstNestCtrlB",
-              "SubstRankCtrlA", "SubstRankCtrlB")} | {("Other", "OtherRows")},
+              "SubstRankCtrlA", "SubstRankCtrlB", "SwiNarrowA", "SwiNarrowB",
+              "RankNestCtrlA", "RankNestCtrlB", "TopnCallerCtrlA", "TopnCallerCtrlB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -539,6 +546,21 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertFalse(self._canon("SubstRankCtrlA").uncertain)
         result = consolidate.merge(self.ws, self.project, "SubstRankCtrlB", "SubstRankCtrlA", dry_run=True)
         self.assertEqual(result["equivalence"], "identical")
+
+    def test_narrowed_swi_caller_is_refused(self):
+        self.assertEqual(self._key("SwiNarrowA"), self._key("SwiNarrowB"))
+        self.assertTrue(self._canon("SwiNarrowA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "SwiNarrowB", "SwiNarrowA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_rankx_nested_and_topn_callers_stay_certain(self):
+        for name, dup in (("RankNestCtrlA", "RankNestCtrlB"),
+                          ("TopnCallerCtrlA", "TopnCallerCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
 
     def test_identity_dependent_format_is_refused(self):
         with self.assertRaises(PbzError) as caught:
