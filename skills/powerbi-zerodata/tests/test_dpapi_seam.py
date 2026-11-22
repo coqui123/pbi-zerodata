@@ -27,10 +27,15 @@ class DpapiSeamTests(unittest.TestCase):
         child = self._child('''
             import ctypes
             class _Boom:
+                def __init__(self):
+                    self.accesses = []
                 def __getattr__(self, name):
+                    self.accesses.append(name)
                     raise AttributeError("windll sabotaged")
-            ctypes.windll = _Boom()
+            boom = _Boom()
+            ctypes.windll = boom
             import pbz.dpapi
+            assert not boom.accesses, boom.accesses
             print("import ok")
         ''', {})
         self.assertEqual(child.returncode, 0, child.stderr)
@@ -41,6 +46,13 @@ class DpapiSeamTests(unittest.TestCase):
             from pbz import dpapi
             dpapi.protect(b"x")
             print("protected")
+        ''', {'PBZ_FAKE_DPAPI': '1'})
+        self.assertNotEqual(child.returncode, 0, child.stdout)
+        self.assertIn('outside the test harness', child.stderr)
+        child = self._child('''
+            from pbz import dpapi
+            dpapi.unprotect(b"PBZFAKE1\\x00x")
+            print("unprotected")
         ''', {'PBZ_FAKE_DPAPI': '1'})
         self.assertNotEqual(child.returncode, 0, child.stdout)
         self.assertIn('outside the test harness', child.stderr)
@@ -127,6 +139,11 @@ class DpapiSeamTests(unittest.TestCase):
     def test_fake_provider_covers_key_and_file_call_sites(self):
         with tempfile.TemporaryDirectory() as tmp:
             child = self._child('''
+                import ctypes
+                class _Boom:
+                    def __getattr__(self, name):
+                        raise AttributeError("windll sabotaged")
+                ctypes.windll = _Boom()
                 import os, sys
                 from pbz import dpapi
                 private = os.path.join(sys.argv[1], "private")
