@@ -90,9 +90,11 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             ops.append(("write", path, apply_edits(text, edits), bom))
             changed.append(f"{project.name}.SemanticModel/definition/{rel}")
     from .move import plan_pbir
+    ext_owned = _extension_owned(project.mirror_report, home)
     for path, text, bom, rel in plan_pbir(
             ws, project.mirror_report,
-            lambda root, _text: (pbir_ref_edits(root, model, kind, home, old, new), False)):
+            lambda root, _text: (pbir_ref_edits(root, model, kind, home, old, new,
+                                                extra_owned=ext_owned), False)):
         ops.append(("write", path, text, bom))
         changed.append(rel)
     from .governance import culture_rename_texts
@@ -205,6 +207,7 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     # produced no write operation for the containing file.
     writes = {op[1]: op[2] for op in ops if op[0] == "write"}
     ext_q = _extension_qualified(project.mirror_report, old) if kind == "table" else set()
+    ext_owned = _extension_owned(project.mirror_report, home) if kind != "table" else set()
     for path in pbir.report_files(project.mirror_report):
         text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
         try:
@@ -220,7 +223,7 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
         home, old = _canonical_target(model, kind, home, old)
         for site, (node, field) in _report_string_sites(original_root, model, original).items():
             expected = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
-                                             extra_qualified=ext_q)
+                                             extra_qualified=ext_q, extra_owned=ext_owned)
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         for ref, site in original:
@@ -358,6 +361,17 @@ def _path_extension(rest, old, tables=()):
     return True
 
 
+def _rest_after(text, prefix_lower):
+    """The remainder of text after a dotted prefix matched case-insensitively,
+    sliced at the value's own boundary dot, or None when the prefix does not
+    match. Length-based slicing is unsafe: case folding can change the code
+    point count of the written segment."""
+    for i, ch in enumerate(text):
+        if ch == "." and text[:i].lower() == prefix_lower:
+            return text[i + 1:]
+    return None
+
+
 def _head_swap(value, table, new):
     """Replace the leading table segment of a dotted value with new, slicing
     at the value's own boundary dot: the written segment can differ in length
@@ -368,11 +382,14 @@ def _head_swap(value, table, new):
     return new + value[len(table):]
 
 
-def _other_table_owns(model, home, value):
+def _other_table_owns(model, home, value, extra_owned=()):
     """True when value is exactly the qualified path of an object on another
     table whose dotted name extends home (Sales.Region.Amount beside the
     Sales column 'Region.Amount'): the unbound string is ambiguous and the
-    other table's reading wins, so it stays unchanged."""
+    other table's reading wins, so it stays unchanged. extra_owned carries
+    the report-extension measure paths owned by such tables."""
+    if value.lower() in {p.lower() for p in extra_owned}:
+        return True
     if model is None:
         return False
     low = value.lower()
@@ -413,10 +430,9 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None):
 
     def _extends(text):
         for q in qualified:
-            if text.lower().startswith(q + "."):
-                rest = text[len(q) + 1:]
-                if _path_extension(rest, old, _tables):
-                    return True
+            rest = _rest_after(text, q)
+            if rest is not None and _path_extension(rest, old, _tables):
+                return True
         return False
 
     if low in qualified or _extends(value):
@@ -445,40 +461,57 @@ def _single_wrapped(value):
     return None
 
 
-def _extension_qualified(report_dir, old):
-    """Qualified paths of the report-extension measures defined for a table.
-
-    reportExtensions.json can attach measures to a model table inside the
-    report. They are not model objects, but reference strings naming them
-    belong to the table and must follow its rename like model measures do."""
+def _extension_entities(report_dir):
+    """(entity name, [measure names]) pairs from reportExtensions.json."""
     path = os.path.join(report_dir, "definition", "reportExtensions.json")
     if not os.path.isfile(path):
-        return set()
+        return []
     try:
         with open(path, encoding="utf-8-sig") as fh:
             root = pbir.parse_json(fh.read())
     except Exception:
-        return set()
-    qualified = set()
+        return []
+    out = []
     ents = root.get("entities") if isinstance(root, pbir.JObj) else None
     if isinstance(ents, pbir.JArr):
         for ent in ents.items:
             if not isinstance(ent, pbir.JObj):
                 continue
             nm = ent.get("name")
-            if not isinstance(nm, pbir.JStr) or nm.value.lower() != old.lower():
+            if not isinstance(nm, pbir.JStr):
                 continue
-            measures = ent.get("measures")
-            if isinstance(measures, pbir.JArr):
-                for m in measures.items:
+            measures = []
+            ms = ent.get("measures")
+            if isinstance(ms, pbir.JArr):
+                for m in ms.items:
                     mn = m.get("name") if isinstance(m, pbir.JObj) else None
                     if isinstance(mn, pbir.JStr):
-                        qualified.add(f"{nm.value}.{mn.value}".lower())
-    return qualified
+                        measures.append(mn.value)
+            out.append((nm.value, measures))
+    return out
+
+
+def _extension_qualified(report_dir, old):
+    """Qualified paths of the report-extension measures defined for a table.
+
+    reportExtensions.json can attach measures to a model table inside the
+    report. They are not model objects, but reference strings naming them
+    belong to the table and must follow its rename like model measures do."""
+    return {f"{name}.{m}".lower()
+            for name, measures in _extension_entities(report_dir)
+            if name.lower() == old.lower() for m in measures}
+
+
+def _extension_owned(report_dir, home):
+    """Qualified paths of report-extension measures on tables whose dotted
+    name extends home: strings the longer-table reading owns."""
+    return {f"{name}.{m}".lower()
+            for name, measures in _extension_entities(report_dir)
+            if name.lower().startswith(home.lower() + ".") for m in measures}
 
 
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
-                          extra_qualified=()):
+                          extra_qualified=(), extra_owned=()):
     if kind == "table":
         if key in ("queryRef", "metadata", "queryName"):
             if field is not None and field is not _AMBIGUOUS:
@@ -489,9 +522,10 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                 base = f"{field.table}.{field.name}"
                 wrapped = _wrapped_inner(value)
                 probe = wrapped[1] if wrapped else value
+                _rest = _rest_after(probe, base.lower())
                 if probe.lower() == base.lower() \
-                        or (probe.lower().startswith(base.lower() + ".")
-                            and _path_extension(probe[len(base) + 1:], old,
+                        or (_rest is not None
+                            and _path_extension(_rest, old,
                                                 [t.name for t in model.tables.values()]
                                                 if model is not None else ())):
                     if field.table.lower() != old.lower():
@@ -504,8 +538,9 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
             if value.lower().startswith(old.lower() + "."):
                 return _head_swap(value, old, new)
             wrapped = _single_wrapped(value)
-            if wrapped and wrapped[1].lower().startswith(old.lower() + ".") \
-                    and _path_extension(wrapped[1][len(old) + 1:], old,
+            _rest = _rest_after(wrapped[1], old.lower()) if wrapped else None
+            if wrapped and _rest is not None \
+                    and _path_extension(_rest, old,
                                         [t.name for t in model.tables.values()]
                                         if model is not None else ()):
                 return f"{wrapped[0]}({_head_swap(wrapped[1], old, new)})"
@@ -529,14 +564,14 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                 return f"{wrapped.group(1)}({home}.{new})"
         return value
     if key in ("queryRef", "metadata", "nativeQueryRef") and value.lower() == f"{home}.{old}".lower() \
-            and not _other_table_owns(model, home, value):
+            and not _other_table_owns(model, home, value, extra_owned):
         return f"{home}.{new}"
     if key == "nativeQueryRef" and value.lower() == old.lower():
         return new
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
         wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
         if wrapped and wrapped.group(2).lower() == f"{home}.{old}".lower() \
-                and not _other_table_owns(model, home, wrapped.group(2)):
+                and not _other_table_owns(model, home, wrapped.group(2), extra_owned):
             return f"{wrapped.group(1)}({home}.{new})"
     return value
 
@@ -566,7 +601,8 @@ def dax_ref_edits(text: str, start: int, end: int, kind: str, home: str, old: st
     return _binding_edits(bindings, kind, home, old, new, text)
 
 
-def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str) -> list[tuple[int, int, str]]:
+def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
+                   extra_owned=()) -> list[tuple[int, int, str]]:
     """Edits renaming measure / column `old` of table `home` in one parsed PBIR document: every field
     reference's Property, and queryRef / nativeQueryRef / metadata strings."""
     edits = []
@@ -578,7 +614,8 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str) -> lis
             edits.append((ref.prop_node.start, ref.prop_node.end, json.dumps(new, ensure_ascii=False)))
     home, old = _canonical_target(model, kind, home, old)
     for site, (node, field) in _report_string_sites(root, model, fields).items():
-        nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model)
+        nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
+                                   extra_owned=extra_owned)
         if nv != node.value:
             edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
     return edits
