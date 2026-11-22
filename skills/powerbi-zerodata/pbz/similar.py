@@ -212,6 +212,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     def _crossing_ok(p, d) -> bool:
         if p["fn"] in CONDITIONALS or p["fn"] == "":
             return True
+        if p["fn"] == "WINDOW":
+            return d in (2, 3, 4)
+        if p["fn"] == "RANK":
+            return d in (0, 1)
+        if p["fn"] == "ROWNUMBER":
+            return d == 0
         if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
             return d == 1
         if p["fn"] in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN", "GENERATE", "GENERATEALL",
@@ -390,8 +396,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     fr["row_table"] = None
                     fr["poisoned"] = True
 
-    pending_var = None
-    pending_depth = 0
+    pending_vars: list = []
     var_names_defined: dict[str, set] = {}
     i, n = 0, len(sig)
     while i < n:
@@ -403,10 +408,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 fr["x_span"].append(t)
         if t.kind == "ident" and t.text.upper() == "VAR" \
                 and nxt is not None and nxt.kind == "ident":
-            pending_var = nxt.text.lower()
-            pending_depth = len(stack)
-        elif t.kind == "ident" and t.text.upper() == "RETURN" and len(stack) == pending_depth:
-            pending_var = None
+            if pending_vars and pending_vars[-1][1] == len(stack):
+                pending_vars.pop()
+            pending_vars.append((nxt.text.lower(), len(stack)))
+        elif t.kind == "ident" and t.text.upper() == "RETURN" \
+                and pending_vars and pending_vars[-1][1] == len(stack):
+            pending_vars.pop()
         if t.kind == "op" and t.text in ("(", "{"):
             prev = sig[i - 1] if i else None
             fn = "{" if t.text == "{" else (prev.text.upper() if prev is not None and prev.kind == "ident" else "")
@@ -434,8 +441,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             ok = _first_nonsource(path, closed["parent_arg"]) is None
                         if ok:
                             fr.setdefault("captured", set()).update(closed["names"])
-                    if pending_var:
-                        var_names_defined.setdefault(pending_var, set()).update(closed["names"])
+                    if pending_vars:
+                        var_names_defined.setdefault(pending_vars[-1][0], set()).update(closed["names"])
                 if closed.get("x_span") is not None and closed["arg"] == 0 \
                         and closed.get("x_table") is None:
                     closed["x_table"] = _span_table(closed["x_span"])
@@ -552,6 +559,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] in (1, 2) \
                         and ((ref.kind == "column" and fr.get("x_table") != ref.table)
+                             or (ref.kind == "measure" and fr.get("x_table") is None)
                              or t.value.lower() in fr.get("captured", ())) \
                         and not (ref.kind == "column" and any(
                                     g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
@@ -604,6 +612,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         if _first_nonsource(stack[f_idx + 1:],
                                             stack[-1]["arg"] if len(stack) > f_idx + 1 else 0) is None:
                             fr.setdefault("captured", set()).update(var_names_defined[low])
+                    if pending_vars and pending_vars[-1][0] != low:
+                        var_names_defined.setdefault(pending_vars[-1][0], set()).update(
+                            var_names_defined[low])
                 if low in table_vars and not (prev is not None and prev.kind == "ident"
                                               and prev.text.upper() == "VAR"):
                     for f_idx, fr in enumerate(stack):
