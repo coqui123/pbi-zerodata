@@ -209,12 +209,37 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 return g
         return None
 
+    def _crossing_ok(p, d) -> bool:
+        if p["fn"] in CONDITIONALS or p["fn"] == "":
+            return True
+        if p["fn"] in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN", "GENERATE", "GENERATEALL"):
+            return True
+        if p["fn"] in TABLE_INPUT_ARG0 and d == 0:
+            return True
+        if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and d == 1:
+            return True
+        if _is_table_frame(p) and d == 0:
+            return True
+        return False
+
+    def _first_nonsource(frames, last_d):
+        for j, p in enumerate(frames):
+            d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else last_d
+            if not _crossing_ok(p, d):
+                return p, d
+        return None
+
+    def _in_source_region(idx, last_d) -> bool:
+        frames = stack[idx + 1:]
+        if not frames:
+            return True
+        return _first_nonsource(frames, last_d) is None
+
     def learn(table, bare: bool = False) -> None:
         if table:
             for idx, fr in enumerate(stack):
                 if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"]:
-                    trusted = all(_is_table_frame(g) or g["fn"] in CONDITIONALS or g["fn"] == ""
-                                  for g in stack[idx + 1:])
+                    trusted = _in_source_region(idx, stack[-1]["arg"] if len(stack) > idx + 1 else 0)
                     eff_bare = bare and trusted
                     if fr["row_table"] is None:
                         fr["row_table"] = table
@@ -238,8 +263,19 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         for idx, fr in enumerate(stack):
             if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"] \
                     and fr["row_table"] is not None and fr["row_table"] != tab:
-                g = _source_frame(idx)
-                if g is not None and not (g["fn"] in PREDICATE_EXEMPT and g["arg"] >= 1):
+                frames = stack[idx + 1:]
+                if not frames:
+                    continue
+                bad = _first_nonsource(frames, stack[-1]["arg"])
+                if bad is None:
+                    fr["row_table"] = None
+                    fr["poisoned"] = True
+                else:
+                    p, d = bad
+                    if p["fn"] in PREDICATE_EXEMPT and d >= 1:
+                        continue
+                    if p["fn"] in SCALAR_FUNCS or p["fn"] in X_ITERATORS or p["fn"] == "{":
+                        continue
                     fr["row_table"] = None
                     fr["poisoned"] = True
 
@@ -257,27 +293,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 for f_idx, fr in enumerate(stack[:-1]):
                     if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
                             and fr["row_table"] is not None and not fr["poisoned"]:
-                        path = stack[f_idx + 1:-1]
-                        in_region = True
-                        for j, p in enumerate(path):
-                            d = path[j + 1]["parent_arg"] if j + 1 < len(path) else frame["parent_arg"]
-                            if p["fn"] in SCALAR_FUNCS:
-                                in_region = False
-                                break
-                            if p["fn"] in CONDITIONALS or p["fn"] == "":
-                                continue
-                            if p["fn"] in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN",
-                                            "GENERATE", "GENERATEALL"):
-                                continue
-                            if p["fn"] in TABLE_INPUT_ARG0 and d == 0:
-                                continue
-                            if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and d == 1:
-                                continue
-                            if _is_table_frame(p) and d == 0:
-                                continue
-                            in_region = False
-                            break
-                        if in_region:
+                        if _first_nonsource(stack[f_idx + 1:-1], frame["parent_arg"]) is None:
                             fr["taint"] = frame
         elif t.kind == "op" and t.text in (")", "}"):
             if stack:
@@ -361,8 +377,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 prev = sig[i - 1] if i else None
                 if low in table_vars and not (prev is not None and prev.kind == "ident"
                                               and prev.text.upper() == "VAR"):
-                    for fr in stack:
-                        if fr["fn"] in deps.ITERATORS and fr["arg"] == 0:
+                    for f_idx, fr in enumerate(stack):
+                        if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
+                                and _in_source_region(f_idx, stack[-1]["arg"] if len(stack) > f_idx + 1 else 0):
                             fr["row_table"] = None
                             fr["poisoned"] = True
             elif res.table(t.text):

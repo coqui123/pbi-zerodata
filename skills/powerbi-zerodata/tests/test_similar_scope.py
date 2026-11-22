@@ -95,6 +95,12 @@ SALES = (
     "\tmeasure PredCountCtrlB = SUMX(FILTER(Sales, COUNTROWS(ALL(Other)) > 0), [Price])\n\n"
     "\tmeasure MaxxCtrlA = SUMX(FILTER(Sales, Sales[Price] > MAXX(ALL(Sales), Sales[Price])), [Price])\n\n"
     "\tmeasure MaxxCtrlB = SUMX(FILTER(Sales, Sales[Price] > MAXX(ALL(Sales), Sales[Price])), [Price])\n\n"
+    "\tmeasure PredMaxxA = SUMX(FILTER(Sales, Sales[Price] > MAXX(Other, Other[Price])), [Price])\n\n"
+    "\tmeasure PredMaxxB = SUMX(FILTER(Sales, Sales[Price] > MAXX(Other, Other[Price])), [Price])\n\n"
+    "\tmeasure PredValuesA = SUMX(FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0), [Price])\n\n"
+    "\tmeasure PredValuesB = SUMX(FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0), [Price])\n\n"
+    "\tmeasure PredVarA = VAR v = Other RETURN SUMX(FILTER(Sales, COUNTROWS(v) > 0), [Price])\n\n"
+    "\tmeasure PredVarB = VAR v = Other RETURN SUMX(FILTER(Sales, COUNTROWS(v) > 0), [Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -148,7 +154,8 @@ class SimilarScopeTests(unittest.TestCase):
               "Gen3A", "Gen3B", "ConsA", "ConsB", "IfCtrlA", "IfCtrlB",
               "CalcA", "CalcB", "AllCountA", "AllCountB", "FiltCountA", "FiltCountB",
               "IfPredCtrlA", "IfPredCtrlB", "ContainsA", "ContainsB",
-              "PredCountCtrlA", "PredCountCtrlB", "MaxxCtrlA", "MaxxCtrlB")},
+              "PredCountCtrlA", "PredCountCtrlB", "MaxxCtrlA", "MaxxCtrlB",
+              "PredMaxxA", "PredMaxxB", "PredValuesA", "PredValuesB", "PredVarA", "PredVarB")},
         )
 
     def _canon(self, name):
@@ -321,7 +328,9 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_predicate_table_calls_stay_certain(self):
-        for name, dup in (("PredCountCtrlA", "PredCountCtrlB"), ("MaxxCtrlA", "MaxxCtrlB")):
+        for name, dup in (("PredCountCtrlA", "PredCountCtrlB"), ("MaxxCtrlA", "MaxxCtrlB"),
+                          ("PredMaxxA", "PredMaxxB"), ("PredValuesA", "PredValuesB"),
+                          ("PredVarA", "PredVarB")):
             with self.subTest(name=name):
                 self.assertFalse(self._canon(name).uncertain)
                 result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
