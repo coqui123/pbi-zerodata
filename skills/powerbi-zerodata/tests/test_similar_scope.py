@@ -59,6 +59,10 @@ SALES = (
     "\tmeasure CtorB = VAR v = { 1, 2 } RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
     "\tmeasure CountA = VAR n = COUNTROWS(Other) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
     "\tmeasure CountB = VAR n = COUNTROWS(Other) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure ScopeA = (VAR v = Other RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])) + (VAR v = 1 RETURN v)\n\n"
+    "\tmeasure ScopeB = (VAR v = Other RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])) + (VAR v = 1 RETURN v)\n\n"
+    "\tmeasure InlineA = SUMX(TOPN(MAX(Sales[Price]), Other), [Price])\n\n"
+    "\tmeasure InlineB = SUMX(TOPN(MAX(Sales[Price]), Other), Sales[Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -106,7 +110,7 @@ class SimilarScopeTests(unittest.TestCase):
               "TabA", "TabB", "TabCtrlA", "TabCtrlB", "TopA", "TopB", "ScalarA", "ScalarB",
               "ExprA", "ExprB", "ChainA", "ChainB", "ValuesA", "ValuesB",
               "DerivedA", "DerivedB", "ScalarQA", "ScalarQB", "CrossA", "CrossB",
-              "CtorA", "CtorB", "CountA", "CountB")},
+              "CtorA", "CtorB", "CountA", "CountB", "ScopeA", "ScopeB", "InlineA", "InlineB")},
         )
 
     def _canon(self, name):
@@ -215,6 +219,15 @@ class SimilarScopeTests(unittest.TestCase):
 
     def test_unlisted_table_forms_still_poison(self):
         for dup, into in (("CrossB", "CrossA"), ("CtorB", "CtorA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_sibling_scope_and_inline_source_still_poison(self):
+        for dup, into in (("ScopeB", "ScopeA"), ("InlineB", "InlineA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

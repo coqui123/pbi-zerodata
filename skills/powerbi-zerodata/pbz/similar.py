@@ -87,7 +87,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     if depth == 0 and u.kind == "ident" and u.text.upper() in ("RETURN", "VAR"):
                         break
                     rhs.append(u)
-                var_rhs[sig[i + 1].text.lower()] = rhs
+                var_rhs.setdefault(sig[i + 1].text.lower(), []).append(rhs)
 
     SCALAR_FUNCS = {"MAX", "MIN", "SUM", "AVERAGE", "COUNT", "COUNTA", "COUNTROWS", "COUNTAX",
                     "DISTINCTCOUNT", "DISTINCTCOUNTNOBLANK", "SUMX", "AVERAGEX", "MINX", "MAXX",
@@ -168,8 +168,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     changed = True
     while changed:
         changed = False
-        for name, rhs in var_rhs.items():
-            if name not in scalar_vars and _is_scalar_expr(rhs, scalar_vars):
+        for name, rhss in var_rhs.items():
+            if name not in scalar_vars and all(_is_scalar_expr(rhs, scalar_vars) for rhs in rhss):
                 scalar_vars.add(name)
                 changed = True
     table_vars = set(var_rhs) - scalar_vars
@@ -178,12 +178,15 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     uncertain = False
     stack: list[dict] = []   # {"fn", "arg", "row_table"}: mirrors the deps.dax_bindings frames
 
-    def learn(table) -> None:
+    def learn(table, bare: bool = False) -> None:
         if table:
             for fr in stack:
-                if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and fr["row_table"] is None \
-                        and not fr["poisoned"]:
-                    fr["row_table"] = table
+                if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"]:
+                    if fr["row_table"] is None:
+                        fr["row_table"] = table
+                    elif bare and fr["row_table"] != table:
+                        fr["row_table"] = None
+                        fr["poisoned"] = True
 
     i, n = 0, len(sig)
     while i < n:
@@ -253,7 +256,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 uncertain |= binding.uncertain
             tab = res.table(t.value) or t.value
             toks.append(("t:" + tab.lower(), "", ""))
-            learn(res.table(t.value))
+            learn(res.table(t.value), bare=True)
         elif t.kind == "ident":
             low = t.text.lower()
             if nxt is not None and nxt.kind == "op" and nxt.text == "(":
@@ -269,7 +272,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             fr["poisoned"] = True
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
-                learn(res.table(t.text))
+                learn(res.table(t.text), bare=True)
             else:
                 toks.append((t.text.upper(), "", ""))
         else:
