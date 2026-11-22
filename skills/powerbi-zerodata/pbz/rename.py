@@ -218,7 +218,7 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
         after_strings = dict(_report_strings(following_root))
         home, old = _canonical_target(model, kind, home, old)
         for site, (node, field) in _report_string_sites(original_root, model, original).items():
-            expected = _report_string_rename(site[-1], node.value, kind, home, old, new, field)
+            expected = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model)
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         for ref, site in original:
@@ -317,9 +317,19 @@ def _single_wrapped(value):
     return None
 
 
-def _report_string_rename(key, value, kind, home, old, new, field=None):
+def _report_string_rename(key, value, kind, home, old, new, field=None, model=None):
     if kind == "table":
         if key in ("queryRef", "metadata", "queryName"):
+            table = model.table(old) if model is not None else None
+            if table is not None:
+                qualified = {f"{table.name}.{obj.name}".lower()
+                             for obj in list(table.columns.values()) + list(table.measures.values())}
+                if value.lower() in qualified:
+                    return new + value[len(old):]
+                wrapped = _single_wrapped(value)
+                if wrapped and wrapped[1].lower() in qualified:
+                    return f"{wrapped[0]}({new}{wrapped[1][len(old):]})"
+                return value
             if value.lower().startswith(old.lower() + "."):
                 return new + value[len(old):]
             wrapped = _single_wrapped(value)
@@ -393,7 +403,7 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str) -> lis
             edits.append((ref.prop_node.start, ref.prop_node.end, json.dumps(new, ensure_ascii=False)))
     home, old = _canonical_target(model, kind, home, old)
     for site, (node, field) in _report_string_sites(root, model, fields).items():
-        nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field)
+        nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model)
         if nv != node.value:
             edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
     return edits
@@ -556,14 +566,16 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                     visit(v, key)
 
         visit(root)
+        _tbl = model.table(old)
+        _qualified = {f"{_tbl.name}.{obj.name}".lower()
+                      for obj in list(_tbl.columns.values()) + list(_tbl.measures.values())} if _tbl else set()
         for key, node in pbir.string_nodes(root):
             if key in ("queryRef", "metadata", "queryName"):
-                if node.value.lower().startswith(low + "."):
+                if node.value.lower() in _qualified:
                     edits.append((node.start, node.end, json.dumps(new + node.value[len(old):], ensure_ascii=False)))
                 else:
                     wrapped = _single_wrapped(node.value)
-                    if wrapped and wrapped[1].lower().startswith(low + ".") \
-                            and not re.search(r"[+\-*/^&=<>]", wrapped[1][len(old) + 1:]):
+                    if wrapped and wrapped[1].lower() in _qualified:
                         edits.append((node.start, node.end, json.dumps(
                             f"{wrapped[0]}({new}{wrapped[1][len(old):]})", ensure_ascii=False)))
         return edits, False
