@@ -322,23 +322,33 @@ def _table_qualified(model, old):
     return table, qualified
 
 
-def _table_rewrite(value, old, new, qualified):
+def _table_rewrite(value, old, new, qualified, table=None):
     """Rewrite one table reference in a report string, or return the value unchanged.
 
     A value rewrites when it is exactly a qualified object path of the old
-    table, or a longer path extending one (hierarchy levels, variations)."""
+    table, or a longer operator-free path extending one (hierarchy levels,
+    variations)."""
     low = value.lower()
+    dots = table.name.count(".") if table is not None else old.count(".")
 
     def _swap(text):
-        return new + text[text.index("."):]
+        at = -1
+        for _ in range(dots + 1):
+            at = text.index(".", at + 1)
+        return new + text[at:]
 
-    if low in qualified:
-        return _swap(value)
-    if any(low.startswith(q + ".") for q in qualified):
+    def _extends(text):
+        for q in qualified:
+            if text.lower().startswith(q + "."):
+                rest = text[len(q) + 1:]
+                if not re.search(r"[+\-*/^&=<>(),]", rest):
+                    return True
+        return False
+
+    if low in qualified or _extends(value):
         return _swap(value)
     wrapped = _wrapped_inner(value)
-    if wrapped and (wrapped[1].lower() in qualified
-                    or any(wrapped[1].lower().startswith(q + ".") for q in qualified)):
+    if wrapped and (wrapped[1].lower() in qualified or _extends(wrapped[1])):
         return f"{wrapped[0]}({_swap(wrapped[1])})"
     return value
 
@@ -366,7 +376,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         if key in ("queryRef", "metadata", "queryName"):
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
-                return _table_rewrite(value, old, new, qualified)
+                return _table_rewrite(value, old, new, qualified, _tbl)
             if value.lower().startswith(old.lower() + "."):
                 return new + value[len(old):]
             wrapped = _single_wrapped(value)
@@ -606,7 +616,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         _tbl, _qualified = _table_qualified(model, old)
         for key, node in pbir.string_nodes(root):
             if key in ("queryRef", "metadata", "queryName") and _tbl is not None:
-                nv = _table_rewrite(node.value, old, new, _qualified)
+                nv = _table_rewrite(node.value, old, new, _qualified, _tbl)
                 if nv != node.value:
                     edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
         return edits, False
