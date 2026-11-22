@@ -11,6 +11,15 @@ from .common import PbzError, commit_bytes
 from .tokens import apply_edits
 
 
+def _fold(name: str) -> str:
+    """The one case-insensitive equivalence for names in this module: lower(),
+    with the Greek final sigma normalized to the medial form. lower() alone
+    splits a name ending in capital sigma from the same name written with a
+    medial sigma before a dot, while casefold() would additionally merge
+    distinct names such as Maße and Masse."""
+    return name.lower().replace("ς", "σ")
+
+
 def _bracket(name: str) -> str:
     return "[" + name.replace("]", "]]") + "]"
 
@@ -34,17 +43,17 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         m = model.measure(old)
         if not m:
             raise PbzError("NOT_FOUND", f"measure {old}")
-        if (model.measure(new) or model.column(m.table, new)) and new.lower() != old.lower():
+        if (model.measure(new) or model.column(m.table, new)) and _fold(new) != _fold(old):
             raise PbzError("NAME_TAKEN", new)
-        if any(c.name.lower() == old.lower() for c in model.all_columns()):
+        if any(_fold(c.name) == _fold(old) for c in model.all_columns()):
             raise PbzError("AMBIGUOUS", f"a column is also named {old}; rename it in Desktop")
         home = m.table
     elif kind == "column":
-        hits = [c for c in model.all_columns() if c.name.lower() == old.lower() and (not table or c.table.lower() == table.lower())]
+        hits = [c for c in model.all_columns() if _fold(c.name) == _fold(old) and (not table or _fold(c.table) == _fold(table))]
         if len(hits) != 1:
             raise PbzError("AMBIGUOUS" if hits else "NOT_FOUND", f"column {old}; pass --table")
         home = hits[0].table
-        if (model.column(home, new) or model.measure(new)) and new.lower() != old.lower():
+        if (model.column(home, new) or model.measure(new)) and _fold(new) != _fold(old):
             raise PbzError("NAME_TAKEN", new)
     elif kind == "table":
         return rename_table(ws, project, model, old, new)
@@ -61,12 +70,12 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         edits = []
         pkind = {"measure": "perspectiveMeasure", "column": "perspectiveColumn"}[kind]
         for node in doc.nodes:
-            if node.kind == kind and node.name.lower() == old.lower() and node.parent and node.parent.name == home:
+            if node.kind == kind and _fold(node.name) == _fold(old) and node.parent and node.parent.name == home:
                 e = _decl_edit(text, node, kind, new)
                 if e:
                     edits.append(e)
-            elif node.kind in ((pkind, "columnPermission") if kind == "column" else (pkind,)) and node.name.lower() == old.lower() and node.parent is not None \
-                    and node.parent.name.lower() == home.lower() and node.parent.kind in ("perspectiveTable", "tablePermission"):
+            elif node.kind in ((pkind, "columnPermission") if kind == "column" else (pkind,)) and _fold(node.name) == _fold(old) and node.parent is not None \
+                    and _fold(node.parent.name) == _fold(home) and node.parent.kind in ("perspectiveTable", "tablePermission"):
                 # Perspective membership and object-level security follow the rename.
                 e = _decl_edit(text, node, node.kind, new)
                 if e:
@@ -78,11 +87,11 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             edits += _binding_edits(bindings, kind, home, old, new, text)
         if kind == "column":
             for m_ in re.finditer(r"(?m)^(\t*(?:sortByColumn|column)\s*:\s*)('(?:[^']|'')*'|\S+)\s*$", text):
-                if tmdl.unquote(m_.group(2)).lower() == old.lower() and rel == model.tables[home].file:
+                if _fold(tmdl.unquote(m_.group(2))) == _fold(old) and rel == model.tables[home].file:
                     edits.append((m_.start(2), m_.end(2), lexers.tmdl_name(new)))
             for m_ in re.finditer(r"(?m)^(\t*(?:fromColumn|toColumn|baseColumn)\s*:\s*)(.+?)\s*$", text):
                 parts = tmdl.split_dotted(m_.group(2))
-                if len(parts) == 2 and parts[0].lower() == home.lower() and parts[1].lower() == old.lower():
+                if len(parts) == 2 and _fold(parts[0]) == _fold(home) and _fold(parts[1]) == _fold(old):
                     edits.append((m_.start(2), m_.end(2), f"{lexers.tmdl_name(parts[0])}.{lexers.tmdl_name(new)}"))
         if edits:
             path = os.path.join(mdef, *rel.split("/"))
@@ -188,11 +197,11 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     after = _inventory(planned)
     for site, ref in before.items():
         k, table, name = ref
-        if k != kind or name.lower() != old.lower() or (kind != "table" and table.lower() != home.lower()):
+        if k != kind or _fold(name) != _fold(old) or (kind != "table" and _fold(table) != _fold(home)):
             continue
         if kind == "measure" and len(site) == 4 and site[1] == "dax":
             qualifier = before.get((site[0], "qualifier", *site[2:]))
-            if qualifier and qualifier[2].lower() != home.lower():
+            if qualifier and _fold(qualifier[2]) != _fold(home):
                 continue
         dest = (moved.get(site[0], site[0]), *site[1:])
         expected = (kind, table, new)
@@ -234,8 +243,8 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         for ref, site in original:
             k = "column" if ref.kind == "aggregation" else ref.kind
-            target = (ref.table.lower() == old.lower()) if kind == "table" else (
-                k == kind and ref.table.lower() == home.lower() and ref.name.lower() == old.lower())
+            target = (_fold(ref.table) == _fold(old)) if kind == "table" else (
+                k == kind and _fold(ref.table) == _fold(home) and _fold(ref.name) == _fold(old))
             if not target:
                 continue
             after_ref = following.get(site)
@@ -315,7 +324,7 @@ def _canonical_target(model, kind, home, old):
         return table.name, old
     pool = table.columns if kind == "column" else table.measures
     for obj in pool.values():
-        if obj.name.lower() == old.lower():
+        if _fold(obj.name) == _fold(old):
             return table.name, obj.name
     return table.name, old
 
@@ -335,11 +344,11 @@ def _table_qualified(model, old):
     table = model.table(old)
     if table is None:
         return None, set()
-    qualified = {f"{table.name}.{obj.name}".casefold()
+    qualified = {_fold(f"{table.name}.{obj.name}")
                  for obj in list(table.columns.values()) + list(table.measures.values())}
     for hname, levels in table.hierarchies.items():
         for level in levels:
-            qualified.add(f"{table.name}.{hname}.{level}".casefold())
+            qualified.add(_fold(f"{table.name}.{hname}.{level}"))
     return table, qualified
 
 
@@ -354,15 +363,15 @@ def _path_extension(rest, old, tables=()):
     remainder, since either means the string holds more than one reference."""
     if not rest:
         return False
-    names = {old.casefold()} | {t.casefold() for t in tables}
+    names = {_fold(old)} | {_fold(t) for t in tables}
     pattern = rf"(?<![\w])(?:{'|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True))})\."
-    if re.search(pattern, rest.casefold()):
+    if re.search(pattern, _fold(rest)):
         return False
     for seg in rest.split("."):
         seg = seg.strip()
         if not seg or not all(ch.isalnum() or ch in "_ " for ch in seg):
             return False
-        if any(tok in _WORD_OPERATORS for tok in seg.casefold().split()):
+        if any(tok in _WORD_OPERATORS for tok in _fold(seg).split()):
             return False
     return True
 
@@ -373,7 +382,7 @@ def _rest_after(text, prefix_lower):
     match. Length-based slicing is unsafe: case folding can change the code
     point count of the written segment."""
     for i, ch in enumerate(text):
-        if ch == "." and text[:i].casefold() == prefix_lower:
+        if ch == "." and _fold(text[:i]) == prefix_lower:
             return text[i + 1:]
     return None
 
@@ -383,7 +392,7 @@ def _head_swap(value, table, new):
     at the value's own boundary dot: the written segment can differ in length
     from the canonical name when case folding changes code points."""
     for i, ch in enumerate(value):
-        if ch == "." and value[:i].casefold() == table.casefold():
+        if ch == "." and _fold(value[:i]) == _fold(table):
             return new + value[i:]
     return new + value[len(table):]
 
@@ -400,12 +409,12 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
     owning entity, not by the flattened path. extensions_any extends the
     extension test to every other table, for values with no home anchor
     (a bare nativeQueryRef)."""
-    low = value.casefold()
+    low = _fold(value)
     tables = tuple(t.name for t in model.tables.values()) if model is not None else ()
-    if low in {p.casefold() for p in extra_owned}:
+    if low in {_fold(p) for p in extra_owned}:
         return True
     for p in extra_extending:
-        pl = p.casefold()
+        pl = _fold(p)
         if low == pl:
             return True
         rest = _rest_after(value, pl)
@@ -413,21 +422,21 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
             return True
     if extensions_any:
         for p in extra_owned:
-            rest = _rest_after(value, p.casefold())
+            rest = _rest_after(value, _fold(p))
             if rest is not None and _path_extension(rest, home, tables):
                 return True
     if model is None:
         return False
     for t in model.tables.values():
-        if t.name.casefold() == home.casefold():
+        if _fold(t.name) == _fold(home):
             continue
-        paths = {f"{t.name}.{o.name}".casefold()
+        paths = {_fold(f"{t.name}.{o.name}")
                  for o in list(t.columns.values()) + list(t.measures.values())}
         for hname, levels in t.hierarchies.items():
-            paths |= {f"{t.name}.{hname}.{lvl}".casefold() for lvl in levels}
+            paths |= {_fold(f"{t.name}.{hname}.{lvl}") for lvl in levels}
         if low in paths:
             return True
-        if extensions_any or t.name.casefold().startswith(home.casefold() + "."):
+        if extensions_any or _fold(t.name).startswith(_fold(home) + "."):
             for q in paths:
                 rest = _rest_after(value, q)
                 if rest is not None and _path_extension(rest, home, tables):
@@ -455,14 +464,14 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
         return new + text[at:]
 
     _tables = [t.name for t in model.tables.values()] if model is not None else ()
-    other_exact = {p.casefold() for p in other_owned}
-    other_ext = {p.casefold() for p in other_extending}
+    other_exact = {_fold(p) for p in other_owned}
+    other_ext = {_fold(p) for p in other_extending}
     if model is not None:
         for other in model.tables.values():
-            if other.name.casefold() == old.casefold():
+            if _fold(other.name) == _fold(old):
                 continue
             other_exact |= _table_qualified(model, other.name)[1]
-            if other.name.casefold().startswith(old.casefold() + "."):
+            if _fold(other.name).startswith(_fold(old) + "."):
                 other_ext |= _table_qualified(model, other.name)[1]
 
     def _extends(text, qset):
@@ -473,9 +482,9 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
         return False
 
     def _rewrite(text):
-        if text.casefold() in other_exact:
+        if _fold(text) in other_exact:
             return _BLOCKED
-        if text.casefold() in qualified or _extends(text, qualified):
+        if _fold(text) in qualified or _extends(text, qualified):
             if _extends(text, other_ext):
                 return _BLOCKED
             return _swap(text)
@@ -548,25 +557,25 @@ def _extension_qualified(report_dir, old):
     reportExtensions.json can attach measures to a model table inside the
     report. They are not model objects, but reference strings naming them
     belong to the table and must follow its rename like model measures do."""
-    return {f"{name}.{m}".casefold()
+    return {_fold(f"{name}.{m}")
             for name, measures in _extension_entities(report_dir)
-            if name.casefold() == old.casefold() for m in measures}
+            if _fold(name) == _fold(old) for m in measures}
 
 
 def _extension_owned(report_dir, home):
     """Qualified paths of report-extension measures on tables whose dotted
     name extends home: strings the longer-table reading owns."""
-    return {f"{name}.{m}".casefold()
+    return {_fold(f"{name}.{m}")
             for name, measures in _extension_entities(report_dir)
-            if name.casefold().startswith(home.casefold() + ".") for m in measures}
+            if _fold(name).startswith(_fold(home) + ".") for m in measures}
 
 
 def _extension_owned_others(report_dir, home):
     """Qualified paths of report-extension measures on any entity other
     than home: strings another table's reading owns."""
-    return {f"{name}.{m}".casefold()
+    return {_fold(f"{name}.{m}")
             for name, measures in _extension_entities(report_dir)
-            if name.casefold() != home.casefold() for m in measures}
+            if _fold(name) != _fold(home) for m in measures}
 
 
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
@@ -590,13 +599,13 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                 wrapped = _wrapped_inner(value)
                 probes = [(value, None)] + ([(wrapped[1], wrapped[0])] if wrapped else [])
                 for probe, wrap_name in probes:
-                    _rest = _rest_after(probe, base.casefold())
-                    if probe.casefold() == base.casefold() \
+                    _rest = _rest_after(probe, _fold(base))
+                    if _fold(probe) == _fold(base) \
                             or (_rest is not None
                                 and _path_extension(_rest, old,
                                                     [t.name for t in model.tables.values()]
                                                     if model is not None else ())):
-                        if field.table.casefold() != old.casefold():
+                        if _fold(field.table) != _fold(old):
                             return value
                         swapped = _head_swap(probe, field.table, new)
                         return f"{wrap_name}({swapped})" if wrap_name else swapped
@@ -608,10 +617,10 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
             if _tbl is not None:
                 return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model,
                                       other_owned=extra_owned, other_extending=extra_extending)
-            if value.casefold().startswith(old.casefold() + "."):
+            if _fold(value).startswith(_fold(old) + "."):
                 return _head_swap(value, old, new)
             wrapped = _single_wrapped(value)
-            _rest = _rest_after(wrapped[1], old.casefold()) if wrapped else None
+            _rest = _rest_after(wrapped[1], _fold(old)) if wrapped else None
             if wrapped and _rest is not None \
                     and _path_extension(_rest, old,
                                         [t.name for t in model.tables.values()]
@@ -624,22 +633,22 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         return value
     if field is not None:
         field_kind = "column" if field.kind == "aggregation" else field.kind
-        if field_kind != kind or field.table.casefold() != home.casefold() or field.name.casefold() != old.casefold():
+        if field_kind != kind or _fold(field.table) != _fold(home) or _fold(field.name) != _fold(old):
             return value
-        if value.casefold() in (f"{field.table}.{field.name}".casefold(), f"{home}.{old}".casefold()):
+        if _fold(value) in (_fold(f"{field.table}.{field.name}"), _fold(f"{home}.{old}")):
             return f"{home}.{new}"
-        if key == "nativeQueryRef" and value.casefold() == field.name.casefold():
+        if key == "nativeQueryRef" and _fold(value) == _fold(field.name):
             return new
         if field_kind == "column":
             wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
-            if wrapped and wrapped.group(2).casefold() in (
-                    f"{field.table}.{field.name}".casefold(), f"{home}.{old}".casefold()):
+            if wrapped and _fold(wrapped.group(2)) in (
+                    _fold(f"{field.table}.{field.name}"), _fold(f"{home}.{old}")):
                 return f"{wrapped.group(1)}({home}.{new})"
         return value
-    if key in ("queryRef", "metadata", "nativeQueryRef") and value.casefold() == f"{home}.{old}".casefold() \
+    if key in ("queryRef", "metadata", "nativeQueryRef") and _fold(value) == _fold(f"{home}.{old}") \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending):
         return f"{home}.{new}"
-    if key == "nativeQueryRef" and value.casefold() == old.casefold() \
+    if key == "nativeQueryRef" and _fold(value) == _fold(old) \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending,
                                       extensions_any=True):
         return new
@@ -648,7 +657,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         return value
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
         wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
-        if wrapped and wrapped.group(2).casefold() == f"{home}.{old}".casefold() \
+        if wrapped and _fold(wrapped.group(2)) == _fold(f"{home}.{old}") \
                 and not _other_table_owns(model, home, wrapped.group(2), extra_owned, extra_extending):
             return f"{wrapped.group(1)}({home}.{new})"
     return value
@@ -658,16 +667,16 @@ def _binding_edits(bindings, kind, home, old, new, text):
     edits = []
     for binding in bindings:
         ref = binding.ref
-        if ref.name.casefold() != old.casefold():
+        if _fold(ref.name) != _fold(old):
             continue
         if binding.uncertain:
             raise PbzError("AMBIGUOUS", f"cannot safely bind a reference to {old}; nothing renamed")
         if kind == "measure" and binding.qualifier is not None:
             a, b = binding.qualifier
             tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
-            if (tok.value or tok.text).casefold() != home.casefold():
+            if _fold(tok.value or tok.text) != _fold(home):
                 continue
-        if ref.kind == kind and ref.table.casefold() == home.casefold():
+        if ref.kind == kind and _fold(ref.table) == _fold(home):
             edits.append((binding.start, binding.end, _bracket(new)))
     return edits
 
@@ -688,7 +697,7 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
     fields = pbir.walk_fields_with_path(root, model)
     for ref, _site in fields:
         k = "column" if ref.kind == "aggregation" else ref.kind
-        if k == want and ref.name.casefold() == old.casefold() and ref.table.casefold() == home.casefold() and ref.prop_node:
+        if k == want and _fold(ref.name) == _fold(old) and _fold(ref.table) == _fold(home) and ref.prop_node:
             edits.append((ref.prop_node.start, ref.prop_node.end, json.dumps(new, ensure_ascii=False)))
     home, old = _canonical_target(model, kind, home, old)
     for site, (node, field) in _report_string_sites(root, model, fields).items():
@@ -738,13 +747,13 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     if t is None:
         raise PbzError("NOT_FOUND", f"table {old}")
     old = t.name
-    if model.table(new) and new.lower() != old.lower():
+    if model.table(new) and _fold(new) != _fold(old):
         raise PbzError("NAME_TAKEN", new)
     if not new.strip() or new != new.strip() or any(c in new for c in "\r\n\t"):
         raise PbzError("BAD_REQUEST", "table names cannot be blank, padded or contain control characters")
-    if any(n == old.lower() for n in translated_names(project)):
+    if any(n == _fold(old) for n in translated_names(project)):
         raise PbzError("UNSUPPORTED", "cultures not in this mirror: run pbz pull")
-    if any(e.lower() == old.lower() for e in model.expressions):
+    if any(_fold(e) == _fold(old) for e in model.expressions):
         raise PbzError("AMBIGUOUS", f"a shared query is also named {old}")
     ext = _external_users(ws, project, "table", "", old)
     mdef = os.path.join(project.mirror_model, "definition")
@@ -758,23 +767,23 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     # M partitions can reference table queries as well as shared expressions.
     mres = deps.Resolver(model)
     mres.expressions.update({name: name for name in model.tables})
-    low = old.lower()
+    low = _fold(old)
     changed, renamed_file = [], None
     ops = []
     for rel, doc in model.docs.items():
         text = doc.text
         edits = []
         for node in doc.nodes:
-            if node.kind == "table" and node.parent is None and node.name.lower() == low:
+            if node.kind == "table" and node.parent is None and _fold(node.name) == low:
                 e = _decl_edit(text, node, "table", new)
                 if e:
                     edits.append(e)
-            elif node.kind == "partition" and node.parent is not None and node.parent.name.lower() == low \
-                    and node.name.lower() == low:
+            elif node.kind == "partition" and node.parent is not None and _fold(node.parent.name) == low \
+                    and _fold(node.name) == low:
                 e = _decl_edit(text, node, "partition", new)
                 if e:
                     edits.append(e)
-            elif node.kind in ("perspectiveTable", "tablePermission") and node.name.lower() == low:
+            elif node.kind in ("perspectiveTable", "tablePermission") and _fold(node.name) == low:
                 e = _decl_edit(text, node, node.kind, new)
                 if e:
                     edits.append(e)
@@ -783,16 +792,16 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
             if reg.kind == "dax":
                 for binding in deps.dax_region(text, reg, res).bindings:
                     ref = binding.ref
-                    if binding.uncertain and ref.table.lower() == low:
+                    if binding.uncertain and _fold(ref.table) == low:
                         raise PbzError("AMBIGUOUS", f"cannot safely bind a reference to {old}")
-                    if ref.kind == "table" and ref.name.lower() == low:
+                    if ref.kind == "table" and _fold(ref.name) == low:
                         quoted = text[binding.start:binding.start + 1] == "'"
                         edits.append((binding.start, binding.end, _dax_table(new, quoted)))
                     elif binding.qualifier and ref.kind in {"column", "measure"}:
                         a, b = binding.qualifier
                         # A qualified measure can name any table; rename its actual qualifier.
                         tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
-                        if (tok.value or tok.text).lower() == low:
+                        if _fold(tok.value or tok.text) == low:
                             edits.append((a, b, _dax_table(new, tok.kind == "table")))
             elif reg.kind == "m":
                 for binding in deps.m_bindings(seg, mres, base=reg.start):
@@ -813,18 +822,18 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                                                                  separators=(",", ":"), ensure_ascii=False)))
         for m_ in re.finditer(r"(?m)^(\t*(?:fromColumn|toColumn|baseColumn|baseTable|defaultHierarchy)\s*:\s*)(.+?)\s*$", text):
             parts = tmdl.split_dotted(m_.group(2))
-            if parts and parts[0].lower() == low:
+            if parts and _fold(parts[0]) == low:
                 edits.append((m_.start(2), m_.end(2), ".".join([lexers.tmdl_name(new)] + [lexers.tmdl_name(p) for p in parts[1:]])))
         if rel == "model.tmdl":
             for m_ in re.finditer(r"(?m)^ref table ('(?:[^']|'')*'|[^\s]+)[ \t]*\r?$", text):
-                if tmdl.unquote(m_.group(1)).lower() == low:
+                if _fold(tmdl.unquote(m_.group(1))) == low:
                     edits.append((m_.start(1), m_.end(1), lexers.tmdl_name(new)))
         if not edits and rel != t.file:
             continue
         new_text = apply_edits(text, edits) if edits else text
         path = os.path.join(mdef, *rel.split("/"))
         _t, bom = mirror.read_mirror_text(path, root=ws.mirror)
-        if rel == t.file and os.path.basename(rel)[:-5].lower() == low and old != new:
+        if rel == t.file and _fold(os.path.basename(rel)[:-5]) == low and old != new:
             target = "/".join(rel.split("/")[:-1] + [_safe_file(new) + ".tmdl"])
             if target != rel:
                 ops.append(("write", os.path.join(mdef, *target.split("/")), new_text, bom))
@@ -843,13 +852,13 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
             if isinstance(node, pbir.JObj):
                 ents = node.get("entities") if key == "" else None
                 for k, v in node.pairs:
-                    if k.value == "Entity" and isinstance(v, pbir.JStr) and v.value.lower() == low:
+                    if k.value == "Entity" and isinstance(v, pbir.JStr) and _fold(v.value) == low:
                         edits.append((v.start, v.end, json.dumps(new, ensure_ascii=False)))
                     visit(v, k.value)
                 if isinstance(ents, pbir.JArr):
                     for ent in ents.items:
                         nm = ent.get("name") if isinstance(ent, pbir.JObj) else None
-                        if isinstance(nm, pbir.JStr) and nm.value.lower() == low:
+                        if isinstance(nm, pbir.JStr) and _fold(nm.value) == low:
                             edits.append((nm.start, nm.end, json.dumps(new, ensure_ascii=False)))
             elif isinstance(node, pbir.JArr):
                 for v in node.items:

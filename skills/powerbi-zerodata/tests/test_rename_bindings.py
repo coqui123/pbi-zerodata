@@ -577,6 +577,31 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
         self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Sum(Sales.Value)")
 
+    def test_table_rename_medial_sigma_entity_and_string_follow(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "οσ"}}, "Property": "Amount"},
+               "queryRef": "οσ.Amount"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        _write(os.path.join(mdef, "tables", "ΟΣ.tmdl"),
+               "table 'ΟΣ'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "ΟΣ", "Revenue")
+        proj = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(proj["Column"]["Expression"]["SourceRef"]["Entity"], "Revenue")
+        self.assertEqual(proj["queryRef"], "Revenue.Amount")
+
+    def test_column_rename_sharp_s_names_stay_distinct(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Masse"},
+               "queryRef": "Sales.Masse"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        sales_path = os.path.join(mdef, "tables", "Sales.tmdl")
+        _write(sales_path,
+               "table Sales\n\tcolumn 'Maße'\n\t\tdataType: int64\n\tcolumn Masse\n\t\tdataType: int64\n\tmeasure Use = SUM(Sales[Masse])\n")
+        rename.rename(ws, project, "column", "Maße", "Value", table="Sales")
+        proj = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(proj["queryRef"], "Sales.Masse")
+        sales = open(sales_path).read()
+        self.assertIn("SUM(Sales[Masse])", sales)
+        self.assertIn("column Value", sales)
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
