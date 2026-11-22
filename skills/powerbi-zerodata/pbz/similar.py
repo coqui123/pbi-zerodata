@@ -571,6 +571,13 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         or t.value.lower() in fr.get("captured", ()))
                    for fr in stack):
                 uncertain = True
+            CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
+                           "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}
+
+            def _in_caller_args(g) -> bool:
+                ca = CALLER_ARGS.get(g["fn"])
+                return ca is not None and g["arg"] >= ca[0] and (ca[1] is None or g["arg"] <= ca[1])
+
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] in ("ORDERBY", "PARTITIONBY", "MATCHBY") and c_idx > 0:
                     parent = stack[c_idx - 1]
@@ -580,19 +587,19 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                 and res.column(parent["row_table"], t.value) is not None) \
                             or t.value.lower() in parent.get("captured", ()):
                         uncertain = True
-            for fr in stack:
+            for c_idx, fr in enumerate(stack):
                 if fr["fn"] == "SUBSTITUTEWITHINDEX" and fr["arg"] >= 3 and fr["arg"] % 2 == 1 \
                         and ((ref.kind == "column" and fr.get("x_table") != ref.table)
                              or (ref.kind == "measure" and (fr.get("x_table") is None
                                  or res.column(fr.get("x_table"), t.value) is not None))
-                             or t.value.lower() in fr.get("captured", ())):
+                             or t.value.lower() in fr.get("captured", ())) \
+                        and not (ref.kind == "column" and any(
+                                    g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
+                                    and not _in_caller_args(g) and g["row_table"] == ref.table
+                                    and not g.get("projected")
+                                    and g.get("only_column") in (None, ref.name.lower())
+                                    for g in stack[c_idx + 1:])):
                     uncertain = True
-            CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
-                           "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}
-
-            def _in_caller_args(g) -> bool:
-                ca = CALLER_ARGS.get(g["fn"])
-                return ca is not None and g["arg"] >= ca[0] and (ca[1] is None or g["arg"] <= ca[1])
 
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] in (1, 2) \
