@@ -299,6 +299,50 @@ def _canonical_target(model, kind, home, old):
     return table.name, old
 
 
+def _wrapped_inner(value):
+    """(wrapper, inner) when value is Name(...) with the final character closing it."""
+    m = re.match(r"([A-Za-z_][\w]*)\(", value)
+    if not m or not value.endswith(")"):
+        return None
+    return m.group(1), value[m.end():-1]
+
+
+def _table_qualified(model, old):
+    """(table, {qualified object paths}) for a table rename, or (None, empty set)."""
+    if model is None:
+        return None, set()
+    table = model.table(old)
+    if table is None:
+        return None, set()
+    qualified = {f"{table.name}.{obj.name}".lower()
+                 for obj in list(table.columns.values()) + list(table.measures.values())}
+    for hname, levels in table.hierarchies.items():
+        for level in levels:
+            qualified.add(f"{table.name}.{hname}.{level}".lower())
+    return table, qualified
+
+
+def _table_rewrite(value, old, new, qualified):
+    """Rewrite one table reference in a report string, or return the value unchanged.
+
+    A value rewrites when it is exactly a qualified object path of the old
+    table, or a longer path extending one (hierarchy levels, variations)."""
+    low = value.lower()
+
+    def _swap(text):
+        return new + text[text.index("."):]
+
+    if low in qualified:
+        return _swap(value)
+    if any(low.startswith(q + ".") for q in qualified):
+        return _swap(value)
+    wrapped = _wrapped_inner(value)
+    if wrapped and (wrapped[1].lower() in qualified
+                    or any(wrapped[1].lower().startswith(q + ".") for q in qualified)):
+        return f"{wrapped[0]}({_swap(wrapped[1])})"
+    return value
+
+
 def _single_wrapped(value):
     """(wrapper, inner) when value is exactly one Name(...) call, else None."""
     m = re.match(r"([A-Za-z_][\w]*)\(", value)
@@ -320,16 +364,9 @@ def _single_wrapped(value):
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None):
     if kind == "table":
         if key in ("queryRef", "metadata", "queryName"):
-            table = model.table(old) if model is not None else None
-            if table is not None:
-                qualified = {f"{table.name}.{obj.name}".lower()
-                             for obj in list(table.columns.values()) + list(table.measures.values())}
-                if value.lower() in qualified:
-                    return new + value[len(old):]
-                wrapped = _single_wrapped(value)
-                if wrapped and wrapped[1].lower() in qualified:
-                    return f"{wrapped[0]}({new}{wrapped[1][len(old):]})"
-                return value
+            _tbl, qualified = _table_qualified(model, old)
+            if _tbl is not None:
+                return _table_rewrite(value, old, new, qualified)
             if value.lower().startswith(old.lower() + "."):
                 return new + value[len(old):]
             wrapped = _single_wrapped(value)
@@ -566,18 +603,12 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                     visit(v, key)
 
         visit(root)
-        _tbl = model.table(old)
-        _qualified = {f"{_tbl.name}.{obj.name}".lower()
-                      for obj in list(_tbl.columns.values()) + list(_tbl.measures.values())} if _tbl else set()
+        _tbl, _qualified = _table_qualified(model, old)
         for key, node in pbir.string_nodes(root):
-            if key in ("queryRef", "metadata", "queryName"):
-                if node.value.lower() in _qualified:
-                    edits.append((node.start, node.end, json.dumps(new + node.value[len(old):], ensure_ascii=False)))
-                else:
-                    wrapped = _single_wrapped(node.value)
-                    if wrapped and wrapped[1].lower() in _qualified:
-                        edits.append((node.start, node.end, json.dumps(
-                            f"{wrapped[0]}({new}{wrapped[1][len(old):]})", ensure_ascii=False)))
+            if key in ("queryRef", "metadata", "queryName") and _tbl is not None:
+                nv = _table_rewrite(node.value, old, new, _qualified)
+                if nv != node.value:
+                    edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
         return edits, False
 
     from .move import plan_pbir
