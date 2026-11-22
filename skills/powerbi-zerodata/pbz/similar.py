@@ -602,8 +602,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         if t.kind == "ident" and t.text.upper() == "VAR" \
                 and nxt is not None and nxt.kind == "ident":
             _prev = sig[i - 1] if i else None
-            if pending_vars and pending_vars[-1][1] == len(stack) \
-                    and not (_prev is not None and _prev.kind == "op" and _prev.text == "="):
+            _sequential = _prev is not None and _prev.kind in ("ident", "bracket", "num", "str", "table") \
+                and not (_prev.kind == "ident" and _prev.text.upper() in ("RETURN", "VAR"))
+            if pending_vars and pending_vars[-1][1] == len(stack) and _sequential:
                 pending_vars.pop()
             pending_vars.append((nxt.text.lower(), len(stack)))
         elif t.kind == "ident" and t.text.upper() == "RETURN" \
@@ -947,7 +948,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                 var_names_defined[low])
                 if low in table_vars and not (prev is not None and prev.kind == "ident"
                                               and prev.text.upper() == "VAR"):
+                    _def_depth = pending_vars[-1][1] if pending_vars else -1
                     for f_idx, fr in enumerate(stack):
+                        if f_idx < _def_depth:
+                            continue
                         if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
                                 and _in_source_region(f_idx, stack[-1]["arg"] if len(stack) > f_idx + 1 else 0):
                             _rhss = var_rhs.get(low)
