@@ -136,6 +136,8 @@ SALES = (
     "\tmeasure TopnFilterAllB = COUNTROWS(TOPN(1, FILTER(ALL(Other[Price], Other[ShadowM]), TRUE()), Sales[ShadowM]))\n\n"
     "\tmeasure ExcAccA = SUMX(Wide, SUMX(Sales, SUMX(EXCEPT(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), [Price])))\n\n"
     "\tmeasure ExcAccB = SUMX(Wide, SUMX(Sales, SUMX(EXCEPT(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), Wide[Price])))\n\n"
+    "\tmeasure ScopeA = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = Wide RETURN QtyRows, [Price])))\n\n"
+    "\tmeasure ScopeB = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = Wide RETURN QtyRows, Wide[Price])))\n\n"
     "\tmeasure TopnCountCtrlA = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
@@ -410,7 +412,7 @@ class SimilarScopeTests(unittest.TestCase):
               "JoinBareVarA", "JoinBareVarB", "CalcPredA", "CalcPredB",
               "CalcPred2A", "CalcPred2B", "ParenVarA", "ParenVarB",
               "CalcPred3A", "CalcPred3B", "TopnFilterAllA", "TopnFilterAllB",
-              "ExcAccA", "ExcAccB",
+              "ExcAccA", "ExcAccB", "ScopeA", "ScopeB",
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
               "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
@@ -709,7 +711,7 @@ class SimilarScopeTests(unittest.TestCase):
                           ("CalcPred2B", "CalcPred2A"), ("ParenVarB", "ParenVarA"),
                           ("CalcPred3B", "CalcPred3A"),
                           ("TopnFilterAllB", "TopnFilterAllA"),
-                          ("ExcAccB", "ExcAccA")):
+                          ("ExcAccB", "ExcAccA"), ("ScopeB", "ScopeA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

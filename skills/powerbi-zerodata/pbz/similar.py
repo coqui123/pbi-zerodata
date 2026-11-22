@@ -410,7 +410,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             if _applies:
                                 fr["only_columns"] = _val
                     if eff_bare and fr["row_table"] == table and fr.get("only_columns") is not None \
-                            and _widens(idx):
+                            and not pending_vars and _widens(idx):
                         fr["only_columns"] = None
                         fr["only_src"] = None
                     if eff_bare and fr.get("taint") is not None and fr["row_table"] == table \
@@ -951,7 +951,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             if _vt is None or fr["row_table"] != _vt:
                                 fr["row_table"] = None
                                 fr["poisoned"] = True
-                            elif _widens(f_idx):
+                            elif not pending_vars and _widens(f_idx):
                                 _par = next((g for g in reversed(stack) if g["fn"]), None)
                                 _applies, _val = _combine(
                                     fr, _par, _par["arg"] if _par else 0,
