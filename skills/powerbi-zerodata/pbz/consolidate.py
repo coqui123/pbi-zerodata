@@ -287,7 +287,7 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
         raise PbzError("CYCLE", f"[{t.name}] references [{d.name}]: after the merge it would reference itself")
     cd, ct = similar.canon(d.expression, d.table, res), similar.canon(t.expression, t.table, res)
     disc = similar.discovery(cd).toks
-    if cd.words("hash") == ct.words("hash"):
+    if cd.words("hash") == ct.words("hash") and not cd.uncertain and not ct.uncertain:
         equivalence = "identical"
     elif len(disc) == 1 and disc[0][1] == "meas" and disc[0][2].lower() == f"[{t.name}]".lower():
         equivalence = "alias"

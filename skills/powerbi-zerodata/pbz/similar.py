@@ -29,6 +29,7 @@ MIN_SHAPE_TOKENS = 8
 @dataclass
 class Canon:
     toks: list = field(default_factory=list)   # [(token, kind, value)]; kind "" | lit | col | meas
+    uncertain: bool = False
 
     def words(self, literals: str = "hash") -> list[str]:
         """Token strings. literals: "hash" (private exact compare), "slot" (any literal), "shape" (all slots)."""
@@ -69,12 +70,15 @@ def _num(text: str) -> str:
 
 def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     sig = lexers.significant(lexers.lex_dax(expr))
+    bindings = deps.dax_bindings(expr, home, res)
+    by_span = {(b.start, b.end): b for b in bindings.bindings}
     var_names: dict[str, str] = {}
     for i, t in enumerate(sig):
         if t.kind == "ident" and t.text.upper() == "VAR" and i + 1 < len(sig) and sig[i + 1].kind == "ident":
             var_names.setdefault(sig[i + 1].text.lower(), f"$v{len(var_names) + 1}")
     extension = {t.value.lower() for t in sig if t.kind == "str"}
     toks: list[tuple[str, str, str]] = []
+    uncertain = False
     i, n = 0, len(sig)
     while i < n:
         t = sig[i]
@@ -84,6 +88,11 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             toks.append(("LIT", "lit", val))
         elif t.kind in ("table", "ident") and nxt is not None and nxt.kind == "bracket" and (
                 t.kind == "table" or t.text.lower() in var_names or res.table(t.text)):
+            binding = by_span.get((nxt.start, nxt.end))
+            if binding is not None:
+                uncertain |= binding.uncertain
+            else:
+                uncertain = True
             if t.kind == "ident" and t.text.lower() in var_names:
                 toks.append((f"{var_names[t.text.lower()]}[{nxt.value.lower()}]", "", ""))
             else:
@@ -102,7 +111,13 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             i += 2
             continue
         elif t.kind == "bracket":
-            ref = deps._bare(t.value, home, res, False, [], extension)
+            binding = by_span.get((t.start, t.end))
+            if binding is not None:
+                ref = binding.ref
+                uncertain |= binding.uncertain
+            else:
+                uncertain = True
+                ref = deps._bare(t.value, home, res, False, [], extension)
             if ref.kind == "measure":
                 lab = f"[{ref.name}]"
                 toks.append((lab.lower(), "meas", lab))
@@ -132,7 +147,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     if words.count("VAR") == 1 and len(words) >= 6 and words[0] == "VAR" and words[-2] == "RETURN" \
             and words[-1] == words[1] and words[2] == "=":
         toks = _strip_parens(toks[3:-2])
-    return Canon(toks)
+    return Canon(toks, uncertain)
 
 
 def _close_of(toks, i: int) -> int:
@@ -166,7 +181,7 @@ def discovery(c: Canon) -> Canon:
         if top_comma:
             break
         toks = _strip_parens(inner)
-    return Canon(toks)
+    return Canon(toks, c.uncertain)
 
 
 def _grams(words: list[str]) -> set:
