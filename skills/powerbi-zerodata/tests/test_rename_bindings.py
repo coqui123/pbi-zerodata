@@ -1379,6 +1379,22 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
         self.assertEqual(m, "COUNTROWS('Evaluate')")
 
+    def test_table_rename_interval_argument_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Calendar.tmdl"),
+               "table Calendar\n\tcolumn Date\n\t\tdataType: dateTime\n")
+        _write(os.path.join(mdef, "tables", "Year.tmdl"),
+               "table Year\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATEADD('Calendar'[Date], -1, YEAR)) + COUNTROWS('Year')"}]}]}))
+        rename.rename(ws, project, "table", "Year", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATEADD('Calendar'[Date], -1, YEAR)) + COUNTROWS('Archive')")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
