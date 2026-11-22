@@ -993,6 +993,32 @@ class RenameBindingsTests(unittest.TestCase):
             rename.rename(ws, project, "table", "Sales", "Calendar")
         self.assertEqual(caught.exception.code, "AMBIGUOUS")
 
+    def test_table_rename_unrecognizable_path_not_masked_by_longer_column(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+                "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                           "Property": "OrderDate"}},
+                "Hierarchy": "Calendar"}}, "Level": "Year"},
+              "queryRef": "Sales.OrderDate.Calendar.Year"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n\tcolumn 'OrderDate.Calendar'\n\t\tdataType: string\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "Calendar")
+        self.assertEqual(caught.exception.code, "AMBIGUOUS")
+
+    def test_table_rename_unrecognizable_extension_path_unicode_name_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "İ.M.Calendar.Year"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "I.tmdl"),
+               "table 'İ'\n\tcolumn X\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "İ", "measures": [{"name": "M", "expression": "1"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "İ", "Calendar")
+        self.assertEqual(caught.exception.code, "AMBIGUOUS")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

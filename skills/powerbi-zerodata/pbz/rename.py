@@ -721,14 +721,27 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                           for lvl in levels]
             for q in extra_qualified:
                 if _fold(q).startswith(_fold(old) + "."):
-                    bases.append(new + q[len(old):])
+                    bases.append(new + q[len(_fold(old)):])
             names = list(dest_tables or ()) + list(dest_extra or ())
+            own_base = None
+            if field is not None and field is not _AMBIGUOUS:
+                if field.kind == "hierarchy" and field.hierarchy and not field.variation:
+                    own_base = f"{new}.{field.hierarchy}.{field.level}"
+                else:
+                    own_base = f"{new}.{field.name}"
             for text in produced:
-                cands = [b for b in bases
-                         if _fold(text) == _fold(b) or _rest_after(text, _fold(b)) is not None]
-                if not cands:
-                    continue
-                rest = _rest_after(text, _fold(max(cands, key=len)))
+                if own_base is not None:
+                    rest = _rest_after(text, _fold(own_base))
+                    if _fold(text) != _fold(own_base) and rest is None:
+                        continue
+                    cands = [own_base]
+                else:
+                    cands = [b for b in bases
+                             if _fold(text) == _fold(b) or _rest_after(text, _fold(b)) is not None]
+                    if not cands:
+                        continue
+                    cands = [max(cands, key=len)]
+                rest = _rest_after(text, _fold(cands[0]))
                 if rest is not None and not _path_extension(rest, new, names):
                     raise PbzError("AMBIGUOUS",
                                    f"the renamed path {nv} would no longer be recognized; nothing renamed")
