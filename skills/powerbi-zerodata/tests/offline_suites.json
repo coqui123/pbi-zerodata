@@ -833,5 +833,13 @@
     ],
     "windows": false,
     "engine": false
+  },
+  {
+    "id": "rewrite_qualify",
+    "argv": [
+      "tests/test_rewrite_qualify.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]

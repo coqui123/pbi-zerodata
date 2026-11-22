@@ -185,3 +185,25 @@ def compile_note(ws, project, model) -> dict:
             status = item.get("status") if item.get("status") in ("PASS", "ERROR") else "ERROR"
             counts[status] = counts.get(status, 0) + 1
     return {"status": "DONE", "counts": counts}
+
+
+def compile_candidate(ws, project, measure, candidate_expr) -> dict:
+    """Ask Desktop to bind one candidate expression before it is written."""
+    from . import desktop
+    from .common import PbzError, engine_call
+    try:
+        port = desktop.require_port(project)
+    except PbzError:
+        return {"status": "NOT_RUN"}
+    items = [{"id": measure.name[:120], "table": measure.table, "expression": candidate_expr}]
+    try:
+        res = engine_call("compiles", {"private_dir": ws.private, "port": port, "items": items}, timeout=120)
+    except PbzError:
+        return {"status": "NOT_RUN"}
+    if not isinstance(res, dict) or res.get("ok") is not True:
+        return {"status": "NOT_RUN"}
+    for item in res.get("items") or []:
+        if isinstance(item, dict):
+            status = item.get("status") if item.get("status") in ("PASS", "ERROR") else "ERROR"
+            return {"status": "PASS" if status == "PASS" else "FAIL"}
+    return {"status": "NOT_RUN"}
