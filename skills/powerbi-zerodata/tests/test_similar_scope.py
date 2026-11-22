@@ -29,6 +29,10 @@ SALES = (
     "\tmeasure UnresB = SUMX(Sales, [Nope])\n\n"
     "\tmeasure CtrlA = SUM(Sales[Price])\n\n"
     "\tmeasure CtrlB = SUM(Sales[Price])\n\n"
+    "\tmeasure VarA = VAR v = Other RETURN SUMX(v, [Price])\n\n"
+    "\tmeasure VarB = VAR v = Other RETURN SUMX(v, Sales[Price])\n\n"
+    "\tmeasure AliasUnres = 'Missing'[CtrlA]\n\n"
+    "\tmeasure AliasOk = [CtrlA]\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -71,13 +75,17 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertEqual(
             {(m.table, m.name) for m in self.model.all_measures()},
             {("Sales", name) for name in
-             ("IterA", "IterB", "IterC", "IterD", "UnresA", "UnresB", "CtrlA", "CtrlB")},
+             ("IterA", "IterB", "IterC", "IterD", "UnresA", "UnresB", "CtrlA", "CtrlB",
+              "VarA", "VarB", "AliasUnres", "AliasOk")},
         )
 
-    def _key(self, name):
+    def _canon(self, name):
         measure = self.model.measure(name)
         self.assertIsNotNone(measure)
-        return similar.canon(measure.expression, "Sales", self.resolver).words("hash")
+        return similar.canon(measure.expression, "Sales", self.resolver)
+
+    def _key(self, name):
+        return self._canon(name).words("hash")
 
     def test_nested_iterator_occurrences_get_different_keys(self):
         key_a, key_b = self._key("IterA"), self._key("IterB")
@@ -115,6 +123,23 @@ class SimilarScopeTests(unittest.TestCase):
     def test_identical_control_still_previews_identical(self):
         result = consolidate.merge(self.ws, self.project, "CtrlB", "CtrlA", dry_run=True)
         self.assertEqual(result["equivalence"], "identical")
+        self.assertEqual(result["result"], "DRY_RUN")
+
+    def test_var_table_iterator_occurrence_is_uncertain(self):
+        self.assertEqual(self._key("VarA"), self._key("VarB"))
+        self.assertTrue(self._canon("VarA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "VarB", "VarA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_uncertain_alias_is_refused(self):
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "AliasUnres", "CtrlA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_resolved_alias_still_previews_alias(self):
+        result = consolidate.merge(self.ws, self.project, "AliasOk", "CtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "alias")
         self.assertEqual(result["result"], "DRY_RUN")
 
     def test_similar_run_does_not_group_scoped_pair(self):

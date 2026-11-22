@@ -79,10 +79,27 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     extension = {t.value.lower() for t in sig if t.kind == "str"}
     toks: list[tuple[str, str, str]] = []
     uncertain = False
+    stack: list[dict] = []   # {"fn", "arg", "row_table"}: mirrors the deps.dax_bindings frames
+
+    def learn(table) -> None:
+        if table:
+            for fr in stack:
+                if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and fr["row_table"] is None:
+                    fr["row_table"] = table
+
     i, n = 0, len(sig)
     while i < n:
         t = sig[i]
         nxt = sig[i + 1] if i + 1 < n else None
+        if t.kind == "op" and t.text == "(":
+            prev = sig[i - 1] if i else None
+            fn = prev.text.upper() if prev is not None and prev.kind == "ident" else ""
+            stack.append({"fn": fn, "arg": 0, "row_table": None})
+        elif t.kind == "op" and t.text == ")":
+            if stack:
+                stack.pop()
+        elif t.kind == "op" and t.text == "," and stack:
+            stack[-1]["arg"] += 1
         if t.kind in LIT_KINDS:
             val = _num(t.text) if t.kind == "num" else ("T" + t.text if t.kind == "pbztok" else "S" + t.value)
             toks.append(("LIT", "lit", val))
@@ -102,6 +119,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if col:
                     lab = f"{tab}[{col}]"
                     toks.append((lab.lower(), "col", lab))
+                    learn(tab)
                 elif res.measure(nxt.value):
                     lab = f"[{res.measure(nxt.value)[1]}]"
                     toks.append((lab.lower(), "meas", lab))
@@ -118,6 +136,11 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             else:
                 uncertain = True
                 ref = deps._bare(t.value, home, res, False, [], extension)
+            if any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1 and fr["row_table"] is None
+                   for fr in stack):
+                uncertain = True
+            if ref.kind == "column":
+                learn(ref.table)
             if ref.kind == "measure":
                 lab = f"[{ref.name}]"
                 toks.append((lab.lower(), "meas", lab))
@@ -129,6 +152,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         elif t.kind == "table":
             tab = res.table(t.value) or t.value
             toks.append(("t:" + tab.lower(), "", ""))
+            learn(res.table(t.value))
         elif t.kind == "ident":
             low = t.text.lower()
             if nxt is not None and nxt.kind == "op" and nxt.text == "(":
@@ -137,6 +161,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 toks.append((var_names[low], "", ""))
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
+                learn(res.table(t.text))
             else:
                 toks.append((t.text.upper(), "", ""))
         else:

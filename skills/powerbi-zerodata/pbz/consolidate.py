@@ -289,7 +289,7 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
     disc = similar.discovery(cd).toks
     if cd.words("hash") == ct.words("hash") and not cd.uncertain and not ct.uncertain:
         equivalence = "identical"
-    elif len(disc) == 1 and disc[0][1] == "meas" and disc[0][2].lower() == f"[{t.name}]".lower():
+    elif not cd.uncertain and len(disc) == 1 and disc[0][1] == "meas" and disc[0][2].lower() == f"[{t.name}]".lower():
         equivalence = "alias"
     elif force:
         equivalence = "forced"
