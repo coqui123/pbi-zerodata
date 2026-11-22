@@ -167,6 +167,10 @@ SALES = (
     "\tmeasure XnpvRankB = SUMX(Sales, XNPV(Other, RANKX(Sales, Sales[Price], Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure XnpvRateCtrlA = SUMX(Sales, XNPV(Other, Other[Price], DATE(2026, 1, 1), [Price]))\n\n"
     "\tmeasure XnpvRateCtrlB = SUMX(Sales, XNPV(Other, Other[Price], DATE(2026, 1, 1), Sales[Price]))\n\n"
+    "\tmeasure XnpvDateA = SUMX(Sales, XNPV(Other, Other[Price], [Price], 0))\n\n"
+    "\tmeasure XnpvDateB = SUMX(Sales, XNPV(Other, Other[Price], Sales[Price], 0))\n\n"
+    "\tmeasure XnpvThirdA = SUMX(Sales, XNPV(Other, SUMX(Dates, [Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvThirdB = SUMX(Sales, XNPV(Other, SUMX(Dates, Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
 )
@@ -174,7 +178,11 @@ OTHER = (
     "table Other\n\n"
     "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
 )
-MODEL = "model Model\n\tculture: en-US\n\nref table Sales\nref table Other\n"
+DATES = (
+    "table Dates\n\n"
+    "\tcolumn Day\n\t\tdataType: dateTime\n\t\tsourceColumn: Day\n\n"
+)
+MODEL = "model Model\n\tculture: en-US\n\nref table Sales\nref table Other\nref table Dates\n"
 DATABASE = "database\n\tcompatibilityLevel: 1400\n"
 
 
@@ -197,12 +205,13 @@ class SimilarScopeTests(unittest.TestCase):
         mdef = os.path.join(self.project.mirror_model, "definition")
         _write(os.path.join(mdef, "tables", "Sales.tmdl"), SALES)
         _write(os.path.join(mdef, "tables", "Other.tmdl"), OTHER)
+        _write(os.path.join(mdef, "tables", "Dates.tmdl"), DATES)
         _write(os.path.join(mdef, "model.tmdl"), MODEL)
         _write(os.path.join(mdef, "database.tmdl"), DATABASE)
         os.makedirs(self.project.model_dir, exist_ok=True)
         self.model = tmdl.load_model(mdef)
         self.resolver = deps.Resolver(self.model)
-        self.assertEqual(set(self.model.tables), {"Sales", "Other"})
+        self.assertEqual(set(self.model.tables), {"Sales", "Other", "Dates"})
         for table in ("Sales", "Other"):
             self.assertIsNotNone(self.model.column(table, "Price"))
             self.assertIsNone(self.model.column(table, "Nope"))
@@ -237,7 +246,8 @@ class SimilarScopeTests(unittest.TestCase):
               "XnpvA", "XnpvB", "ConcatxSortCtrlA", "ConcatxSortCtrlB",
               "XnpvTopA", "XnpvTopB", "XnpvNestCtrlA", "XnpvNestCtrlB",
               "XnpvExcA", "XnpvExcB", "XnpvSelA", "XnpvSelB", "XnpvRankA", "XnpvRankB",
-              "XnpvRateCtrlA", "XnpvRateCtrlB")},
+              "XnpvRateCtrlA", "XnpvRateCtrlB", "XnpvDateA", "XnpvDateB",
+              "XnpvThirdA", "XnpvThirdB")},
         )
 
     def _canon(self, name):
@@ -457,7 +467,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("RankxB", "RankxA"), ("PercxB", "PercxA"), ("ConcatxB", "ConcatxA"),
                           ("XnpvB", "XnpvA"), ("XnpvTopB", "XnpvTopA"),
                           ("XnpvExcB", "XnpvExcA"), ("XnpvSelB", "XnpvSelA"),
-                          ("XnpvRankB", "XnpvRankA")):
+                          ("XnpvRankB", "XnpvRankA"), ("XnpvDateB", "XnpvDateA"),
+                          ("XnpvThirdB", "XnpvThirdA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

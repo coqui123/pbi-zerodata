@@ -310,7 +310,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         args.append(cur)
         return args
 
-    def _span_table(span):
+    def _span_table(span, seen=frozenset()):
         while len(span) >= 2 and span[0].kind == "op" and span[0].text == "(" \
                 and _call_span(span, 0) == len(span) - 1:
             span = span[1:-1]
@@ -323,9 +323,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             if u.kind == "ident":
                 if res.table(u.text):
                     return res.table(u.text)
-                rhss = var_rhs.get(u.text.lower())
+                low = u.text.lower()
+                if low in seen:
+                    return None
+                rhss = var_rhs.get(low)
                 if rhss:
-                    vals = {_span_table(r) for r in rhss}
+                    vals = {_span_table(r, seen | {low}) for r in rhss}
                     return vals.pop() if len(vals) == 1 else None
             return None
         if span[0].kind == "ident" and span[1].kind == "op" and span[1].text == "(" \
@@ -334,17 +337,17 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             args = _span_args(span[2:-1])
             if fn in ("FILTER", "CALCULATETABLE", "ALL", "ALLEXCEPT", "ALLNOBLANKROW",
                       "ALLSELECTED", "DISTINCT", "KEEPFILTERS", "FILTERS"):
-                return _span_table(args[0]) if args else None
+                return _span_table(args[0], seen) if args else None
             if fn == "VALUES":
                 a = args[0] if args else []
                 if len(a) == 2 and a[1].kind == "bracket":
                     return res.table(a[0].value if a[0].kind == "table" else a[0].text)
-                return _span_table(a)
+                return _span_table(a, seen)
             if fn in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
-                return _span_table(args[1]) if len(args) > 1 else None
+                return _span_table(args[1], seen) if len(args) > 1 else None
             if fn in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN", "NATURALINNERJOIN",
                       "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
-                vals = {_span_table(a) for a in args}
+                vals = {_span_table(a, seen) for a in args}
                 return vals.pop() if len(vals) == 1 else None
             return None
         if len(span) == 2 and span[1].kind == "bracket" \
@@ -480,10 +483,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 return ca is not None and g["arg"] >= ca[0] and (ca[1] is None or g["arg"] <= ca[1])
 
             for c_idx, fr in enumerate(stack):
-                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] == 1 and ref.kind == "column" \
+                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] in (1, 2) and ref.kind == "column" \
                         and fr.get("x_table") != ref.table \
                         and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
-                                    and not _in_caller_args(g)
+                                    and not _in_caller_args(g) and g["row_table"] == ref.table
                                     for g in stack[c_idx + 1:]):
                     uncertain = True
                 caller_args = CALLER_ARGS.get(fr["fn"])
@@ -492,7 +495,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         and (caller_args[1] is None or fr["arg"] <= caller_args[1]):
                     caller = None
                     for below in reversed(stack[:c_idx]):
-                        if below["fn"] in ("XNPV", "XIRR") and below["arg"] >= 1:
+                        if below["fn"] in ("XNPV", "XIRR") and below["arg"] in (1, 2):
                             caller = below.get("x_table")
                             break
                         if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:
