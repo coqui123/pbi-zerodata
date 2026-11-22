@@ -335,11 +335,11 @@ def _table_qualified(model, old):
     table = model.table(old)
     if table is None:
         return None, set()
-    qualified = {f"{table.name}.{obj.name}".lower()
+    qualified = {f"{table.name}.{obj.name}".casefold()
                  for obj in list(table.columns.values()) + list(table.measures.values())}
     for hname, levels in table.hierarchies.items():
         for level in levels:
-            qualified.add(f"{table.name}.{hname}.{level}".lower())
+            qualified.add(f"{table.name}.{hname}.{level}".casefold())
     return table, qualified
 
 
@@ -354,15 +354,15 @@ def _path_extension(rest, old, tables=()):
     remainder, since either means the string holds more than one reference."""
     if not rest:
         return False
-    names = {old.lower()} | {t.lower() for t in tables}
+    names = {old.casefold()} | {t.casefold() for t in tables}
     pattern = rf"(?<![\w])(?:{'|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True))})\."
-    if re.search(pattern, rest.lower()):
+    if re.search(pattern, rest.casefold()):
         return False
     for seg in rest.split("."):
         seg = seg.strip()
         if not seg or not all(ch.isalnum() or ch in "_ " for ch in seg):
             return False
-        if any(tok in _WORD_OPERATORS for tok in seg.lower().split()):
+        if any(tok in _WORD_OPERATORS for tok in seg.casefold().split()):
             return False
     return True
 
@@ -373,7 +373,7 @@ def _rest_after(text, prefix_lower):
     match. Length-based slicing is unsafe: case folding can change the code
     point count of the written segment."""
     for i, ch in enumerate(text):
-        if ch == "." and text[:i].lower() == prefix_lower:
+        if ch == "." and text[:i].casefold() == prefix_lower:
             return text[i + 1:]
     return None
 
@@ -383,7 +383,7 @@ def _head_swap(value, table, new):
     at the value's own boundary dot: the written segment can differ in length
     from the canonical name when case folding changes code points."""
     for i, ch in enumerate(value):
-        if ch == "." and value[:i].lower() == table.lower():
+        if ch == "." and value[:i].casefold() == table.casefold():
             return new + value[i:]
     return new + value[len(table):]
 
@@ -400,12 +400,12 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
     owning entity, not by the flattened path. extensions_any extends the
     extension test to every other table, for values with no home anchor
     (a bare nativeQueryRef)."""
-    low = value.lower()
+    low = value.casefold()
     tables = tuple(t.name for t in model.tables.values()) if model is not None else ()
-    if low in {p.lower() for p in extra_owned}:
+    if low in {p.casefold() for p in extra_owned}:
         return True
     for p in extra_extending:
-        pl = p.lower()
+        pl = p.casefold()
         if low == pl:
             return True
         rest = _rest_after(value, pl)
@@ -413,21 +413,21 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
             return True
     if extensions_any:
         for p in extra_owned:
-            rest = _rest_after(value, p.lower())
+            rest = _rest_after(value, p.casefold())
             if rest is not None and _path_extension(rest, home, tables):
                 return True
     if model is None:
         return False
     for t in model.tables.values():
-        if t.name.lower() == home.lower():
+        if t.name.casefold() == home.casefold():
             continue
-        paths = {f"{t.name}.{o.name}".lower()
+        paths = {f"{t.name}.{o.name}".casefold()
                  for o in list(t.columns.values()) + list(t.measures.values())}
         for hname, levels in t.hierarchies.items():
-            paths |= {f"{t.name}.{hname}.{lvl}".lower() for lvl in levels}
+            paths |= {f"{t.name}.{hname}.{lvl}".casefold() for lvl in levels}
         if low in paths:
             return True
-        if extensions_any or t.name.lower().startswith(home.lower() + "."):
+        if extensions_any or t.name.casefold().startswith(home.casefold() + "."):
             for q in paths:
                 rest = _rest_after(value, q)
                 if rest is not None and _path_extension(rest, home, tables):
@@ -455,14 +455,14 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
         return new + text[at:]
 
     _tables = [t.name for t in model.tables.values()] if model is not None else ()
-    other_exact = {p.lower() for p in other_owned}
-    other_ext = {p.lower() for p in other_extending}
+    other_exact = {p.casefold() for p in other_owned}
+    other_ext = {p.casefold() for p in other_extending}
     if model is not None:
         for other in model.tables.values():
-            if other.name.lower() == old.lower():
+            if other.name.casefold() == old.casefold():
                 continue
             other_exact |= _table_qualified(model, other.name)[1]
-            if other.name.lower().startswith(old.lower() + "."):
+            if other.name.casefold().startswith(old.casefold() + "."):
                 other_ext |= _table_qualified(model, other.name)[1]
 
     def _extends(text, qset):
@@ -473,9 +473,9 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
         return False
 
     def _rewrite(text):
-        if text.lower() in other_exact:
+        if text.casefold() in other_exact:
             return _BLOCKED
-        if text.lower() in qualified or _extends(text, qualified):
+        if text.casefold() in qualified or _extends(text, qualified):
             if _extends(text, other_ext):
                 return _BLOCKED
             return _swap(text)
@@ -548,25 +548,25 @@ def _extension_qualified(report_dir, old):
     reportExtensions.json can attach measures to a model table inside the
     report. They are not model objects, but reference strings naming them
     belong to the table and must follow its rename like model measures do."""
-    return {f"{name}.{m}".lower()
+    return {f"{name}.{m}".casefold()
             for name, measures in _extension_entities(report_dir)
-            if name.lower() == old.lower() for m in measures}
+            if name.casefold() == old.casefold() for m in measures}
 
 
 def _extension_owned(report_dir, home):
     """Qualified paths of report-extension measures on tables whose dotted
     name extends home: strings the longer-table reading owns."""
-    return {f"{name}.{m}".lower()
+    return {f"{name}.{m}".casefold()
             for name, measures in _extension_entities(report_dir)
-            if name.lower().startswith(home.lower() + ".") for m in measures}
+            if name.casefold().startswith(home.casefold() + ".") for m in measures}
 
 
 def _extension_owned_others(report_dir, home):
     """Qualified paths of report-extension measures on any entity other
     than home: strings another table's reading owns."""
-    return {f"{name}.{m}".lower()
+    return {f"{name}.{m}".casefold()
             for name, measures in _extension_entities(report_dir)
-            if name.lower() != home.lower() for m in measures}
+            if name.casefold() != home.casefold() for m in measures}
 
 
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
@@ -590,13 +590,13 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                 wrapped = _wrapped_inner(value)
                 probes = [(value, None)] + ([(wrapped[1], wrapped[0])] if wrapped else [])
                 for probe, wrap_name in probes:
-                    _rest = _rest_after(probe, base.lower())
-                    if probe.lower() == base.lower() \
+                    _rest = _rest_after(probe, base.casefold())
+                    if probe.casefold() == base.casefold() \
                             or (_rest is not None
                                 and _path_extension(_rest, old,
                                                     [t.name for t in model.tables.values()]
                                                     if model is not None else ())):
-                        if field.table.lower() != old.lower():
+                        if field.table.casefold() != old.casefold():
                             return value
                         swapped = _head_swap(probe, field.table, new)
                         return f"{wrap_name}({swapped})" if wrap_name else swapped
@@ -608,10 +608,10 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
             if _tbl is not None:
                 return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model,
                                       other_owned=extra_owned, other_extending=extra_extending)
-            if value.lower().startswith(old.lower() + "."):
+            if value.casefold().startswith(old.casefold() + "."):
                 return _head_swap(value, old, new)
             wrapped = _single_wrapped(value)
-            _rest = _rest_after(wrapped[1], old.lower()) if wrapped else None
+            _rest = _rest_after(wrapped[1], old.casefold()) if wrapped else None
             if wrapped and _rest is not None \
                     and _path_extension(_rest, old,
                                         [t.name for t in model.tables.values()]
@@ -624,22 +624,22 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         return value
     if field is not None:
         field_kind = "column" if field.kind == "aggregation" else field.kind
-        if field_kind != kind or field.table.lower() != home.lower() or field.name.lower() != old.lower():
+        if field_kind != kind or field.table.casefold() != home.casefold() or field.name.casefold() != old.casefold():
             return value
-        if value.lower() in (f"{field.table}.{field.name}".lower(), f"{home}.{old}".lower()):
+        if value.casefold() in (f"{field.table}.{field.name}".casefold(), f"{home}.{old}".casefold()):
             return f"{home}.{new}"
-        if key == "nativeQueryRef" and value.lower() == field.name.lower():
+        if key == "nativeQueryRef" and value.casefold() == field.name.casefold():
             return new
-        if field.kind == "aggregation":
+        if field_kind == "column":
             wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
-            if wrapped and wrapped.group(2).lower() in (
-                    f"{field.table}.{field.name}".lower(), f"{home}.{old}".lower()):
+            if wrapped and wrapped.group(2).casefold() in (
+                    f"{field.table}.{field.name}".casefold(), f"{home}.{old}".casefold()):
                 return f"{wrapped.group(1)}({home}.{new})"
         return value
-    if key in ("queryRef", "metadata", "nativeQueryRef") and value.lower() == f"{home}.{old}".lower() \
+    if key in ("queryRef", "metadata", "nativeQueryRef") and value.casefold() == f"{home}.{old}".casefold() \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending):
         return f"{home}.{new}"
-    if key == "nativeQueryRef" and value.lower() == old.lower() \
+    if key == "nativeQueryRef" and value.casefold() == old.casefold() \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending,
                                       extensions_any=True):
         return new
@@ -648,7 +648,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         return value
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
         wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
-        if wrapped and wrapped.group(2).lower() == f"{home}.{old}".lower() \
+        if wrapped and wrapped.group(2).casefold() == f"{home}.{old}".casefold() \
                 and not _other_table_owns(model, home, wrapped.group(2), extra_owned, extra_extending):
             return f"{wrapped.group(1)}({home}.{new})"
     return value
@@ -658,16 +658,16 @@ def _binding_edits(bindings, kind, home, old, new, text):
     edits = []
     for binding in bindings:
         ref = binding.ref
-        if ref.name.lower() != old.lower():
+        if ref.name.casefold() != old.casefold():
             continue
         if binding.uncertain:
             raise PbzError("AMBIGUOUS", f"cannot safely bind a reference to {old}; nothing renamed")
         if kind == "measure" and binding.qualifier is not None:
             a, b = binding.qualifier
             tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
-            if (tok.value or tok.text).lower() != home.lower():
+            if (tok.value or tok.text).casefold() != home.casefold():
                 continue
-        if ref.kind == kind and ref.table.lower() == home.lower():
+        if ref.kind == kind and ref.table.casefold() == home.casefold():
             edits.append((binding.start, binding.end, _bracket(new)))
     return edits
 
@@ -688,7 +688,7 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
     fields = pbir.walk_fields_with_path(root, model)
     for ref, _site in fields:
         k = "column" if ref.kind == "aggregation" else ref.kind
-        if k == want and ref.name.lower() == old.lower() and ref.table.lower() == home.lower() and ref.prop_node:
+        if k == want and ref.name.casefold() == old.casefold() and ref.table.casefold() == home.casefold() and ref.prop_node:
             edits.append((ref.prop_node.start, ref.prop_node.end, json.dumps(new, ensure_ascii=False)))
     home, old = _canonical_target(model, kind, home, old)
     for site, (node, field) in _report_string_sites(root, model, fields).items():

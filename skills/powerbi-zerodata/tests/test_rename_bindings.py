@@ -562,6 +562,21 @@ class RenameBindingsTests(unittest.TestCase):
                                            field=rename._AMBIGUOUS, model=None)
         self.assertEqual(out, "Sales.Amount")
 
+    def test_table_rename_final_sigma_casefold(self):
+        from types import SimpleNamespace as NS
+        field = NS(table="İΟΣ", name="Amount", kind="column")
+        out = rename._report_string_rename("queryRef", "i̇οσ.Amount", "table", "", "İΟΣ", "Revenue",
+                                           field=field, model=None)
+        self.assertEqual(out, "Revenue.Amount")
+        self.assertEqual(rename._head_swap("i̇οσ.Amount", "İΟΣ", "Revenue"), "Revenue.Amount")
+
+    def test_column_rename_bound_wrapped_query_ref_follows(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"},
+               "queryRef": "Sum(Sales.Amount)"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Sum(Sales.Value)")
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
