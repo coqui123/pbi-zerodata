@@ -514,6 +514,22 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "column", "Amount.Share", "Value", table="Sales.Region")
         self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Sales.Region.Value")
 
+    def test_table_rename_extension_of_shorter_table_does_not_block(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn 'Amount.Share'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales.Region", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Revenue.Amount.Share")
+
+    def test_table_rewrite_wrapper_does_not_bypass_exact_block(self):
+        from types import SimpleNamespace as NS
+        sales = NS(name="Sales", columns={"Amount": NS(name="Amount")}, measures={}, hierarchies={})
+        weird = NS(name="Sum(Sales", columns={"Amount)": NS(name="Amount)")}, measures={}, hierarchies={})
+        tables = {"Sales": sales, "Sum(Sales": weird}
+        model = NS(tables=tables, table=lambda name: tables.get(name))
+        out = rename._table_rewrite("Sum(Sales.Amount)", "Sales", "Revenue", {"sales.amount"}, sales, model)
+        self.assertEqual(out, "Sum(Sales.Amount)")
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")

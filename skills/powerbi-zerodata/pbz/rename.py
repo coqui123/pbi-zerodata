@@ -211,7 +211,8 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     ext_q = _extension_qualified(project.mirror_report, old) if kind == "table" else set()
     ext_owned = _extension_owned_others(project.mirror_report, home) if kind != "table" \
         else _extension_owned_others(project.mirror_report, old)
-    ext_ext = _extension_owned(project.mirror_report, home) if kind != "table" else set()
+    ext_ext = _extension_owned(project.mirror_report, home) if kind != "table" \
+        else _extension_owned(project.mirror_report, old)
     for path in pbir.report_files(project.mirror_report):
         text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
         try:
@@ -434,7 +435,11 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
     return False
 
 
-def _table_rewrite(value, old, new, qualified, table=None, model=None, other_owned=()):
+_BLOCKED = object()
+
+
+def _table_rewrite(value, old, new, qualified, table=None, model=None, other_owned=(),
+                   other_extending=()):
     """Rewrite one table reference in a report string, or return the value unchanged.
 
     A value rewrites when it is exactly a qualified object path of the old
@@ -450,11 +455,15 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
         return new + text[at:]
 
     _tables = [t.name for t in model.tables.values()] if model is not None else ()
-    other_q = {p.lower() for p in other_owned}
+    other_exact = {p.lower() for p in other_owned}
+    other_ext = {p.lower() for p in other_extending}
     if model is not None:
         for other in model.tables.values():
-            if other.name.lower() != old.lower():
-                other_q |= _table_qualified(model, other.name)[1]
+            if other.name.lower() == old.lower():
+                continue
+            other_exact |= _table_qualified(model, other.name)[1]
+            if other.name.lower().startswith(old.lower() + "."):
+                other_ext |= _table_qualified(model, other.name)[1]
 
     def _extends(text, qset):
         for q in qset:
@@ -464,21 +473,23 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
         return False
 
     def _rewrite(text):
-        if text.lower() in other_q:
-            return None
+        if text.lower() in other_exact:
+            return _BLOCKED
         if text.lower() in qualified or _extends(text, qualified):
-            if _extends(text, other_q):
-                return None
+            if _extends(text, other_ext):
+                return _BLOCKED
             return _swap(text)
         return None
 
     out = _rewrite(value)
+    if out is _BLOCKED:
+        return value
     if out is not None:
         return out
     wrapped = _wrapped_inner(value)
     if wrapped:
         inner = _rewrite(wrapped[1])
-        if inner is not None:
+        if inner is not None and inner is not _BLOCKED:
             return f"{wrapped[0]}({inner})"
     return value
 
@@ -587,7 +598,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
                 return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model,
-                                      other_owned=extra_owned)
+                                      other_owned=extra_owned, other_extending=extra_extending)
             if value.lower().startswith(old.lower() + "."):
                 return _head_swap(value, old, new)
             wrapped = _single_wrapped(value)
@@ -841,7 +852,8 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                 if site[-1] in ("queryRef", "metadata", "queryName"):
                     nv = _report_string_rename(site[-1], node.value, "table", "", old, new,
                                                field, model, extra_qualified=ext_q,
-                                               extra_owned=ext_owned)
+                                               extra_owned=ext_owned,
+                                               extra_extending=_extension_owned(project.mirror_report, old))
                     if nv != node.value:
                         edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
         return edits, False
