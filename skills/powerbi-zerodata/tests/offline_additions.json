@@ -35,6 +35,12 @@
       "argv": [
         "tests/test_rewrite_qualify.py"
       ]
+    },
+    {
+      "id": "rewrite_scopes",
+      "argv": [
+        "tests/test_rewrite_scopes.py"
+      ]
     }
   ]
 }

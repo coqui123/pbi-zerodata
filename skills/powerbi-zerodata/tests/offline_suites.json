@@ -841,5 +841,13 @@
     ],
     "windows": false,
     "engine": false
+  },
+  {
+    "id": "rewrite_scopes",
+    "argv": [
+      "tests/test_rewrite_scopes.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]
