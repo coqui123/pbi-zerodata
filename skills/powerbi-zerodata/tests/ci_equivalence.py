@@ -9,6 +9,35 @@ from pathlib import Path
 import statistics
 from ci_manifest import BASELINE, controls, allocate, MANIFEST
 
+SKIP_INVENTORY = json.loads((BASELINE.parent / 'offline_skips.json').read_text(encoding='utf-8'))
+
+
+# The PBZ_SKIP prefix is retained only in the checked-in allowlist for compatibility
+# with the source-inventory test; observed skips come from the JSONL sidecar, never from stdout.
+def _skip_tuples(name, reasons):
+    result = Counter()
+    for entry in reasons:
+        record = entry
+        if isinstance(entry, str) and entry.startswith('PBZ_SKIP '):
+            try:
+                record = json.loads(entry[len('PBZ_SKIP '):])
+            except ValueError:
+                record = None
+        if isinstance(record, dict):
+            result[(record.get('suite', name), record.get('test', ''), record.get('reason', ''))] += 1
+        else:
+            result[(name, '', entry)] += 1
+    return result
+
+
+def _row_skips(name, row):
+    if 'skip_reasons' not in row:
+        raise ValueError(name + ': missing skip_reasons')
+    value = row['skip_reasons']
+    if not isinstance(value, list) or any(not isinstance(entry, str) for entry in value):
+        raise ValueError(name + ': invalid skip_reasons')
+    return _skip_tuples(name, value)
+
 
 def inventory():
     frozen = json.loads(BASELINE.read_text(encoding='utf-8'))['suites']
@@ -53,6 +82,10 @@ def serial_inventory(report):
         raise ValueError('serial verdict or scan failed')
     if any(e['exit_code'] != 0 or e.get('error') for e in rows):
         raise ValueError('serial suite failed')
+    platform = 'windows' if report['identity']['os'].startswith('Windows') else 'posix'
+    for row in rows:
+        if _row_skips(row['id'], row) != _skip_tuples(row['id'], SKIP_INVENTORY.get(platform, {}).get(row['id'], [])):
+            raise ValueError(row['id'] + ': unexpected skip')
     return True
 
 
@@ -105,16 +138,23 @@ def compare(reference, shards, expected_shards=2, expected_failures=None, contro
     failures = expected_failures or {}
     for name in expected:
         for key in ('exit_code', 'skip_reasons', 'error', 'failure_reason'):
+            if key == 'skip_reasons':
+                leftc = _row_skips(name, left[name])
+                rightc = _row_skips(name, right[name])
+                if leftc != rightc:
+                    raise ValueError(name + ': different skip_reasons')
+                continue
             if left[name].get(key) != right[name].get(key):
                 raise ValueError(f'{name}: different {key}')
-        # Baseline skips are compared exactly; new skips need independent approval.
-        allowed = json.loads((BASELINE.parent / 'offline_skips.json').read_text(encoding='utf-8'))
-        if left[name]['skip_reasons'] != allowed.get('windows' if reference['identity']['os'].startswith('Windows') else 'posix', {}).get(name, []):
+        allowed = _skip_tuples(name, SKIP_INVENTORY.get('windows' if reference['identity']['os'].startswith('Windows') else 'posix', {}).get(name, []))
+        if leftc - allowed:
             raise ValueError(name + ': unexpected skip')
         if name in failures:
             code, reason = failures[name]
             if left[name]['exit_code'] != code or left[name].get('failure_reason') != reason:
                 raise ValueError(name + ': expected failure reason absent')
+            if left[name].get('error') is not None:
+                raise ValueError(name + ': unexpected error')
         elif left[name]['exit_code'] != 0 or left[name].get('error'):
             raise ValueError(name + ': unexpected suite failure')
     print('PBZ_INVENTORY ' + json.dumps({'frozen_count': len(json.loads(BASELINE.read_text())['suites']),
