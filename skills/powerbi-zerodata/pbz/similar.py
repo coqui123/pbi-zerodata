@@ -604,7 +604,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             _prev = sig[i - 1] if i else None
             _sequential = _prev is not None and (
                 (_prev.kind == "op" and _prev.text in (")", "}"))
-                or (_prev.kind in ("ident", "bracket", "num", "str", "table")
+                or (_prev.kind in ("ident", "bracket", "num", "str", "table", "pbztok")
                     and not (_prev.kind == "ident" and _prev.text.upper() in (
                         "RETURN", "VAR", "IN", "AND", "OR", "NOT"))))
             if pending_vars and pending_vars[-1][1] == len(stack) and _sequential:
