@@ -425,9 +425,20 @@ def _path_extension(rest, old, tables=()):
     if not rest:
         return False
     names = {_fold(old)} | {_fold(t) for t in tables}
-    pattern = rf"(?<![\w])(?:{'|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True))})\."
-    if re.search(pattern, _fold(rest)):
-        return False
+    folded = _fold(rest)
+
+    def _name_char(ch):
+        return ch.isalnum() or ch == "_" or unicodedata.category(ch).startswith("M")
+
+    for n in names:
+        idx = folded.find(n + ".")
+        while idx != -1:
+            # A fresh reference starts only where the preceding character is
+            # not a name character, under the same rule the segment check
+            # below applies (combining marks are part of a name).
+            if idx == 0 or not _name_char(folded[idx - 1]):
+                return False
+            idx = folded.find(n + ".", idx + 1)
     for seg in rest.split("."):
         # Classify the folded segment, and count combining marks as name
         # characters: spellings that fold to the same string (a precomposed
