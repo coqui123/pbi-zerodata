@@ -398,6 +398,9 @@ def _other_table_owns(model, home, value, extra_owned=()):
             pool = list(t.columns.values()) + list(t.measures.values())
             if any(low == f"{t.name}.{o.name}".lower() for o in pool):
                 return True
+            for hname, levels in t.hierarchies.items():
+                if any(low == f"{t.name}.{hname}.{lvl}".lower() for lvl in levels):
+                    return True
     return False
 
 
@@ -410,11 +413,11 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None):
     low = value.lower()
     if model is not None:
         for other in model.tables.values():
-            if other.name.lower() != old.lower() and len(other.name) > len(old) \
+            if other.name.lower() != old.lower() \
                     and low.startswith(other.name.lower() + "."):
                 return value
         _wrapped0 = _wrapped_inner(value)
-        if _wrapped0 and any(other.name.lower() != old.lower() and len(other.name) > len(old)
+        if _wrapped0 and any(other.name.lower() != old.lower()
                               and _wrapped0[1].lower().startswith(other.name.lower() + ".")
                               for other in model.tables.values()):
             return value

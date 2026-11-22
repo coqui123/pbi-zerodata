@@ -399,6 +399,24 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "column", "Region.Ext", "Value", table="Sales")
         self.assertEqual(path.read_bytes(), before)
 
+    def test_column_rename_hierarchy_owned_string_unchanged(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Calendar.Year"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Calendar.Year'\n\t\tdataType: string\n")
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n\n\thierarchy Calendar\n\n\t\tlevel Year\n\t\t\tcolumn: Amount\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Region.Calendar.Year", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rewrite_unicode_equal_length_guard(self):
+        from types import SimpleNamespace as NS
+        t1, other = "i̇i̇", "İİ.X"
+        model = NS(tables={t1: NS(name=t1), other: NS(name=other)})
+        qualified = {f"{t1}.X.Amount".lower(), f"{other}.Amount".lower()}
+        out = rename._table_rewrite("İİ.X.Amount", t1, "Revenue", qualified, NS(name=t1), model)
+        self.assertEqual(out, "İİ.X.Amount")
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
