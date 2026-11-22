@@ -205,6 +205,14 @@ SALES = (
     "\tmeasure XnpvShadowB = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
     "\tmeasure RankCapA = RANK(DENSE, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY([CtrlA]))\n\n"
     "\tmeasure RankCapB = RANK(DENSE, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY(Sales[CtrlA]))\n\n"
+    "\tmeasure RowXnpvA = XNPV(ROW(\"CtrlA\", 1), [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure RowXnpvB = XNPV(ROW(\"CtrlA\", 1), Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure VarXnpvA = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) RETURN XNPV(t, [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure VarXnpvB = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) RETURN XNPV(t, Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure RollupWrapA = SUMX(FILTER(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"CtrlA\")), TRUE()), [CtrlA])\n\n"
+    "\tmeasure RollupWrapB = SUMX(FILTER(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"CtrlA\")), TRUE()), Sales[CtrlA])\n\n"
+    "\tmeasure XnpvNestShadowA = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), SUMX(Sales, [CtrlA]), DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure XnpvNestShadowB = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), SUMX(Sales, Sales[CtrlA]), DATE(2026, 1, 1), 0)\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -295,7 +303,9 @@ class SimilarScopeTests(unittest.TestCase):
               "SumzCapA", "SumzCapB", "SumzColA", "SumzColB",
               "SelOptA", "SelOptB", "RollupA", "RollupB", "SelMidA", "SelMidB",
               "SelStrA", "SelStrB", "ShadowA", "ShadowB", "TopnCapA", "TopnCapB",
-              "XnpvShadowA", "XnpvShadowB", "RankCapA", "RankCapB")},
+              "XnpvShadowA", "XnpvShadowB", "RankCapA", "RankCapB",
+              "RowXnpvA", "RowXnpvB", "VarXnpvA", "VarXnpvB",
+              "RollupWrapA", "RollupWrapB", "XnpvNestShadowA", "XnpvNestShadowB")},
         )
 
     def _canon(self, name):
@@ -524,7 +534,10 @@ class SimilarScopeTests(unittest.TestCase):
                           ("SelOptB", "SelOptA"), ("RollupB", "RollupA"),
                           ("SelMidB", "SelMidA"), ("SelStrB", "SelStrA"),
                           ("ShadowB", "ShadowA"), ("TopnCapB", "TopnCapA"),
-                          ("XnpvShadowB", "XnpvShadowA"), ("RankCapB", "RankCapA")):
+                          ("XnpvShadowB", "XnpvShadowA"), ("RankCapB", "RankCapA"),
+                          ("RowXnpvB", "RowXnpvA"), ("VarXnpvB", "VarXnpvA"),
+                          ("RollupWrapB", "RollupWrapA"),
+                          ("XnpvNestShadowB", "XnpvNestShadowA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

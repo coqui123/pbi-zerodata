@@ -390,6 +390,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     fr["row_table"] = None
                     fr["poisoned"] = True
 
+    pending_var = None
+    pending_depth = 0
+    var_names_defined: dict[str, set] = {}
     i, n = 0, len(sig)
     while i < n:
         t = sig[i]
@@ -398,6 +401,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             if fr.get("x_span") is not None and fr["arg"] == 0 \
                     and not (t.kind == "op" and t.text in (",", ")") and stack[-1] is fr):
                 fr["x_span"].append(t)
+        if t.kind == "ident" and t.text.upper() == "VAR" \
+                and nxt is not None and nxt.kind == "ident":
+            pending_var = nxt.text.lower()
+            pending_depth = len(stack)
+        elif t.kind == "ident" and t.text.upper() == "RETURN" and len(stack) == pending_depth:
+            pending_var = None
         if t.kind == "op" and t.text in ("(", "{"):
             prev = sig[i - 1] if i else None
             fn = "{" if t.text == "{" else (prev.text.upper() if prev is not None and prev.kind == "ident" else "")
@@ -420,11 +429,13 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         path = stack[f_idx + 1:]
                         if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
                                 and path[-1]["fn"] == "SUMMARIZECOLUMNS":
-                            ok = _first_nonsource(path[:-1], closed["parent_arg"]) is None
+                            ok = _first_nonsource(path[:-1], path[-1]["parent_arg"]) is None
                         else:
                             ok = _first_nonsource(path, closed["parent_arg"]) is None
                         if ok:
                             fr.setdefault("captured", set()).update(closed["names"])
+                    if pending_var:
+                        var_names_defined.setdefault(pending_var, set()).update(closed["names"])
                 if closed.get("x_span") is not None and closed["arg"] == 0 \
                         and closed.get("x_table") is None:
                     closed["x_table"] = _span_table(closed["x_span"])
@@ -453,14 +464,15 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             top["arg"] += 1
         if stack and t.kind == "str" and stack[-1]["fn"] in (
                 "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "SUMMARIZE", "GROUPBY",
-                "ROLLUPADDISSUBTOTAL") \
+                "ROLLUPADDISSUBTOTAL", "ROW", "DATATABLE") \
                 and (i == 0 or (sig[i - 1].kind == "op" and sig[i - 1].text in (",", "("))) \
                 and (nxt is not None and nxt.kind == "op" and nxt.text in (",", ")")):
             fr0 = stack[-1]
             if fr0["fn"] == "ROLLUPADDISSUBTOTAL":
                 fr0.setdefault("names", set()).add(t.value.lower())
             elif fr0.get("expect") is None:
-                if fr0["fn"] not in ("SELECTCOLUMNS", "ADDCOLUMNS") or fr0["arg"] >= 1:
+                if fr0["fn"] not in ("SELECTCOLUMNS", "ADDCOLUMNS") or fr0["arg"] >= 1 \
+                        or fr0["fn"] in ("ROW", "DATATABLE"):
                     fr0["expect"] = "item"
                     fr0["item_named"] = True
                     fr0.setdefault("names", set()).add(t.value.lower())
@@ -541,11 +553,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] in (1, 2) \
                         and ((ref.kind == "column" and fr.get("x_table") != ref.table)
                              or t.value.lower() in fr.get("captured", ())) \
-                        and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
+                        and not (ref.kind == "column" and any(
+                                    g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
                                     and not _in_caller_args(g) and g["row_table"] == ref.table
                                     and not g.get("projected")
                                     and g.get("only_column") in (None, ref.name.lower())
-                                    for g in stack[c_idx + 1:]):
+                                    for g in stack[c_idx + 1:])):
                     uncertain = True
                 caller_args = CALLER_ARGS.get(fr["fn"])
                 if caller_args is not None and ref.kind == "column" \
@@ -585,6 +598,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             elif low in var_names:
                 toks.append((var_names[low], "", ""))
                 prev = sig[i - 1] if i else None
+                if low in var_names_defined and not (prev is not None and prev.kind == "ident"
+                                                     and prev.text.upper() == "VAR"):
+                    for f_idx, fr in enumerate(stack):
+                        if _first_nonsource(stack[f_idx + 1:],
+                                            stack[-1]["arg"] if len(stack) > f_idx + 1 else 0) is None:
+                            fr.setdefault("captured", set()).update(var_names_defined[low])
                 if low in table_vars and not (prev is not None and prev.kind == "ident"
                                               and prev.text.upper() == "VAR"):
                     for f_idx, fr in enumerate(stack):
