@@ -413,11 +413,11 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None):
     low = value.lower()
     if model is not None:
         for other in model.tables.values():
-            if other.name.lower() != old.lower() \
+            if other.name.lower().startswith(old.lower() + ".") \
                     and low.startswith(other.name.lower() + "."):
                 return value
         _wrapped0 = _wrapped_inner(value)
-        if _wrapped0 and any(other.name.lower() != old.lower()
+        if _wrapped0 and any(other.name.lower().startswith(old.lower() + ".")
                               and _wrapped0[1].lower().startswith(other.name.lower() + ".")
                               for other in model.tables.values()):
             return value

@@ -417,6 +417,13 @@ class RenameBindingsTests(unittest.TestCase):
         out = rename._table_rewrite("İİ.X.Amount", t1, "Revenue", qualified, NS(name=t1), model)
         self.assertEqual(out, "İİ.X.Amount")
 
+    def test_table_rename_longer_table_not_blocked_by_prefix_table(self):
+        ws, project, mdef, path = self._colliding_project(
+            {"refs": [{"queryRef": "Sales.Region.Amount"}, {"queryRef": "Sum(Sales.Region.Amount)"}]})
+        rename.rename(ws, project, "table", "Sales.Region", "Territory")
+        refs = [r["queryRef"] for r in json.loads(path.read_text())["refs"]]
+        self.assertEqual(refs, ["Territory.Amount", "Sum(Territory.Amount)"])
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
