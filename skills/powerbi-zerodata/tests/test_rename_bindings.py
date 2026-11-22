@@ -980,6 +980,19 @@ class RenameBindingsTests(unittest.TestCase):
             rename.rename(ws, project, "table", "Old", "Dest")
         self.assertEqual(caught.exception.code, "NAME_TAKEN")
 
+    def test_table_rename_emitting_unrecognizable_variation_path_refused(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+                "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                           "Property": "OrderDate"}},
+                "Hierarchy": "Calendar"}}, "Level": "Year"},
+              "queryRef": "Sales.OrderDate.Calendar.Year"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "Calendar")
+        self.assertEqual(caught.exception.code, "AMBIGUOUS")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

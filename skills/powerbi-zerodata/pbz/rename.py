@@ -707,6 +707,31 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                                  extensions_any=bare, extra_tables=dest_extra, head=head,
                                  dest_tables=dest_tables):
                 raise PbzError("NAME_TAKEN", nv)
+        if kind == "table":
+            # The emitted path must stay recognizable as its own field's
+            # path in the destination namespace: a retained suffix that is
+            # not a pure extension there (it names the new table as a fresh
+            # reference) would strand the string on the next rename.
+            bases = []
+            for t in model.tables.values():
+                tname = new if _fold(t.name) == _fold(old) else t.name
+                bases += [f"{tname}.{o.name}"
+                          for o in list(t.columns.values()) + list(t.measures.values())]
+                bases += [f"{tname}.{h}.{lvl}" for h, levels in t.hierarchies.items()
+                          for lvl in levels]
+            for q in extra_qualified:
+                if _fold(q).startswith(_fold(old) + "."):
+                    bases.append(new + q[len(old):])
+            names = list(dest_tables or ()) + list(dest_extra or ())
+            for text in produced:
+                cands = [b for b in bases
+                         if _fold(text) == _fold(b) or _rest_after(text, _fold(b)) is not None]
+                if not cands:
+                    continue
+                rest = _rest_after(text, _fold(max(cands, key=len)))
+                if rest is not None and not _path_extension(rest, new, names):
+                    raise PbzError("AMBIGUOUS",
+                                   f"the renamed path {nv} would no longer be recognized; nothing renamed")
     return nv
 
 
