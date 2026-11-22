@@ -304,7 +304,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None):
         if key in ("queryRef", "metadata", "queryName"):
             if value.lower().startswith(old.lower() + "."):
                 return new + value[len(old):]
-            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
+            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\(([^()]*)\)", value)
             if wrapped and wrapped.group(2).lower().startswith(old.lower() + "."):
                 inner = wrapped.group(2)
                 return f"{wrapped.group(1)}({new}{inner[len(old):]})"
@@ -322,7 +322,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None):
         if key == "nativeQueryRef" and value.lower() == field.name.lower():
             return new
         if field.kind == "aggregation":
-            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
+            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\(([^()]*)\)", value)
             if wrapped and wrapped.group(2).lower() in (
                     f"{field.table}.{field.name}".lower(), f"{home}.{old}".lower()):
                 return f"{wrapped.group(1)}({home}.{new})"
@@ -332,7 +332,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None):
     if key == "nativeQueryRef" and value.lower() == old.lower():
         return new
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
-        wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
+        wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\(([^()]*)\)", value)
         if wrapped and wrapped.group(2).lower() == f"{home}.{old}".lower():
             return f"{wrapped.group(1)}({home}.{new})"
     return value
@@ -543,7 +543,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                 if node.value.lower().startswith(low + "."):
                     edits.append((node.start, node.end, json.dumps(new + node.value[len(old):], ensure_ascii=False)))
                 else:
-                    wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", node.value)
+                    wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\(([^()]*)\)", node.value)
                     if wrapped and wrapped.group(2).lower().startswith(low + "."):
                         inner = wrapped.group(2)
                         edits.append((node.start, node.end, json.dumps(

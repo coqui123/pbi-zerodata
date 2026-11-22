@@ -226,6 +226,26 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
         self.assertEqual(json.loads(path.read_text())["queryName"], "Sales.Amount")
 
+    def test_council_round_shapes(self):
+        # Sibling string of a wrapper field for Other stays unchanged.
+        obj = {"projections": [{"field": {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"}}, "nativeQueryRef": "Amount"}]}
+        ws, project, _mdef, path = self._report_project(obj)
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["nativeQueryRef"], "Amount")
+        # Standalone wrapped aggregation string follows a column rename.
+        ws, project, _mdef, path = self._report_project({"objects": {"metadata": "Sum(Sales.Amount)"}})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["objects"]["metadata"], "Sum(Sales.Value)")
+        # Descriptive metadata containing two wrapped terms is not one reference.
+        ws, project, _mdef, path = self._report_project({"objects": {"metadata": "Sum(Sales.Amount) vs Sum(Other.Amount)"}})
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["objects"]["metadata"],
+                         "Sum(Sales.Amount) vs Sum(Other.Amount)")
+        # Case-variant standalone string follows.
+        ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "sales.amount"}]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Sales.Value")
+
     def test_standalone_report_strings_verified(self):
         for kind, old, new, strings in (
             ("column", "Amount", "Value", ["Sales.Amount", "Other.Amount", "Amount"]),
