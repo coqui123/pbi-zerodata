@@ -120,12 +120,16 @@ SALES = (
     "\tmeasure RankBareB = SUMX(Sales, RANK(DENSE, Other, ORDERBY(Sales[Price])))\n\n"
     "\tmeasure FailA = SUMX(Sales, SUMX(TOPN(1, SUMMARIZE(Sales, Other[Price]), [Price]), Other[Price]))\n\n"
     "\tmeasure FailB = SUMX(Sales, SUMX(TOPN(1, SUMMARIZE(Sales, Other[Price]), Sales[Price]), Other[Price]))\n\n"
-    "\tmeasure ExcA = VAR v = Other RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), [Price], ASC)))\n\n"
-    "\tmeasure ExcB = VAR v = Other RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), Sales[Price], ASC)))\n\n"
+    "\tmeasure ExcA = VAR v = VALUES(Other[Price]) RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), [Price], ASC)))\n\n"
+    "\tmeasure ExcB = VAR v = VALUES(Other[Price]) RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), Sales[Price], ASC)))\n\n"
     "\tmeasure MissingA = COUNTROWS(Missing)\n\n"
     "\tmeasure MissingB = COUNTROWS(Missing)\n\n"
-    "\tmeasure PoisA = SUMX(Sales, SUMX(EXCEPT(GENERATESERIES(1, MAX(Other[Price])), Other), [Price]))\n\n"
-    "\tmeasure PoisB = SUMX(Sales, SUMX(EXCEPT(GENERATESERIES(1, MAX(Other[Price])), Other), Other[Price]))\n\n"
+    "\tmeasure PoisA = SUMX(Sales, SUMX(EXCEPT(GENERATESERIES(1, MAX(Other[Price])), VALUES(Other[Price])), [Price]))\n\n"
+    "\tmeasure PoisB = SUMX(Sales, SUMX(EXCEPT(GENERATESERIES(1, MAX(Other[Price])), VALUES(Other[Price])), Other[Price]))\n\n"
+    "\tmeasure ProjDropCtrlA = SUMX(SELECTCOLUMNS(ADDCOLUMNS(Sales, \"CtrlA\", 1), \"P\", Sales[Price]), [CtrlA])\n\n"
+    "\tmeasure ProjDropCtrlB = SUMX(SELECTCOLUMNS(ADDCOLUMNS(Sales, \"CtrlA\", 1), \"P\", Sales[Price]), Sales[CtrlA])\n\n"
+    "\tmeasure SpanExcCtrlA = XNPV(EXCEPT(Sales, ROW(\"CtrlA\", 1)), [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure SpanExcCtrlB = XNPV(EXCEPT(Sales, ROW(\"CtrlA\", 1)), Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
     "\tmeasure UnionRowA = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), Sales), [Price]))\n\n"
     "\tmeasure UnionRowB = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), Sales), Sales[Price]))\n\n"
     "\tmeasure WinOptA = SUMX(Sales, COUNTROWS(WINDOW(1, ABS, 3, Other, ORDERBY(Sales[Price], [Price]))))\n\n"
@@ -160,8 +164,8 @@ SALES = (
     "\tmeasure XnpvTopB = SUMX(Sales, XNPV(TOPN(MAX(Sales[Price]), Other), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure XnpvNestCtrlA = XNPV(Other, SUMX(Sales, [Price]), DATE(2026, 1, 1), 0)\n\n"
     "\tmeasure XnpvNestCtrlB = XNPV(Other, SUMX(Sales, Sales[Price]), DATE(2026, 1, 1), 0)\n\n"
-    "\tmeasure XnpvExcA = VAR v = Other RETURN SUMX(Sales, XNPV(EXCEPT(v, Sales), [Price], DATE(2026, 1, 1), 0))\n\n"
-    "\tmeasure XnpvExcB = VAR v = Other RETURN SUMX(Sales, XNPV(EXCEPT(v, Sales), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvExcA = VAR v = VALUES(Other[Price]) RETURN SUMX(Sales, XNPV(EXCEPT(v, Sales), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvExcB = VAR v = VALUES(Other[Price]) RETURN SUMX(Sales, XNPV(EXCEPT(v, Sales), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure XnpvSelA = SUMX(Sales, XNPV(SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), [Price], DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure XnpvSelB = SUMX(Sales, XNPV(SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure XnpvRankA = SUMX(Sales, XNPV(Other, RANKX(Sales, Sales[Price], [Price]), DATE(2026, 1, 1), 0))\n\n"
@@ -408,7 +412,7 @@ class SimilarScopeTests(unittest.TestCase):
               "ShadowCtorA", "ShadowCtorB", "CtorNestCtrlA", "CtorNestCtrlB",
               "CtorNarrowCtrlA", "CtorNarrowCtrlB", "NestTopnA", "NestTopnB",
               "CapNestCtrlA", "CapNestCtrlB", "CapSelfA", "CapSelfB",
-              "ExcCapCtrlA", "ExcCapCtrlB",
+              "ExcCapCtrlA", "ExcCapCtrlB", "ProjDropCtrlA", "ProjDropCtrlB", "SpanExcCtrlA", "SpanExcCtrlB",
               "ClauseNestCtrlA", "ClauseNestCtrlB", "RowOuterCtrlA", "RowOuterCtrlB",
               "VarRowCtrlA", "VarRowCtrlB", "ExprCapCtrlA", "ExprCapCtrlB",
               "VarRefCtrlA", "VarRefCtrlB", "SwiCapCtrlA", "SwiCapCtrlB",
@@ -651,6 +655,14 @@ class SimilarScopeTests(unittest.TestCase):
         with self.assertRaises(PbzError) as caught:
             consolidate.merge(self.ws, self.project, "CapSelfB", "CapSelfA", dry_run=True)
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_projection_drop_and_span_except_stay_certain(self):
+        for name, dup in (("ProjDropCtrlA", "ProjDropCtrlB"),
+                          ("SpanExcCtrlA", "SpanExcCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
 
     def test_except_second_operand_names_stay_certain(self):
         self.assertFalse(self._canon("ExcCapCtrlA").uncertain)

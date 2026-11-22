@@ -435,7 +435,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 return None, None
             if fn in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
                 return _span_table(args[1], seen) if len(args) > 1 else (None, None)
-            if fn in ("INTERSECT", "EXCEPT", "CROSSJOIN", "NATURALINNERJOIN",
+            if fn in ("INTERSECT", "EXCEPT"):
+                return _span_table(args[0], seen) if args else (None, None)
+            if fn in ("CROSSJOIN", "NATURALINNERJOIN",
                       "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
                 vals = {_span_table(a, seen) for a in args}
                 return vals.pop() if len(vals) == 1 else (None, None)
@@ -535,6 +537,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         path = stack[f_idx + 1:]
                         first_d = path[0]["parent_arg"] if path else closed["parent_arg"]
                         if not _in_source(fr, first_d):
+                            continue
+                        chain = path + [closed]
+                        if any(chain[j]["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS",
+                                                  "SUMMARIZE", "GROUPBY")
+                               and chain[j + 1]["fn"] not in ("ROLLUPADDISSUBTOTAL", "ROLLUP")
+                               for j in range(len(chain) - 1)):
                             continue
                         if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
                                 and path[-1]["fn"] == "SUMMARIZECOLUMNS":
