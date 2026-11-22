@@ -303,8 +303,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         src_fr = _source_frame(idx)
                         if not bare and column and src_fr is not None \
                                 and src_fr["fn"] in NARROWING:
+                            _si = next(j for j, g in enumerate(stack) if g is src_fr)
                             fr["only_columns"] = {column.lower()}
-                            fr["only_src"] = src_fr
+                            fr["only_src"] = stack[_si - 1] if _si > 0 else src_fr
                         if not bare and column and fr["fn"] in (
                                 "FIRSTNONBLANK", "LASTNONBLANK",
                                 "FIRSTNONBLANKVALUE", "LASTNONBLANKVALUE"):
@@ -323,29 +324,16 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         fr["row_table"] = None
                         fr["poisoned"] = True
                     if not bare and column and fr.get("only_src") is not None \
-                            and _source_frame(idx) is fr.get("only_src"):
-                        fr["only_columns"].add(column.lower())
-                    if eff_bare and fr["row_table"] == table and fr.get("only_columns") is not None:
-                        frames = stack[idx + 1:]
-                        widens = True
-                        for j, p in enumerate(frames):
-                            d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else stack[-1]["arg"]
-                            if p["fn"] in CONDITIONALS or p["fn"] == "":
-                                continue
-                            if p["fn"] in ("INTERSECT", "EXCEPT", "UNION"):
-                                if d != 0:
-                                    widens = False
-                                    break
-                                continue
-                            if p["fn"] in ("CROSSJOIN", "NATURALINNERJOIN",
-                                            "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
-                                continue
-                            if not _crossing_ok(p, d):
-                                widens = False
-                                break
-                        if widens:
-                            fr["only_columns"] = None
-                            fr["only_src"] = None
+                            and fr["row_table"] == table:
+                        _sf = _source_frame(idx)
+                        _si = next((j for j, g in enumerate(stack) if g is _sf), None)
+                        _par = stack[_si - 1] if _si else None
+                        if _par is not None and _par is fr.get("only_src"):
+                            fr["only_columns"].add(column.lower())
+                    if eff_bare and fr["row_table"] == table and fr.get("only_columns") is not None \
+                            and _widens(idx):
+                        fr["only_columns"] = None
+                        fr["only_src"] = None
                     if eff_bare and fr.get("taint") is not None and fr["row_table"] == table \
                             and _taint_cleared(fr, idx):
                         fr["taint"] = None
@@ -459,6 +447,23 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         kind, s = cols
         return (name in s) if kind == "only" else (name not in s)
 
+    def _widens(idx) -> bool:
+        frames = stack[idx + 1:]
+        for j, p in enumerate(frames):
+            d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else stack[-1]["arg"]
+            if p["fn"] in CONDITIONALS or p["fn"] == "":
+                continue
+            if p["fn"] in ("INTERSECT", "EXCEPT", "UNION"):
+                if d != 0:
+                    return False
+                continue
+            if p["fn"] in ("CROSSJOIN", "NATURALINNERJOIN",
+                            "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
+                continue
+            if not _crossing_ok(p, d):
+                return False
+        return True
+
     def poison_qualified(tab) -> None:
         if not tab:
             return
@@ -479,8 +484,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     if p["fn"] in ("INTERSECT", "EXCEPT"):
                         continue
                     if p["fn"] == "UNION":
-                        g = _source_frame(idx)
-                        if g is not None and g["fn"] in PREDICATE_EXEMPT and g["arg"] >= 1:
+                        if any(g["fn"] in PREDICATE_EXEMPT and g["arg"] >= 1
+                               for g in stack[idx + 1:]):
                             continue
                         if stack[-1]["fn"] in SCALAR_FUNCS:
                             continue
@@ -551,13 +556,17 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                            "SUMMARIZE", "GROUPBY"):
                             _proj = _cand
                             break
+                    _proj_idx = next((j for j, g in enumerate(stack) if g is _proj), None) \
+                        if _proj is not None else None
                     if _proj is not None and closed["fn"] not in (
                             "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY"):
                         _proj.setdefault("captured", set()).update(_out_names)
                         if closed["fn"] in ("ROLLUPADDISSUBTOTAL", "ROLLUP"):
                             _proj.setdefault("refs", set()).update(_out_names)
-                    else:
+                    if True:
                         for f_idx, fr in enumerate(stack):
+                            if _proj_idx is not None and f_idx < _proj_idx:
+                                continue
                             path = stack[f_idx + 1:]
                             first_d = path[0]["parent_arg"] if path else closed["parent_arg"]
                             if not _in_source(fr, first_d):
@@ -858,13 +867,19 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
                                 and _in_source_region(f_idx, stack[-1]["arg"] if len(stack) > f_idx + 1 else 0):
                             _rhss = var_rhs.get(low)
-                            _vt = _span_table(_rhss[0])[0] if _rhss and len(_rhss) == 1 else None
+                            _vt, _vcols = _span_table(_rhss[0]) if _rhss and len(_rhss) == 1 \
+                                else (None, None)
                             if _vt is None or fr["row_table"] != _vt:
                                 fr["row_table"] = None
                                 fr["poisoned"] = True
-                            elif fr.get("only_columns") is not None:
-                                fr["only_columns"] = None
-                                fr["only_src"] = None
+                            elif _widens(f_idx):
+                                if _vcols is None:
+                                    fr["only_columns"] = None
+                                    fr["only_src"] = None
+                                elif _vcols[0] == "only":
+                                    fr["only_columns"] = set(_vcols[1]) \
+                                        if fr.get("only_columns") is None \
+                                        else fr["only_columns"] & set(_vcols[1])
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
                 learn(res.table(t.text), bare=True)

@@ -114,6 +114,14 @@ SALES = (
     "\tmeasure JoinShadowVarB = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), v), Sales[ShadowM]))\n\n"
     "\tmeasure UnionPredCtrlA = SUMX(UNION(Sales, FILTER(Sales, Sales[Price] > MAX(Other[Price]))), [Price])\n\n"
     "\tmeasure UnionPredCtrlB = SUMX(UNION(Sales, FILTER(Sales, Sales[Price] > MAX(Other[Price]))), Sales[Price])\n\n"
+    "\tmeasure VarUnionPadA = VAR v = Wide RETURN SUMX(Wide, SUMX(Sales, SUMX(UNION(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), v), [Price])))\n\n"
+    "\tmeasure VarUnionPadB = VAR v = Wide RETURN SUMX(Wide, SUMX(Sales, SUMX(UNION(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), v), Wide[Price])))\n\n"
+    "\tmeasure IntermA = COUNTROWS(SELECTCOLUMNS(FILTER(ADDCOLUMNS(Dates, \"CtrlA\", 1), [CtrlA] > 0), \"D\", Dates[Day]))\n\n"
+    "\tmeasure IntermB = COUNTROWS(SELECTCOLUMNS(FILTER(ADDCOLUMNS(Dates, \"CtrlA\", 1), Sales[CtrlA] > 0), \"D\", Dates[Day]))\n\n"
+    "\tmeasure UnionScalarCtrlA = SUMX(UNION(Sales, FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0)), [Price])\n\n"
+    "\tmeasure UnionScalarCtrlB = SUMX(UNION(Sales, FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0)), Sales[Price])\n\n"
+    "\tmeasure CrossJoinNarrowA = COUNTROWS(TOPN(1, CROSSJOIN(VALUES(Other[Price]), VALUES(Other[ShadowM])), [ShadowM]))\n\n"
+    "\tmeasure CrossJoinNarrowB = COUNTROWS(TOPN(1, CROSSJOIN(VALUES(Other[Price]), VALUES(Other[ShadowM])), Sales[ShadowM]))\n\n"
     "\tmeasure TopnCountCtrlA = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
@@ -382,7 +390,9 @@ class SimilarScopeTests(unittest.TestCase):
               "PredMaxxA", "PredMaxxB", "PredValuesA", "PredValuesB", "PredVarA", "PredVarB",
               "JoinA", "JoinB", "JoinInlA", "JoinInlB", "ExcQualCtrlA", "ExcQualCtrlB",
               "SumzGroupA", "SumzGroupB", "JoinShadowVarA", "JoinShadowVarB",
+              "VarUnionPadA", "VarUnionPadB", "IntermA", "IntermB",
               "UnionPredCtrlA", "UnionPredCtrlB",
+              "UnionScalarCtrlA", "UnionScalarCtrlB", "CrossJoinNarrowA", "CrossJoinNarrowB",
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
               "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
@@ -601,7 +611,8 @@ class SimilarScopeTests(unittest.TestCase):
     def test_shared_lineage_joins_stay_certain(self):
         for name, dup in (("JoinA", "JoinB"), ("JoinInlA", "JoinInlB"),
                           ("ExcQualCtrlA", "ExcQualCtrlB"),
-                          ("UnionPredCtrlA", "UnionPredCtrlB")):
+                          ("UnionPredCtrlA", "UnionPredCtrlB"),
+                          ("UnionScalarCtrlA", "UnionScalarCtrlB")):
             with self.subTest(name=name):
                 self.assertFalse(self._canon(name).uncertain)
                 result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
@@ -672,6 +683,16 @@ class SimilarScopeTests(unittest.TestCase):
         with self.assertRaises(PbzError) as caught:
             consolidate.merge(self.ws, self.project, "CapSelfB", "CapSelfA", dry_run=True)
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_var_union_and_intermediate_consumers_are_refused(self):
+        for dup, into in (("VarUnionPadB", "VarUnionPadA"), ("IntermB", "IntermA"),
+                          ("CrossJoinNarrowB", "CrossJoinNarrowA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_var_join_shadow_is_refused(self):
         self.assertEqual(self._key("JoinShadowVarA"), self._key("JoinShadowVarB"))
