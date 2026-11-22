@@ -513,6 +513,17 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if closed.get("names"):
                     for f_idx, fr in enumerate(stack):
                         path = stack[f_idx + 1:]
+                        first_d = path[0]["parent_arg"] if path else closed["parent_arg"]
+                        if fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+                            in_source = first_d == 1
+                        elif fr["fn"] == "RANK":
+                            in_source = first_d in (0, 1)
+                        elif fr["fn"] == "WINDOW":
+                            in_source = first_d in (2, 3, 4)
+                        else:
+                            in_source = first_d == 0
+                        if not in_source:
+                            continue
                         if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
                                 and path[-1]["fn"] == "SUMMARIZECOLUMNS":
                             ok = _first_nonsource(path[:-1], path[-1]["parent_arg"]) is None
