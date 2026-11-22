@@ -253,7 +253,7 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
         else _extension_owned_others(project.mirror_report, old)
     ext_ext = _extension_owned(project.mirror_report, home) if kind != "table" \
         else (_extension_owned(project.mirror_report, old)
-              | _extension_owned(project.mirror_report, new))
+              | _extension_owned_dest(project.mirror_report, old, new))
     for path in pbir.report_files(project.mirror_report):
         text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
         try:
@@ -639,6 +639,17 @@ def _extension_owned(report_dir, home):
     return {_fold(f"{name}.{m}")
             for name, measures in _extension_entities(report_dir)
             if _fold(name).startswith(_fold(home) + ".") for m in measures}
+
+
+def _extension_owned_dest(report_dir, old, new):
+    """Qualified paths of report-extension measures on entities extending
+    the destination name, excluding the renamed entity itself: ownership
+    in the destination namespace, where the renamed table's own extension
+    paths are not another table's."""
+    return {_fold(f"{name}.{m}")
+            for name, measures in _extension_entities(report_dir)
+            if _fold(name).startswith(_fold(new) + ".") and _fold(name) != _fold(old)
+            for m in measures}
 
 
 def _extension_owned_others(report_dir, home):
@@ -1071,7 +1082,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         for rest in rests:
             if _other_table_owns(model, old, f"{new}.{rest}",
                                  _extension_owned_others(project.mirror_report, old),
-                                 _extension_owned(project.mirror_report, new),
+                                 _extension_owned_dest(project.mirror_report, old, new),
                                  extra_tables=_extension_tables(project.mirror_report),
                                  head=new):
                 raise PbzError("NAME_TAKEN", f"{new}.{rest}")
@@ -1196,7 +1207,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                                                field, model, extra_qualified=ext_q,
                                                extra_owned=ext_owned,
                                                extra_extending=(_extension_owned(project.mirror_report, old)
-                                                                | _extension_owned(project.mirror_report, new)),
+                                                                | _extension_owned_dest(project.mirror_report, old, new)),
                                                extra_tables=_extension_tables(project.mirror_report))
                     if nv != node.value:
                         edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))

@@ -920,6 +920,27 @@ class RenameBindingsTests(unittest.TestCase):
             rename.rename(ws, project, "table", "A", "B")
         self.assertEqual(caught.exception.code, "NAME_TAKEN")
 
+    def test_table_rename_to_shorter_name_own_extension_path_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Region.Total.Level"}]})
+        os.remove(os.path.join(mdef, "tables", "Sales.tmdl"))
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales.Region", "measures": [{"name": "Total", "expression": "1"}]}]}))
+        rename.rename(ws, project, "table", "Sales.Region", "Sales")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Sales.Total.Level")
+
+    def test_table_rename_to_shorter_name_no_self_preflight_block(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        os.remove(os.path.join(mdef, "tables", "Sales.tmdl"))
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn 'Region.Total'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales.Region", "measures": [{"name": "Total", "expression": "1"}]}]}))
+        rename.rename(ws, project, "table", "Sales.Region", "Sales")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
