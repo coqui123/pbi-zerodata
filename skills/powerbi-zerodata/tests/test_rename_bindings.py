@@ -602,6 +602,34 @@ class RenameBindingsTests(unittest.TestCase):
         self.assertIn("SUM(Sales[Masse])", sales)
         self.assertIn("column Value", sales)
 
+    def test_column_rename_to_fold_collision_refused(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn 'ΟΣ'\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "οσ", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_table_rename_fresh_reference_to_extension_entity_stays(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"metadata": "Sales.Amount.Share vs Local.Total"}]})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Local", "measures": [{"name": "Total", "expression": "1"}]}]}))
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_translated_sigma_name_refused(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "ΟΣ.tmdl"),
+               "table 'ΟΣ'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        with patch("pbz.rename.translated_names", return_value={"ος"}):
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "table", "ΟΣ", "Revenue")
+        self.assertEqual(caught.exception.code, "UNSUPPORTED")
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")

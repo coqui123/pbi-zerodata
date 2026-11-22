@@ -43,7 +43,9 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         m = model.measure(old)
         if not m:
             raise PbzError("NOT_FOUND", f"measure {old}")
-        if (model.measure(new) or model.column(m.table, new)) and _fold(new) != _fold(old):
+        if _fold(new) != _fold(old) and (any(_fold(mm.name) == _fold(new) for mm in model.all_measures())
+                                         or any(_fold(c.name) == _fold(new) and c.table == m.table
+                                                for c in model.all_columns())):
             raise PbzError("NAME_TAKEN", new)
         if any(_fold(c.name) == _fold(old) for c in model.all_columns()):
             raise PbzError("AMBIGUOUS", f"a column is also named {old}; rename it in Desktop")
@@ -53,7 +55,9 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         if len(hits) != 1:
             raise PbzError("AMBIGUOUS" if hits else "NOT_FOUND", f"column {old}; pass --table")
         home = hits[0].table
-        if (model.column(home, new) or model.measure(new)) and _fold(new) != _fold(old):
+        if _fold(new) != _fold(old) and (any(_fold(c.name) == _fold(new) and c.table == home
+                                              for c in model.all_columns())
+                                         or any(_fold(mm.name) == _fold(new) for mm in model.all_measures())):
             raise PbzError("NAME_TAKEN", new)
     elif kind == "table":
         return rename_table(ws, project, model, old, new)
@@ -101,11 +105,13 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
     from .move import plan_pbir
     ext_owned = _extension_owned_others(project.mirror_report, home)
     ext_ext = _extension_owned(project.mirror_report, home)
+    ext_tables = _extension_tables(project.mirror_report)
     for path, text, bom, rel in plan_pbir(
             ws, project.mirror_report,
             lambda root, _text: (pbir_ref_edits(root, model, kind, home, old, new,
                                                 extra_owned=ext_owned,
-                                                extra_extending=ext_ext), False)):
+                                                extra_extending=ext_ext,
+                                                extra_tables=ext_tables), False)):
         ops.append(("write", path, text, bom))
         changed.append(rel)
     from .governance import culture_rename_texts
@@ -238,7 +244,8 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
         for site, (node, field) in _report_string_sites(original_root, model, original).items():
             expected = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
                                              extra_qualified=ext_q, extra_owned=ext_owned,
-                                             extra_extending=ext_ext)
+                                             extra_extending=ext_ext,
+                                             extra_tables=_extension_tables(project.mirror_report))
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         for ref, site in original:
@@ -398,7 +405,7 @@ def _head_swap(value, table, new):
 
 
 def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
-                      extensions_any=False):
+                      extensions_any=False, extra_tables=()):
     """True when an unbound string is owned by another table: exactly a
     qualified path of any other table (Sales.Region.Amount beside the Sales
     column 'Region.Amount'), or an owned extension of a longer-named
@@ -411,6 +418,7 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
     (a bare nativeQueryRef)."""
     low = _fold(value)
     tables = tuple(t.name for t in model.tables.values()) if model is not None else ()
+    tables = tables + tuple(extra_tables)
     if low in {_fold(p) for p in extra_owned}:
         return True
     for p in extra_extending:
@@ -448,7 +456,7 @@ _BLOCKED = object()
 
 
 def _table_rewrite(value, old, new, qualified, table=None, model=None, other_owned=(),
-                   other_extending=()):
+                   other_extending=(), other_tables=()):
     """Rewrite one table reference in a report string, or return the value unchanged.
 
     A value rewrites when it is exactly a qualified object path of the old
@@ -463,7 +471,8 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
             at = text.index(".", at + 1)
         return new + text[at:]
 
-    _tables = [t.name for t in model.tables.values()] if model is not None else ()
+    _tables = [t.name for t in model.tables.values()] if model is not None else []
+    _tables = _tables + list(other_tables)
     other_exact = {_fold(p) for p in other_owned}
     other_ext = {_fold(p) for p in other_extending}
     if model is not None:
@@ -578,8 +587,16 @@ def _extension_owned_others(report_dir, home):
             if _fold(name) != _fold(home) for m in measures}
 
 
+def _extension_tables(report_dir):
+    """Entity names defined in reportExtensions.json, including report-only
+    entities the model does not know: a fresh reference to one must stop a
+    partial rewrite like a model table reference does."""
+    return [name for name, _measures in _extension_entities(report_dir)]
+
+
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
-                          extra_qualified=(), extra_owned=(), extra_extending=()):
+                          extra_qualified=(), extra_owned=(), extra_extending=(),
+                          extra_tables=()):
     if kind == "table":
         if field is _AMBIGUOUS:
             return value
@@ -603,8 +620,8 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                     if _fold(probe) == _fold(base) \
                             or (_rest is not None
                                 and _path_extension(_rest, old,
-                                                    [t.name for t in model.tables.values()]
-                                                    if model is not None else ())):
+                                                    ([t.name for t in model.tables.values()]
+                                                     if model is not None else []) + list(extra_tables))):
                         if _fold(field.table) != _fold(old):
                             return value
                         swapped = _head_swap(probe, field.table, new)
@@ -616,15 +633,16 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
                 return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model,
-                                      other_owned=extra_owned, other_extending=extra_extending)
+                                      other_owned=extra_owned, other_extending=extra_extending,
+                                      other_tables=extra_tables)
             if _fold(value).startswith(_fold(old) + "."):
                 return _head_swap(value, old, new)
             wrapped = _single_wrapped(value)
             _rest = _rest_after(wrapped[1], _fold(old)) if wrapped else None
             if wrapped and _rest is not None \
                     and _path_extension(_rest, old,
-                                        [t.name for t in model.tables.values()]
-                                        if model is not None else ()):
+                                        ([t.name for t in model.tables.values()]
+                                         if model is not None else []) + list(extra_tables)):
                 return f"{wrapped[0]}({_head_swap(wrapped[1], old, new)})"
         return value
     if key == "queryName":
@@ -646,19 +664,22 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                 return f"{wrapped.group(1)}({home}.{new})"
         return value
     if key in ("queryRef", "metadata", "nativeQueryRef") and _fold(value) == _fold(f"{home}.{old}") \
-            and not _other_table_owns(model, home, value, extra_owned, extra_extending):
+            and not _other_table_owns(model, home, value, extra_owned, extra_extending,
+                                      extra_tables=extra_tables):
         return f"{home}.{new}"
     if key == "nativeQueryRef" and _fold(value) == _fold(old) \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending,
-                                      extensions_any=True):
+                                      extensions_any=True, extra_tables=extra_tables):
         return new
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef") \
-            and _other_table_owns(model, home, value, extra_owned, extra_extending):
+            and _other_table_owns(model, home, value, extra_owned, extra_extending,
+                                  extra_tables=extra_tables):
         return value
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
         wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
         if wrapped and _fold(wrapped.group(2)) == _fold(f"{home}.{old}") \
-                and not _other_table_owns(model, home, wrapped.group(2), extra_owned, extra_extending):
+                and not _other_table_owns(model, home, wrapped.group(2), extra_owned, extra_extending,
+                                          extra_tables=extra_tables):
             return f"{wrapped.group(1)}({home}.{new})"
     return value
 
@@ -689,7 +710,7 @@ def dax_ref_edits(text: str, start: int, end: int, kind: str, home: str, old: st
 
 
 def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
-                   extra_owned=(), extra_extending=()) -> list[tuple[int, int, str]]:
+                   extra_owned=(), extra_extending=(), extra_tables=()) -> list[tuple[int, int, str]]:
     """Edits renaming measure / column `old` of table `home` in one parsed PBIR document: every field
     reference's Property, and queryRef / nativeQueryRef / metadata strings."""
     edits = []
@@ -702,7 +723,8 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
     home, old = _canonical_target(model, kind, home, old)
     for site, (node, field) in _report_string_sites(root, model, fields).items():
         nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
-                                   extra_owned=extra_owned, extra_extending=extra_extending)
+                                   extra_owned=extra_owned, extra_extending=extra_extending,
+                                   extra_tables=extra_tables)
         if nv != node.value:
             edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
     return edits
@@ -747,11 +769,11 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     if t is None:
         raise PbzError("NOT_FOUND", f"table {old}")
     old = t.name
-    if model.table(new) and _fold(new) != _fold(old):
+    if _fold(new) != _fold(old) and any(_fold(t2.name) == _fold(new) for t2 in model.tables.values()):
         raise PbzError("NAME_TAKEN", new)
     if not new.strip() or new != new.strip() or any(c in new for c in "\r\n\t"):
         raise PbzError("BAD_REQUEST", "table names cannot be blank, padded or contain control characters")
-    if any(n == _fold(old) for n in translated_names(project)):
+    if any(_fold(n) == _fold(old) for n in translated_names(project)):
         raise PbzError("UNSUPPORTED", "cultures not in this mirror: run pbz pull")
     if any(_fold(e) == _fold(old) for e in model.expressions):
         raise PbzError("AMBIGUOUS", f"a shared query is also named {old}")
@@ -874,7 +896,8 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                     nv = _report_string_rename(site[-1], node.value, "table", "", old, new,
                                                field, model, extra_qualified=ext_q,
                                                extra_owned=ext_owned,
-                                               extra_extending=_extension_owned(project.mirror_report, old))
+                                               extra_extending=_extension_owned(project.mirror_report, old),
+                                               extra_tables=_extension_tables(project.mirror_report))
                     if nv != node.value:
                         edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
         return edits, False
