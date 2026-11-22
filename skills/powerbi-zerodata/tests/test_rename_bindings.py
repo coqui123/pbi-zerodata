@@ -278,10 +278,14 @@ class RenameBindingsTests(unittest.TestCase):
                 before = path.read_bytes()
                 rename.rename(ws, project, "table", "Sales", "Revenue")
                 self.assertEqual(path.read_bytes(), before)
-        # A pure dotted extension of a qualified path still follows.
-        ws, project, _mdef, path = self._report_project({"refs": [{"metadata": "Sales.Amount.Share"}]})
-        rename.rename(ws, project, "table", "Sales", "Revenue")
-        self.assertEqual(json.loads(path.read_text())["refs"][0]["metadata"], "Revenue.Amount.Share")
+        # A pure dotted extension of a qualified path still follows, including
+        # a segment that merely ends in the table's name.
+        for value, expected in (("Sales.Amount.Share", "Revenue.Amount.Share"),
+                                ("Sales.Amount.Net Sales", "Revenue.Amount.Net Sales")):
+            with self.subTest(value=value):
+                ws, project, _mdef, path = self._report_project({"refs": [{"metadata": value}]})
+                rename.rename(ws, project, "table", "Sales", "Revenue")
+                self.assertEqual(json.loads(path.read_text())["refs"][0]["metadata"], expected)
 
     def test_nested_string_follows_owning_projection(self):
         def proj(entity):
@@ -312,7 +316,9 @@ class RenameBindingsTests(unittest.TestCase):
         self.assertEqual(after[2]["details"]["nativeQueryRef"], "Value")
         self.assertEqual(after[0]["Column"]["Property"], "Amount")
 
-    def test_table_rename_field_binding_beats_longer_table_prefix(self):
+    def _colliding_project(self, obj):
+        """A project where Sales has a column named 'Region.Amount' and a
+        second table is named 'Sales.Region', plus a report holding obj."""
         ws, project, mdef = self._project()
         _write(os.path.join(mdef, "model.tmdl"),
                "model Model\n\tculture: en-US\n\nref table Sales\n\nref table 'Sales.Region'\n")
@@ -322,25 +328,43 @@ class RenameBindingsTests(unittest.TestCase):
                "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
         path = Path(project.mirror_report, "definition", "report.json")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"projections": [{
+        path.write_text(json.dumps(obj))
+        return ws, project, mdef, path
+
+    def _bound_colliding(self, query_ref):
+        return {"projections": [{
             "field": {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}},
                                  "Property": "Region.Amount"}},
-            "queryRef": "Sales.Region.Amount"}]}))
+            "queryRef": query_ref}]}
+
+    def test_table_rename_field_binding_beats_longer_table_prefix(self):
+        ws, project, mdef, path = self._colliding_project(self._bound_colliding("Sales.Region.Amount"))
         rename.rename(ws, project, "table", "Sales", "Revenue")
         after = json.loads(path.read_text())["projections"][0]
         self.assertEqual(after["queryRef"], "Revenue.Region.Amount")
         self.assertEqual(after["field"]["Column"]["Expression"]["SourceRef"]["Entity"], "Revenue")
         # The same string with no binding stays untouched: the longer table owns it.
-        ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Region.Amount"}]})
-        _write(os.path.join(mdef, "model.tmdl"),
-               "model Model\n\tculture: en-US\n\nref table Sales\n\nref table 'Sales.Region'\n")
-        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
-               "table Sales\n\tcolumn 'Region.Amount'\n\t\tdataType: int64\n")
-        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
-               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount"}]})
+        model = tmdl.load_model(mdef)
+        self.assertIsNotNone(model.column("Sales", "Region.Amount"))
+        self.assertIsNotNone(model.table("Sales.Region"))
         before = path.read_bytes()
         rename.rename(ws, project, "table", "Sales", "Revenue")
         self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_other_table_keeps_bound_string(self):
+        ws, project, mdef, path = self._colliding_project(self._bound_colliding("Sales.Region.Amount"))
+        rename.rename(ws, project, "table", "Sales.Region", "Territory")
+        after = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(after["queryRef"], "Sales.Region.Amount")
+        self.assertEqual(after["field"]["Column"]["Expression"]["SourceRef"]["Entity"], "Sales")
+
+    def test_table_rename_bound_wrapped_extension_follows(self):
+        ws, project, mdef, path = self._colliding_project(
+            self._bound_colliding("Sum(Sales.Region.Amount.Share)"))
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        after = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(after["queryRef"], "Sum(Revenue.Region.Amount.Share)")
 
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})

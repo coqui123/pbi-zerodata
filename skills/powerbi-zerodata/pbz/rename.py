@@ -345,11 +345,13 @@ def _path_extension(rest, old):
     remainder, since either means the string holds more than one reference."""
     if not rest:
         return False
+    if re.search(rf"(?<![\w]){re.escape(old.lower())}\.", rest.lower()):
+        return False
     for seg in rest.split("."):
         seg = seg.strip()
         if not seg or not all(ch.isalnum() or ch in "_ " for ch in seg):
             return False
-        if any(tok in _WORD_OPERATORS or tok == old.lower() for tok in seg.lower().split()):
+        if any(tok in _WORD_OPERATORS for tok in seg.lower().split()):
             return False
     return True
 
@@ -449,19 +451,21 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                           extra_qualified=()):
     if kind == "table":
         if key in ("queryRef", "metadata", "queryName"):
-            if field is not None and field is not _AMBIGUOUS \
-                    and field.table.lower() == old.lower():
-                # The resolved field settles ownership: a string naming the
-                # field's own qualified path follows its table even when a
-                # longer table name shares the prefix.
+            if field is not None and field is not _AMBIGUOUS:
+                # The resolved field settles ownership of a string naming its
+                # own qualified path (exact or pure extension, raw or wrapped):
+                # the string follows the field's table rename, and no other
+                # table's, even when a longer table name shares the prefix.
                 base = f"{field.table}.{field.name}"
-                if value.lower() == base.lower() \
-                        or (value.lower().startswith(base.lower() + ".")
-                            and _path_extension(value[len(base) + 1:], old)):
-                    return new + value[len(field.table):]
                 wrapped = _wrapped_inner(value)
-                if wrapped and wrapped[1].lower() == base.lower():
-                    return f"{wrapped[0]}({new}{wrapped[1][len(field.table):]})"
+                probe = wrapped[1] if wrapped else value
+                if probe.lower() == base.lower() \
+                        or (probe.lower().startswith(base.lower() + ".")
+                            and _path_extension(probe[len(base) + 1:], old)):
+                    if field.table.lower() != old.lower():
+                        return value
+                    swapped = new + probe[len(field.table):]
+                    return f"{wrapped[0]}({swapped})" if wrapped else swapped
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
                 return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model)
