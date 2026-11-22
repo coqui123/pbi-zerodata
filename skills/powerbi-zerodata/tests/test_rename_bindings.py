@@ -941,6 +941,30 @@ class RenameBindingsTests(unittest.TestCase):
             {"name": "Sales.Region", "measures": [{"name": "Total", "expression": "1"}]}]}))
         rename.rename(ws, project, "table", "Sales.Region", "Sales")
 
+    def test_table_rename_shorter_source_not_blocked_by_destination_set(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "A.B.C.X"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "ABC.tmdl"),
+               "table 'A.B.C'\n\tcolumn X\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "A.B", "measures": [{"name": "C", "expression": "1"}]}]}))
+        rename.rename(ws, project, "table", "A.B.C", "A")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "A.X")
+
+    def test_table_rename_longer_destination_extending_shorter_entity_allowed(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "A.X"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "A.B", "measures": [{"name": "C", "expression": "1"}]}]}))
+        rename.rename(ws, project, "table", "A", "A.B.C")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "A.B.C.X")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

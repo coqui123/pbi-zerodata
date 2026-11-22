@@ -252,8 +252,7 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     ext_owned = _extension_owned_others(project.mirror_report, home) if kind != "table" \
         else _extension_owned_others(project.mirror_report, old)
     ext_ext = _extension_owned(project.mirror_report, home) if kind != "table" \
-        else (_extension_owned(project.mirror_report, old)
-              | _extension_owned_dest(project.mirror_report, old, new))
+        else _extension_owned(project.mirror_report, old)
     for path in pbir.report_files(project.mirror_report):
         text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
         try:
@@ -271,7 +270,10 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
             expected = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
                                              extra_qualified=ext_q, extra_owned=ext_owned,
                                              extra_extending=ext_ext,
-                                             extra_tables=_extension_tables(project.mirror_report))
+                                             extra_tables=_extension_tables(project.mirror_report),
+                                             dest_owned=(ext_owned if kind == "table" else None),
+                                             dest_extending=(_extension_owned_dest(project.mirror_report, old, new)
+                                                             if kind == "table" else None))
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         def _kind_of(r):
@@ -669,7 +671,7 @@ def _extension_tables(report_dir):
 
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
                           extra_qualified=(), extra_owned=(), extra_extending=(),
-                          extra_tables=()):
+                          extra_tables=(), dest_owned=None, dest_extending=None):
     nv = _report_string_rename_inner(key, value, kind, home, old, new, field, model,
                                      extra_qualified, extra_owned, extra_extending,
                                      extra_tables)
@@ -677,16 +679,19 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         # The emitted string, exactly as produced (extensions retained from
         # the source string, wrapper text included), must not be owned by
         # another table in the destination namespace; a wrapped emission is
-        # also checked on its inner path.
+        # also checked on its inner path. Destination ownership uses its own
+        # sets: the source namespace's sets do not decide it.
         anchor = old if kind == "table" else home
         head = new if kind == "table" else home
         bare = key == "nativeQueryRef" and _fold(value) == _fold(old)
+        owned = extra_owned if dest_owned is None else dest_owned
+        extending = extra_extending if dest_extending is None else dest_extending
         produced = [nv]
         wrapped = _wrapped_inner(nv)
         if wrapped:
             produced.append(wrapped[1])
         for text in produced:
-            if _other_table_owns(model, anchor, text, extra_owned, extra_extending,
+            if _other_table_owns(model, anchor, text, owned, extending,
                                  extensions_any=bare, extra_tables=extra_tables, head=head):
                 raise PbzError("NAME_TAKEN", nv)
     return nv
@@ -1206,9 +1211,10 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                     nv = _report_string_rename(site[-1], node.value, "table", "", old, new,
                                                field, model, extra_qualified=ext_q,
                                                extra_owned=ext_owned,
-                                               extra_extending=(_extension_owned(project.mirror_report, old)
-                                                                | _extension_owned_dest(project.mirror_report, old, new)),
-                                               extra_tables=_extension_tables(project.mirror_report))
+                                               extra_extending=_extension_owned(project.mirror_report, old),
+                                               extra_tables=_extension_tables(project.mirror_report),
+                                               dest_owned=ext_owned,
+                                               dest_extending=_extension_owned_dest(project.mirror_report, old, new))
                     if nv != node.value:
                         edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
             edits.extend(_measure_expression_edits(root, model, "table", "", old, new))
