@@ -274,14 +274,16 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         if table:
             for idx, fr in enumerate(stack):
                 if fr["fn"] in deps.ITERATORS and _teaches_at(fr) and not fr["poisoned"]:
-                    trusted = _in_source_region(idx, stack[-1]["arg"] if len(stack) > idx + 1 else 0)
+                    trusted = _in_source_region(idx, stack[-1]["arg"] if len(stack) > idx + 1 else 0) \
+                        and not any(g["fn"] == "TREATAS" for g in stack[idx + 1:])
                     eff_bare = bare and trusted
                     if fr["row_table"] is None:
                         fr["row_table"] = table
                         if not eff_bare:
                             g = _source_frame(idx)
                             exempt = trusted and g is not None and stack[-1] is g \
-                                and g["arg"] == 0 and g["fn"] in TABLE_INPUT_ARG0
+                                and g["arg"] == 0 and g["fn"] in TABLE_INPUT_ARG0 \
+                                and g["fn"] != "TREATAS"
                             if not exempt:
                                 target = g if g is not None else _taint_frame(idx)
                                 if target is not None and fr.get("taint") is None:
