@@ -262,7 +262,7 @@ def _report_string_sites(root, model, fields=None):
     siblings = {}
     for ref, site in fields:
         parent = site[:-1]
-        siblings[parent] = ref if parent not in siblings else None
+        siblings[parent] = ref if parent not in siblings else _AMBIGUOUS
     sites = {}
     for site, node in _report_string_nodes(root):
         field = None
@@ -274,6 +274,9 @@ def _report_string_sites(root, model, fields=None):
             field = siblings.get(site[:-1])
         sites[site] = (node, field)
     return sites
+
+
+_AMBIGUOUS = object()
 
 
 def _canonical_target(model, kind, home, old):
@@ -299,13 +302,15 @@ def _report_string_rename(key, value, kind, home, old, new, field=None):
         return value
     if key == "queryName":
         return value
+    if field is _AMBIGUOUS:
+        return value
     if field is not None:
         field_kind = "column" if field.kind == "aggregation" else field.kind
         if field_kind != kind or field.table.lower() != home.lower() or field.name.lower() != old.lower():
             return value
-        if value == f"{field.table}.{field.name}":
-            return f"{field.table}.{new}"
-        if key == "nativeQueryRef" and value == field.name:
+        if value == f"{field.table}.{field.name}" or value == f"{home}.{old}":
+            return f"{home}.{new}"
+        if key == "nativeQueryRef" and (value == field.name or value.lower() == old.lower()):
             return new
         return value
     if key in ("queryRef", "metadata", "nativeQueryRef") and value == f"{home}.{old}":
