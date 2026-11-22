@@ -134,6 +134,8 @@ SALES = (
     "\tmeasure CalcPred3B = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(VALUES(Wide[Qty]), (FILTER(VALUES(Wide[Price]), TRUE()))), Wide[Price])))\n\n"
     "\tmeasure TopnFilterAllA = COUNTROWS(TOPN(1, FILTER(ALL(Other[Price], Other[ShadowM]), TRUE()), [ShadowM]))\n\n"
     "\tmeasure TopnFilterAllB = COUNTROWS(TOPN(1, FILTER(ALL(Other[Price], Other[ShadowM]), TRUE()), Sales[ShadowM]))\n\n"
+    "\tmeasure ExcAccA = SUMX(Wide, SUMX(Sales, SUMX(EXCEPT(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), [Price])))\n\n"
+    "\tmeasure ExcAccB = SUMX(Wide, SUMX(Sales, SUMX(EXCEPT(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), Wide[Price])))\n\n"
     "\tmeasure TopnCountCtrlA = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
@@ -408,6 +410,7 @@ class SimilarScopeTests(unittest.TestCase):
               "JoinBareVarA", "JoinBareVarB", "CalcPredA", "CalcPredB",
               "CalcPred2A", "CalcPred2B", "ParenVarA", "ParenVarB",
               "CalcPred3A", "CalcPred3B", "TopnFilterAllA", "TopnFilterAllB",
+              "ExcAccA", "ExcAccB",
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
               "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
@@ -705,7 +708,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("JoinBareVarB", "JoinBareVarA"), ("CalcPredB", "CalcPredA"),
                           ("CalcPred2B", "CalcPred2A"), ("ParenVarB", "ParenVarA"),
                           ("CalcPred3B", "CalcPred3A"),
-                          ("TopnFilterAllB", "TopnFilterAllA")):
+                          ("TopnFilterAllB", "TopnFilterAllA"),
+                          ("ExcAccB", "ExcAccA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

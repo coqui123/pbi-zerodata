@@ -363,13 +363,37 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         fr["row_table"] = None
                         fr["poisoned"] = True
                     _acc_path = stack[idx + 1:]
+
+                    def _acc_descent_ok() -> bool:
+                        for j, g in enumerate(_acc_path):
+                            if g["fn"] in SCALAR_FUNCS:
+                                return False
+                            d = _acc_path[j + 1]["parent_arg"] if j + 1 < len(_acc_path) \
+                                else stack[-1]["arg"]
+                            fn = g["fn"]
+                            if fn in ("ALL", "ALLSELECTED", "ALLNOBLANKROW"):
+                                continue
+                            if fn in ("FILTER", "CALCULATETABLE") or fn in FIRST_OPERAND \
+                                    or fn in TABLE_INPUT_ARG0 or fn in X_ITERATORS:
+                                if d != 0:
+                                    return False
+                            elif fn in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+                                if d != 1:
+                                    return False
+                            elif fn == "WINDOW":
+                                if d not in (2, 3, 4):
+                                    return False
+                            elif fn == "RANK":
+                                if d not in (0, 1):
+                                    return False
+                            elif fn in COMBINING_UNION or fn in CONDITIONALS or fn == "":
+                                continue
+                            else:
+                                return False
+                        return True
+
                     _acc_ok = not bare and column and fr.get("only_src") is not None \
-                        and fr["row_table"] == table \
-                        and not any(g["fn"] in SCALAR_FUNCS for g in _acc_path) \
-                        and not any(g["fn"] in ("FILTER", "CALCULATETABLE")
-                                    and (_acc_path[j + 1]["parent_arg"] if j + 1 < len(_acc_path)
-                                         else stack[-1]["arg"]) != 0
-                                    for j, g in enumerate(_acc_path))
+                        and fr["row_table"] == table and _acc_descent_ok()
                     if _acc_ok:
                         _sf = _source_frame(idx)
                         if _sf is None or _sf["fn"] not in NARROWING:
