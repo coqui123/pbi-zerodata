@@ -317,6 +317,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     if not bare and column and fr.get("only_src") is not None \
                             and _source_frame(idx) is fr.get("only_src"):
                         fr["only_columns"].add(column.lower())
+                    if eff_bare and fr["row_table"] == table and fr.get("only_columns") is not None:
+                        fr["only_columns"] = None
+                        fr["only_src"] = None
                     if eff_bare and fr.get("taint") is not None and fr["row_table"] == table \
                             and _taint_cleared(fr, idx):
                         fr["taint"] = None
