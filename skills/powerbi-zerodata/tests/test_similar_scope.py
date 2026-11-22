@@ -102,10 +102,14 @@ SALES = (
     "\tmeasure PredValuesB = SUMX(FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0), [Price])\n\n"
     "\tmeasure PredVarA = VAR v = Other RETURN SUMX(FILTER(Sales, COUNTROWS(v) > 0), [Price])\n\n"
     "\tmeasure PredVarB = VAR v = Other RETURN SUMX(FILTER(Sales, COUNTROWS(v) > 0), [Price])\n\n"
-    "\tmeasure JoinA = VAR v = Other RETURN SUMX(NATURALLEFTOUTERJOIN(Sales, v), [Price])\n\n"
-    "\tmeasure JoinB = VAR v = Other RETURN SUMX(NATURALLEFTOUTERJOIN(Sales, v), Sales[Price])\n\n"
-    "\tmeasure JoinInlA = SUMX(NATURALLEFTOUTERJOIN(Sales, Other), [Price])\n\n"
-    "\tmeasure JoinInlB = SUMX(NATURALLEFTOUTERJOIN(Sales, Other), Sales[Price])\n\n"
+    "\tmeasure JoinA = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN SUMX(NATURALLEFTOUTERJOIN(VALUES(Other[Price]), v), [Price])\n\n"
+    "\tmeasure JoinB = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN SUMX(NATURALLEFTOUTERJOIN(VALUES(Other[Price]), v), Other[Price])\n\n"
+    "\tmeasure JoinInlA = SUMX(NATURALLEFTOUTERJOIN(VALUES(Other[Price]), Other), [Price])\n\n"
+    "\tmeasure JoinInlB = SUMX(NATURALLEFTOUTERJOIN(VALUES(Other[Price]), Other), Other[Price])\n\n"
+    "\tmeasure ExcQualCtrlA = SUMX(EXCEPT(Sales, VALUES(Other[Price])), [CtrlA])\n\n"
+    "\tmeasure ExcQualCtrlB = SUMX(EXCEPT(Sales, VALUES(Other[Price])), Sales[CtrlA])\n\n"
+    "\tmeasure SumzGroupA = SUMX(SUMMARIZE(ADDCOLUMNS(Sales, \"CtrlA\", 1), [CtrlA]), [CtrlA])\n\n"
+    "\tmeasure SumzGroupB = SUMX(SUMMARIZE(ADDCOLUMNS(Sales, \"CtrlA\", 1), [CtrlA]), Sales[CtrlA])\n\n"
     "\tmeasure TopnCountCtrlA = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
@@ -372,7 +376,8 @@ class SimilarScopeTests(unittest.TestCase):
               "IfPredCtrlA", "IfPredCtrlB", "ContainsA", "ContainsB",
               "PredCountCtrlA", "PredCountCtrlB", "MaxxCtrlA", "MaxxCtrlB",
               "PredMaxxA", "PredMaxxB", "PredValuesA", "PredValuesB", "PredVarA", "PredVarB",
-              "JoinA", "JoinB", "JoinInlA", "JoinInlB",
+              "JoinA", "JoinB", "JoinInlA", "JoinInlB", "ExcQualCtrlA", "ExcQualCtrlB",
+              "SumzGroupA", "SumzGroupB",
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
               "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
@@ -582,13 +587,19 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_natural_join_second_table_still_poisons(self):
-        for dup, into in (("JoinB", "JoinA"), ("JoinInlB", "JoinInlA")):
-            with self.subTest(into=into):
-                self.assertEqual(self._key(dup), self._key(into))
-                self.assertTrue(self._canon(into).uncertain)
-                with self.assertRaises(PbzError) as caught:
-                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
-                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+        self.assertEqual(self._key("SumzGroupB"), self._key("SumzGroupA"))
+        self.assertTrue(self._canon("SumzGroupA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "SumzGroupB", "SumzGroupA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_shared_lineage_joins_stay_certain(self):
+        for name, dup in (("JoinA", "JoinB"), ("JoinInlA", "JoinInlB"),
+                          ("ExcQualCtrlA", "ExcQualCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
 
     def test_zero_argument_countrows_keys_include_home(self):
         self.assertNotEqual(self._key("HomeCountA"),

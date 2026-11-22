@@ -468,13 +468,15 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 frames = stack[idx + 1:]
                 if not frames:
                     continue
-                bad = _first_nonsource(frames, stack[-1]["arg"])
+                bad = _first_nonsource(frames, stack[-1]["arg"], lineage="names")
                 if bad is None:
                     fr["row_table"] = None
                     fr["poisoned"] = True
                 else:
                     p, d = bad
                     if p["fn"] in PREDICATE_EXEMPT and d >= 1:
+                        continue
+                    if p["fn"] in ("INTERSECT", "EXCEPT"):
                         continue
                     if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
                         continue
@@ -539,10 +541,15 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         if not _in_source(fr, first_d):
                             continue
                         chain = path + [closed]
-                        if any(chain[j]["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS",
-                                                  "SUMMARIZE", "GROUPBY")
-                               and chain[j + 1]["fn"] not in ("ROLLUPADDISSUBTOTAL", "ROLLUP")
-                               for j in range(len(chain) - 1)):
+                        _names = set()
+                        for _nm in closed["names"]:
+                            if not any(chain[j]["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS",
+                                                          "SUMMARIZE", "GROUPBY")
+                                       and chain[j + 1]["fn"] not in ("ROLLUPADDISSUBTOTAL", "ROLLUP")
+                                       and _nm not in chain[j].get("refs", ())
+                                       for j in range(len(chain) - 1)):
+                                _names.add(_nm)
+                        if not _names:
                             continue
                         if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
                                 and path[-1]["fn"] == "SUMMARIZECOLUMNS":
@@ -550,7 +557,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         else:
                             ok = _first_nonsource(path, closed["parent_arg"], lineage="names") is None
                         if ok:
-                            fr.setdefault("captured", set()).update(closed["names"])
+                            fr.setdefault("captured", set()).update(_names)
                     if pending_vars and _first_nonsource(
                             stack[pending_vars[-1][1]:], closed["parent_arg"], lineage="names") is None:
                         var_names_defined.setdefault(pending_vars[-1][0], set()).update(closed["names"])
@@ -580,6 +587,14 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     and top.get("x_table") is None:
                 top["x_table"], top["x_cols"] = _span_table(top["x_span"])
             top["arg"] += 1
+        if stack and t.kind == "bracket" and stack[-1]["fn"] in (
+                "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY") \
+                and (i == 0 or (sig[i - 1].kind == "op" and sig[i - 1].text in (",", "("))) \
+                and (nxt is not None and nxt.kind == "op" and nxt.text in (",", ")")):
+            _pf = stack[-1]
+            if _pf["fn"] == "SELECTCOLUMNS" and _pf.get("expect") in (None, "item") \
+                    or _pf["fn"] != "SELECTCOLUMNS" and _pf.get("expect") is None:
+                _pf.setdefault("refs", set()).add(t.value.lower())
         if stack and t.kind == "str" and stack[-1]["fn"] in (
                 "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "SUMMARIZE", "GROUPBY",
                 "ROLLUPADDISSUBTOTAL", "ROW", "DATATABLE") \
@@ -602,6 +617,14 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             toks.append(("LIT", "lit", val))
         elif t.kind in ("table", "ident") and nxt is not None and nxt.kind == "bracket" and (
                 t.kind == "table" or t.text.lower() in var_names or res.table(t.text)):
+            if stack and stack[-1]["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS",
+                                             "SUMMARIZE", "GROUPBY") \
+                    and (i == 0 or (sig[i - 1].kind == "op" and sig[i - 1].text in (",", "("))) \
+                    and (i + 2 >= n or (sig[i + 2].kind == "op" and sig[i + 2].text in (",", ")"))):
+                _pf = stack[-1]
+                if _pf["fn"] == "SELECTCOLUMNS" and _pf.get("expect") in (None, "item") \
+                        or _pf["fn"] != "SELECTCOLUMNS" and _pf.get("expect") is None:
+                    _pf.setdefault("refs", set()).add(nxt.value.lower())
             binding = by_span.get((nxt.start, nxt.end))
             if binding is not None:
                 uncertain |= binding.uncertain
@@ -823,8 +846,11 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     for f_idx, fr in enumerate(stack):
                         if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
                                 and _in_source_region(f_idx, stack[-1]["arg"] if len(stack) > f_idx + 1 else 0):
-                            fr["row_table"] = None
-                            fr["poisoned"] = True
+                            _rhss = var_rhs.get(low)
+                            _vt = _span_table(_rhss[0])[0] if _rhss and len(_rhss) == 1 else None
+                            if _vt is None or fr["row_table"] != _vt:
+                                fr["row_table"] = None
+                                fr["poisoned"] = True
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
                 learn(res.table(t.text), bare=True)
