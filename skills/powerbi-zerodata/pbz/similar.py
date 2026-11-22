@@ -534,7 +534,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             ok = _first_nonsource(path, closed["parent_arg"]) is None
                         if ok:
                             fr.setdefault("captured", set()).update(closed["names"])
-                    if pending_vars:
+                    if pending_vars and _first_nonsource(
+                            stack[pending_vars[-1][1]:], closed["parent_arg"]) is None:
                         var_names_defined.setdefault(pending_vars[-1][0], set()).update(closed["names"])
                 if closed.get("x_span") is not None and closed["arg"] == closed.get("span_arg", 0) \
                         and closed.get("x_table") is None:
@@ -793,8 +794,11 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                 stack[-1]["arg"] if len(stack) > f_idx + 1 else 0) is None:
                             fr.setdefault("captured", set()).update(var_names_defined[low])
                     if pending_vars and pending_vars[-1][0] != low:
-                        var_names_defined.setdefault(pending_vars[-1][0], set()).update(
-                            var_names_defined[low])
+                        _depth = pending_vars[-1][1]
+                        if _first_nonsource(stack[_depth:],
+                                            stack[-1]["arg"] if len(stack) > _depth else 0) is None:
+                            var_names_defined.setdefault(pending_vars[-1][0], set()).update(
+                                var_names_defined[low])
                 if low in table_vars and not (prev is not None and prev.kind == "ident"
                                               and prev.text.upper() == "VAR"):
                     for f_idx, fr in enumerate(stack):

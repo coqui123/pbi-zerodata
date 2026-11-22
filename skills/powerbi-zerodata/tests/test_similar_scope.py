@@ -291,8 +291,10 @@ SALES = (
     "\tmeasure ExprCapCtrlB = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), 1) + Sales[Price])\n\n"
     "\tmeasure VarRefCtrlA = VAR T = ADDCOLUMNS(Dates, \"Price\", 1) RETURN SUMX(Sales, SUMX(T, 1) + [Price])\n\n"
     "\tmeasure VarRefCtrlB = VAR T = ADDCOLUMNS(Dates, \"Price\", 1) RETURN SUMX(Sales, SUMX(T, 1) + Sales[Price])\n\n"
-    "\tmeasure SwiCapCtrlA = TOCSV(SUBSTITUTEWITHINDEX(ADDCOLUMNS(Other, \"Price\", 1), \"Idx\", Sales, [Price], ASC))\n\n"
-    "\tmeasure SwiCapCtrlB = TOCSV(SUBSTITUTEWITHINDEX(ADDCOLUMNS(Other, \"Price\", 1), \"Idx\", Sales, Sales[Price], ASC))\n\n"
+    "\tmeasure SwiCapCtrlA = TOCSV(SUBSTITUTEWITHINDEX(ADDCOLUMNS(Sales, \"CtrlA\", 1), \"Idx\", Sales, [CtrlA], ASC))\n\n"
+    "\tmeasure SwiCapCtrlB = TOCSV(SUBSTITUTEWITHINDEX(ADDCOLUMNS(Sales, \"CtrlA\", 1), \"Idx\", Sales, Sales[CtrlA], ASC))\n\n"
+    "\tmeasure VarPredCtrlA = VAR T = FILTER(Sales, COUNTROWS(ROW(\"CtrlA\", 1)) > 0) RETURN XNPV(T, [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure VarPredCtrlB = VAR T = FILTER(Sales, COUNTROWS(ROW(\"CtrlA\", 1)) > 0) RETURN XNPV(T, Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -406,7 +408,8 @@ class SimilarScopeTests(unittest.TestCase):
               "CapNestCtrlA", "CapNestCtrlB", "CapSelfA", "CapSelfB",
               "ClauseNestCtrlA", "ClauseNestCtrlB", "RowOuterCtrlA", "RowOuterCtrlB",
               "VarRowCtrlA", "VarRowCtrlB", "ExprCapCtrlA", "ExprCapCtrlB",
-              "VarRefCtrlA", "VarRefCtrlB", "SwiCapCtrlA", "SwiCapCtrlB")} | {("Other", "OtherRows")},
+              "VarRefCtrlA", "VarRefCtrlB", "SwiCapCtrlA", "SwiCapCtrlB",
+              "VarPredCtrlA", "VarPredCtrlB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -653,7 +656,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("VarRowCtrlA", "VarRowCtrlB"),
                           ("ExprCapCtrlA", "ExprCapCtrlB"),
                           ("VarRefCtrlA", "VarRefCtrlB"),
-                          ("SwiCapCtrlA", "SwiCapCtrlB")):
+                          ("SwiCapCtrlA", "SwiCapCtrlB"),
+                          ("VarPredCtrlA", "VarPredCtrlB")):
             with self.subTest(name=name):
                 self.assertFalse(self._canon(name).uncertain)
                 result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
