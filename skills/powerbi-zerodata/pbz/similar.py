@@ -89,49 +89,90 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     rhs.append(u)
                 var_rhs[sig[i + 1].text.lower()] = rhs
 
-    TABLE_FUNCS = {"ALL", "ALLEXCEPT", "ALLNOBLANKROW", "ALLSELECTED", "VALUES", "DISTINCT",
-                   "FILTER", "CALCULATETABLE", "SUMMARIZE", "SUMMARIZECOLUMNS", "TOPN", "UNION",
-                   "INTERSECT", "EXCEPT", "TREATAS", "GENERATE", "GENERATEALL", "GENERATESERIES",
-                   "ADDCOLUMNS", "SELECTCOLUMNS", "GROUPBY", "ROW", "DATATABLE",
-                   "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN", "SAMPLE", "INDEX", "OFFSET", "WINDOW"}
+    SCALAR_FUNCS = {"MAX", "MIN", "SUM", "AVERAGE", "COUNT", "COUNTA", "COUNTROWS", "COUNTAX",
+                    "DISTINCTCOUNT", "DISTINCTCOUNTNOBLANK", "SUMX", "AVERAGEX", "MINX", "MAXX",
+                    "COUNTX", "PRODUCTX", "GEOMEANX", "MEDIANX", "CONCATENATEX", "RANKX",
+                    "ABS", "INT", "ROUND", "ROUNDUP", "ROUNDDOWN", "TRUNC", "MOD", "DIVIDE",
+                    "POWER", "SQRT", "EXP", "LN", "LOG", "LOG10", "SIGN", "CEILING", "FLOOR",
+                    "MROUND", "VALUE", "FORMAT", "LEN", "UPPER", "LOWER", "TRIM", "LEFT", "RIGHT",
+                    "MID", "SUBSTITUTE", "REPLACE", "CONCATENATE", "EXACT", "FIND", "SEARCH",
+                    "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DATE", "TIME", "TODAY",
+                    "NOW", "UTCNOW", "EDATE", "EOMONTH", "DATEDIFF", "YEARFRAC", "WEEKDAY",
+                    "WEEKNUM", "NETWORKDAYS", "BLANK", "TRUE", "FALSE", "ISBLANK", "ISERROR",
+                    "ISNUMBER", "ISTEXT", "ISLOGICAL", "ISNONTEXT", "ISEMPTY", "HASONEVALUE",
+                    "HASONEFILTER", "SELECTEDVALUE", "USERNAME", "USERPRINCIPALNAME", "CUSTOMDATA"}
 
-    def _rhs_is_table(rhs) -> bool:
-        for j, u in enumerate(rhs):
-            nxt = rhs[j + 1] if j + 1 < len(rhs) else None
-            if nxt is not None and nxt.kind == "bracket":
-                continue
-            if u.kind == "table":
-                return True
-            if u.kind == "ident" and res.table(u.text):
-                return True
-            if u.kind == "ident" and u.text.upper() in TABLE_FUNCS \
-                    and nxt is not None and nxt.kind == "op" and nxt.text == "(":
-                return True
-        return False
-
-    def _single_scalar_call(rhs) -> bool:
-        if len(rhs) < 3 or rhs[0].kind != "ident" or rhs[0].text.upper() in TABLE_FUNCS \
-                or rhs[1].kind != "op" or rhs[1].text != "(":
-            return False
+    def _call_span(rhs, open_idx):
         depth = 0
-        for j, u in enumerate(rhs):
+        for j in range(open_idx, len(rhs)):
+            u = rhs[j]
             if u.kind == "op" and u.text in ("(", "{"):
                 depth += 1
             elif u.kind == "op" and u.text in (")", "}"):
                 depth -= 1
                 if depth == 0:
-                    return j == len(rhs) - 1
-        return False
+                    return j
+        return None
 
-    table_vars = {name for name, rhs in var_rhs.items() if _rhs_is_table(rhs)}
+    def _is_scalar_expr(rhs, scalar_vars) -> bool:
+        if not rhs:
+            return False
+        i = 0
+        while i < len(rhs):
+            u = rhs[i]
+            nxt = rhs[i + 1] if i + 1 < len(rhs) else None
+            if u.kind in ("num", "str", "bracket"):
+                i += 1
+                continue
+            if u.kind == "op":
+                if u.text == "{":
+                    return False
+                if u.text == "(":
+                    j = _call_span(rhs, i)
+                    if j is None or not _is_scalar_expr(rhs[i + 1:j], scalar_vars):
+                        return False
+                    i = j + 1
+                    continue
+                i += 1
+                continue
+            if u.kind == "table":
+                if nxt is not None and nxt.kind == "bracket":
+                    i += 2
+                    continue
+                return False
+            if u.kind == "ident":
+                if nxt is not None and nxt.kind == "bracket":
+                    i += 2
+                    continue
+                up = u.text.upper()
+                if nxt is not None and nxt.kind == "op" and nxt.text == "(":
+                    j = _call_span(rhs, i + 1)
+                    if j is None:
+                        return False
+                    if up in SCALAR_FUNCS:
+                        i = j + 1
+                        continue
+                    if up in ("IF", "IFERROR", "SWITCH", "COALESCE") \
+                            and _is_scalar_expr(rhs[i + 2:j], scalar_vars):
+                        i = j + 1
+                        continue
+                    return False
+                if u.text.lower() in scalar_vars or up in ("AND", "OR", "NOT", "IN"):
+                    i += 1
+                    continue
+                return False
+            return False
+        return True
+
+    scalar_vars: set[str] = set()
     changed = True
     while changed:
         changed = False
         for name, rhs in var_rhs.items():
-            if name not in table_vars and not _single_scalar_call(rhs) \
-                    and any(u.kind == "ident" and u.text.lower() in table_vars for u in rhs):
-                table_vars.add(name)
+            if name not in scalar_vars and _is_scalar_expr(rhs, scalar_vars):
+                scalar_vars.add(name)
                 changed = True
+    table_vars = set(var_rhs) - scalar_vars
     extension = {t.value.lower() for t in sig if t.kind == "str"}
     toks: list[tuple[str, str, str]] = []
     uncertain = False

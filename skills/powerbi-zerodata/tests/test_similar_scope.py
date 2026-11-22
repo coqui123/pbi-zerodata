@@ -53,6 +53,12 @@ SALES = (
     "\tmeasure DerivedB = VAR a = Other VAR v = FILTER(a, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
     "\tmeasure ScalarQA = VAR n = MAX('Sales'[Price]) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
     "\tmeasure ScalarQB = VAR n = MAX('Sales'[Price]) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure CrossA = VAR src = Other VAR v = CROSSJOIN(src, { 1 }) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure CrossB = VAR src = Other VAR v = CROSSJOIN(src, { 1 }) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure CtorA = VAR v = { 1, 2 } RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure CtorB = VAR v = { 1, 2 } RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure CountA = VAR n = COUNTROWS(Other) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure CountB = VAR n = COUNTROWS(Other) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -99,7 +105,8 @@ class SimilarScopeTests(unittest.TestCase):
               "VarA", "VarB", "AliasUnres", "AliasOk", "WrapA", "WrapB",
               "TabA", "TabB", "TabCtrlA", "TabCtrlB", "TopA", "TopB", "ScalarA", "ScalarB",
               "ExprA", "ExprB", "ChainA", "ChainB", "ValuesA", "ValuesB",
-              "DerivedA", "DerivedB", "ScalarQA", "ScalarQB")},
+              "DerivedA", "DerivedB", "ScalarQA", "ScalarQB", "CrossA", "CrossB",
+              "CtorA", "CtorB", "CountA", "CountB")},
         )
 
     def _canon(self, name):
@@ -205,6 +212,20 @@ class SimilarScopeTests(unittest.TestCase):
                 with self.assertRaises(PbzError) as caught:
                     consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_unlisted_table_forms_still_poison(self):
+        for dup, into in (("CrossB", "CrossA"), ("CtorB", "CtorA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_table_consuming_scalar_var_does_not_poison(self):
+        self.assertFalse(self._canon("CountA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "CountB", "CountA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
 
     def test_quoted_qualified_scalar_var_does_not_poison(self):
         self.assertFalse(self._canon("ScalarQA").uncertain)
