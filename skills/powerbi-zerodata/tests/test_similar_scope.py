@@ -21,6 +21,7 @@ from pbz.common import PbzError  # noqa: E402
 SALES = (
     "table Sales\n\n"
     "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
+    "\tcolumn Qty\n\t\tdataType: int64\n\t\tsourceColumn: Qty\n\n"
     "\tmeasure IterA = SUMX(Sales, SUMX(Other, [Price]))\n\n"
     "\tmeasure IterB = SUMX(Sales, SUMX(Other, Sales[Price]))\n\n"
     "\tmeasure IterC = SUMX(Sales, [Price] + SUMX(Other, [Price]))\n\n"
@@ -175,6 +176,12 @@ SALES = (
     "\tmeasure XnpvUnionB = SUMX(Sales, XNPV(UNION(VALUES(Sales[Price]), VALUES(Sales[Price])), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure XnpvProjA = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), [Price]), DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure XnpvProjB = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure WrapProjA = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(FILTER(Sales, TRUE()), \"K\", 1), [Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure WrapProjB = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(FILTER(Sales, TRUE()), \"K\", 1), Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure PlainProjA = SUMX(Sales, SUMX(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), [Price])))\n\n"
+    "\tmeasure PlainProjB = SUMX(Sales, SUMX(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), Sales[Price])))\n\n"
+    "\tmeasure ValuesColA = SUMX(Sales, SUMX(VALUES(Sales[Qty]), [Price]))\n\n"
+    "\tmeasure ValuesColB = SUMX(Sales, SUMX(VALUES(Sales[Qty]), Sales[Price]))\n\n"
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
 )
@@ -252,7 +259,8 @@ class SimilarScopeTests(unittest.TestCase):
               "XnpvExcA", "XnpvExcB", "XnpvSelA", "XnpvSelB", "XnpvRankA", "XnpvRankB",
               "XnpvRateCtrlA", "XnpvRateCtrlB", "XnpvDateA", "XnpvDateB",
               "XnpvThirdA", "XnpvThirdB", "XnpvUnionA", "XnpvUnionB",
-              "XnpvProjA", "XnpvProjB")},
+              "XnpvProjA", "XnpvProjB", "WrapProjA", "WrapProjB",
+              "PlainProjA", "PlainProjB", "ValuesColA", "ValuesColB")},
         )
 
     def _canon(self, name):
@@ -474,7 +482,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("XnpvExcB", "XnpvExcA"), ("XnpvSelB", "XnpvSelA"),
                           ("XnpvRankB", "XnpvRankA"), ("XnpvDateB", "XnpvDateA"),
                           ("XnpvThirdB", "XnpvThirdA"), ("XnpvUnionB", "XnpvUnionA"),
-                          ("XnpvProjB", "XnpvProjA")):
+                          ("XnpvProjB", "XnpvProjA"), ("WrapProjB", "WrapProjA"),
+                          ("PlainProjB", "PlainProjA"), ("ValuesColB", "ValuesColA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

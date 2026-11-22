@@ -270,7 +270,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 return True
         return False
 
-    def learn(table, bare: bool = False) -> None:
+    PROJECTING = ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY",
+                  "ALLEXCEPT", "TREATAS")
+    NARROWING = ("VALUES", "DISTINCT", "ALL", "ALLEXCEPT", "ALLSELECTED", "ALLNOBLANKROW",
+                 "FILTERS")
+
+    def learn(table, bare: bool = False, column=None) -> None:
         if table:
             for idx, fr in enumerate(stack):
                 if fr["fn"] in deps.ITERATORS and _teaches_at(fr) and not fr["poisoned"]:
@@ -279,10 +284,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     eff_bare = bare and trusted
                     if fr["row_table"] is None:
                         fr["row_table"] = table
-                        src_fr = _source_frame(idx)
-                        if src_fr is not None and src_fr["fn"] in (
-                                "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY"):
+                        if any(g["fn"] in PROJECTING for g in stack[idx + 1:]):
                             fr["projected"] = True
+                        src_fr = _source_frame(idx)
+                        if not bare and column and src_fr is not None \
+                                and src_fr["fn"] in NARROWING:
+                            fr["only_column"] = column
                         if not eff_bare:
                             g = _source_frame(idx)
                             exempt = trusted and g is not None and stack[-1] is g \
@@ -447,7 +454,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if col:
                     lab = f"{tab}[{col}]"
                     toks.append((lab.lower(), "col", lab))
-                    learn(tab)
+                    learn(tab, column=nxt.value)
                     poison_qualified(tab)
                 elif res.measure(nxt.value):
                     lab = f"[{res.measure(nxt.value)[1]}]"
@@ -467,6 +474,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 ref = deps._bare(t.value, home, res, False, [], extension)
             if any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1 and fr["row_table"] is None
                    for fr in stack):
+                uncertain = True
+            if ref.kind == "column" and any(
+                    fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
+                    and (fr.get("projected") and fr["row_table"] == ref.table
+                         or fr.get("only_column") not in (None, ref.name))
+                    for fr in stack):
                 uncertain = True
             if any(fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and fr["arg"] >= 2
                    and (fr["row_table"] is None
@@ -492,6 +505,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
                                     and not _in_caller_args(g) and g["row_table"] == ref.table
                                     and not g.get("projected")
+                                    and g.get("only_column") in (None, ref.name)
                                     for g in stack[c_idx + 1:]):
                     uncertain = True
                 caller_args = CALLER_ARGS.get(fr["fn"])
