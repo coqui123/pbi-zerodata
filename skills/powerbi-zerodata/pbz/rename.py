@@ -44,7 +44,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         if not m:
             raise PbzError("NOT_FOUND", f"measure {old}")
         if _fold(new) != _fold(old) and (any(_fold(mm.name) == _fold(new) for mm in model.all_measures())
-                                         or any(_fold(c.name) == _fold(new) and c.table == m.table
+                                         or any(_fold(c.name) == _fold(new)
                                                 for c in model.all_columns())):
             raise PbzError("NAME_TAKEN", new)
         if any(_fold(c.name) == _fold(old) for c in model.all_columns()):
@@ -75,6 +75,12 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         return rename_table(ws, project, model, old, new)
     else:
         raise PbzError("UNSUPPORTED", "rename supports measure, column and table")
+    if _fold(new) != _fold(old) and _other_table_owns(
+            model, home, f"{home}.{new}",
+            _extension_owned(project.mirror_report, home),
+            _extension_owned_others(project.mirror_report, home),
+            extra_tables=_extension_tables(project.mirror_report)):
+        raise PbzError("NAME_TAKEN", f"{home}.{new}")
     ext = _external_users(ws, project, kind, home, old)
 
     res = deps.Resolver(model)

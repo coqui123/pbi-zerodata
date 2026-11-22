@@ -809,6 +809,27 @@ class RenameBindingsTests(unittest.TestCase):
             rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
         self.assertEqual(caught.exception.code, "NAME_TAKEN")
 
+    def test_measure_rename_into_column_on_other_table_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tmeasure Margin = 1\n")
+        _write(os.path.join(mdef, "tables", "Other.tmdl"),
+               "table Other\n\tcolumn Net\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Total", "expression": "SUMX('Other', [Margin])"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "measure", "Margin", "Net")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_column_rename_destination_string_owned_by_longer_table_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Amount"}]})
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Value\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "Region.Value", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
