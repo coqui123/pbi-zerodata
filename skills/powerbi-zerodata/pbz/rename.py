@@ -1060,6 +1060,12 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
                 prev_name = toks[-1].value or toks[-1].text
                 if _fold(binding.ref.name) in ext_measures.get(_fold(prev_name), set()):
                     return True
+        if binding.ref.kind == "measure" and _fold(binding.ref.name) in ext_names:
+            # A bare measure reference is ambiguous whenever a report-
+            # extension measure bears the name: measures bind by name
+            # alone, so the resolver's firm answer cannot distinguish
+            # the model measure from the extension measure.
+            return True
         if binding.ref.kind == "table" or not (binding.uncertain or binding.ref.kind == "unresolved"):
             # A firm binding (a table reference, or a row-context column)
             # is the resolver's answer and is honored; only an unresolved
@@ -1254,7 +1260,10 @@ IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _dax_table(new: str, quoted: bool) -> str:
-    return lexers.dax_table_name(new) if quoted or not IDENT_RE.fullmatch(new) else new
+    # A DAX keyword name is quoted even when the source was unquoted: the
+    # bare token would be the keyword, not a table reference.
+    return lexers.dax_table_name(new) if quoted or not IDENT_RE.fullmatch(new) \
+        or _fold(new) in _DAX_KEYWORDS else new
 
 
 def _m_ident(new: str) -> str:

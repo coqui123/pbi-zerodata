@@ -1280,6 +1280,36 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "column", "Amount", "Total", table="Sales")
         self.assertEqual(json.loads(path.read_text()), {"refs": [{"queryRef": "Sum(Sales.Total)"}]})
 
+    def test_table_rename_to_keyword_name_quotes_and_renames_on(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "M", "expression": "COUNTROWS(Sales)"}]}]}))
+        rename.rename(ws, project, "table", "Sales", "Return")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS('Return')")
+        rename.rename(ws, project, "table", "Return", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS('Archive')")
+
+    def test_bare_ref_ambiguous_between_model_and_extension_measure_stays(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tmeasure M = 1\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "M", "expression": "7"}]},
+            {"name": "Forecast", "measures": [{"name": "F", "expression": "[M]"}]}]}))
+        rename.rename(ws, project, "measure", "M", "Net", table="Sales")
+        f = json.loads(ext_path.read_text())["entities"][1]["measures"][0]["expression"]
+        self.assertEqual(f, "[M]")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
