@@ -271,7 +271,8 @@ class RenameBindingsTests(unittest.TestCase):
 
     def test_table_rename_expression_metadata_unchanged(self):
         for value in ("Sales.Amount.Share IN { 2025 }", "Sales.Amount.Share % Sales.Total",
-                      "Sales.Amount.Share || Sales.Amount"):
+                      "Sales.Amount.Share || Sales.Amount", "Sales.Amount.Share AND Sales.Total",
+                      "Sales.Amount.Share IN AllowedYears"):
             with self.subTest(value=value):
                 ws, project, _mdef, path = self._report_project({"refs": [{"metadata": value}]})
                 before = path.read_bytes()
@@ -292,6 +293,54 @@ class RenameBindingsTests(unittest.TestCase):
         after = json.loads(path.read_text())["projections"]
         self.assertEqual(after[0]["details"]["nativeQueryRef"], "Amount")
         self.assertEqual(after[1]["details"]["nativeQueryRef"], "Value")
+
+    def test_string_ownership_scoped_to_containing_element(self):
+        col = lambda e: {"Column": {"Expression": {"SourceRef": {"Entity": e}}, "Property": "Amount"}}
+        # A standalone string in a sibling element does not inherit its field.
+        ws, project, _mdef, path = self._report_project(
+            {"projections": [col("Other"), {"queryRef": "Sales.Amount"}]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][1]["queryRef"], "Sales.Value")
+        # A nearer unique field is not poisoned by the array's other elements.
+        ws, project, _mdef, path = self._report_project({"projections": [
+            col("Other"), col("Sales"),
+            {"field": col("Sales"), "queryRef": "Sales.Amount",
+             "details": {"nativeQueryRef": "Amount"}}]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        after = json.loads(path.read_text())["projections"]
+        self.assertEqual(after[2]["queryRef"], "Sales.Value")
+        self.assertEqual(after[2]["details"]["nativeQueryRef"], "Value")
+        self.assertEqual(after[0]["Column"]["Property"], "Amount")
+
+    def test_table_rename_field_binding_beats_longer_table_prefix(self):
+        ws, project, mdef = self._project()
+        _write(os.path.join(mdef, "model.tmdl"),
+               "model Model\n\tculture: en-US\n\nref table Sales\n\nref table 'Sales.Region'\n")
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Amount'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        path = Path(project.mirror_report, "definition", "report.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"projections": [{
+            "field": {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                 "Property": "Region.Amount"}},
+            "queryRef": "Sales.Region.Amount"}]}))
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        after = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(after["queryRef"], "Revenue.Region.Amount")
+        self.assertEqual(after["field"]["Column"]["Expression"]["SourceRef"]["Entity"], "Revenue")
+        # The same string with no binding stays untouched: the longer table owns it.
+        ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Region.Amount"}]})
+        _write(os.path.join(mdef, "model.tmdl"),
+               "model Model\n\tculture: en-US\n\nref table Sales\n\nref table 'Sales.Region'\n")
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Amount'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(path.read_bytes(), before)
 
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})

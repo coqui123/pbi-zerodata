@@ -265,7 +265,6 @@ def _report_string_sites(root, model, fields=None):
     for ref, site in fields:
         parent = site[:-1]
         siblings[parent] = ref if parent not in siblings else _AMBIGUOUS
-    ambiguous = {parent for parent, ref in siblings.items() if ref is _AMBIGUOUS}
     sites = {}
     for site, node in _report_string_nodes(root):
         field = None
@@ -273,11 +272,19 @@ def _report_string_sites(root, model, fields=None):
             field = owners.get(site[:length])
             if field is not None:
                 break
-        if field is None and any(site[:length] in ambiguous
-                                 for length in range(len(site) - 1, -1, -1)):
-            field = _AMBIGUOUS
         if field is None:
-            for length in range(len(site) - 1, -1, -1):
+            # Inherit the field of the containing element: ascend only within
+            # the innermost array element on the path, and let the nearest
+            # ancestor decide. siblings stores _AMBIGUOUS for a parent holding
+            # several fields, so an ambiguous container still fails closed,
+            # while a unique nearer field is not poisoned by a farther
+            # ambiguous container and a sibling element's field is never
+            # inherited.
+            floor = 0
+            for i, part in enumerate(site):
+                if isinstance(part, int):
+                    floor = i + 1
+            for length in range(len(site) - 1, floor - 1, -1):
                 field = siblings.get(site[:length])
                 if field is not None:
                     break
@@ -327,15 +334,22 @@ def _table_qualified(model, old):
     return table, qualified
 
 
-def _path_extension(rest):
+_WORD_OPERATORS = {"and", "in", "not", "or"}
+
+
+def _path_extension(rest, old):
     """True when rest is only dotted name segments extending a qualified path
     (hierarchy levels, variations), never an expression fragment. An allowlist,
-    so a new operator character cannot reopen a partial rewrite."""
+    so a new operator character cannot reopen a partial rewrite; a word
+    operator or a fresh reference to the renamed table also disqualifies the
+    remainder, since either means the string holds more than one reference."""
     if not rest:
         return False
     for seg in rest.split("."):
         seg = seg.strip()
         if not seg or not all(ch.isalnum() or ch in "_ " for ch in seg):
+            return False
+        if any(tok in _WORD_OPERATORS or tok == old.lower() for tok in seg.lower().split()):
             return False
     return True
 
@@ -369,7 +383,7 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None):
         for q in qualified:
             if text.lower().startswith(q + "."):
                 rest = text[len(q) + 1:]
-                if _path_extension(rest):
+                if _path_extension(rest, old):
                     return True
         return False
 
@@ -435,6 +449,19 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                           extra_qualified=()):
     if kind == "table":
         if key in ("queryRef", "metadata", "queryName"):
+            if field is not None and field is not _AMBIGUOUS \
+                    and field.table.lower() == old.lower():
+                # The resolved field settles ownership: a string naming the
+                # field's own qualified path follows its table even when a
+                # longer table name shares the prefix.
+                base = f"{field.table}.{field.name}"
+                if value.lower() == base.lower() \
+                        or (value.lower().startswith(base.lower() + ".")
+                            and _path_extension(value[len(base) + 1:], old)):
+                    return new + value[len(field.table):]
+                wrapped = _wrapped_inner(value)
+                if wrapped and wrapped[1].lower() == base.lower():
+                    return f"{wrapped[0]}({new}{wrapped[1][len(field.table):]})"
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
                 return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model)
@@ -442,7 +469,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                 return new + value[len(old):]
             wrapped = _single_wrapped(value)
             if wrapped and wrapped[1].lower().startswith(old.lower() + ".") \
-                    and _path_extension(wrapped[1][len(old) + 1:]):
+                    and _path_extension(wrapped[1][len(old) + 1:], old):
                 return f"{wrapped[0]}({new}{wrapped[1][len(old):]})"
         return value
     if key == "queryName":
@@ -675,12 +702,14 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
 
         visit(root)
         _tbl, _qualified = _table_qualified(model, old)
-        _qualified = _qualified | _extension_qualified(project.mirror_report, old)
-        for key, node in pbir.string_nodes(root):
-            if key in ("queryRef", "metadata", "queryName") and _tbl is not None:
-                nv = _table_rewrite(node.value, old, new, _qualified, _tbl, model)
-                if nv != node.value:
-                    edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
+        if _tbl is not None:
+            ext_q = _extension_qualified(project.mirror_report, old)
+            for site, (node, field) in _report_string_sites(root, model).items():
+                if site[-1] in ("queryRef", "metadata", "queryName"):
+                    nv = _report_string_rename(site[-1], node.value, "table", "", old, new,
+                                               field, model, extra_qualified=ext_q)
+                    if nv != node.value:
+                        edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
         return edits, False
 
     from .move import plan_pbir
