@@ -289,7 +289,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         src_fr = _source_frame(idx)
                         if not bare and column and src_fr is not None \
                                 and src_fr["fn"] in NARROWING:
-                            fr["only_column"] = column
+                            fr["only_column"] = column.lower()
                         if not eff_bare:
                             g = _source_frame(idx)
                             exempt = trusted and g is not None and stack[-1] is g \
@@ -415,6 +415,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         elif t.kind == "op" and t.text in (")", "}"):
             if stack:
                 closed = stack.pop()
+                if closed.get("names"):
+                    for fr in stack:
+                        if fr["fn"] in deps.ITERATORS:
+                            fr.setdefault("captured", set()).update(closed["names"])
                 if closed.get("x_span") is not None and closed["arg"] == 0 \
                         and closed.get("x_table") is None:
                     closed["x_table"] = _span_table(closed["x_span"])
@@ -435,6 +439,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     and stack[-1].get("x_table") is None:
                 stack[-1]["x_table"] = _span_table(stack[-1]["x_span"])
             stack[-1]["arg"] += 1
+        if stack and stack[-1]["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS") \
+                and stack[-1]["arg"] % 2 == 1 and t.kind == "str":
+            stack[-1].setdefault("names", set()).add(t.value.lower())
         if t.kind in LIT_KINDS:
             val = _num(t.text) if t.kind == "num" else ("T" + t.text if t.kind == "pbztok" else "S" + t.value)
             toks.append(("LIT", "lit", val))
@@ -478,7 +485,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             if ref.kind == "column" and any(
                     fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
                     and (fr.get("projected") and fr["row_table"] == ref.table
-                         or fr.get("only_column") not in (None, ref.name))
+                         or fr.get("only_column") not in (None, ref.name.lower())
+                         or ref.name.lower() in fr.get("captured", ()))
                     for fr in stack):
                 uncertain = True
             if any(fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and fr["arg"] >= 2
@@ -505,7 +513,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
                                     and not _in_caller_args(g) and g["row_table"] == ref.table
                                     and not g.get("projected")
-                                    and g.get("only_column") in (None, ref.name)
+                                    and g.get("only_column") in (None, ref.name.lower())
                                     for g in stack[c_idx + 1:]):
                     uncertain = True
                 caller_args = CALLER_ARGS.get(fr["fn"])

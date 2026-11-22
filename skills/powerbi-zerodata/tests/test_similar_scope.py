@@ -21,7 +21,6 @@ from pbz.common import PbzError  # noqa: E402
 SALES = (
     "table Sales\n\n"
     "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
-    "\tcolumn Qty\n\t\tdataType: int64\n\t\tsourceColumn: Qty\n\n"
     "\tmeasure IterA = SUMX(Sales, SUMX(Other, [Price]))\n\n"
     "\tmeasure IterB = SUMX(Sales, SUMX(Other, Sales[Price]))\n\n"
     "\tmeasure IterC = SUMX(Sales, [Price] + SUMX(Other, [Price]))\n\n"
@@ -180,8 +179,13 @@ SALES = (
     "\tmeasure WrapProjB = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(FILTER(Sales, TRUE()), \"K\", 1), Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure PlainProjA = SUMX(Sales, SUMX(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), [Price])))\n\n"
     "\tmeasure PlainProjB = SUMX(Sales, SUMX(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), Sales[Price])))\n\n"
-    "\tmeasure ValuesColA = SUMX(Sales, SUMX(VALUES(Sales[Qty]), [Price]))\n\n"
-    "\tmeasure ValuesColB = SUMX(Sales, SUMX(VALUES(Sales[Qty]), Sales[Price]))\n\n"
+    "\tmeasure ValuesColA = SUMX(Sales, SUMX(VALUES(Wide[Qty]), [Price]))\n\n"
+    "\tmeasure ValuesColB = SUMX(Sales, SUMX(VALUES(Wide[Qty]), Wide[Price]))\n\n"
+    "\tmeasure AddColA = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), [Price]))\n\n"
+    "\tmeasure AddColB = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure ProjCapA = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"Price\", 1), [Price]))\n\n"
+    "\tmeasure ProjCapB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"Price\", 1), Sales[Price]))\n\n"
+
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
 )
@@ -189,11 +193,16 @@ OTHER = (
     "table Other\n\n"
     "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
 )
+WIDE = (
+    "table Wide\n\n"
+    "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
+    "\tcolumn Qty\n\t\tdataType: int64\n\t\tsourceColumn: Qty\n\n"
+)
 DATES = (
     "table Dates\n\n"
     "\tcolumn Day\n\t\tdataType: dateTime\n\t\tsourceColumn: Day\n\n"
 )
-MODEL = "model Model\n\tculture: en-US\n\nref table Sales\nref table Other\nref table Dates\n"
+MODEL = "model Model\n\tculture: en-US\n\nref table Sales\nref table Other\nref table Dates\nref table Wide\n"
 DATABASE = "database\n\tcompatibilityLevel: 1400\n"
 
 
@@ -217,12 +226,13 @@ class SimilarScopeTests(unittest.TestCase):
         _write(os.path.join(mdef, "tables", "Sales.tmdl"), SALES)
         _write(os.path.join(mdef, "tables", "Other.tmdl"), OTHER)
         _write(os.path.join(mdef, "tables", "Dates.tmdl"), DATES)
+        _write(os.path.join(mdef, "tables", "Wide.tmdl"), WIDE)
         _write(os.path.join(mdef, "model.tmdl"), MODEL)
         _write(os.path.join(mdef, "database.tmdl"), DATABASE)
         os.makedirs(self.project.model_dir, exist_ok=True)
         self.model = tmdl.load_model(mdef)
         self.resolver = deps.Resolver(self.model)
-        self.assertEqual(set(self.model.tables), {"Sales", "Other", "Dates"})
+        self.assertEqual(set(self.model.tables), {"Sales", "Other", "Dates", "Wide"})
         for table in ("Sales", "Other"):
             self.assertIsNotNone(self.model.column(table, "Price"))
             self.assertIsNone(self.model.column(table, "Nope"))
@@ -260,7 +270,8 @@ class SimilarScopeTests(unittest.TestCase):
               "XnpvRateCtrlA", "XnpvRateCtrlB", "XnpvDateA", "XnpvDateB",
               "XnpvThirdA", "XnpvThirdB", "XnpvUnionA", "XnpvUnionB",
               "XnpvProjA", "XnpvProjB", "WrapProjA", "WrapProjB",
-              "PlainProjA", "PlainProjB", "ValuesColA", "ValuesColB")},
+              "PlainProjA", "PlainProjB", "ValuesColA", "ValuesColB",
+              "AddColA", "AddColB", "ProjCapA", "ProjCapB")},
         )
 
     def _canon(self, name):
@@ -483,7 +494,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("XnpvRankB", "XnpvRankA"), ("XnpvDateB", "XnpvDateA"),
                           ("XnpvThirdB", "XnpvThirdA"), ("XnpvUnionB", "XnpvUnionA"),
                           ("XnpvProjB", "XnpvProjA"), ("WrapProjB", "WrapProjA"),
-                          ("PlainProjB", "PlainProjA"), ("ValuesColB", "ValuesColA")):
+                          ("PlainProjB", "PlainProjA"), ("ValuesColB", "ValuesColA"),
+                          ("AddColB", "AddColA"), ("ProjCapB", "ProjCapA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
