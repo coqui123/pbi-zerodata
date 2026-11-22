@@ -11,16 +11,55 @@ TEXT_VISUALS = {"textbox", "image", "shape", "basicShape", "actionButton", "page
                 "group", ""}
 
 
-def _unused_vars(expr: str) -> list[str]:
+def _unused_decls(expr: str) -> list[dict]:
+    """Bind uses by scope, then discard declarations with no live uses."""
     sig = lexers.significant(lexers.lex_dax(expr))
-    out = []
+    keys = []
+    stack = []
+    for tok in sig:
+        keys.append(tuple(stack))
+        if tok.kind == "op":
+            if tok.text in ("(", "{"):
+                stack.append(tok.start)
+            elif tok.text in (")", "}") and stack:
+                stack.pop()
+
+    decls = []
+    name_indices = set()
     for i, t in enumerate(sig):
         if t.kind == "ident" and t.text.upper() == "VAR" and i + 1 < len(sig) and sig[i + 1].kind == "ident":
-            name = sig[i + 1].text.lower()
-            later = [x for x in sig[i + 2:] if x.kind == "ident" and x.text.lower() == name]
-            if not later:
-                out.append(sig[i + 1].text)
-    return out
+            end = next((sig[j].start for j in range(i + 2, len(sig))
+                        if keys[j] == keys[i] and sig[j].text.upper() in ("VAR", "RETURN")), None)
+            decls.append({"name": sig[i + 1].text, "lower": sig[i + 1].text.lower(),
+                          "index": i, "start": t.start, "end": end, "key": keys[i], "used": True})
+            name_indices.add(i + 1)
+
+    bindings = []
+    for i, tok in enumerate(sig):
+        if tok.kind != "ident" or tok.text.upper() == "VAR" or i in name_indices:
+            continue
+        bound = next((d for d in reversed(decls)
+                      if d["index"] < i and d["lower"] == tok.text.lower()
+                      and d["key"] == keys[i][:len(d["key"])]), None)
+        if bound is not None:
+            bindings.append((tok.start, bound["index"]))
+
+    dead = set()
+    while True:
+        dead_spans = [(d["start"], d["end"]) for d in decls if d["index"] in dead]
+        live = {index for start, index in bindings
+                if not any(begin <= start < end for begin, end in dead_spans)}
+        newly_dead = {d["index"] for d in decls if d["end"] is not None and d["index"] not in live}
+        if newly_dead <= dead:
+            break
+        dead.update(newly_dead)
+    for d in decls:
+        d["used"] = d["index"] not in dead
+    return decls
+
+
+def _unused_vars(expr: str) -> list[str]:
+    return [d["name"] for d in _unused_decls(expr) if not d["used"]]
 
 
 def run(ws, project, extra_reports=()) -> dict:
