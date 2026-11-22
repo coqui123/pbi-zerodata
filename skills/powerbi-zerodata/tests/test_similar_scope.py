@@ -101,6 +101,14 @@ SALES = (
     "\tmeasure PredValuesB = SUMX(FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0), [Price])\n\n"
     "\tmeasure PredVarA = VAR v = Other RETURN SUMX(FILTER(Sales, COUNTROWS(v) > 0), [Price])\n\n"
     "\tmeasure PredVarB = VAR v = Other RETURN SUMX(FILTER(Sales, COUNTROWS(v) > 0), [Price])\n\n"
+    "\tmeasure JoinA = VAR v = Other RETURN SUMX(NATURALLEFTOUTERJOIN(Sales, v), [Price])\n\n"
+    "\tmeasure JoinB = VAR v = Other RETURN SUMX(NATURALLEFTOUTERJOIN(Sales, v), Sales[Price])\n\n"
+    "\tmeasure JoinInlA = SUMX(NATURALLEFTOUTERJOIN(Sales, Other), [Price])\n\n"
+    "\tmeasure JoinInlB = SUMX(NATURALLEFTOUTERJOIN(Sales, Other), Sales[Price])\n\n"
+    "\tmeasure TopnCountCtrlA = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
+    "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
+    "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
+    "\tmeasure TopnSortCtrlB = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -155,7 +163,9 @@ class SimilarScopeTests(unittest.TestCase):
               "CalcA", "CalcB", "AllCountA", "AllCountB", "FiltCountA", "FiltCountB",
               "IfPredCtrlA", "IfPredCtrlB", "ContainsA", "ContainsB",
               "PredCountCtrlA", "PredCountCtrlB", "MaxxCtrlA", "MaxxCtrlB",
-              "PredMaxxA", "PredMaxxB", "PredValuesA", "PredValuesB", "PredVarA", "PredVarB")},
+              "PredMaxxA", "PredMaxxB", "PredValuesA", "PredValuesB", "PredVarA", "PredVarB",
+              "JoinA", "JoinB", "JoinInlA", "JoinInlB",
+              "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB")},
         )
 
     def _canon(self, name):
@@ -319,6 +329,22 @@ class SimilarScopeTests(unittest.TestCase):
         with self.assertRaises(PbzError) as caught:
             consolidate.merge(self.ws, self.project, "FiltCountB", "FiltCountA", dry_run=True)
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_natural_join_second_table_still_poisons(self):
+        for dup, into in (("JoinB", "JoinA"), ("JoinInlB", "JoinInlA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_topn_scalar_arguments_stay_certain(self):
+        for name, dup in (("TopnCountCtrlA", "TopnCountCtrlB"), ("TopnSortCtrlA", "TopnSortCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
 
     def test_unlisted_scalar_wrapper_still_poisons(self):
         self.assertEqual(self._key("ContainsA"), self._key("ContainsB"))

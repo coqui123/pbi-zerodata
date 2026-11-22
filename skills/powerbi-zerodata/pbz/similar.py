@@ -212,11 +212,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     def _crossing_ok(p, d) -> bool:
         if p["fn"] in CONDITIONALS or p["fn"] == "":
             return True
-        if p["fn"] in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN", "GENERATE", "GENERATEALL"):
+        if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+            return d == 1
+        if p["fn"] in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN", "GENERATE", "GENERATEALL",
+                       "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN"):
             return True
         if p["fn"] in TABLE_INPUT_ARG0 and d == 0:
-            return True
-        if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and d == 1:
             return True
         if _is_table_frame(p) and d == 0:
             return True
@@ -273,6 +274,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 else:
                     p, d = bad
                     if p["fn"] in PREDICATE_EXEMPT and d >= 1:
+                        continue
+                    if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
                         continue
                     if p["fn"] in SCALAR_FUNCS or p["fn"] in X_ITERATORS or p["fn"] == "{":
                         continue
