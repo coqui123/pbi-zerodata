@@ -279,6 +279,12 @@ SALES = (
     "\tmeasure NestTopnB = COUNTROWS(TOPN(1, Other, SUMX(Sales, Sales[Price])))\n\n"
     "\tmeasure CapNestCtrlA = SUMX(ADDCOLUMNS(Dates, \"Price\", 1), SUMX(Other, [Price]))\n\n"
     "\tmeasure CapNestCtrlB = SUMX(ADDCOLUMNS(Dates, \"Price\", 1), SUMX(Other, Other[Price]))\n\n"
+    "\tmeasure CapSelfA = SUMX(ADDCOLUMNS(Sales, \"Price\", 1), [Price])\n\n"
+    "\tmeasure CapSelfB = SUMX(ADDCOLUMNS(Sales, \"Price\", 1), Sales[Price])\n\n"
+    "\tmeasure ClauseNestCtrlA = COUNTROWS(INDEX(1, Other, ORDERBY(SUMX(Sales, [Price]), DESC)))\n\n"
+    "\tmeasure ClauseNestCtrlB = COUNTROWS(INDEX(1, Other, ORDERBY(SUMX(Sales, Sales[Price]), DESC)))\n\n"
+    "\tmeasure RowOuterCtrlA = SUMX(ROW(\"K\", 1), SUMX(Sales, [Price]))\n\n"
+    "\tmeasure RowOuterCtrlB = SUMX(ROW(\"K\", 1), SUMX(Sales, Sales[Price]))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -389,7 +395,8 @@ class SimilarScopeTests(unittest.TestCase):
               "CtorCommaA", "CtorCommaB", "UnionPadA", "UnionPadB",
               "ShadowCtorA", "ShadowCtorB", "CtorNestCtrlA", "CtorNestCtrlB",
               "CtorNarrowCtrlA", "CtorNarrowCtrlB", "NestTopnA", "NestTopnB",
-              "CapNestCtrlA", "CapNestCtrlB")} | {("Other", "OtherRows")},
+              "CapNestCtrlA", "CapNestCtrlB", "CapSelfA", "CapSelfB",
+              "ClauseNestCtrlA", "ClauseNestCtrlB", "RowOuterCtrlA", "RowOuterCtrlB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -622,8 +629,17 @@ class SimilarScopeTests(unittest.TestCase):
         result = consolidate.merge(self.ws, self.project, "CtorNarrowCtrlB", "CtorNarrowCtrlA", dry_run=True)
         self.assertEqual(result["equivalence"], "identical")
 
+    def test_owner_captured_name_is_refused(self):
+        self.assertEqual(self._key("CapSelfA"), self._key("CapSelfB"))
+        self.assertTrue(self._canon("CapSelfA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "CapSelfB", "CapSelfA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
     def test_nested_owner_exempts_sort_and_capture_guards(self):
-        for name, dup in (("NestTopnA", "NestTopnB"), ("CapNestCtrlA", "CapNestCtrlB")):
+        for name, dup in (("NestTopnA", "NestTopnB"), ("CapNestCtrlA", "CapNestCtrlB"),
+                          ("ClauseNestCtrlA", "ClauseNestCtrlB"),
+                          ("RowOuterCtrlA", "RowOuterCtrlB")):
             with self.subTest(name=name):
                 self.assertFalse(self._canon(name).uncertain)
                 result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)

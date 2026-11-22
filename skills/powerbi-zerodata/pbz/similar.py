@@ -612,17 +612,32 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             else:
                 uncertain = True
                 ref = deps._bare(t.value, home, res, False, [], extension)
-            if any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1 and fr["row_table"] is None
-                   for fr in stack):
+            def _governed_from(start):
+                if ref.kind != "column":
+                    return -1
+                for j in range(len(stack) - 1, start - 1, -1):
+                    g = stack[j]
+                    if g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1 \
+                            and not _in_caller_args(g):
+                        return j if (g["row_table"] == ref.table
+                                     and not g.get("projected")
+                                     and _only_has(g, ref.name.lower())) else -1
+                return -1
+
+            governed_idx = _governed_from(0)
+            governed = governed_idx >= 0
+            if not governed and any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
+                                    and fr["row_table"] is None
+                                    for fr in stack):
                 uncertain = True
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] == "{":
-                    governed = ref.kind == "column" and any(
+                    ctor_governed = ref.kind == "column" and any(
                         g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
                         and not _in_caller_args(g) and g["row_table"] == ref.table
                         and not g.get("projected") and _only_has(g, ref.name.lower())
                         for g in stack[c_idx + 1:])
-                    if governed:
+                    if ctor_governed:
                         continue
                     ctx = None
                     found = False
@@ -636,30 +651,19 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         uncertain = True
                     elif not found and ref.kind == "column":
                         uncertain = True
-            def _governed_from(start):
-                if ref.kind != "column":
-                    return False
-                for g in reversed(stack[start:]):
-                    if g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1 \
-                            and not _in_caller_args(g):
-                        return g["row_table"] == ref.table \
-                            and not g.get("projected") and _only_has(g, ref.name.lower())
-                return False
-
-            governed = _governed_from(0)
             if ref.kind == "column" and not governed and any(
                     fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
                     and (fr.get("projected") and fr["row_table"] == ref.table
                          or not _only_has(fr, ref.name.lower()))
                     for fr in stack):
                 uncertain = True
-            if not governed and any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
+            if any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
                    and t.value.lower() in fr.get("captured", ())
-                   for fr in stack):
+                   for fr in (stack[governed_idx:] if governed else stack)):
                 uncertain = True
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and fr["arg"] >= 2 \
-                        and not _governed_from(c_idx + 1) \
+                        and _governed_from(c_idx + 1) < 0 \
                         and (fr["row_table"] is None
                              or (ref.kind == "column" and fr["row_table"] != ref.table)
                              or (ref.kind == "measure" and fr["row_table"] is not None
@@ -668,7 +672,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                              or t.value.lower() in fr.get("captured", ())):
                     uncertain = True
             for c_idx, fr in enumerate(stack):
-                if fr["fn"] in ("ORDERBY", "PARTITIONBY", "MATCHBY") and c_idx > 0:
+                if fr["fn"] in ("ORDERBY", "PARTITIONBY", "MATCHBY") and c_idx > 0 \
+                        and _governed_from(c_idx + 1) < 0:
                     parent = stack[c_idx - 1]
                     if parent["row_table"] is None \
                             or (ref.kind == "column" and parent["row_table"] != ref.table) \
