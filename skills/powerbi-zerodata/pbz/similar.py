@@ -295,22 +295,62 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             and _taint_cleared(fr, idx):
                         fr["taint"] = None
 
-    def _note_x(tab, bare: bool = False) -> None:
-        if tab:
-            for idx, fr in enumerate(stack):
-                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] == 0:
-                    frames = stack[idx + 1:]
-                    if any(g["fn"] == "TREATAS" for g in frames):
-                        continue
-                    if _first_nonsource(frames, stack[-1]["arg"] if frames else 0) is not None:
-                        continue
-                    if not bare and not (stack[-1]["fn"] in TABLE_INPUT_ARG0
-                                         and stack[-1]["arg"] == 0):
-                        continue
-                    if fr.get("x_table") is None:
-                        fr["x_table"] = tab
-                    elif fr["x_table"] != tab:
-                        fr["x_table"] = "<conflict>"
+    def _span_args(span):
+        args, depth, cur = [], 0, []
+        for u in span:
+            if u.kind == "op" and u.text in ("(", "{"):
+                depth += 1
+            elif u.kind == "op" and u.text in (")", "}"):
+                depth -= 1
+            if depth == 0 and u.kind == "op" and u.text == ",":
+                args.append(cur)
+                cur = []
+            else:
+                cur.append(u)
+        args.append(cur)
+        return args
+
+    def _span_table(span):
+        while len(span) >= 2 and span[0].kind == "op" and span[0].text == "(" \
+                and _call_span(span, 0) == len(span) - 1:
+            span = span[1:-1]
+        if not span:
+            return None
+        if len(span) == 1:
+            u = span[0]
+            if u.kind == "table":
+                return res.table(u.value) or u.value
+            if u.kind == "ident":
+                if res.table(u.text):
+                    return res.table(u.text)
+                rhss = var_rhs.get(u.text.lower())
+                if rhss:
+                    vals = {_span_table(r) for r in rhss}
+                    return vals.pop() if len(vals) == 1 else None
+            return None
+        if span[0].kind == "ident" and span[1].kind == "op" and span[1].text == "(" \
+                and _call_span(span, 1) == len(span) - 1:
+            fn = span[0].text.upper()
+            args = _span_args(span[2:-1])
+            if fn in ("FILTER", "CALCULATETABLE", "ALL", "ALLEXCEPT", "ALLNOBLANKROW",
+                      "ALLSELECTED", "DISTINCT", "KEEPFILTERS", "FILTERS"):
+                return _span_table(args[0]) if args else None
+            if fn == "VALUES":
+                a = args[0] if args else []
+                if len(a) == 2 and a[1].kind == "bracket":
+                    return res.table(a[0].value if a[0].kind == "table" else a[0].text)
+                return _span_table(a)
+            if fn in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+                return _span_table(args[1]) if len(args) > 1 else None
+            if fn in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN", "NATURALINNERJOIN",
+                      "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
+                vals = {_span_table(a) for a in args}
+                return vals.pop() if len(vals) == 1 else None
+            return None
+        if len(span) == 2 and span[1].kind == "bracket" \
+                and (span[0].kind == "table" or (span[0].kind == "ident" and res.table(span[0].text))):
+            return res.table(span[0].value if span[0].kind == "table" else span[0].text)
+        return None
 
     def poison_qualified(tab) -> None:
         if not tab:
@@ -340,11 +380,16 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     while i < n:
         t = sig[i]
         nxt = sig[i + 1] if i + 1 < n else None
+        for fr in stack:
+            if fr.get("x_span") is not None and fr["arg"] == 0 \
+                    and not (t.kind == "op" and t.text in (",", ")") and stack[-1] is fr):
+                fr["x_span"].append(t)
         if t.kind == "op" and t.text in ("(", "{"):
             prev = sig[i - 1] if i else None
             fn = "{" if t.text == "{" else (prev.text.upper() if prev is not None and prev.kind == "ident" else "")
             frame = {"fn": fn, "arg": 0, "row_table": None, "poisoned": False, "taint": None,
-                     "parent_arg": stack[-1]["arg"] if stack else None}
+                     "parent_arg": stack[-1]["arg"] if stack else None,
+                     "x_span": [] if fn in ("XNPV", "XIRR") else None, "x_skip": True}
             stack.append(frame)
             if fn and fn not in SCALAR_FUNCS and fn not in CONDITIONALS:
                 for f_idx, fr in enumerate(stack[:-1]):
@@ -356,6 +401,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         elif t.kind == "op" and t.text in (")", "}"):
             if stack:
                 closed = stack.pop()
+                if closed.get("x_span") is not None and closed["arg"] == 0 \
+                        and closed.get("x_table") is None:
+                    closed["x_table"] = _span_table(closed["x_span"])
                 for fr in stack:
                     if fr.get("taint") is closed:
                         fr["taint"] = None
@@ -369,6 +417,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                 and _first_nonsource(stack[f_idx + 1:], closed["parent_arg"]) is None:
                             fr["poisoned"] = True
         elif t.kind == "op" and t.text == "," and stack:
+            if stack[-1].get("x_span") is not None and stack[-1]["arg"] == 0 \
+                    and stack[-1].get("x_table") is None:
+                stack[-1]["x_table"] = _span_table(stack[-1]["x_span"])
             stack[-1]["arg"] += 1
         if t.kind in LIT_KINDS:
             val = _num(t.text) if t.kind == "num" else ("T" + t.text if t.kind == "pbztok" else "S" + t.value)
@@ -390,7 +441,6 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     lab = f"{tab}[{col}]"
                     toks.append((lab.lower(), "col", lab))
                     learn(tab)
-                    _note_x(tab)
                     poison_qualified(tab)
                 elif res.measure(nxt.value):
                     lab = f"[{res.measure(nxt.value)[1]}]"
@@ -422,19 +472,29 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     if parent["row_table"] is None \
                             or (ref.kind == "column" and parent["row_table"] != ref.table):
                         uncertain = True
+            CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
+                           "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}
+
+            def _in_caller_args(g) -> bool:
+                ca = CALLER_ARGS.get(g["fn"])
+                return ca is not None and g["arg"] >= ca[0] and (ca[1] is None or g["arg"] <= ca[1])
+
             for c_idx, fr in enumerate(stack):
-                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] >= 1 and ref.kind == "column" \
+                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] == 1 and ref.kind == "column" \
                         and fr.get("x_table") != ref.table \
                         and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
+                                    and not _in_caller_args(g)
                                     for g in stack[c_idx + 1:]):
                     uncertain = True
-                caller_args = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
-                               "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}.get(fr["fn"])
+                caller_args = CALLER_ARGS.get(fr["fn"])
                 if caller_args is not None and ref.kind == "column" \
                         and fr["arg"] >= caller_args[0] \
                         and (caller_args[1] is None or fr["arg"] <= caller_args[1]):
                     caller = None
                     for below in reversed(stack[:c_idx]):
+                        if below["fn"] in ("XNPV", "XIRR") and below["arg"] >= 1:
+                            caller = below.get("x_table")
+                            break
                         if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:
                             caller = below["row_table"]
                             break
@@ -457,7 +517,6 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             tab = res.table(t.value) or t.value
             toks.append(("t:" + tab.lower(), "", ""))
             learn(res.table(t.value), bare=True)
-            _note_x(res.table(t.value), bare=True)
         elif t.kind == "ident":
             low = t.text.lower()
             if nxt is not None and nxt.kind == "op" and nxt.text == "(":
@@ -475,7 +534,6 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
                 learn(res.table(t.text), bare=True)
-                _note_x(res.table(t.text), bare=True)
             else:
                 if t.text.upper() not in ("ASC", "DESC", "DENSE", "SKIP", "AND", "OR", "NOT",
                                           "IN", "TRUE", "FALSE", "BLANK", "ABS", "REL",

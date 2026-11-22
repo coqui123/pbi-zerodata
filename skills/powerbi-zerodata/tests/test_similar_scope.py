@@ -159,6 +159,14 @@ SALES = (
     "\tmeasure XnpvTopB = SUMX(Sales, XNPV(TOPN(MAX(Sales[Price]), Other), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
     "\tmeasure XnpvNestCtrlA = XNPV(Other, SUMX(Sales, [Price]), DATE(2026, 1, 1), 0)\n\n"
     "\tmeasure XnpvNestCtrlB = XNPV(Other, SUMX(Sales, Sales[Price]), DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure XnpvExcA = VAR v = Other RETURN SUMX(Sales, XNPV(EXCEPT(v, Sales), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvExcB = VAR v = Other RETURN SUMX(Sales, XNPV(EXCEPT(v, Sales), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvSelA = SUMX(Sales, XNPV(SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvSelB = SUMX(Sales, XNPV(SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvRankA = SUMX(Sales, XNPV(Other, RANKX(Sales, Sales[Price], [Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvRankB = SUMX(Sales, XNPV(Other, RANKX(Sales, Sales[Price], Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvRateCtrlA = SUMX(Sales, XNPV(Other, Other[Price], DATE(2026, 1, 1), [Price]))\n\n"
+    "\tmeasure XnpvRateCtrlB = SUMX(Sales, XNPV(Other, Other[Price], DATE(2026, 1, 1), Sales[Price]))\n\n"
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
 )
@@ -227,7 +235,9 @@ class SimilarScopeTests(unittest.TestCase):
               "AllExcA", "AllExcB", "TreatA", "TreatB", "TreatFirstA", "TreatFirstB",
               "RankxA", "RankxB", "PercxA", "PercxB", "ConcatxA", "ConcatxB",
               "XnpvA", "XnpvB", "ConcatxSortCtrlA", "ConcatxSortCtrlB",
-              "XnpvTopA", "XnpvTopB", "XnpvNestCtrlA", "XnpvNestCtrlB")},
+              "XnpvTopA", "XnpvTopB", "XnpvNestCtrlA", "XnpvNestCtrlB",
+              "XnpvExcA", "XnpvExcB", "XnpvSelA", "XnpvSelB", "XnpvRankA", "XnpvRankB",
+              "XnpvRateCtrlA", "XnpvRateCtrlB")},
         )
 
     def _canon(self, name):
@@ -401,6 +411,11 @@ class SimilarScopeTests(unittest.TestCase):
                     consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
+    def test_xnpv_rate_argument_stays_certain(self):
+        self.assertFalse(self._canon("XnpvRateCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "XnpvRateCtrlB", "XnpvRateCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
     def test_xnpv_nested_iterator_stays_certain(self):
         self.assertFalse(self._canon("XnpvNestCtrlA").uncertain)
         result = consolidate.merge(self.ws, self.project, "XnpvNestCtrlB", "XnpvNestCtrlA", dry_run=True)
@@ -440,7 +455,9 @@ class SimilarScopeTests(unittest.TestCase):
                           ("SelColB", "SelColA"), ("AllExcB", "AllExcA"),
                           ("TreatB", "TreatA"), ("TreatFirstB", "TreatFirstA"),
                           ("RankxB", "RankxA"), ("PercxB", "PercxA"), ("ConcatxB", "ConcatxA"),
-                          ("XnpvB", "XnpvA"), ("XnpvTopB", "XnpvTopA")):
+                          ("XnpvB", "XnpvA"), ("XnpvTopB", "XnpvTopA"),
+                          ("XnpvExcB", "XnpvExcA"), ("XnpvSelB", "XnpvSelA"),
+                          ("XnpvRankB", "XnpvRankA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
