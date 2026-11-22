@@ -308,9 +308,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         fr["poisoned"] = True
                 if closed["fn"] and closed["fn"] not in SCALAR_FUNCS \
                         and closed["fn"] not in CONDITIONALS:
-                    for fr in stack:
+                    for f_idx, fr in enumerate(stack):
                         if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
-                                and fr["row_table"] is None and not fr["poisoned"]:
+                                and fr["row_table"] is None and not fr["poisoned"] \
+                                and _first_nonsource(stack[f_idx + 1:], closed["parent_arg"]) is None:
                             fr["poisoned"] = True
         elif t.kind == "op" and t.text == "," and stack:
             stack[-1]["arg"] += 1
@@ -352,6 +353,11 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 uncertain = True
                 ref = deps._bare(t.value, home, res, False, [], extension)
             if any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1 and fr["row_table"] is None
+                   for fr in stack):
+                uncertain = True
+            if any(fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and fr["arg"] >= 2
+                   and (fr["row_table"] is None
+                        or (ref.kind == "column" and fr["row_table"] != ref.table))
                    for fr in stack):
                 uncertain = True
             if ref.kind == "column":

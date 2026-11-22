@@ -109,6 +109,10 @@ SALES = (
     "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
     "\tmeasure TopnSortCtrlB = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
+    "\tmeasure TopnBareA = SUMX(Sales, SUMX(TOPN(1, Other, [Price]), Other[Price]))\n\n"
+    "\tmeasure TopnBareB = SUMX(Sales, SUMX(TOPN(1, Other, Sales[Price]), Other[Price]))\n\n"
+    "\tmeasure TopnCountCtorCtrlA = SUMX(TOPN(COUNTROWS({ 1, 2 }), Sales, Sales[Price], DESC), [Price])\n\n"
+    "\tmeasure TopnCountCtorCtrlB = SUMX(TOPN(COUNTROWS({ 1, 2 }), Sales, Sales[Price], DESC), [Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -165,7 +169,8 @@ class SimilarScopeTests(unittest.TestCase):
               "PredCountCtrlA", "PredCountCtrlB", "MaxxCtrlA", "MaxxCtrlB",
               "PredMaxxA", "PredMaxxB", "PredValuesA", "PredValuesB", "PredVarA", "PredVarB",
               "JoinA", "JoinB", "JoinInlA", "JoinInlB",
-              "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB")},
+              "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
+              "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB")},
         )
 
     def _canon(self, name):
@@ -340,11 +345,19 @@ class SimilarScopeTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_topn_scalar_arguments_stay_certain(self):
-        for name, dup in (("TopnCountCtrlA", "TopnCountCtrlB"), ("TopnSortCtrlA", "TopnSortCtrlB")):
+        for name, dup in (("TopnCountCtrlA", "TopnCountCtrlB"), ("TopnSortCtrlA", "TopnSortCtrlB"),
+                          ("TopnCountCtorCtrlA", "TopnCountCtorCtrlB")):
             with self.subTest(name=name):
                 self.assertFalse(self._canon(name).uncertain)
                 result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
                 self.assertEqual(result["equivalence"], "identical")
+
+    def test_bare_column_in_topn_sort_is_uncertain(self):
+        self.assertEqual(self._key("TopnBareA"), self._key("TopnBareB"))
+        self.assertTrue(self._canon("TopnBareA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "TopnBareB", "TopnBareA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_unlisted_scalar_wrapper_still_poisons(self):
         self.assertEqual(self._key("ContainsA"), self._key("ContainsB"))
