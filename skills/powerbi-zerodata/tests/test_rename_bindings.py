@@ -1427,6 +1427,26 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
         self.assertEqual(m, "SUMX(VAR x = 1 RETURN Sales, [Net])")
 
+    def test_table_rename_crossfilter_direction_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn ProductKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Product.tmdl"),
+               "table Product\n\tcolumn ProductKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Both.tmdl"),
+               "table Both\n\tcolumn Code\n\t\tdataType: string\n")
+        _write(os.path.join(mdef, "tables", "relationships.tmdl"),
+               "relationship rel1\n\tfromColumn: Sales.ProductKey\n\ttoColumn: Product.ProductKey\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "CALCULATE(COUNTROWS('Both'), CROSSFILTER(Sales[ProductKey], Product[ProductKey], BOTH))"}]}]}))
+        rename.rename(ws, project, "table", "Both", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "CALCULATE(COUNTROWS('Archive'), CROSSFILTER(Sales[ProductKey], Product[ProductKey], BOTH))")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

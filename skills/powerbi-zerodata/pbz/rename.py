@@ -1006,16 +1006,18 @@ def _pvs_property_node(node):
 
 
 # The DAX reserved words, plus the bare enum values that appear as
-# standalone arguments (ASC, DESC, SKIP, DENSE, and the date interval
-# units SECOND through YEAR): an unquoted token with one of
-# these texts is the keyword, never a table reference, since DAX itself
-# requires such table names to be quoted.
+# standalone arguments (ASC, DESC, SKIP, DENSE, the date interval units
+# SECOND through YEAR, and the CROSSFILTER directions): an unquoted
+# token with one of these texts is the keyword, never a table
+# reference, since DAX itself requires such table names to be quoted.
 _DAX_KEYWORDS = {_fold(w) for w in (
-    "and", "asc", "break", "by", "column", "day", "define", "densify",
-    "dense", "desc", "else", "evaluate", "false", "group", "hour", "in",
-    "index", "matchby", "measure", "minute", "month", "mparameter", "not",
-    "or", "order", "quarter", "return", "row", "second", "skip", "table",
-    "then", "total", "true", "var", "week", "window", "year")}
+    "and", "asc", "both", "break", "by", "column", "day", "define",
+    "densify", "dense", "desc", "else", "evaluate", "false", "group",
+    "hour", "in", "index", "matchby", "measure", "minute", "month",
+    "mparameter", "none", "not", "oneway", "oneway_leftfilters",
+    "oneway_rightfilters", "or", "order", "quarter", "return", "row",
+    "second", "skip", "table", "then", "total", "true", "var", "week",
+    "window", "year")}
 
 
 def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None):
