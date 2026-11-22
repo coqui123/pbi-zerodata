@@ -89,13 +89,38 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     rhs.append(u)
                 var_rhs[sig[i + 1].text.lower()] = rhs
 
+    TABLE_FUNCS = {"ALL", "ALLEXCEPT", "ALLNOBLANKROW", "ALLSELECTED", "VALUES", "DISTINCT",
+                   "FILTER", "CALCULATETABLE", "SUMMARIZE", "SUMMARIZECOLUMNS", "TOPN", "UNION",
+                   "INTERSECT", "EXCEPT", "TREATAS", "GENERATE", "GENERATEALL", "GENERATESERIES",
+                   "ADDCOLUMNS", "SELECTCOLUMNS", "GROUPBY", "ROW", "DATATABLE",
+                   "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN", "SAMPLE", "INDEX", "OFFSET", "WINDOW"}
+
     def _rhs_is_table(rhs) -> bool:
         for j, u in enumerate(rhs):
             nxt = rhs[j + 1] if j + 1 < len(rhs) else None
+            if nxt is not None and nxt.kind == "bracket":
+                continue
             if u.kind == "table":
                 return True
-            if u.kind == "ident" and res.table(u.text) and not (nxt is not None and nxt.kind == "bracket"):
+            if u.kind == "ident" and res.table(u.text):
                 return True
+            if u.kind == "ident" and u.text.upper() in TABLE_FUNCS \
+                    and nxt is not None and nxt.kind == "op" and nxt.text == "(":
+                return True
+        return False
+
+    def _single_scalar_call(rhs) -> bool:
+        if len(rhs) < 3 or rhs[0].kind != "ident" or rhs[0].text.upper() in TABLE_FUNCS \
+                or rhs[1].kind != "op" or rhs[1].text != "(":
+            return False
+        depth = 0
+        for j, u in enumerate(rhs):
+            if u.kind == "op" and u.text in ("(", "{"):
+                depth += 1
+            elif u.kind == "op" and u.text in (")", "}"):
+                depth -= 1
+                if depth == 0:
+                    return j == len(rhs) - 1
         return False
 
     table_vars = {name for name, rhs in var_rhs.items() if _rhs_is_table(rhs)}
@@ -103,8 +128,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     while changed:
         changed = False
         for name, rhs in var_rhs.items():
-            if name not in table_vars and len(rhs) == 1 and rhs[0].kind == "ident" \
-                    and rhs[0].text.lower() in table_vars:
+            if name not in table_vars and not _single_scalar_call(rhs) \
+                    and any(u.kind == "ident" and u.text.lower() in table_vars for u in rhs):
                 table_vars.add(name)
                 changed = True
     extension = {t.value.lower() for t in sig if t.kind == "str"}

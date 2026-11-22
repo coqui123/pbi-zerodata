@@ -47,6 +47,12 @@ SALES = (
     "\tmeasure ExprB = VAR v = FILTER(Other, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
     "\tmeasure ChainA = VAR a = Other VAR v = a RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
     "\tmeasure ChainB = VAR a = Other VAR v = a RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure ValuesA = VAR v = VALUES(Other[Price]) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure ValuesB = VAR v = VALUES(Other[Price]) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure DerivedA = VAR a = Other VAR v = FILTER(a, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure DerivedB = VAR a = Other VAR v = FILTER(a, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure ScalarQA = VAR n = MAX('Sales'[Price]) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure ScalarQB = VAR n = MAX('Sales'[Price]) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -92,7 +98,8 @@ class SimilarScopeTests(unittest.TestCase):
              ("IterA", "IterB", "IterC", "IterD", "UnresA", "UnresB", "CtrlA", "CtrlB",
               "VarA", "VarB", "AliasUnres", "AliasOk", "WrapA", "WrapB",
               "TabA", "TabB", "TabCtrlA", "TabCtrlB", "TopA", "TopB", "ScalarA", "ScalarB",
-              "ExprA", "ExprB", "ChainA", "ChainB")},
+              "ExprA", "ExprB", "ChainA", "ChainB", "ValuesA", "ValuesB",
+              "DerivedA", "DerivedB", "ScalarQA", "ScalarQB")},
         )
 
     def _canon(self, name):
@@ -189,6 +196,20 @@ class SimilarScopeTests(unittest.TestCase):
                 with self.assertRaises(PbzError) as caught:
                     consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_column_fed_and_derived_table_vars_still_poison(self):
+        for dup, into in (("ValuesB", "ValuesA"), ("DerivedB", "DerivedA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_quoted_qualified_scalar_var_does_not_poison(self):
+        self.assertFalse(self._canon("ScalarQA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "ScalarQB", "ScalarQA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
 
     def test_scalar_var_does_not_block_learned_row_table(self):
         self.assertFalse(self._canon("ScalarA").uncertain)
