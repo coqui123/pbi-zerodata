@@ -332,7 +332,20 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         return args
 
     _span_memo: dict = {}
-    _span_taint = [False]
+    _cyclic_vars: set = set()
+    for _nm, _rhss in var_rhs.items():
+        _deps = {u.text.lower() for _r in _rhss for u in _r
+                 if u.kind == "ident" and u.text.lower() in var_rhs}
+        _walk, _seen = list(_deps), set()
+        while _walk:
+            _x = _walk.pop()
+            if _x == _nm:
+                _cyclic_vars.add(_nm)
+                break
+            if _x not in _seen:
+                _seen.add(_x)
+                _walk.extend({u.text.lower() for _r in var_rhs.get(_x, []) for u in _r
+                              if u.kind == "ident" and u.text.lower() in var_rhs})
 
     def _span_table(span, seen=frozenset()):
         while len(span) >= 2 and span[0].kind == "op" and span[0].text == "(" \
@@ -349,7 +362,6 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     return res.table(u.text)
                 low = u.text.lower()
                 if low in seen:
-                    _span_taint[0] = True
                     return None
                 if low in _span_memo:
                     return _span_memo[low]
@@ -357,7 +369,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if rhss:
                     vals = {_span_table(r, seen | {low}) for r in rhss}
                     result = vals.pop() if len(vals) == 1 else None
-                    if not _span_taint[0]:
+                    if low not in _cyclic_vars:
                         _span_memo[low] = result
                     return result
             return None
@@ -416,7 +428,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         t = sig[i]
         nxt = sig[i + 1] if i + 1 < n else None
         for fr in stack:
-            if fr.get("x_span") is not None and fr["arg"] == 0 \
+            if fr.get("x_span") is not None and fr["arg"] == fr.get("span_arg", 0) \
                     and not (t.kind == "op" and t.text in (",", ")") and stack[-1] is fr):
                 fr["x_span"].append(t)
         if t.kind == "ident" and t.text.upper() == "VAR" \
@@ -432,7 +444,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             fn = "{" if t.text == "{" else (prev.text.upper() if prev is not None and prev.kind == "ident" else "")
             frame = {"fn": fn, "arg": 0, "row_table": None, "poisoned": False, "taint": None,
                      "parent_arg": stack[-1]["arg"] if stack else None,
-                     "x_span": [] if fn in ("XNPV", "XIRR") else None, "x_skip": True}
+                     "x_span": [] if fn in ("XNPV", "XIRR", "SUBSTITUTEWITHINDEX") else None,
+                     "x_skip": True,
+                     "span_arg": 2 if fn == "SUBSTITUTEWITHINDEX" else 0}
             stack.append(frame)
             if fn and fn not in SCALAR_FUNCS and fn not in CONDITIONALS:
                 for f_idx, fr in enumerate(stack[:-1]):
@@ -456,9 +470,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             fr.setdefault("captured", set()).update(closed["names"])
                     if pending_vars:
                         var_names_defined.setdefault(pending_vars[-1][0], set()).update(closed["names"])
-                if closed.get("x_span") is not None and closed["arg"] == 0 \
+                if closed.get("x_span") is not None and closed["arg"] == closed.get("span_arg", 0) \
                         and closed.get("x_table") is None:
-                    _span_taint[0] = False
                     closed["x_table"] = _span_table(closed["x_span"])
                 for fr in stack:
                     if fr.get("taint") is closed:
@@ -479,9 +492,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     top["expect"] = "expr" if top.pop("item_named", False) else "item"
                 else:
                     top["expect"] = "item"
-            if top.get("x_span") is not None and top["arg"] == 0 \
+            if top.get("x_span") is not None and top["arg"] == top.get("span_arg", 0) \
                     and top.get("x_table") is None:
-                _span_taint[0] = False
                 top["x_table"] = _span_table(top["x_span"])
             top["arg"] += 1
         if stack and t.kind == "str" and stack[-1]["fn"] in (
@@ -568,6 +580,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                 and res.column(parent["row_table"], t.value) is not None) \
                             or t.value.lower() in parent.get("captured", ()):
                         uncertain = True
+            for fr in stack:
+                if fr["fn"] == "SUBSTITUTEWITHINDEX" and fr["arg"] == 3 \
+                        and ((ref.kind == "column" and fr.get("x_table") != ref.table)
+                             or (ref.kind == "measure" and fr.get("x_table") is not None
+                                 and res.column(fr.get("x_table"), t.value) is not None)):
+                    uncertain = True
             CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
                            "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}
 

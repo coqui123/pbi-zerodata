@@ -231,6 +231,10 @@ SALES = (
     "\tmeasure HomeCountA = COUNTROWS()\n\n"
     "\tmeasure FmtShadowA = 1\n\t\tformatStringDefinition = IF(XNPV(Other, [ShadowM], DATE(2026, 1, 1), 0) > 0, \"0.0\", \"0%\")\n\n"
     "\tmeasure FmtShadowB = 1\n\t\tformatStringDefinition = IF(XNPV(Other, Sales[ShadowM], DATE(2026, 1, 1), 0) > 0, \"0.0\", \"0%\")\n\n"
+    "\tmeasure FmtNameA = 1\n\t\tformatStringDefinition = IF(SELECTEDMEASURENAME() = \"FmtNameA\", \"$#,0\", \"#,0\")\n\n"
+    "\tmeasure FmtNameB = 1\n\t\tformatStringDefinition = IF(SELECTEDMEASURENAME() = \"FmtNameA\", \"$#,0\", \"#,0\")\n\n"
+    "\tmeasure SubstA = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, [Price], ASC)))\n\n"
+    "\tmeasure SubstB = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, Sales[Price], ASC)))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -329,7 +333,8 @@ class SimilarScopeTests(unittest.TestCase):
               "VarAliasA", "VarAliasB", "VarNestA", "VarNestB", "WinXnpvA", "WinXnpvB",
               "XnpvColShadowA", "XnpvColShadowB", "TopnColShadowA", "TopnColShadowB",
               "FnbColA", "FnbColB", "SpanChainCtrlA", "SpanChainCtrlB",
-              "HomeCountA", "FmtShadowA", "FmtShadowB")} | {("Other", "OtherRows")},
+              "HomeCountA", "FmtShadowA", "FmtShadowB", "FmtNameA", "FmtNameB",
+              "SubstA", "SubstB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -514,6 +519,18 @@ class SimilarScopeTests(unittest.TestCase):
         with self.assertRaises(PbzError) as caught:
             consolidate.merge(self.ws, self.project, "FmtShadowB", "FmtShadowA", dry_run=True)
         self.assertEqual(caught.exception.code, "FORMAT_DIFFERS")
+
+    def test_identity_dependent_format_is_refused(self):
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "FmtNameB", "FmtNameA", dry_run=True)
+        self.assertEqual(caught.exception.code, "FORMAT_DIFFERS")
+
+    def test_substitutewithindex_sort_bracket_is_uncertain(self):
+        self.assertEqual(self._key("SubstA"), self._key("SubstB"))
+        self.assertTrue(self._canon("SubstA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "SubstB", "SubstA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_span_chain_stays_certain(self):
         self.assertFalse(self._canon("SpanChainCtrlA").uncertain)

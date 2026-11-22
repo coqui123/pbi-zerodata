@@ -162,6 +162,9 @@ def _format_uncertain(model, m, res) -> bool:
         return False
     doc = model.docs[m.node.file]
     text = "".join(doc.text[r.start:r.end] for r in doc.regions_for(fsd))
+    if any(t.kind == "ident" and t.text.upper() in ("SELECTEDMEASURENAME", "ISSELECTEDMEASURE")
+           for t in lexers.significant(lexers.lex_dax(text))):
+        return True
     return similar.canon(text, m.table, res).uncertain
 
 
