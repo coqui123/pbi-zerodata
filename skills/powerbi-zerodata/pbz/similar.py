@@ -475,6 +475,17 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
 
     pending_vars: list = []
     var_names_defined: dict[str, set] = {}
+
+    def _in_source(fr, first_d) -> bool:
+        if fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+            return first_d == 1
+        if fr["fn"] == "RANK":
+            return first_d in (0, 1)
+        if fr["fn"] == "WINDOW":
+            return first_d in (2, 3, 4)
+        if fr["fn"] == "SUBSTITUTEWITHINDEX":
+            return first_d == 2
+        return first_d == 0
     i, n = 0, len(sig)
     while i < n:
         t = sig[i]
@@ -514,15 +525,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     for f_idx, fr in enumerate(stack):
                         path = stack[f_idx + 1:]
                         first_d = path[0]["parent_arg"] if path else closed["parent_arg"]
-                        if fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
-                            in_source = first_d == 1
-                        elif fr["fn"] == "RANK":
-                            in_source = first_d in (0, 1)
-                        elif fr["fn"] == "WINDOW":
-                            in_source = first_d in (2, 3, 4)
-                        else:
-                            in_source = first_d == 0
-                        if not in_source:
+                        if not _in_source(fr, first_d):
                             continue
                         if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
                                 and path[-1]["fn"] == "SUMMARIZECOLUMNS":
@@ -783,8 +786,11 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if low in var_names_defined and not (prev is not None and prev.kind == "ident"
                                                      and prev.text.upper() == "VAR"):
                     for f_idx, fr in enumerate(stack):
-                        if _first_nonsource(stack[f_idx + 1:],
-                                            stack[-1]["arg"] if len(stack) > f_idx + 1 else 0) is None:
+                        first_d = stack[f_idx + 1]["parent_arg"] if len(stack) > f_idx + 1 \
+                            else fr["arg"]
+                        if _in_source(fr, first_d) and _first_nonsource(
+                                stack[f_idx + 1:],
+                                stack[-1]["arg"] if len(stack) > f_idx + 1 else 0) is None:
                             fr.setdefault("captured", set()).update(var_names_defined[low])
                     if pending_vars and pending_vars[-1][0] != low:
                         var_names_defined.setdefault(pending_vars[-1][0], set()).update(

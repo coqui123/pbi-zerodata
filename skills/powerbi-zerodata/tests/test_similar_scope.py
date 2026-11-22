@@ -289,6 +289,10 @@ SALES = (
     "\tmeasure VarRowCtrlB = SUMX(Sales, VAR T = ROW(\"Price\", 1) RETURN COUNTROWS(T) + Sales[Price])\n\n"
     "\tmeasure ExprCapCtrlA = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), 1) + [Price])\n\n"
     "\tmeasure ExprCapCtrlB = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), 1) + Sales[Price])\n\n"
+    "\tmeasure VarRefCtrlA = VAR T = ADDCOLUMNS(Dates, \"Price\", 1) RETURN SUMX(Sales, SUMX(T, 1) + [Price])\n\n"
+    "\tmeasure VarRefCtrlB = VAR T = ADDCOLUMNS(Dates, \"Price\", 1) RETURN SUMX(Sales, SUMX(T, 1) + Sales[Price])\n\n"
+    "\tmeasure SwiCapCtrlA = TOCSV(SUBSTITUTEWITHINDEX(ADDCOLUMNS(Other, \"Price\", 1), \"Idx\", Sales, [Price], ASC))\n\n"
+    "\tmeasure SwiCapCtrlB = TOCSV(SUBSTITUTEWITHINDEX(ADDCOLUMNS(Other, \"Price\", 1), \"Idx\", Sales, Sales[Price], ASC))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -401,7 +405,8 @@ class SimilarScopeTests(unittest.TestCase):
               "CtorNarrowCtrlA", "CtorNarrowCtrlB", "NestTopnA", "NestTopnB",
               "CapNestCtrlA", "CapNestCtrlB", "CapSelfA", "CapSelfB",
               "ClauseNestCtrlA", "ClauseNestCtrlB", "RowOuterCtrlA", "RowOuterCtrlB",
-              "VarRowCtrlA", "VarRowCtrlB", "ExprCapCtrlA", "ExprCapCtrlB")} | {("Other", "OtherRows")},
+              "VarRowCtrlA", "VarRowCtrlB", "ExprCapCtrlA", "ExprCapCtrlB",
+              "VarRefCtrlA", "VarRefCtrlB", "SwiCapCtrlA", "SwiCapCtrlB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -646,7 +651,9 @@ class SimilarScopeTests(unittest.TestCase):
                           ("ClauseNestCtrlA", "ClauseNestCtrlB"),
                           ("RowOuterCtrlA", "RowOuterCtrlB"),
                           ("VarRowCtrlA", "VarRowCtrlB"),
-                          ("ExprCapCtrlA", "ExprCapCtrlB")):
+                          ("ExprCapCtrlA", "ExprCapCtrlB"),
+                          ("VarRefCtrlA", "VarRefCtrlB"),
+                          ("SwiCapCtrlA", "SwiCapCtrlB")):
             with self.subTest(name=name):
                 self.assertFalse(self._canon(name).uncertain)
                 result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
