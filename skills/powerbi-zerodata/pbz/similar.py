@@ -229,9 +229,17 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             return True
         return False
 
-    def _first_nonsource(frames, last_d):
+    def _first_nonsource(frames, last_d, lineage=False):
         for j, p in enumerate(frames):
             d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else last_d
+            if lineage and p["fn"] in ("INTERSECT", "EXCEPT"):
+                if d != 0:
+                    return p, d
+                continue
+            if lineage == "names" and p["fn"] == "UNION":
+                if d != 0:
+                    return p, d
+                continue
             if not _crossing_ok(p, d):
                 return p, d
         return None
@@ -516,7 +524,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
                             and fr["row_table"] is not None and not fr["poisoned"]:
                         if fr.get("taint") is None \
-                                and _first_nonsource(stack[f_idx + 1:-1], frame["parent_arg"]) is None:
+                                and _first_nonsource(stack[f_idx + 1:-1], frame["parent_arg"],
+                                                     lineage="rows") is None:
                             fr["taint"] = frame
         elif t.kind == "op" and t.text in (")", "}"):
             if stack:
@@ -529,13 +538,13 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             continue
                         if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
                                 and path[-1]["fn"] == "SUMMARIZECOLUMNS":
-                            ok = _first_nonsource(path[:-1], path[-1]["parent_arg"]) is None
+                            ok = _first_nonsource(path[:-1], path[-1]["parent_arg"], lineage="names") is None
                         else:
-                            ok = _first_nonsource(path, closed["parent_arg"]) is None
+                            ok = _first_nonsource(path, closed["parent_arg"], lineage="names") is None
                         if ok:
                             fr.setdefault("captured", set()).update(closed["names"])
                     if pending_vars and _first_nonsource(
-                            stack[pending_vars[-1][1]:], closed["parent_arg"]) is None:
+                            stack[pending_vars[-1][1]:], closed["parent_arg"], lineage="names") is None:
                         var_names_defined.setdefault(pending_vars[-1][0], set()).update(closed["names"])
                 if closed.get("x_span") is not None and closed["arg"] == closed.get("span_arg", 0) \
                         and closed.get("x_table") is None:
@@ -791,12 +800,14 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             else fr["arg"]
                         if _in_source(fr, first_d) and _first_nonsource(
                                 stack[f_idx + 1:],
-                                stack[-1]["arg"] if len(stack) > f_idx + 1 else 0) is None:
+                                stack[-1]["arg"] if len(stack) > f_idx + 1 else 0,
+                                lineage="names") is None:
                             fr.setdefault("captured", set()).update(var_names_defined[low])
                     if pending_vars and pending_vars[-1][0] != low:
                         _depth = pending_vars[-1][1]
                         if _first_nonsource(stack[_depth:],
-                                            stack[-1]["arg"] if len(stack) > _depth else 0) is None:
+                                            stack[-1]["arg"] if len(stack) > _depth else 0,
+                                            lineage="names") is None:
                             var_names_defined.setdefault(pending_vars[-1][0], set()).update(
                                 var_names_defined[low])
                 if low in table_vars and not (prev is not None and prev.kind == "ident"
