@@ -404,6 +404,15 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     if parent["row_table"] is None \
                             or (ref.kind == "column" and parent["row_table"] != ref.table):
                         uncertain = True
+            for c_idx, fr in enumerate(stack):
+                if fr["fn"] == "RANKX" and fr["arg"] >= 2 and ref.kind == "column":
+                    caller = home
+                    for below in reversed(stack[:c_idx]):
+                        if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:
+                            caller = below["row_table"]
+                            break
+                    if caller is None or caller != ref.table:
+                        uncertain = True
             if ref.kind == "column":
                 learn(ref.table)
             if ref.kind == "measure":
