@@ -437,7 +437,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         elif t.kind == "op" and t.text == "," and stack:
             top = stack[-1]
             if top.get("expect") is not None:
-                top["expect"] = "expr" if top["expect"] == "item" else "item"
+                if top["expect"] == "item":
+                    top["expect"] = "expr" if top.pop("item_named", False) else "item"
+                else:
+                    top["expect"] = "item"
             if top.get("x_span") is not None and top["arg"] == 0 \
                     and top.get("x_table") is None:
                 top["x_table"] = _span_table(top["x_span"])
@@ -451,8 +454,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             elif fr0.get("expect") is None:
                 if fr0["fn"] not in ("SELECTCOLUMNS", "ADDCOLUMNS") or fr0["arg"] >= 1:
                     fr0["expect"] = "item"
+                    fr0["item_named"] = True
                     fr0.setdefault("names", set()).add(t.value.lower())
             elif fr0["expect"] == "item":
+                fr0["item_named"] = True
                 fr0.setdefault("names", set()).add(t.value.lower())
         if t.kind in LIT_KINDS:
             val = _num(t.text) if t.kind == "num" else ("T" + t.text if t.kind == "pbztok" else "S" + t.value)

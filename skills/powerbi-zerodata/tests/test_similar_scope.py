@@ -193,6 +193,8 @@ SALES = (
     "\tmeasure SelOptB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, Dates[Day], \"Price\", 1), Sales[Price]))\n\n"
     "\tmeasure RollupA = SUMX(Sales, SUMX(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"Price\")), [Price] + 0))\n\n"
     "\tmeasure RollupB = SUMX(Sales, SUMX(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"Price\")), Sales[Price] + 0))\n\n"
+    "\tmeasure SelMidA = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"K\", 1, Dates[Day], \"Price\", 1), [Price]))\n\n"
+    "\tmeasure SelMidB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"K\", 1, Dates[Day], \"Price\", 1), Sales[Price]))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -281,7 +283,7 @@ class SimilarScopeTests(unittest.TestCase):
               "PlainProjA", "PlainProjB", "ValuesColA", "ValuesColB",
               "AddColA", "AddColB", "ProjCapA", "ProjCapB",
               "SumzCapA", "SumzCapB", "SumzColA", "SumzColB",
-              "SelOptA", "SelOptB", "RollupA", "RollupB")},
+              "SelOptA", "SelOptB", "RollupA", "RollupB", "SelMidA", "SelMidB")},
         )
 
     def _canon(self, name):
@@ -507,7 +509,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("PlainProjB", "PlainProjA"), ("ValuesColB", "ValuesColA"),
                           ("AddColB", "AddColA"), ("ProjCapB", "ProjCapA"),
                           ("SumzCapB", "SumzCapA"), ("SumzColB", "SumzColA"),
-                          ("SelOptB", "SelOptA"), ("RollupB", "RollupA")):
+                          ("SelOptB", "SelOptA"), ("RollupB", "RollupA"),
+                          ("SelMidB", "SelMidA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
