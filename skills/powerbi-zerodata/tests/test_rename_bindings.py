@@ -530,6 +530,38 @@ class RenameBindingsTests(unittest.TestCase):
         out = rename._table_rewrite("Sum(Sales.Amount)", "Sales", "Revenue", {"sales.amount"}, sales, model)
         self.assertEqual(out, "Sum(Sales.Amount)")
 
+    def test_table_rename_hierarchy_bound_query_ref_follows(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                              "Hierarchy": "Calendar"}}, "Level": "Year"},
+              "queryRef": "Sales.Calendar.Year"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n\n\thierarchy Calendar\n\n\t\tlevel Year\n\t\t\tcolumn: OrderDate\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Revenue.Calendar.Year")
+
+    def test_column_rename_wrapped_whole_string_owned_by_other_table(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sum(Sales.Amount)"}]})
+        _write(os.path.join(mdef, "tables", "Sum(Sales.tmdl"),
+               "table 'Sum(Sales'\n\tcolumn 'Amount)'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_bound_literal_path_that_looks_wrapped(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sum(Sales"}}, "Property": "Amount)"},
+               "queryRef": "Sum(Sales.Amount)"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        _write(os.path.join(mdef, "tables", "Sum(Sales.tmdl"),
+               "table 'Sum(Sales'\n\tcolumn 'Amount)'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sum(Sales", "Totals")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Totals.Amount)")
+
+    def test_table_rename_ambiguous_site_unchanged(self):
+        out = rename._report_string_rename("queryRef", "Sales.Amount", "table", "", "Sales", "Revenue",
+                                           field=rename._AMBIGUOUS, model=None)
+        self.assertEqual(out, "Sales.Amount")
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")

@@ -572,25 +572,34 @@ def _extension_owned_others(report_dir, home):
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
                           extra_qualified=(), extra_owned=(), extra_extending=()):
     if kind == "table":
+        if field is _AMBIGUOUS:
+            return value
         if key in ("queryRef", "metadata", "queryName"):
-            if field is not None and field is not _AMBIGUOUS:
+            if field is not None:
                 # The resolved field settles ownership of a string naming its
                 # own qualified path (exact or pure extension, raw or wrapped):
                 # the string follows the field's table rename, and no other
                 # table's, even when a longer table name shares the prefix.
-                base = f"{field.table}.{field.name}"
+                # The literal value is tested before its wrapped reading, and
+                # a hierarchy field's path names the hierarchy and level, not
+                # the level's backing column.
+                if field.kind == "hierarchy" and field.hierarchy and not field.variation:
+                    base = f"{field.table}.{field.hierarchy}.{field.level}"
+                else:
+                    base = f"{field.table}.{field.name}"
                 wrapped = _wrapped_inner(value)
-                probe = wrapped[1] if wrapped else value
-                _rest = _rest_after(probe, base.lower())
-                if probe.lower() == base.lower() \
-                        or (_rest is not None
-                            and _path_extension(_rest, old,
-                                                [t.name for t in model.tables.values()]
-                                                if model is not None else ())):
-                    if field.table.lower() != old.lower():
-                        return value
-                    swapped = _head_swap(probe, field.table, new)
-                    return f"{wrapped[0]}({swapped})" if wrapped else swapped
+                probes = [(value, None)] + ([(wrapped[1], wrapped[0])] if wrapped else [])
+                for probe, wrap_name in probes:
+                    _rest = _rest_after(probe, base.lower())
+                    if probe.lower() == base.lower() \
+                            or (_rest is not None
+                                and _path_extension(_rest, old,
+                                                    [t.name for t in model.tables.values()]
+                                                    if model is not None else ())):
+                        if field.table.lower() != old.lower():
+                            return value
+                        swapped = _head_swap(probe, field.table, new)
+                        return f"{wrap_name}({swapped})" if wrap_name else swapped
                 # A resolved binding owns the string even when its text does
                 # not match the field's own path: never fall through to the
                 # unbound rewrite and desync it from its field.
@@ -634,6 +643,9 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
             and not _other_table_owns(model, home, value, extra_owned, extra_extending,
                                       extensions_any=True):
         return new
+    if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef") \
+            and _other_table_owns(model, home, value, extra_owned, extra_extending):
+        return value
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
         wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
         if wrapped and wrapped.group(2).lower() == f"{home}.{old}".lower() \
