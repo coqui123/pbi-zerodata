@@ -60,7 +60,7 @@ def execute(entries, *, shard='serial', output=None, roots=None, run=None, scann
         for entry in entries:
             started = time.monotonic()
             log = output / (entry['id'] + '.log')
-            sidecar = output / (entry['id'] + '.skips.jsonl')
+            sidecar = (output / (entry['id'] + '.skips.jsonl')).resolve()
             logs.append(log)
             code, skips, error, reason, launched = -1, [], None, None, False
             try:

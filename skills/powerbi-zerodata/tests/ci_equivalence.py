@@ -30,6 +30,15 @@ def _skip_tuples(name, reasons):
     return result
 
 
+def _row_skips(name, row):
+    if 'skip_reasons' not in row:
+        raise ValueError(name + ': missing skip_reasons')
+    value = row['skip_reasons']
+    if not isinstance(value, list) or any(not isinstance(entry, str) for entry in value):
+        raise ValueError(name + ': invalid skip_reasons')
+    return _skip_tuples(name, value)
+
+
 def inventory():
     frozen = json.loads(BASELINE.read_text(encoding='utf-8'))['suites']
     additions = json.loads((BASELINE.parent / 'offline_additions.json').read_text(encoding='utf-8'))['suites']
@@ -75,7 +84,7 @@ def serial_inventory(report):
         raise ValueError('serial suite failed')
     platform = 'windows' if report['identity']['os'].startswith('Windows') else 'posix'
     for row in rows:
-        if _skip_tuples(row['id'], row.get('skip_reasons', [])) != _skip_tuples(row['id'], SKIP_INVENTORY.get(platform, {}).get(row['id'], [])):
+        if _row_skips(row['id'], row) != _skip_tuples(row['id'], SKIP_INVENTORY.get(platform, {}).get(row['id'], [])):
             raise ValueError(row['id'] + ': unexpected skip')
     return True
 
@@ -130,8 +139,8 @@ def compare(reference, shards, expected_shards=2, expected_failures=None, contro
     for name in expected:
         for key in ('exit_code', 'skip_reasons', 'error', 'failure_reason'):
             if key == 'skip_reasons':
-                leftc = _skip_tuples(name, left[name].get('skip_reasons', []))
-                rightc = _skip_tuples(name, right[name].get('skip_reasons', []))
+                leftc = _row_skips(name, left[name])
+                rightc = _row_skips(name, right[name])
                 if leftc != rightc:
                     raise ValueError(name + ': different skip_reasons')
                 continue
@@ -144,6 +153,8 @@ def compare(reference, shards, expected_shards=2, expected_failures=None, contro
             code, reason = failures[name]
             if left[name]['exit_code'] != code or left[name].get('failure_reason') != reason:
                 raise ValueError(name + ': expected failure reason absent')
+            if left[name].get('error') is not None:
+                raise ValueError(name + ': unexpected error')
         elif left[name]['exit_code'] != 0 or left[name].get('error'):
             raise ValueError(name + ': unexpected suite failure')
     print('PBZ_INVENTORY ' + json.dumps({'frozen_count': len(json.loads(BASELINE.read_text())['suites']),

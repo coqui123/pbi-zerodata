@@ -106,6 +106,7 @@ class SkipCaptureTests(unittest.TestCase):
                 scanner=lambda roots: {'completed': True, 'ok': True})
         row = report['executed'][0]
         self.assertEqual(row['exit_code'], 0)
+        self.assertIsNone(row['error'])
         self.assertEqual(len(row['skip_reasons']), 1)
         entry = row['skip_reasons'][0]
         self.assertTrue(entry.startswith('PBZ_SKIP '))
@@ -113,6 +114,98 @@ class SkipCaptureTests(unittest.TestCase):
             'test': '__main__.SkipFixtureTests.test_c_skip',
             'reason': 'injected reason',
         })
+
+    def test_missing_sidecar_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(run_offline, 'identity', return_value={}), patch.object(run_offline.subprocess, 'check_output', return_value='fixture'), contextlib.redirect_stdout(io.StringIO()):
+            path = Path(tmp, 'suite.py')
+            path.write_text(
+                "import os\n"
+                "import unittest\n"
+                "os.unlink(os.environ['PBZ_SKIP_SIDECAR'])\n"
+                "class PassFixtureTests(unittest.TestCase):\n"
+                " def test_pass(self): pass\n"
+                "unittest.main()\n", encoding='utf-8')
+            report = run_offline.execute(
+                [{'id': 'control', 'argv': [str(path)]}], output=tmp,
+                scanner=lambda roots: {'completed': True, 'ok': True})
+        self.assertEqual(report['executed'][0]['exit_code'], 0)
+        self.assertEqual(report['executed'][0]['error'], 'skip sidecar missing')
+
+    def test_malformed_sidecar_record_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(run_offline, 'identity', return_value={}), patch.object(run_offline.subprocess, 'check_output', return_value='fixture'), contextlib.redirect_stdout(io.StringIO()):
+            path = Path(tmp, 'suite.py')
+            path.write_text(
+                "import os\n"
+                "import unittest\n"
+                "with open(os.environ['PBZ_SKIP_SIDECAR'], 'a') as stream:\n"
+                " stream.write('not json\\n')\n"
+                "class PassFixtureTests(unittest.TestCase):\n"
+                " def test_pass(self): pass\n"
+                "unittest.main()\n", encoding='utf-8')
+            report = run_offline.execute(
+                [{'id': 'control', 'argv': [str(path)]}], output=tmp,
+                scanner=lambda roots: {'completed': True, 'ok': True})
+        self.assertEqual(report['executed'][0]['exit_code'], 0)
+        self.assertEqual(report['executed'][0]['error'], 'invalid skip sidecar record')
+
+    def test_wrong_suite_sidecar_record_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(run_offline, 'identity', return_value={}), patch.object(run_offline.subprocess, 'check_output', return_value='fixture'), contextlib.redirect_stdout(io.StringIO()):
+            path = Path(tmp, 'suite.py')
+            path.write_text(
+                "import json\n"
+                "import os\n"
+                "import unittest\n"
+                "with open(os.environ['PBZ_SKIP_SIDECAR'], 'a') as stream:\n"
+                " stream.write(json.dumps({'suite': 'other', 'test': 'x', 'reason': 'y'}) + '\\n')\n"
+                "class PassFixtureTests(unittest.TestCase):\n"
+                " def test_pass(self): pass\n"
+                "unittest.main()\n", encoding='utf-8')
+            report = run_offline.execute(
+                [{'id': 'control', 'argv': [str(path)]}], output=tmp,
+                scanner=lambda roots: {'completed': True, 'ok': True})
+        self.assertEqual(report['executed'][0]['exit_code'], 0)
+        self.assertEqual(report['executed'][0]['error'], 'invalid skip sidecar record')
+
+    def test_compare_rejects_unapproved_skip(self):
+        reference, shards = _reports({'mcp': APPROVED_WINDOWS['mcp'] + [
+            'PBZ_SKIP ' + json.dumps({
+                'test': '__main__.GitHookTests.test_unapproved',
+                'reason': 'unapproved',
+            })]})
+        with self.assertRaises(ValueError):
+            compare(reference, shards)
+
+    def test_compare_rejects_error_on_expected_failure(self):
+        reference, shards = _reports({})
+        for report in [reference, *shards]:
+            for row in report['executed']:
+                if row['id'] == 'guard':
+                    row['exit_code'] = 7
+                    row['failure_reason'] = 'planted guard marker'
+                    row['error'] = 'skip sidecar missing'
+                    report['ok'] = False
+        with self.assertRaisesRegex(ValueError, 'guard: unexpected error'):
+            compare(reference, shards, expected_failures={'guard': (7, 'planted guard marker')})
+
+    def test_missing_or_malformed_skip_reasons_fail_closed(self):
+        for variant, value in [('missing', None), ('null', None), ('string', ''),
+                               ('mapping', {}), ('non_string_entry', [None])]:
+            for gate in ('compare', 'serial_inventory'):
+                with self.subTest(variant=variant, gate=gate):
+                    reference, shards = _reports(APPROVED_WINDOWS)
+                    for report in [reference, *shards]:
+                        row = next((row for row in report['executed'] if row['id'] == 'guard'), None)
+                        if row is not None:
+                            if variant == 'missing':
+                                del row['skip_reasons']
+                            else:
+                                row['skip_reasons'] = value
+                    message = 'missing' if variant == 'missing' else 'invalid'
+                    with self.assertRaisesRegex(ValueError, 'guard: ' + message + ' skip_reasons'):
+                        if gate == 'compare':
+                            compare(reference, shards)
+                        else:
+                            serial_inventory(reference)
 
     def test_compare_ignores_skip_order(self):
         ref_skips = {'mcp': APPROVED_WINDOWS['mcp']}
