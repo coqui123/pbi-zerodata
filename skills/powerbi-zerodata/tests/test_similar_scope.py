@@ -1,0 +1,941 @@
+"""Offline checks that scoped canonical keys cannot authorize unsafe merges.
+
+Nested iterator references must preserve their row-table binding, and unresolved
+references must block automatic consolidation even when canonical keys match.
+
+Run: python tests/test_similar_scope.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import unittest
+
+SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, SKILL)
+
+from pbz import common, consolidate, deps, similar, tmdl  # noqa: E402
+from pbz.common import PbzError  # noqa: E402
+
+SALES = (
+    "table Sales\n\n"
+    "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
+    "\tmeasure IterA = SUMX(Sales, SUMX(Other, [Price]))\n\n"
+    "\tmeasure IterB = SUMX(Sales, SUMX(Other, Sales[Price]))\n\n"
+    "\tmeasure IterC = SUMX(Sales, [Price] + SUMX(Other, [Price]))\n\n"
+    "\tmeasure IterD = SUMX(Sales, [Price] + SUMX(Other, Sales[Price]))\n\n"
+    "\tmeasure UnresA = SUMX(Sales, [Nope])\n\n"
+    "\tmeasure UnresB = SUMX(Sales, [Nope])\n\n"
+    "\tmeasure CtrlA = SUM(Sales[Price])\n\n"
+    "\tmeasure ShadowM = SUM(Sales[Price])\n\n"
+    "\tmeasure CtrlB = SUM(Sales[Price])\n\n"
+    "\tmeasure VarA = VAR v = Other RETURN SUMX(v, [Price])\n\n"
+    "\tmeasure VarB = VAR v = Other RETURN SUMX(v, Sales[Price])\n\n"
+    "\tmeasure AliasUnres = 'Missing'[CtrlA]\n\n"
+    "\tmeasure AliasOk = [CtrlA]\n\n"
+    "\tmeasure WrapA = VAR v = Other RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure WrapB = VAR v = Other RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure TabA = COUNTROWS('Missing')\n\n"
+    "\tmeasure TabB = COUNTROWS('Missing')\n\n"
+    "\tmeasure TabCtrlA = COUNTROWS(Sales)\n\n"
+    "\tmeasure TabCtrlB = COUNTROWS(Sales)\n\n"
+    "\tmeasure TopA = VAR v = Other RETURN SUMX(TOPN(MAX(Sales[Price]), v), [Price])\n\n"
+    "\tmeasure TopB = VAR v = Other RETURN SUMX(TOPN(MAX(Sales[Price]), v), Sales[Price])\n\n"
+    "\tmeasure ScalarA = VAR n = 0 RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure ScalarB = VAR n = 0 RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure ExprA = VAR v = FILTER(Other, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure ExprB = VAR v = FILTER(Other, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure ChainA = VAR a = Other VAR v = a RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure ChainB = VAR a = Other VAR v = a RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure ValuesA = VAR v = VALUES(Other[Price]) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure ValuesB = VAR v = VALUES(Other[Price]) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure DerivedA = VAR a = Other VAR v = FILTER(a, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure DerivedB = VAR a = Other VAR v = FILTER(a, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure ScalarQA = VAR n = MAX('Sales'[Price]) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure ScalarQB = VAR n = MAX('Sales'[Price]) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure CrossA = VAR src = Other VAR v = CROSSJOIN(src, { 1 }) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure CrossB = VAR src = Other VAR v = CROSSJOIN(src, { 1 }) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure CtorA = VAR v = { 1, 2 } RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure CtorB = VAR v = { 1, 2 } RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure CountA = VAR n = COUNTROWS(Other) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure CountB = VAR n = COUNTROWS(Other) RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure ScopeA = (VAR v = Other RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])) + (VAR v = 1 RETURN v)\n\n"
+    "\tmeasure ScopeB = (VAR v = Other RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])) + (VAR v = 1 RETURN v)\n\n"
+    "\tmeasure InlineA = SUMX(TOPN(MAX(Sales[Price]), Other), [Price])\n\n"
+    "\tmeasure InlineB = SUMX(TOPN(MAX(Sales[Price]), Other), Sales[Price])\n\n"
+    "\tmeasure QualA = SUMX(Sales, SUMX(TOPN(MAX(Sales[Price]), VALUES(Other[Price])), [Price]))\n\n"
+    "\tmeasure QualB = SUMX(Sales, SUMX(TOPN(MAX(Sales[Price]), VALUES(Other[Price])), Sales[Price]))\n\n"
+    "\tmeasure GenA = SUMX(Sales, SUMX(TOPN(MAX(Sales[Price]), GENERATESERIES(1, 5)), [Price]))\n\n"
+    "\tmeasure GenB = SUMX(Sales, SUMX(TOPN(MAX(Sales[Price]), GENERATESERIES(1, 5)), Sales[Price]))\n\n"
+    "\tmeasure TopNCtrlA = SUMX(TOPN(MAX(Sales[Price]), FILTER(Sales, Sales[Price] > 0)), [Price])\n\n"
+    "\tmeasure TopNCtrlB = SUMX(TOPN(MAX(Sales[Price]), FILTER(Sales, Sales[Price] > 0)), [Price])\n\n"
+    "\tmeasure SumzA = SUMX(SUMMARIZE(Sales, Other[Price]), [Price])\n\n"
+    "\tmeasure SumzB = SUMX(SUMMARIZE(Sales, Other[Price]), Sales[Price])\n\n"
+    "\tmeasure Gen2A = SUMX(GENERATESERIES(1, MAX(Sales[Price])), [Price])\n\n"
+    "\tmeasure Gen2B = SUMX(GENERATESERIES(1, MAX(Sales[Price])), Sales[Price])\n\n"
+    "\tmeasure NestCtrlA = SUMX(CALCULATETABLE(FILTER(Sales, Sales[Price] > MAX(Other[Price]))), [Price])\n\n"
+    "\tmeasure NestCtrlB = SUMX(CALCULATETABLE(FILTER(Sales, Sales[Price] > MAX(Other[Price]))), [Price])\n\n"
+    "\tmeasure Gen3A = SUMX(GENERATESERIES(MAX(Sales[Price]), 3), [Price])\n\n"
+    "\tmeasure Gen3B = SUMX(GENERATESERIES(MAX(Sales[Price]), 3), Sales[Price])\n\n"
+    "\tmeasure ConsA = SUMX(TOPN(MAX(Sales[Price]), { 1, 2 }), [Price])\n\n"
+    "\tmeasure ConsB = SUMX(TOPN(MAX(Sales[Price]), { 1, 2 }), Sales[Price])\n\n"
+    "\tmeasure IfCtrlA = SUMX(FILTER(Sales, IF(Sales[Price] > 0, TRUE(), FALSE())), [Price])\n\n"
+    "\tmeasure IfCtrlB = SUMX(FILTER(Sales, IF(Sales[Price] > 0, TRUE(), FALSE())), [Price])\n\n"
+    "\tmeasure CalcA = SUMX(CALCULATETABLE({ 1, 2 }, Other), [Price])\n\n"
+    "\tmeasure CalcB = SUMX(CALCULATETABLE({ 1, 2 }, Other), Other[Price])\n\n"
+    "\tmeasure AllCountA = SUMX(GENERATESERIES(1, COUNTROWS(ALL(Sales))), [Price])\n\n"
+    "\tmeasure AllCountB = SUMX(GENERATESERIES(1, COUNTROWS(ALL(Sales))), Sales[Price])\n\n"
+    "\tmeasure FiltCountA = SUMX(GENERATESERIES(1, COUNTROWS(FILTER(Other, TRUE()))), [Price])\n\n"
+    "\tmeasure FiltCountB = SUMX(GENERATESERIES(1, COUNTROWS(FILTER(Other, TRUE()))), Sales[Price])\n\n"
+    "\tmeasure IfPredCtrlA = SUMX(FILTER(Sales, IF(Sales[Price] > MAX(Other[Price]), TRUE(), FALSE())), [Price])\n\n"
+    "\tmeasure IfPredCtrlB = SUMX(FILTER(Sales, IF(Sales[Price] > MAX(Other[Price]), TRUE(), FALSE())), [Price])\n\n"
+    "\tmeasure ContainsA = SUMX(GENERATESERIES(1, IF(CONTAINS(Sales, Sales[Price], 1), 2, 3)), [Price])\n\n"
+    "\tmeasure ContainsB = SUMX(GENERATESERIES(1, IF(CONTAINS(Sales, Sales[Price], 1), 2, 3)), Sales[Price])\n\n"
+    "\tmeasure PredCountCtrlA = SUMX(FILTER(Sales, COUNTROWS(ALL(Other)) > 0), [Price])\n\n"
+    "\tmeasure PredCountCtrlB = SUMX(FILTER(Sales, COUNTROWS(ALL(Other)) > 0), [Price])\n\n"
+    "\tmeasure MaxxCtrlA = SUMX(FILTER(Sales, Sales[Price] > MAXX(ALL(Sales), Sales[Price])), [Price])\n\n"
+    "\tmeasure MaxxCtrlB = SUMX(FILTER(Sales, Sales[Price] > MAXX(ALL(Sales), Sales[Price])), [Price])\n\n"
+    "\tmeasure PredMaxxA = SUMX(FILTER(Sales, Sales[Price] > MAXX(Other, Other[Price])), [Price])\n\n"
+    "\tmeasure PredMaxxB = SUMX(FILTER(Sales, Sales[Price] > MAXX(Other, Other[Price])), [Price])\n\n"
+    "\tmeasure PredValuesA = SUMX(FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0), [Price])\n\n"
+    "\tmeasure PredValuesB = SUMX(FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0), [Price])\n\n"
+    "\tmeasure PredVarA = VAR v = Other RETURN SUMX(FILTER(Sales, COUNTROWS(v) > 0), [Price])\n\n"
+    "\tmeasure PredVarB = VAR v = Other RETURN SUMX(FILTER(Sales, COUNTROWS(v) > 0), [Price])\n\n"
+    "\tmeasure JoinA = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN SUMX(NATURALLEFTOUTERJOIN(VALUES(Other[Price]), v), [Price])\n\n"
+    "\tmeasure JoinB = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN SUMX(NATURALLEFTOUTERJOIN(VALUES(Other[Price]), v), Other[Price])\n\n"
+    "\tmeasure JoinInlA = SUMX(NATURALLEFTOUTERJOIN(VALUES(Other[Price]), Other), [Price])\n\n"
+    "\tmeasure JoinInlB = SUMX(NATURALLEFTOUTERJOIN(VALUES(Other[Price]), Other), Other[Price])\n\n"
+    "\tmeasure ExcQualCtrlA = SUMX(EXCEPT(Sales, VALUES(Other[Price])), [CtrlA])\n\n"
+    "\tmeasure ExcQualCtrlB = SUMX(EXCEPT(Sales, VALUES(Other[Price])), Sales[CtrlA])\n\n"
+    "\tmeasure SumzGroupA = SUMX(SUMMARIZE(ADDCOLUMNS(Sales, \"CtrlA\", 1), [CtrlA]), [CtrlA])\n\n"
+    "\tmeasure SumzGroupB = SUMX(SUMMARIZE(ADDCOLUMNS(Sales, \"CtrlA\", 1), [CtrlA]), Sales[CtrlA])\n\n"
+    "\tmeasure JoinShadowVarA = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), v), [ShadowM]))\n\n"
+    "\tmeasure JoinShadowVarB = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), v), Sales[ShadowM]))\n\n"
+    "\tmeasure UnionPredCtrlA = SUMX(UNION(Sales, FILTER(Sales, Sales[Price] > MAX(Other[Price]))), [Price])\n\n"
+    "\tmeasure UnionPredCtrlB = SUMX(UNION(Sales, FILTER(Sales, Sales[Price] > MAX(Other[Price]))), Sales[Price])\n\n"
+    "\tmeasure VarUnionPadA = VAR v = Wide RETURN SUMX(Wide, SUMX(Sales, SUMX(UNION(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), v), [Price])))\n\n"
+    "\tmeasure VarUnionPadB = VAR v = Wide RETURN SUMX(Wide, SUMX(Sales, SUMX(UNION(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), v), Wide[Price])))\n\n"
+    "\tmeasure IntermA = COUNTROWS(SELECTCOLUMNS(FILTER(ADDCOLUMNS(Dates, \"CtrlA\", 1), [CtrlA] > 0), \"D\", Dates[Day]))\n\n"
+    "\tmeasure IntermB = COUNTROWS(SELECTCOLUMNS(FILTER(ADDCOLUMNS(Dates, \"CtrlA\", 1), Sales[CtrlA] > 0), \"D\", Dates[Day]))\n\n"
+    "\tmeasure UnionScalarCtrlA = SUMX(UNION(Sales, FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0)), [Price])\n\n"
+    "\tmeasure UnionScalarCtrlB = SUMX(UNION(Sales, FILTER(Sales, COUNTROWS(VALUES(Other[Price])) > 0)), Sales[Price])\n\n"
+    "\tmeasure CrossJoinNarrowA = COUNTROWS(TOPN(1, CROSSJOIN(VALUES(Other[Price]), VALUES(Other[ShadowM])), [ShadowM]))\n\n"
+    "\tmeasure CrossJoinNarrowB = COUNTROWS(TOPN(1, CROSSJOIN(VALUES(Other[Price]), VALUES(Other[ShadowM])), Sales[ShadowM]))\n\n"
+    "\tmeasure JoinBareVarA = VAR v = VALUES(Other[Price]) RETURN COUNTROWS(TOPN(1, NATURALLEFTOUTERJOIN(Other, v), [ShadowM]))\n\n"
+    "\tmeasure JoinBareVarB = VAR v = VALUES(Other[Price]) RETURN COUNTROWS(TOPN(1, NATURALLEFTOUTERJOIN(Other, v), Sales[ShadowM]))\n\n"
+    "\tmeasure CalcPredA = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(FILTER(VALUES(Wide[Qty]), Wide[Price] > 0)), [Price])))\n\n"
+    "\tmeasure CalcPredB = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(FILTER(VALUES(Wide[Qty]), Wide[Price] > 0)), Wide[Price])))\n\n"
+    "\tmeasure CalcPred2A = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), [Price])))\n\n"
+    "\tmeasure CalcPred2B = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), Wide[Price])))\n\n"
+    "\tmeasure ParenVarA = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), (v)), [ShadowM]))\n\n"
+    "\tmeasure ParenVarB = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), (v)), Sales[ShadowM]))\n\n"
+    "\tmeasure CalcPred3A = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(VALUES(Wide[Qty]), (FILTER(VALUES(Wide[Price]), TRUE()))), [Price])))\n\n"
+    "\tmeasure CalcPred3B = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(VALUES(Wide[Qty]), (FILTER(VALUES(Wide[Price]), TRUE()))), Wide[Price])))\n\n"
+    "\tmeasure TopnFilterAllA = COUNTROWS(TOPN(1, FILTER(ALL(Other[Price], Other[ShadowM]), TRUE()), [ShadowM]))\n\n"
+    "\tmeasure TopnFilterAllB = COUNTROWS(TOPN(1, FILTER(ALL(Other[Price], Other[ShadowM]), TRUE()), Sales[ShadowM]))\n\n"
+    "\tmeasure ExcAccA = SUMX(Wide, SUMX(Sales, SUMX(EXCEPT(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), [Price])))\n\n"
+    "\tmeasure ExcAccB = SUMX(Wide, SUMX(Sales, SUMX(EXCEPT(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), Wide[Price])))\n\n"
+    "\tmeasure ScopeVarA = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = Wide RETURN QtyRows, [Price])))\n\n"
+    "\tmeasure ScopeVarB = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = Wide RETURN QtyRows, Wide[Price])))\n\n"
+    "\tmeasure ScopeNestA = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = VAR Dummy = 1 RETURN Wide RETURN QtyRows, [Price])))\n\n"
+    "\tmeasure ScopeNestB = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = VAR Dummy = 1 RETURN Wide RETURN QtyRows, Wide[Price])))\n\n"
+    "\tmeasure ScopeOrderA = SUMX(Wide, SUMX(Sales, SUMX(VAR UnusedRows = Wide VAR QtyRows = VALUES(Wide[Qty]) RETURN QtyRows, [Price])))\n\n"
+    "\tmeasure ScopeOrderB = SUMX(Wide, SUMX(Sales, SUMX(VAR UnusedRows = Wide VAR QtyRows = VALUES(Wide[Qty]) RETURN QtyRows, Wide[Price])))\n\n"
+    "\tmeasure VarTopnCtrlA = VAR T = TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), Other), [ShadowM]) RETURN COUNTROWS(T)\n\n"
+    "\tmeasure VarTopnCtrlB = VAR T = TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), Other), Sales[ShadowM]) RETURN COUNTROWS(T)\n\n"
+    "\tmeasure VarRefPadA = VAR WholeRows = Wide VAR QtyRows = VALUES(Wide[Qty]) RETURN SUMX(Wide, SUMX(Sales, SUMX(NATURALINNERJOIN(VALUES(Wide[Qty]), VAR UnusedRows = WholeRows RETURN QtyRows), [Price])))\n\n"
+    "\tmeasure VarRefPadB = VAR WholeRows = Wide VAR QtyRows = VALUES(Wide[Qty]) RETURN SUMX(Wide, SUMX(Sales, SUMX(NATURALINNERJOIN(VALUES(Wide[Qty]), VAR UnusedRows = WholeRows RETURN QtyRows), Wide[Price])))\n\n"
+    "\tmeasure VarSeqA = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = VAR Dummy = 1 RETURN VAR Dummy2 = 2 RETURN Wide RETURN QtyRows, [Price])))\n\n"
+    "\tmeasure VarSeqB = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = VAR Dummy = 1 RETURN VAR Dummy2 = 2 RETURN Wide RETURN QtyRows, Wide[Price])))\n\n"
+    "\tmeasure IterStaleA = SUMX(CROSSJOIN(Sales, VAR a = ABS(1) VAR b = 2 RETURN ShadowOnly), [ShadowM])\n\n"
+    "\tmeasure IterStaleB = SUMX(CROSSJOIN(Sales, VAR a = ABS(1) VAR b = 2 RETURN ShadowOnly), Sales[ShadowM])\n\n"
+    "\tmeasure VarParenSeqA = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), VAR A = (1) VAR B = 2 RETURN Other), [ShadowM]))\n\n"
+    "\tmeasure VarParenSeqB = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), VAR A = (1) VAR B = 2 RETURN Other), Sales[ShadowM]))\n\n"
+    "\tmeasure IterStale2A = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), VAR A = (VAR C = 1 RETURN C) VAR B = 2 RETURN Other), [ShadowM]))\n\n"
+    "\tmeasure IterStale2B = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), VAR A = (VAR C = 1 RETURN C) VAR B = 2 RETURN Other), Sales[ShadowM]))\n\n"
+    "\tmeasure TopnCountCtrlA = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
+    "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
+    "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
+    "\tmeasure TopnSortCtrlB = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
+    "\tmeasure TopnBareA = SUMX(Sales, SUMX(TOPN(1, Other, [Price]), Other[Price]))\n\n"
+    "\tmeasure TopnBareB = SUMX(Sales, SUMX(TOPN(1, Other, Sales[Price]), Other[Price]))\n\n"
+    "\tmeasure TopnCountCtorCtrlA = SUMX(TOPN(COUNTROWS({ 1, 2 }), Sales, Sales[Price], DESC), [Price])\n\n"
+    "\tmeasure TopnCountCtorCtrlB = SUMX(TOPN(COUNTROWS({ 1, 2 }), Sales, Sales[Price], DESC), [Price])\n\n"
+    "\tmeasure TopnCntA = SUMX(Sales, SUMX(TOPN(Sales[Price], Other, [Price]), Other[Price]))\n\n"
+    "\tmeasure TopnCntB = SUMX(Sales, SUMX(TOPN(Sales[Price], Other, Sales[Price]), Other[Price]))\n\n"
+    "\tmeasure RankBareA = SUMX(Sales, RANK(DENSE, Other, ORDERBY([Price])))\n\n"
+    "\tmeasure RankBareB = SUMX(Sales, RANK(DENSE, Other, ORDERBY(Sales[Price])))\n\n"
+    "\tmeasure FailA = SUMX(Sales, SUMX(TOPN(1, SUMMARIZE(Sales, Other[Price]), [Price]), Other[Price]))\n\n"
+    "\tmeasure FailB = SUMX(Sales, SUMX(TOPN(1, SUMMARIZE(Sales, Other[Price]), Sales[Price]), Other[Price]))\n\n"
+    "\tmeasure ExcA = VAR v = VALUES(Other[Price]) RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), [Price], ASC)))\n\n"
+    "\tmeasure ExcB = VAR v = VALUES(Other[Price]) RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), Sales[Price], ASC)))\n\n"
+    "\tmeasure MissingA = COUNTROWS(Missing)\n\n"
+    "\tmeasure MissingB = COUNTROWS(Missing)\n\n"
+    "\tmeasure PoisA = SUMX(Sales, SUMX(EXCEPT(GENERATESERIES(1, MAX(Other[Price])), VALUES(Other[Price])), [Price]))\n\n"
+    "\tmeasure PoisB = SUMX(Sales, SUMX(EXCEPT(GENERATESERIES(1, MAX(Other[Price])), VALUES(Other[Price])), Other[Price]))\n\n"
+    "\tmeasure ProjDropCtrlA = SUMX(SELECTCOLUMNS(ADDCOLUMNS(Sales, \"CtrlA\", 1), \"P\", Sales[Price]), [CtrlA])\n\n"
+    "\tmeasure ProjDropCtrlB = SUMX(SELECTCOLUMNS(ADDCOLUMNS(Sales, \"CtrlA\", 1), \"P\", Sales[Price]), Sales[CtrlA])\n\n"
+    "\tmeasure SpanExcCtrlA = XNPV(EXCEPT(Sales, ROW(\"CtrlA\", 1)), [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure SpanExcCtrlB = XNPV(EXCEPT(Sales, ROW(\"CtrlA\", 1)), Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure UnionRowA = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), Sales), [Price]))\n\n"
+    "\tmeasure UnionRowB = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), Sales), Sales[Price]))\n\n"
+    "\tmeasure WinOptA = SUMX(Sales, COUNTROWS(WINDOW(1, ABS, 3, Other, ORDERBY(Sales[Price], [Price]))))\n\n"
+    "\tmeasure WinOptB = SUMX(Sales, COUNTROWS(WINDOW(1, ABS, 3, Other, ORDERBY(Sales[Price], Sales[Price]))))\n\n"
+    "\tmeasure UnionWrapA = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), FILTER(Sales, TRUE())), [Price]))\n\n"
+    "\tmeasure UnionWrapB = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), FILTER(Sales, TRUE())), Sales[Price]))\n\n"
+    "\tmeasure UnionAllA = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), ALL(Sales)), [Price]))\n\n"
+    "\tmeasure UnionAllB = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), ALL(Sales)), Sales[Price]))\n\n"
+    "\tmeasure YearCtrlA = CALCULATE(SUM(Sales[Price]), DATEADD(Sales[Price], -1, YEAR))\n\n"
+    "\tmeasure YearCtrlB = CALCULATE(SUM(Sales[Price]), DATEADD(Sales[Price], -1, YEAR))\n\n"
+    "\tmeasure TopnExcA = SUMX(Sales, SUMX(TOPN(MAX(Sales[Price]), EXCEPT(ROW(\"Price\", 1), Sales)), [Price]))\n\n"
+    "\tmeasure TopnExcB = SUMX(Sales, SUMX(TOPN(MAX(Sales[Price]), EXCEPT(ROW(\"Price\", 1), Sales)), Sales[Price]))\n\n"
+    "\tmeasure NestUnionA = SUMX(Sales, SUMX(UNION(Sales, FILTER(UNION(ROW(\"Price\", Sales[Price] + 1), ALL(Sales)), TRUE())), [Price]))\n\n"
+    "\tmeasure NestUnionB = SUMX(Sales, SUMX(UNION(Sales, FILTER(UNION(ROW(\"Price\", Sales[Price] + 1), ALL(Sales)), TRUE())), Sales[Price]))\n\n"
+    "\tmeasure SelColA = SUMX(Sales, SUMX(UNION(Sales, SELECTCOLUMNS(Sales, \"Adjusted\", Sales[Price] + 1)), [Price]))\n\n"
+    "\tmeasure SelColB = SUMX(Sales, SUMX(UNION(Sales, SELECTCOLUMNS(Sales, \"Adjusted\", Sales[Price] + 1)), Sales[Price]))\n\n"
+    "\tmeasure AllExcA = SUMX(Sales, SUMX(UNION(VALUES(Sales[Price]), ALLEXCEPT(Sales, Sales[Price])), [Price]))\n\n"
+    "\tmeasure AllExcB = SUMX(Sales, SUMX(UNION(VALUES(Sales[Price]), ALLEXCEPT(Sales, Sales[Price])), Sales[Price]))\n\n"
+    "\tmeasure TreatA = SUMX(FILTER(Sales, Sales[Price] = 1), SUMX(UNION(Sales, TREATAS(Sales, Sales[Price])), [Price]))\n\n"
+    "\tmeasure TreatB = SUMX(FILTER(Sales, Sales[Price] = 1), SUMX(UNION(Sales, TREATAS(Sales, Sales[Price])), Sales[Price]))\n\n"
+    "\tmeasure TreatFirstA = SUMX(FILTER(Sales, Sales[Price] = 1), SUMX(UNION(TREATAS(Sales, Sales[Price]), Sales), [Price]))\n\n"
+    "\tmeasure TreatFirstB = SUMX(FILTER(Sales, Sales[Price] = 1), SUMX(UNION(TREATAS(Sales, Sales[Price]), Sales), Sales[Price]))\n\n"
+    "\tmeasure RankxA = SUMX(Other, SUMX(Sales, RANKX(Other, Other[Price], [Price])))\n\n"
+    "\tmeasure RankxB = SUMX(Other, SUMX(Sales, RANKX(Other, Other[Price], Other[Price])))\n\n"
+    "\tmeasure PercxA = SUMX(Other, SUMX(Sales, PERCENTILEX.INC(Other, Other[Price], [Price] / 100)))\n\n"
+    "\tmeasure PercxB = SUMX(Other, SUMX(Sales, PERCENTILEX.INC(Other, Other[Price], Other[Price] / 100)))\n\n"
+    "\tmeasure ConcatxA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], [Price] & \"\"))))\n\n"
+    "\tmeasure ConcatxB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], Other[Price] & \"\"))))\n\n"
+    "\tmeasure XnpvA = SUMX(Sales, XNPV(Other, [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvB = SUMX(Sales, XNPV(Other, Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvTopA = SUMX(Sales, XNPV(TOPN(MAX(Sales[Price]), Other), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvTopB = SUMX(Sales, XNPV(TOPN(MAX(Sales[Price]), Other), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvNestCtrlA = XNPV(Other, SUMX(Sales, [Price]), DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure XnpvNestCtrlB = XNPV(Other, SUMX(Sales, Sales[Price]), DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure XnpvExcA = VAR v = VALUES(Other[Price]) RETURN SUMX(Sales, XNPV(EXCEPT(v, Sales), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvExcB = VAR v = VALUES(Other[Price]) RETURN SUMX(Sales, XNPV(EXCEPT(v, Sales), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvSelA = SUMX(Sales, XNPV(SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvSelB = SUMX(Sales, XNPV(SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvRankA = SUMX(Sales, XNPV(Other, RANKX(Sales, Sales[Price], [Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvRankB = SUMX(Sales, XNPV(Other, RANKX(Sales, Sales[Price], Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvRateCtrlA = SUMX(Sales, XNPV(Other, Other[Price], DATE(2026, 1, 1), [Price]))\n\n"
+    "\tmeasure XnpvRateCtrlB = SUMX(Sales, XNPV(Other, Other[Price], DATE(2026, 1, 1), Sales[Price]))\n\n"
+    "\tmeasure XnpvDateA = SUMX(Sales, XNPV(Other, Other[Price], [Price], 0))\n\n"
+    "\tmeasure XnpvDateB = SUMX(Sales, XNPV(Other, Other[Price], Sales[Price], 0))\n\n"
+    "\tmeasure XnpvThirdA = SUMX(Sales, XNPV(Other, SUMX(Dates, [Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvThirdB = SUMX(Sales, XNPV(Other, SUMX(Dates, Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvUnionA = SUMX(Sales, XNPV(UNION(VALUES(Sales[Price]), VALUES(Sales[Price])), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvUnionB = SUMX(Sales, XNPV(UNION(VALUES(Sales[Price]), VALUES(Sales[Price])), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvProjA = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), [Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure XnpvProjB = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure WrapProjA = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(FILTER(Sales, TRUE()), \"K\", 1), [Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure WrapProjB = SUMX(Sales, XNPV(Other, SUMX(SELECTCOLUMNS(FILTER(Sales, TRUE()), \"K\", 1), Sales[Price]), DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure PlainProjA = SUMX(Sales, SUMX(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), [Price])))\n\n"
+    "\tmeasure PlainProjB = SUMX(Sales, SUMX(Other, SUMX(SELECTCOLUMNS(Sales, \"K\", 1), Sales[Price])))\n\n"
+    "\tmeasure ValuesColA = SUMX(Sales, SUMX(VALUES(Wide[Qty]), [Price]))\n\n"
+    "\tmeasure ValuesColB = SUMX(Sales, SUMX(VALUES(Wide[Qty]), Wide[Price]))\n\n"
+    "\tmeasure AddColA = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), [Price]))\n\n"
+    "\tmeasure AddColB = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure ProjCapA = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"Price\", 1), [Price]))\n\n"
+    "\tmeasure ProjCapB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure SumzCapA = SUMX(Sales, SUMX(SUMMARIZE(Dates, Dates[Day], \"Price\", 1), [Price]))\n\n"
+    "\tmeasure SumzCapB = SUMX(Sales, SUMX(SUMMARIZE(Dates, Dates[Day], \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure SumzColA = SUMX(Sales, SUMX(SUMMARIZECOLUMNS(Dates[Day], Dates, \"Price\", 1), [Price]))\n\n"
+    "\tmeasure SumzColB = SUMX(Sales, SUMX(SUMMARIZECOLUMNS(Dates[Day], Dates, \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure SelOptA = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, Dates[Day], \"Price\", 1), [Price]))\n\n"
+    "\tmeasure SelOptB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, Dates[Day], \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure RollupA = SUMX(Sales, SUMX(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"Price\")), [Price] + 0))\n\n"
+    "\tmeasure RollupB = SUMX(Sales, SUMX(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"Price\")), Sales[Price] + 0))\n\n"
+    "\tmeasure SelMidA = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"K\", 1, Dates[Day], \"Price\", 1), [Price]))\n\n"
+    "\tmeasure SelMidB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, \"K\", 1, Dates[Day], \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure SelStrA = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, Dates[Day] & \"\", \"Price\", 1), [Price]))\n\n"
+    "\tmeasure SelStrB = SUMX(Sales, SUMX(SELECTCOLUMNS(Dates, Dates[Day] & \"\", \"Price\", 1), Sales[Price]))\n\n"
+    "\tmeasure ShadowA = SUMX(ADDCOLUMNS(Dates, \"CtrlA\", 1), [CtrlA])\n\n"
+    "\tmeasure ShadowB = SUMX(ADDCOLUMNS(Dates, \"CtrlA\", 1), Sales[CtrlA])\n\n"
+    "\tmeasure TopnCapA = COUNTROWS(TOPN(1, Sales, IF(Sales[Price] = 10, COUNTROWS(TOPN(1, SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), [Price], DESC)), 1), DESC))\n\n"
+    "\tmeasure TopnCapB = COUNTROWS(TOPN(1, Sales, IF(Sales[Price] = 10, COUNTROWS(TOPN(1, SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), Sales[Price], DESC)), 1), DESC))\n\n"
+    "\tmeasure XnpvShadowA = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure XnpvShadowB = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure RankCapA = RANK(DENSE, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY([CtrlA]))\n\n"
+    "\tmeasure RankCapB = RANK(DENSE, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY(Sales[CtrlA]))\n\n"
+    "\tmeasure RowXnpvA = XNPV(ROW(\"CtrlA\", 1), [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure RowXnpvB = XNPV(ROW(\"CtrlA\", 1), Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure VarXnpvA = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) RETURN XNPV(t, [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure VarXnpvB = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) RETURN XNPV(t, Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure RollupWrapA = SUMX(FILTER(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"CtrlA\")), TRUE()), [CtrlA])\n\n"
+    "\tmeasure RollupWrapB = SUMX(FILTER(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"CtrlA\")), TRUE()), Sales[CtrlA])\n\n"
+    "\tmeasure XnpvNestShadowA = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), SUMX(Sales, [CtrlA]), DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure XnpvNestShadowB = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), SUMX(Sales, Sales[CtrlA]), DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure VarAliasA = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) VAR u = FILTER(t, TRUE()) RETURN SUMX(u, [CtrlA] + Sales[Price])\n\n"
+    "\tmeasure VarAliasB = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) VAR u = FILTER(t, TRUE()) RETURN SUMX(u, Sales[CtrlA] + Sales[Price])\n\n"
+    "\tmeasure VarNestA = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", VAR x = 1 RETURN x) RETURN SUMX(t, [CtrlA] + Sales[Price])\n\n"
+    "\tmeasure VarNestB = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", VAR x = 1 RETURN x) RETURN SUMX(t, Sales[CtrlA] + Sales[Price])\n\n"
+    "\tmeasure WinXnpvA = SUMX(WINDOW(1, ABS, 3, ABS, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY(Sales[Price])), [CtrlA] + Sales[Price])\n\n"
+    "\tmeasure WinXnpvB = SUMX(WINDOW(1, ABS, 3, ABS, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY(Sales[Price])), Sales[CtrlA] + Sales[Price])\n\n"
+    "\tmeasure XnpvColShadowA = XNPV(Other, [ShadowM], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure XnpvColShadowB = XNPV(Other, Sales[ShadowM], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure TopnColShadowA = COUNTROWS(TOPN(1, Other, [ShadowM]))\n\n"
+    "\tmeasure TopnColShadowB = COUNTROWS(TOPN(1, Other, Sales[ShadowM]))\n\n"
+    "\tmeasure FnbColA = SUMX(Sales, FIRSTNONBLANK(Wide[Qty], [Price]))\n\n"
+    "\tmeasure FnbColB = SUMX(Sales, FIRSTNONBLANK(Wide[Qty], Wide[Price]))\n\n"
+    "\tmeasure SpanChainCtrlA = VAR __a = Sales VAR __b = INTERSECT(__a, __a) VAR __c = INTERSECT(__b, __b) RETURN XNPV(__c, [Price], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure SpanChainCtrlB = VAR __a = Sales VAR __b = INTERSECT(__a, __a) VAR __c = INTERSECT(__b, __b) RETURN XNPV(__c, Sales[Price], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure HomeCountA = COUNTROWS()\n\n"
+    "\tmeasure FmtShadowA = 1\n\t\tformatStringDefinition = IF(XNPV(Other, [ShadowM], DATE(2026, 1, 1), 0) > 0, \"0.0\", \"0%\")\n\n"
+    "\tmeasure FmtShadowB = 1\n\t\tformatStringDefinition = IF(XNPV(Other, Sales[ShadowM], DATE(2026, 1, 1), 0) > 0, \"0.0\", \"0%\")\n\n"
+    "\tmeasure FmtNameA = 1\n\t\tformatStringDefinition = IF(SELECTEDMEASURENAME() = \"FmtNameA\", \"$#,0\", \"#,0\")\n\n"
+    "\tmeasure FmtNameB = 1\n\t\tformatStringDefinition = IF(SELECTEDMEASURENAME() = \"FmtNameA\", \"$#,0\", \"#,0\")\n\n"
+    "\tmeasure SubstA = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, [Price], ASC)))\n\n"
+    "\tmeasure SubstB = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, Sales[Price], ASC)))\n\n"
+    "\tmeasure SubstLateA = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, Other[ShadowM], ASC, [Price], ASC)))\n\n"
+    "\tmeasure SubstLateB = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, Other[ShadowM], ASC, Sales[Price], ASC)))\n\n"
+    "\tmeasure SubstUnkA = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", ADDCOLUMNS(Other, \"CtrlA\", Other[Price]), [CtrlA], ASC))\n\n"
+    "\tmeasure SubstUnkB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", ADDCOLUMNS(Other, \"CtrlA\", Other[Price]), Sales[CtrlA], ASC))\n\n"
+    "\tmeasure SubstNestCtrlA = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, Other[Price] + SUMX(Sales, [Price]), ASC))\n\n"
+    "\tmeasure SubstNestCtrlB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, Other[Price] + SUMX(Sales, Sales[Price]), ASC))\n\n"
+    "\tmeasure SubstRankCtrlA = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], [Price]), ASC))\n\n"
+    "\tmeasure SubstRankCtrlB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], Other[Price]), ASC))\n\n"
+    "\tmeasure SwiNarrowA = SUMX(Other, SUMX(Sales, TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", VALUES(Other[ShadowM]), RANKX(Other, Other[Price], [Price]), ASC))))\n\n"
+    "\tmeasure SwiNarrowB = SUMX(Other, SUMX(Sales, TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", VALUES(Other[ShadowM]), RANKX(Other, Other[Price], Other[Price]), ASC))))\n\n"
+    "\tmeasure RankNestCtrlA = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], SUMX(Sales, [Price])), ASC))\n\n"
+    "\tmeasure RankNestCtrlB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], SUMX(Sales, Sales[Price])), ASC))\n\n"
+    "\tmeasure TopnCallerCtrlA = SUMX(Sales, COUNTROWS(TOPN(1, Other, RANKX(Other, Other[Price], [Price]))))\n\n"
+    "\tmeasure TopnCallerCtrlB = SUMX(Sales, COUNTROWS(TOPN(1, Other, RANKX(Other, Other[Price], Other[Price]))))\n\n"
+    "\tmeasure AllMultiA = SUMX(Sales, XNPV(ALL(Wide[Qty], Wide[Price]), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllMultiB = SUMX(Sales, XNPV(ALL(Wide[Qty], Wide[Price]), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllExcSpanA = SUMX(Other, SUMX(Sales, XNPV(ALLEXCEPT(Other, Other[Price]), RANKX(Other, Other[Price], [Price]), DATE(2026, 1, 1), 0)))\n\n"
+    "\tmeasure AllExcSpanB = SUMX(Other, SUMX(Sales, XNPV(ALLEXCEPT(Other, Other[Price]), RANKX(Other, Other[Price], Other[Price]), DATE(2026, 1, 1), 0)))\n\n"
+    "\tmeasure NarrowMeasCtrlA = XNPV(VALUES(Other[Price]), [ShadowM], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure NarrowMeasCtrlB = XNPV(VALUES(Other[Price]), Sales[ShadowM], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure AllNbA = SUMX(Sales, XNPV(ALLNOBLANKROW(Wide[Qty], Wide[Price]), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllNbB = SUMX(Sales, XNPV(ALLNOBLANKROW(Wide[Qty], Wide[Price]), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllExcDirectA = SUMX(Sales, XNPV(ALLEXCEPT(Other, Other[Price]), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllExcDirectB = SUMX(Sales, XNPV(ALLEXCEPT(Other, Other[Price]), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure TopnAllA = COUNTROWS(TOPN(1, ALL(Other[Price], Other[ShadowM]), [ShadowM]))\n\n"
+    "\tmeasure TopnAllB = COUNTROWS(TOPN(1, ALL(Other[Price], Other[ShadowM]), Sales[ShadowM]))\n\n"
+    "\tmeasure JoinShadowA = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), Other), [ShadowM]))\n\n"
+    "\tmeasure JoinShadowB = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), Other), Sales[ShadowM]))\n\n"
+    "\tmeasure PadA = SUMX(Sales, SUMX(INTERSECT(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), Wide), [Price]))\n\n"
+    "\tmeasure PadB = SUMX(Sales, SUMX(INTERSECT(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), Wide), Wide[Price]))\n\n"
+    "\tmeasure CtorCommaA = SUMX(Sales, SUMX(Other, COUNTROWS(DISTINCT(FILTER({ Sales[Price], [Price] }, TRUE())))))\n\n"
+    "\tmeasure CtorCommaB = SUMX(Sales, SUMX(Other, COUNTROWS(DISTINCT(FILTER({ Sales[Price], Sales[Price] }, TRUE())))))\n\n"
+    "\tmeasure UnionPadA = SUMX(Wide, SUMX(Sales, SUMX(UNION(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), Wide), [Price])))\n\n"
+    "\tmeasure UnionPadB = SUMX(Wide, SUMX(Sales, SUMX(UNION(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), Wide), Wide[Price])))\n\n"
+    "\tmeasure ShadowCtorA = COUNTROWS(FILTER({ MAX(Other[Price]), [ShadowM] }, TRUE()))\n\n"
+    "\tmeasure ShadowCtorB = COUNTROWS(FILTER({ MAX(Other[Price]), Other[ShadowM] }, TRUE()))\n\n"
+    "\tmeasure CtorNestCtrlA = SUMX(Sales, COUNTROWS({ SUMX(Other, [Price]) }))\n\n"
+    "\tmeasure CtorNestCtrlB = SUMX(Sales, COUNTROWS({ SUMX(Other, Other[Price]) }))\n\n"
+    "\tmeasure CtorNarrowCtrlA = SUMX(VALUES(Wide[Qty]), COUNTROWS({ SUMX(Other, [Price]) }))\n\n"
+    "\tmeasure CtorNarrowCtrlB = SUMX(VALUES(Wide[Qty]), COUNTROWS({ SUMX(Other, Other[Price]) }))\n\n"
+    "\tmeasure NestTopnA = COUNTROWS(TOPN(1, Other, SUMX(Sales, [Price])))\n\n"
+    "\tmeasure NestTopnB = COUNTROWS(TOPN(1, Other, SUMX(Sales, Sales[Price])))\n\n"
+    "\tmeasure CapNestCtrlA = SUMX(ADDCOLUMNS(Dates, \"Price\", 1), SUMX(Other, [Price]))\n\n"
+    "\tmeasure CapNestCtrlB = SUMX(ADDCOLUMNS(Dates, \"Price\", 1), SUMX(Other, Other[Price]))\n\n"
+    "\tmeasure CapSelfA = SUMX(Wide, SUMX(ADDCOLUMNS(VALUES(Wide[Qty]), \"Price\", 1), [Price]))\n\n"
+    "\tmeasure CapSelfB = SUMX(Wide, SUMX(ADDCOLUMNS(VALUES(Wide[Qty]), \"Price\", 1), Wide[Price]))\n\n"
+    "\tmeasure ExcCapCtrlA = SUMX(EXCEPT(Sales, ROW(\"CtrlA\", 1)), [CtrlA])\n\n"
+    "\tmeasure ExcCapCtrlB = SUMX(EXCEPT(Sales, ROW(\"CtrlA\", 1)), Sales[CtrlA])\n\n"
+    "\tmeasure ClauseNestCtrlA = COUNTROWS(INDEX(1, Other, ORDERBY(SUMX(Sales, [Price]), DESC)))\n\n"
+    "\tmeasure ClauseNestCtrlB = COUNTROWS(INDEX(1, Other, ORDERBY(SUMX(Sales, Sales[Price]), DESC)))\n\n"
+    "\tmeasure RowOuterCtrlA = SUMX(ROW(\"K\", 1), SUMX(Sales, [Price]))\n\n"
+    "\tmeasure RowOuterCtrlB = SUMX(ROW(\"K\", 1), SUMX(Sales, Sales[Price]))\n\n"
+    "\tmeasure VarRowCtrlA = SUMX(Sales, VAR T = ROW(\"Price\", 1) RETURN COUNTROWS(T) + [Price])\n\n"
+    "\tmeasure VarRowCtrlB = SUMX(Sales, VAR T = ROW(\"Price\", 1) RETURN COUNTROWS(T) + Sales[Price])\n\n"
+    "\tmeasure ExprCapCtrlA = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), 1) + [Price])\n\n"
+    "\tmeasure ExprCapCtrlB = SUMX(Sales, SUMX(ADDCOLUMNS(Dates, \"Price\", 1), 1) + Sales[Price])\n\n"
+    "\tmeasure VarRefCtrlA = VAR T = ADDCOLUMNS(Dates, \"Price\", 1) RETURN SUMX(Sales, SUMX(T, 1) + [Price])\n\n"
+    "\tmeasure VarRefCtrlB = VAR T = ADDCOLUMNS(Dates, \"Price\", 1) RETURN SUMX(Sales, SUMX(T, 1) + Sales[Price])\n\n"
+    "\tmeasure SwiCapCtrlA = TOCSV(SUBSTITUTEWITHINDEX(ADDCOLUMNS(Sales, \"CtrlA\", 1), \"Idx\", Sales, [CtrlA], ASC))\n\n"
+    "\tmeasure SwiCapCtrlB = TOCSV(SUBSTITUTEWITHINDEX(ADDCOLUMNS(Sales, \"CtrlA\", 1), \"Idx\", Sales, Sales[CtrlA], ASC))\n\n"
+    "\tmeasure VarPredCtrlA = VAR T = FILTER(Sales, COUNTROWS(ROW(\"CtrlA\", 1)) > 0) RETURN XNPV(T, [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure VarPredCtrlB = VAR T = FILTER(Sales, COUNTROWS(ROW(\"CtrlA\", 1)) > 0) RETURN XNPV(T, Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
+
+    "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
+    "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
+)
+OTHER = (
+    "table Other\n\n"
+    "\tmeasure OtherRows = COUNTROWS()\n\n"
+    "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
+    "\tcolumn ShadowM\n\t\tdataType: int64\n\t\tsourceColumn: ShadowM\n\n"
+)
+WIDE = (
+    "table Wide\n\n"
+    "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
+    "\tcolumn Qty\n\t\tdataType: int64\n\t\tsourceColumn: Qty\n\n"
+)
+SHADOWONLY = (
+    "table ShadowOnly\n\n"
+    "\tcolumn ShadowM\n\t\tdataType: int64\n\t\tsourceColumn: ShadowM\n\n"
+)
+DATES = (
+    "table Dates\n\n"
+    "\tcolumn Day\n\t\tdataType: dateTime\n\t\tsourceColumn: Day\n\n"
+)
+MODEL = "model Model\n\tculture: en-US\n\nref table Sales\nref table Other\nref table Dates\nref table Wide\nref table ShadowOnly\n"
+DATABASE = "database\n\tcompatibilityLevel: 1400\n"
+
+
+def _write(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+class SimilarScopeTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        self.ws = common.Workspace(root)
+        self.ws.private = os.path.join(root, "private")
+        os.makedirs(self.ws.private)
+        _write(os.path.join(root, "Mini.pbip"), "{}")
+        self.project = common.Project(self.ws, "Mini")
+        mdef = os.path.join(self.project.mirror_model, "definition")
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"), SALES)
+        _write(os.path.join(mdef, "tables", "Other.tmdl"), OTHER)
+        _write(os.path.join(mdef, "tables", "Dates.tmdl"), DATES)
+        _write(os.path.join(mdef, "tables", "Wide.tmdl"), WIDE)
+        _write(os.path.join(mdef, "tables", "ShadowOnly.tmdl"), SHADOWONLY)
+        _write(os.path.join(mdef, "model.tmdl"), MODEL)
+        _write(os.path.join(mdef, "database.tmdl"), DATABASE)
+        os.makedirs(self.project.model_dir, exist_ok=True)
+        self.model = tmdl.load_model(mdef)
+        self.resolver = deps.Resolver(self.model)
+        self.assertEqual(set(self.model.tables), {"Sales", "Other", "Dates", "Wide", "ShadowOnly"})
+        for table in ("Sales", "Other"):
+            self.assertIsNotNone(self.model.column(table, "Price"))
+            self.assertIsNone(self.model.column(table, "Nope"))
+        self.assertIsNone(self.model.measure("Price"))
+        self.assertIsNone(self.model.measure("Nope"))
+        self.assertEqual(
+            {(m.table, m.name) for m in self.model.all_measures()},
+            {("Sales", name) for name in
+             ("IterA", "IterB", "IterC", "IterD", "UnresA", "UnresB", "CtrlA", "CtrlB", "ShadowM",
+              "VarA", "VarB", "AliasUnres", "AliasOk", "WrapA", "WrapB",
+              "TabA", "TabB", "TabCtrlA", "TabCtrlB", "TopA", "TopB", "ScalarA", "ScalarB",
+              "ExprA", "ExprB", "ChainA", "ChainB", "ValuesA", "ValuesB",
+              "DerivedA", "DerivedB", "ScalarQA", "ScalarQB", "CrossA", "CrossB",
+              "CtorA", "CtorB", "CountA", "CountB", "ScopeA", "ScopeB", "InlineA", "InlineB",
+              "QualA", "QualB", "GenA", "GenB", "TopNCtrlA", "TopNCtrlB",
+              "SumzA", "SumzB", "Gen2A", "Gen2B", "NestCtrlA", "NestCtrlB",
+              "Gen3A", "Gen3B", "ConsA", "ConsB", "IfCtrlA", "IfCtrlB",
+              "CalcA", "CalcB", "AllCountA", "AllCountB", "FiltCountA", "FiltCountB",
+              "IfPredCtrlA", "IfPredCtrlB", "ContainsA", "ContainsB",
+              "PredCountCtrlA", "PredCountCtrlB", "MaxxCtrlA", "MaxxCtrlB",
+              "PredMaxxA", "PredMaxxB", "PredValuesA", "PredValuesB", "PredVarA", "PredVarB",
+              "JoinA", "JoinB", "JoinInlA", "JoinInlB", "ExcQualCtrlA", "ExcQualCtrlB",
+              "SumzGroupA", "SumzGroupB", "JoinShadowVarA", "JoinShadowVarB",
+              "VarUnionPadA", "VarUnionPadB", "IntermA", "IntermB",
+              "UnionPredCtrlA", "UnionPredCtrlB",
+              "UnionScalarCtrlA", "UnionScalarCtrlB", "CrossJoinNarrowA", "CrossJoinNarrowB",
+              "JoinBareVarA", "JoinBareVarB", "CalcPredA", "CalcPredB",
+              "CalcPred2A", "CalcPred2B", "ParenVarA", "ParenVarB",
+              "CalcPred3A", "CalcPred3B", "TopnFilterAllA", "TopnFilterAllB",
+              "ExcAccA", "ExcAccB", "ScopeVarA", "ScopeVarB",
+              "ScopeNestA", "ScopeNestB", "ScopeOrderA", "ScopeOrderB",
+              "VarTopnCtrlA", "VarTopnCtrlB", "VarRefPadA", "VarRefPadB",
+              "VarSeqA", "VarSeqB", "IterStaleA", "IterStaleB", "IterStale2A", "IterStale2B",
+              "VarParenSeqA", "VarParenSeqB",
+              "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
+              "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
+              "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
+              "FailA", "FailB", "ExcA", "ExcB", "MissingA", "MissingB",
+              "PoisA", "PoisB", "UnionRowA", "UnionRowB", "WinOptA", "WinOptB",
+              "UnionWrapA", "UnionWrapB", "UnionAllA", "UnionAllB", "YearCtrlA", "YearCtrlB",
+              "TopnExcA", "TopnExcB", "NestUnionA", "NestUnionB", "SelColA", "SelColB",
+              "AllExcA", "AllExcB", "TreatA", "TreatB", "TreatFirstA", "TreatFirstB",
+              "RankxA", "RankxB", "PercxA", "PercxB", "ConcatxA", "ConcatxB",
+              "XnpvA", "XnpvB", "ConcatxSortCtrlA", "ConcatxSortCtrlB",
+              "XnpvTopA", "XnpvTopB", "XnpvNestCtrlA", "XnpvNestCtrlB",
+              "XnpvExcA", "XnpvExcB", "XnpvSelA", "XnpvSelB", "XnpvRankA", "XnpvRankB",
+              "XnpvRateCtrlA", "XnpvRateCtrlB", "XnpvDateA", "XnpvDateB",
+              "XnpvThirdA", "XnpvThirdB", "XnpvUnionA", "XnpvUnionB",
+              "XnpvProjA", "XnpvProjB", "WrapProjA", "WrapProjB",
+              "PlainProjA", "PlainProjB", "ValuesColA", "ValuesColB",
+              "AddColA", "AddColB", "ProjCapA", "ProjCapB",
+              "SumzCapA", "SumzCapB", "SumzColA", "SumzColB",
+              "SelOptA", "SelOptB", "RollupA", "RollupB", "SelMidA", "SelMidB",
+              "SelStrA", "SelStrB", "ShadowA", "ShadowB", "TopnCapA", "TopnCapB",
+              "XnpvShadowA", "XnpvShadowB", "RankCapA", "RankCapB",
+              "RowXnpvA", "RowXnpvB", "VarXnpvA", "VarXnpvB",
+              "RollupWrapA", "RollupWrapB", "XnpvNestShadowA", "XnpvNestShadowB",
+              "VarAliasA", "VarAliasB", "VarNestA", "VarNestB", "WinXnpvA", "WinXnpvB",
+              "XnpvColShadowA", "XnpvColShadowB", "TopnColShadowA", "TopnColShadowB",
+              "FnbColA", "FnbColB", "SpanChainCtrlA", "SpanChainCtrlB",
+              "HomeCountA", "FmtShadowA", "FmtShadowB", "FmtNameA", "FmtNameB",
+              "SubstA", "SubstB", "SubstLateA", "SubstLateB", "SubstUnkA", "SubstUnkB",
+              "SubstNestCtrlA", "SubstNestCtrlB",
+              "SubstRankCtrlA", "SubstRankCtrlB", "SwiNarrowA", "SwiNarrowB",
+              "RankNestCtrlA", "RankNestCtrlB", "TopnCallerCtrlA", "TopnCallerCtrlB",
+              "AllMultiA", "AllMultiB", "AllExcSpanA", "AllExcSpanB",
+              "NarrowMeasCtrlA", "NarrowMeasCtrlB", "AllNbA", "AllNbB",
+              "AllExcDirectA", "AllExcDirectB", "TopnAllA", "TopnAllB",
+              "JoinShadowA", "JoinShadowB", "PadA", "PadB",
+              "CtorCommaA", "CtorCommaB", "UnionPadA", "UnionPadB",
+              "ShadowCtorA", "ShadowCtorB", "CtorNestCtrlA", "CtorNestCtrlB",
+              "CtorNarrowCtrlA", "CtorNarrowCtrlB", "NestTopnA", "NestTopnB",
+              "CapNestCtrlA", "CapNestCtrlB", "CapSelfA", "CapSelfB",
+              "ExcCapCtrlA", "ExcCapCtrlB", "ProjDropCtrlA", "ProjDropCtrlB", "SpanExcCtrlA", "SpanExcCtrlB",
+              "ClauseNestCtrlA", "ClauseNestCtrlB", "RowOuterCtrlA", "RowOuterCtrlB",
+              "VarRowCtrlA", "VarRowCtrlB", "ExprCapCtrlA", "ExprCapCtrlB",
+              "VarRefCtrlA", "VarRefCtrlB", "SwiCapCtrlA", "SwiCapCtrlB",
+              "VarPredCtrlA", "VarPredCtrlB")} | {("Other", "OtherRows")},
+        )
+
+    def _canon(self, name):
+        measure = self.model.measure(name)
+        self.assertIsNotNone(measure)
+        return similar.canon(measure.expression, "Sales", self.resolver)
+
+    def _key(self, name):
+        return self._canon(name).words("hash")
+
+    def test_nested_iterator_occurrences_get_different_keys(self):
+        key_a, key_b = self._key("IterA"), self._key("IterB")
+        self.assertNotEqual(key_a, key_b)
+        self.assertIn("other[price]", key_a)
+        self.assertIn("sales[price]", key_b)
+        self.assertEqual(
+            key_a,
+            similar.canon("SUMX(Sales, SUMX(Other, Other[Price]))",
+                          "Sales", self.resolver).words("hash"),
+        )
+
+    def test_each_occurrence_binds_its_own_row_context(self):
+        key_c, key_d = self._key("IterC"), self._key("IterD")
+        self.assertNotEqual(key_c, key_d)
+        self.assertIn("sales[price]", key_c)
+        self.assertIn("other[price]", key_c)
+        self.assertEqual(
+            key_c,
+            similar.canon("SUMX(Sales, Sales[Price] + SUMX(Other, Other[Price]))",
+                          "Sales", self.resolver).words("hash"),
+        )
+
+    def test_merge_preview_refuses_scoped_pair_without_force(self):
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "IterB", "IterA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_unresolved_occurrence_blocks_automatic_merge(self):
+        self.assertEqual(self._key("UnresA"), self._key("UnresB"))
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "UnresB", "UnresA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_identical_control_still_previews_identical(self):
+        result = consolidate.merge(self.ws, self.project, "CtrlB", "CtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+        self.assertEqual(result["result"], "DRY_RUN")
+
+    def test_var_table_iterator_occurrence_is_uncertain(self):
+        self.assertEqual(self._key("VarA"), self._key("VarB"))
+        self.assertTrue(self._canon("VarA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "VarB", "VarA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_uncertain_alias_is_refused(self):
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "AliasUnres", "CtrlA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_resolved_alias_still_previews_alias(self):
+        result = consolidate.merge(self.ws, self.project, "AliasOk", "CtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "alias")
+        self.assertEqual(result["result"], "DRY_RUN")
+
+    def test_wrapped_var_source_stays_uncertain(self):
+        self.assertEqual(self._key("WrapA"), self._key("WrapB"))
+        self.assertTrue(self._canon("WrapA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "WrapB", "WrapA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_unresolved_table_token_blocks_identical_merge(self):
+        self.assertEqual(self._key("TabA"), self._key("TabB"))
+        self.assertTrue(self._canon("TabA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "TabB", "TabA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+        result = consolidate.merge(self.ws, self.project, "TabCtrlB", "TabCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_table_var_after_reference_still_poisons(self):
+        self.assertEqual(self._key("TopA"), self._key("TopB"))
+        self.assertTrue(self._canon("TopA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "TopB", "TopA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_expression_defined_table_var_still_poisons(self):
+        for dup, into in (("ExprB", "ExprA"), ("ChainB", "ChainA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_column_fed_and_derived_table_vars_still_poison(self):
+        for dup, into in (("ValuesB", "ValuesA"), ("DerivedB", "DerivedA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_unlisted_table_forms_still_poison(self):
+        for dup, into in (("CrossB", "CrossA"), ("CtorB", "CtorA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_sibling_scope_and_inline_source_still_poison(self):
+        for dup, into in (("ScopeB", "ScopeA"), ("InlineB", "InlineA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_qualified_and_generated_sources_still_poison(self):
+        for dup, into in (("QualB", "QualA"), ("GenB", "GenA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_projected_and_generated_sources_still_poison(self):
+        for dup, into in (("SumzB", "SumzA"), ("Gen2B", "Gen2A")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_scalar_bound_and_constructor_sources_still_poison(self):
+        for dup, into in (("Gen3B", "Gen3A"), ("ConsB", "ConsA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_silent_source_and_scalar_wrapped_teachings_still_poison(self):
+        for dup, into in (("CalcB", "CalcA"), ("AllCountB", "AllCountA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+        self.assertTrue(self._canon("FiltCountA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "FiltCountB", "FiltCountA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_natural_join_second_table_still_poisons(self):
+        self.assertEqual(self._key("SumzGroupB"), self._key("SumzGroupA"))
+        self.assertTrue(self._canon("SumzGroupA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "SumzGroupB", "SumzGroupA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_shared_lineage_joins_stay_certain(self):
+        for name, dup in (("JoinA", "JoinB"), ("JoinInlA", "JoinInlB"),
+                          ("ExcQualCtrlA", "ExcQualCtrlB"),
+                          ("UnionPredCtrlA", "UnionPredCtrlB"),
+                          ("UnionScalarCtrlA", "UnionScalarCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
+
+    def test_zero_argument_countrows_keys_include_home(self):
+        self.assertNotEqual(self._key("HomeCountA"),
+                            similar.canon("COUNTROWS()", "Other", self.resolver).words("hash"))
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "OtherRows", "HomeCountA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_uncertain_dynamic_format_is_refused(self):
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "FmtShadowB", "FmtShadowA", dry_run=True)
+        self.assertEqual(caught.exception.code, "FORMAT_DIFFERS")
+
+    def test_substitutewithindex_nested_iterator_stays_certain(self):
+        self.assertFalse(self._canon("SubstNestCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "SubstNestCtrlB", "SubstNestCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_substitutewithindex_rankx_value_stays_certain(self):
+        self.assertFalse(self._canon("SubstRankCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "SubstRankCtrlB", "SubstRankCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_narrowed_swi_caller_is_refused(self):
+        for dup, into in (("SwiNarrowB", "SwiNarrowA"), ("AllMultiB", "AllMultiA"),
+                          ("AllExcSpanB", "AllExcSpanA"), ("AllNbB", "AllNbA"),
+                          ("AllExcDirectB", "AllExcDirectA"), ("TopnAllB", "TopnAllA"),
+                          ("JoinShadowB", "JoinShadowA"), ("PadB", "PadA"),
+                          ("CtorCommaB", "CtorCommaA"), ("UnionPadB", "UnionPadA"),
+                          ("ShadowCtorB", "ShadowCtorA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_measure_outside_narrowed_source_stays_certain(self):
+        self.assertFalse(self._canon("NarrowMeasCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "NarrowMeasCtrlB", "NarrowMeasCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_rankx_nested_and_topn_callers_stay_certain(self):
+        for name, dup in (("RankNestCtrlA", "RankNestCtrlB"),
+                          ("TopnCallerCtrlA", "TopnCallerCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
+
+    def test_constructor_nested_iterator_stays_certain(self):
+        self.assertFalse(self._canon("CtorNestCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "CtorNestCtrlB", "CtorNestCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_constructor_narrowed_outer_stays_certain(self):
+        self.assertFalse(self._canon("CtorNarrowCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "CtorNarrowCtrlB", "CtorNarrowCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_owner_captured_name_is_refused(self):
+        self.assertEqual(self._key("CapSelfA"), self._key("CapSelfB"))
+        self.assertTrue(self._canon("CapSelfA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "CapSelfB", "CapSelfA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_var_union_and_intermediate_consumers_are_refused(self):
+        for dup, into in (("VarUnionPadB", "VarUnionPadA"), ("IntermB", "IntermA"),
+                          ("CrossJoinNarrowB", "CrossJoinNarrowA"),
+                          ("JoinBareVarB", "JoinBareVarA"), ("CalcPredB", "CalcPredA"),
+                          ("CalcPred2B", "CalcPred2A"), ("ParenVarB", "ParenVarA"),
+                          ("CalcPred3B", "CalcPred3A"),
+                          ("TopnFilterAllB", "TopnFilterAllA"),
+                          ("ExcAccB", "ExcAccA"), ("ScopeVarB", "ScopeVarA"),
+                          ("ScopeNestB", "ScopeNestA"), ("ScopeOrderB", "ScopeOrderA"),
+                          ("VarRefPadB", "VarRefPadA"), ("VarSeqB", "VarSeqA"),
+                          ("IterStaleB", "IterStaleA"), ("VarParenSeqB", "VarParenSeqA"),
+                          ("IterStale2B", "IterStale2A")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_var_join_shadow_is_refused(self):
+        self.assertEqual(self._key("JoinShadowVarA"), self._key("JoinShadowVarB"))
+        self.assertTrue(self._canon("JoinShadowVarA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "JoinShadowVarB", "JoinShadowVarA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_projection_drop_and_span_except_stay_certain(self):
+        for name, dup in (("ProjDropCtrlA", "ProjDropCtrlB"),
+                          ("SpanExcCtrlA", "SpanExcCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
+
+    def test_except_second_operand_names_stay_certain(self):
+        self.assertFalse(self._canon("ExcCapCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "ExcCapCtrlB", "ExcCapCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_nested_owner_exempts_sort_and_capture_guards(self):
+        for name, dup in (("NestTopnA", "NestTopnB"), ("CapNestCtrlA", "CapNestCtrlB"),
+                          ("ClauseNestCtrlA", "ClauseNestCtrlB"),
+                          ("RowOuterCtrlA", "RowOuterCtrlB"),
+                          ("VarRowCtrlA", "VarRowCtrlB"),
+                          ("ExprCapCtrlA", "ExprCapCtrlB"),
+                          ("VarRefCtrlA", "VarRefCtrlB"),
+                          ("SwiCapCtrlA", "SwiCapCtrlB"),
+                          ("VarPredCtrlA", "VarPredCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
+
+    def test_enclosing_var_topn_is_refused(self):
+        self.assertEqual(self._key("VarTopnCtrlA"), self._key("VarTopnCtrlB"))
+        self.assertTrue(self._canon("VarTopnCtrlA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "VarTopnCtrlB", "VarTopnCtrlA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_identity_dependent_format_is_refused(self):
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "FmtNameB", "FmtNameA", dry_run=True)
+        self.assertEqual(caught.exception.code, "FORMAT_DIFFERS")
+
+    def test_substitutewithindex_sort_bracket_is_uncertain(self):
+        for dup, into in (("SubstB", "SubstA"), ("SubstLateB", "SubstLateA"),
+                          ("SubstUnkB", "SubstUnkA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_span_chain_stays_certain(self):
+        self.assertFalse(self._canon("SpanChainCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "SpanChainCtrlB", "SpanChainCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_xnpv_rate_argument_stays_certain(self):
+        self.assertFalse(self._canon("XnpvRateCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "XnpvRateCtrlB", "XnpvRateCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_xnpv_nested_iterator_stays_certain(self):
+        self.assertFalse(self._canon("XnpvNestCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "XnpvNestCtrlB", "XnpvNestCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_concatx_sort_argument_stays_certain(self):
+        self.assertFalse(self._canon("ConcatxSortCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "ConcatxSortCtrlB", "ConcatxSortCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_interval_keyword_argument_stays_certain(self):
+        self.assertFalse(self._canon("YearCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "YearCtrlB", "YearCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_topn_scalar_arguments_stay_certain(self):
+        for name, dup in (("TopnCountCtrlA", "TopnCountCtrlB"), ("TopnSortCtrlA", "TopnSortCtrlB"),
+                          ("TopnCountCtorCtrlA", "TopnCountCtorCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
+
+    def test_bare_column_in_topn_sort_is_uncertain(self):
+        self.assertEqual(self._key("TopnBareA"), self._key("TopnBareB"))
+        self.assertTrue(self._canon("TopnBareA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "TopnBareB", "TopnBareA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_count_taught_and_clause_brackets_are_uncertain(self):
+        for dup, into in (("TopnCntB", "TopnCntA"), ("RankBareB", "RankBareA"),
+                          ("FailB", "FailA"), ("ExcB", "ExcA"), ("MissingB", "MissingA"),
+                          ("PoisB", "PoisA"), ("UnionRowB", "UnionRowA"), ("WinOptB", "WinOptA"),
+                          ("UnionWrapB", "UnionWrapA"), ("UnionAllB", "UnionAllA"),
+                          ("TopnExcB", "TopnExcA"), ("NestUnionB", "NestUnionA"),
+                          ("SelColB", "SelColA"), ("AllExcB", "AllExcA"),
+                          ("TreatB", "TreatA"), ("TreatFirstB", "TreatFirstA"),
+                          ("RankxB", "RankxA"), ("PercxB", "PercxA"), ("ConcatxB", "ConcatxA"),
+                          ("XnpvB", "XnpvA"), ("XnpvTopB", "XnpvTopA"),
+                          ("XnpvExcB", "XnpvExcA"), ("XnpvSelB", "XnpvSelA"),
+                          ("XnpvRankB", "XnpvRankA"), ("XnpvDateB", "XnpvDateA"),
+                          ("XnpvThirdB", "XnpvThirdA"), ("XnpvUnionB", "XnpvUnionA"),
+                          ("XnpvProjB", "XnpvProjA"), ("WrapProjB", "WrapProjA"),
+                          ("PlainProjB", "PlainProjA"), ("ValuesColB", "ValuesColA"),
+                          ("AddColB", "AddColA"), ("ProjCapB", "ProjCapA"),
+                          ("SumzCapB", "SumzCapA"), ("SumzColB", "SumzColA"),
+                          ("SelOptB", "SelOptA"), ("RollupB", "RollupA"),
+                          ("SelMidB", "SelMidA"), ("SelStrB", "SelStrA"),
+                          ("ShadowB", "ShadowA"), ("TopnCapB", "TopnCapA"),
+                          ("XnpvShadowB", "XnpvShadowA"), ("RankCapB", "RankCapA"),
+                          ("RowXnpvB", "RowXnpvA"), ("VarXnpvB", "VarXnpvA"),
+                          ("RollupWrapB", "RollupWrapA"),
+                          ("XnpvNestShadowB", "XnpvNestShadowA"),
+                          ("VarAliasB", "VarAliasA"), ("VarNestB", "VarNestA"),
+                          ("WinXnpvB", "WinXnpvA"), ("XnpvColShadowB", "XnpvColShadowA"),
+                          ("TopnColShadowB", "TopnColShadowA"), ("FnbColB", "FnbColA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_unlisted_scalar_wrapper_still_poisons(self):
+        self.assertEqual(self._key("ContainsA"), self._key("ContainsB"))
+        self.assertTrue(self._canon("ContainsA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "ContainsB", "ContainsA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_predicate_table_calls_stay_certain(self):
+        for name, dup in (("PredCountCtrlA", "PredCountCtrlB"), ("MaxxCtrlA", "MaxxCtrlB"),
+                          ("PredMaxxA", "PredMaxxB"), ("PredValuesA", "PredValuesB"),
+                          ("PredVarA", "PredVarB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
+
+    def test_conditional_predicate_with_lookup_stays_certain(self):
+        self.assertFalse(self._canon("IfPredCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "IfPredCtrlB", "IfPredCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_conditional_predicate_source_stays_certain(self):
+        self.assertFalse(self._canon("IfCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "IfCtrlB", "IfCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_nested_predicate_source_stays_certain(self):
+        self.assertFalse(self._canon("NestCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "NestCtrlB", "NestCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_filtered_same_table_source_stays_certain(self):
+        self.assertFalse(self._canon("TopNCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "TopNCtrlB", "TopNCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_table_consuming_scalar_var_does_not_poison(self):
+        self.assertFalse(self._canon("CountA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "CountB", "CountA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_quoted_qualified_scalar_var_does_not_poison(self):
+        self.assertFalse(self._canon("ScalarQA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "ScalarQB", "ScalarQA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_scalar_var_does_not_block_learned_row_table(self):
+        self.assertFalse(self._canon("ScalarA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "ScalarB", "ScalarA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_similar_run_does_not_group_scoped_pair(self):
+        groups = similar.run(self.ws, self.project)["identical"]
+        self.assertTrue(any({"[CtrlA]", "[CtrlB]"} <= set(group["measures"])
+                            for group in groups))
+        for group in groups:
+            self.assertFalse({"[IterA]", "[IterB]"} <= set(group["measures"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -29,6 +29,7 @@ MIN_SHAPE_TOKENS = 8
 @dataclass
 class Canon:
     toks: list = field(default_factory=list)   # [(token, kind, value)]; kind "" | lit | col | meas
+    uncertain: bool = False
 
     def words(self, literals: str = "hash") -> list[str]:
         """Token strings. literals: "hash" (private exact compare), "slot" (any literal), "shape" (all slots)."""
@@ -69,21 +70,674 @@ def _num(text: str) -> str:
 
 def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     sig = lexers.significant(lexers.lex_dax(expr))
+    bindings = deps.dax_bindings(expr, home, res)
+    by_span = {(b.start, b.end): b for b in bindings.bindings}
     var_names: dict[str, str] = {}
+    var_rhs: dict[str, list] = {}
     for i, t in enumerate(sig):
         if t.kind == "ident" and t.text.upper() == "VAR" and i + 1 < len(sig) and sig[i + 1].kind == "ident":
             var_names.setdefault(sig[i + 1].text.lower(), f"$v{len(var_names) + 1}")
+            if i + 2 < len(sig) and sig[i + 2].kind == "op" and sig[i + 2].text == "=":
+                rhs, depth = [], 0
+                for u in sig[i + 3:]:
+                    if u.kind == "op" and u.text in ("(", "{"):
+                        depth += 1
+                    elif u.kind == "op" and u.text in (")", "}"):
+                        depth -= 1
+                    if depth == 0 and u.kind == "ident" and u.text.upper() in ("RETURN", "VAR"):
+                        break
+                    rhs.append(u)
+                var_rhs.setdefault(sig[i + 1].text.lower(), []).append(rhs)
+
+    SCALAR_FUNCS = {"MAX", "MIN", "SUM", "AVERAGE", "COUNT", "COUNTA", "COUNTROWS", "COUNTAX",
+                    "DISTINCTCOUNT", "DISTINCTCOUNTNOBLANK", "SUMX", "AVERAGEX", "MINX", "MAXX",
+                    "COUNTX", "PRODUCTX", "GEOMEANX", "MEDIANX", "CONCATENATEX", "RANKX",
+                    "ABS", "INT", "ROUND", "ROUNDUP", "ROUNDDOWN", "TRUNC", "MOD", "DIVIDE",
+                    "POWER", "SQRT", "EXP", "LN", "LOG", "LOG10", "SIGN", "CEILING", "FLOOR",
+                    "MROUND", "VALUE", "FORMAT", "LEN", "UPPER", "LOWER", "TRIM", "LEFT", "RIGHT",
+                    "MID", "SUBSTITUTE", "REPLACE", "CONCATENATE", "EXACT", "FIND", "SEARCH",
+                    "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DATE", "TIME", "TODAY",
+                    "NOW", "UTCNOW", "EDATE", "EOMONTH", "DATEDIFF", "YEARFRAC", "WEEKDAY",
+                    "WEEKNUM", "NETWORKDAYS", "BLANK", "TRUE", "FALSE", "ISBLANK", "ISERROR",
+                    "ISNUMBER", "ISTEXT", "ISLOGICAL", "ISNONTEXT", "ISEMPTY", "HASONEVALUE",
+                    "HASONEFILTER", "SELECTEDVALUE", "USERNAME", "USERPRINCIPALNAME", "CUSTOMDATA",
+                    "CALCULATE", "RAND", "RANDBETWEEN", "PI", "CURRENCY"}
+
+    def _call_span(rhs, open_idx):
+        depth = 0
+        for j in range(open_idx, len(rhs)):
+            u = rhs[j]
+            if u.kind == "op" and u.text in ("(", "{"):
+                depth += 1
+            elif u.kind == "op" and u.text in (")", "}"):
+                depth -= 1
+                if depth == 0:
+                    return j
+        return None
+
+    def _is_scalar_expr(rhs, scalar_vars) -> bool:
+        if not rhs:
+            return False
+        i = 0
+        while i < len(rhs):
+            u = rhs[i]
+            nxt = rhs[i + 1] if i + 1 < len(rhs) else None
+            if u.kind in ("num", "str", "bracket"):
+                i += 1
+                continue
+            if u.kind == "op":
+                if u.text == "{":
+                    return False
+                if u.text == "(":
+                    j = _call_span(rhs, i)
+                    if j is None or not _is_scalar_expr(rhs[i + 1:j], scalar_vars):
+                        return False
+                    i = j + 1
+                    continue
+                i += 1
+                continue
+            if u.kind == "table":
+                if nxt is not None and nxt.kind == "bracket":
+                    i += 2
+                    continue
+                return False
+            if u.kind == "ident":
+                if nxt is not None and nxt.kind == "bracket":
+                    i += 2
+                    continue
+                up = u.text.upper()
+                if nxt is not None and nxt.kind == "op" and nxt.text == "(":
+                    j = _call_span(rhs, i + 1)
+                    if j is None:
+                        return False
+                    if up in SCALAR_FUNCS:
+                        i = j + 1
+                        continue
+                    if up in ("IF", "IFERROR", "SWITCH", "COALESCE") \
+                            and _is_scalar_expr(rhs[i + 2:j], scalar_vars):
+                        i = j + 1
+                        continue
+                    return False
+                if u.text.lower() in scalar_vars or up in ("AND", "OR", "NOT", "IN"):
+                    i += 1
+                    continue
+                return False
+            return False
+        return True
+
+    scalar_vars: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, rhss in var_rhs.items():
+            if name not in scalar_vars and all(_is_scalar_expr(rhs, scalar_vars) for rhs in rhss):
+                scalar_vars.add(name)
+                changed = True
+    table_vars = set(var_rhs) - scalar_vars
     extension = {t.value.lower() for t in sig if t.kind == "str"}
     toks: list[tuple[str, str, str]] = []
+    uncertain = False
+    stack: list[dict] = []   # {"fn", "arg", "row_table"}: mirrors the deps.dax_bindings frames
+
+    PREDICATE_EXEMPT = {"FILTER", "CALCULATETABLE", "ADDCOLUMNS"}
+    CONDITIONALS = {"IF", "IFERROR", "SWITCH", "COALESCE"}
+    TABLE_INPUT_ARG0 = {"VALUES", "DISTINCT", "ALL", "ALLEXCEPT", "ALLNOBLANKROW", "ALLSELECTED",
+                        "FILTER", "CALCULATETABLE", "SUMMARIZE", "SUMMARIZECOLUMNS", "ADDCOLUMNS",
+                        "SELECTCOLUMNS", "GENERATE", "UNION", "INTERSECT", "EXCEPT", "CROSSJOIN",
+                        "TREATAS", "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN", "GROUPBY",
+                        "KEEPFILTERS", "FILTERS"}
+    KNOWN_TABLE_FRAMES = TABLE_INPUT_ARG0 | {"TOPN", "SAMPLE", "INDEX", "OFFSET", "GENERATEALL",
+                                              "DATEADD", "DATESYTD", "DATESMTD", "DATESQTD",
+                                              "DATESBETWEEN", "SAMEPERIODLASTYEAR"}
+
+    X_ITERATORS = {"SUMX", "AVERAGEX", "MINX", "MAXX", "COUNTX", "COUNTAX", "PRODUCTX",
+                   "CONCATENATEX", "RANKX", "MEDIANX", "PERCENTILEX.INC", "PERCENTILEX.EXC",
+                   "GEOMEANX", "STDEVX.P", "STDEVX.S", "VARX.P", "VARX.S"}
+
+    def _is_table_frame(g) -> bool:
+        return g["fn"] in KNOWN_TABLE_FRAMES or g["fn"] in X_ITERATORS
+
+    def _source_frame(idx):
+        for g in reversed(stack[idx + 1:]):
+            if _is_table_frame(g):
+                return g
+        return None
+
+    def _taint_frame(idx):
+        for g in reversed(stack[idx + 1:]):
+            if g["fn"] and g["fn"] not in CONDITIONALS:
+                return g
+        return None
+
+    def _crossing_ok(p, d) -> bool:
+        if p["fn"] in CONDITIONALS or p["fn"] == "":
+            return True
+        if p["fn"] == "WINDOW":
+            return d in (2, 3, 4)
+        if p["fn"] == "RANK":
+            return d in (0, 1)
+        if p["fn"] == "ROWNUMBER":
+            return d == 0
+        if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+            return d == 1
+        if p["fn"] in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN", "GENERATE", "GENERATEALL",
+                       "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN"):
+            return True
+        if p["fn"] in TABLE_INPUT_ARG0 and d == 0:
+            return True
+        if _is_table_frame(p) and d == 0:
+            return True
+        return False
+
+    def _first_nonsource(frames, last_d, lineage=False):
+        for j, p in enumerate(frames):
+            d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else last_d
+            if lineage and p["fn"] in ("INTERSECT", "EXCEPT"):
+                if d != 0:
+                    return p, d
+                continue
+            if lineage == "names" and p["fn"] == "UNION":
+                if d != 0:
+                    return p, d
+                continue
+            if not _crossing_ok(p, d):
+                return p, d
+        return None
+
+    def _in_source_region(idx, last_d) -> bool:
+        frames = stack[idx + 1:]
+        if not frames:
+            return True
+        return _first_nonsource(frames, last_d) is None
+
+    TOPN_LIKE = ("TOPN", "SAMPLE", "INDEX", "OFFSET")
+
+    def _teaches_at(fr) -> bool:
+        if fr["fn"] in TOPN_LIKE:
+            return fr["arg"] == 1
+        if fr["fn"] == "RANK":
+            return fr["arg"] in (0, 1)
+        if fr["fn"] == "WINDOW":
+            return fr["arg"] in (2, 3, 4)
+        return fr["arg"] == 0
+
+    def _taint_cleared(fr, idx) -> bool:
+        g = fr.get("taint")
+        if g is None:
+            return False
+        frames = stack[idx + 1:]
+        for j, p in enumerate(frames):
+            if p is g:
+                path = frames[j:]
+                for k, q in enumerate(path):
+                    d = path[k + 1]["parent_arg"] if k + 1 < len(path) else stack[-1]["arg"]
+                    if q["fn"] in CONDITIONALS or q["fn"] == "":
+                        continue
+                    if q["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY",
+                                   "ALLEXCEPT", "TREATAS"):
+                        return False
+                    if not _is_table_frame(q):
+                        return False
+                    lineage = 1 if q["fn"] in TOPN_LIKE else (4 if q["fn"] == "WINDOW" else 0)
+                    if d != lineage:
+                        return False
+                return True
+        return False
+
+    PROJECTING = ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY",
+                  "ALLEXCEPT", "TREATAS")
+    NARROWING = ("VALUES", "DISTINCT", "ALL", "ALLEXCEPT", "ALLSELECTED", "ALLNOBLANKROW",
+                 "FILTERS")
+
+    COMBINING_UNION = ("CROSSJOIN", "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN",
+                       "GENERATE", "GENERATEALL")
+    FIRST_OPERAND = ("INTERSECT", "EXCEPT", "UNION")
+
+    def _combine(fr, parent, pos, cols):
+        """Combine a contributing teaching's column set into fr's exposure.
+
+        Returns (applies, value): value is the new only_columns (None means
+        unrestricted). cols is the teaching's exposed set, or None when the
+        teaching exposes the whole table."""
+        if "only_columns" not in fr:
+            if parent is not None and (parent["fn"] in FIRST_OPERAND
+                                       or parent["fn"] in ("FILTER", "CALCULATETABLE")) \
+                    and pos != 0:
+                return False, None
+            return True, cols
+        if parent is not None and parent["fn"] in COMBINING_UNION:
+            if fr["only_columns"] is None or cols is None:
+                return True, None
+            return True, fr["only_columns"] | cols
+        if parent is not None and (parent["fn"] in FIRST_OPERAND
+                                   or parent["fn"] in ("FILTER", "CALCULATETABLE")):
+            if pos != 0:
+                return False, fr.get("only_columns")
+            if fr["only_columns"] is None or cols is None:
+                return True, None
+            return True, fr["only_columns"] | cols
+        if fr.get("only_src") is not None and parent is not fr.get("only_src"):
+            return False, fr.get("only_columns")
+        if fr["only_columns"] is None or cols is None:
+            return True, None
+        return True, fr["only_columns"] | cols
+
+    def learn(table, bare: bool = False, column=None) -> None:
+        if table:
+            _def_depth = pending_vars[-1][1] if pending_vars else -1
+            for idx, fr in enumerate(stack):
+                if idx < _def_depth:
+                    continue
+                if fr["fn"] in deps.ITERATORS and _teaches_at(fr) and not fr["poisoned"]:
+                    trusted = _in_source_region(idx, stack[-1]["arg"] if len(stack) > idx + 1 else 0) \
+                        and not any(g["fn"] == "TREATAS" for g in stack[idx + 1:])
+                    eff_bare = bare and trusted
+                    if fr["row_table"] is None:
+                        fr["row_table"] = table
+                        if bare:
+                            fr["only_columns"] = None
+                        if any(g["fn"] in PROJECTING for g in stack[idx + 1:]):
+                            fr["projected"] = True
+                        src_fr = _source_frame(idx)
+                        if not bare and column and src_fr is not None \
+                                and src_fr["fn"] in NARROWING:
+                            _si = next(j for j, g in enumerate(stack) if g is src_fr)
+                            _par = stack[_si - 1] if _si > 0 else src_fr
+                            _applies, _val = _combine(fr, _par, src_fr["parent_arg"],
+                                                      {column.lower()})
+                            if _applies:
+                                fr["only_columns"] = _val
+                                fr["only_src"] = _par
+                        if not bare and column and fr["fn"] in (
+                                "FIRSTNONBLANK", "LASTNONBLANK",
+                                "FIRSTNONBLANKVALUE", "LASTNONBLANKVALUE"):
+                            fr["only_columns"] = {column.lower()}
+                            fr["only_src"] = fr
+                        if not eff_bare:
+                            g = _source_frame(idx)
+                            exempt = trusted and g is not None and stack[-1] is g \
+                                and g["arg"] == 0 and g["fn"] in TABLE_INPUT_ARG0 \
+                                and g["fn"] != "TREATAS"
+                            if not exempt:
+                                target = g if g is not None else _taint_frame(idx)
+                                if target is not None and fr.get("taint") is None:
+                                    fr["taint"] = target
+                    elif eff_bare and fr["row_table"] != table:
+                        fr["row_table"] = None
+                        fr["poisoned"] = True
+                    _acc_path = stack[idx + 1:]
+
+                    def _acc_descent_ok() -> bool:
+                        for j, g in enumerate(_acc_path):
+                            if g["fn"] in SCALAR_FUNCS:
+                                return False
+                            d = _acc_path[j + 1]["parent_arg"] if j + 1 < len(_acc_path) \
+                                else stack[-1]["arg"]
+                            fn = g["fn"]
+                            if fn in ("ALL", "ALLSELECTED", "ALLNOBLANKROW"):
+                                continue
+                            if fn in ("FILTER", "CALCULATETABLE") or fn in FIRST_OPERAND \
+                                    or fn in TABLE_INPUT_ARG0 or fn in X_ITERATORS:
+                                if d != 0:
+                                    return False
+                            elif fn in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+                                if d != 1:
+                                    return False
+                            elif fn == "WINDOW":
+                                if d not in (2, 3, 4):
+                                    return False
+                            elif fn == "RANK":
+                                if d not in (0, 1):
+                                    return False
+                            elif fn in COMBINING_UNION or fn in CONDITIONALS or fn == "":
+                                continue
+                            else:
+                                return False
+                        return True
+
+                    _acc_ok = not bare and column and fr.get("only_src") is not None \
+                        and fr["row_table"] == table and _acc_descent_ok()
+                    if _acc_ok:
+                        _sf = _source_frame(idx)
+                        if _sf is None or _sf["fn"] not in NARROWING:
+                            _sf = None
+                        elif _sf["fn"] in ("FILTER", "CALCULATETABLE") \
+                                and stack[-1] is _sf and _sf["arg"] >= 1:
+                            _sf = None
+                        _si = next((j for j, g in enumerate(stack) if g is _sf), None) \
+                            if _sf is not None else None
+                        _par = stack[_si - 1] if _si else None
+                        if _par is not None:
+                            _applies, _val = _combine(fr, _par, _sf["parent_arg"],
+                                                      {column.lower()})
+                            if _applies:
+                                fr["only_columns"] = _val
+                    if eff_bare and fr["row_table"] == table and fr.get("only_columns") is not None \
+                            and _widens(idx):
+                        fr["only_columns"] = None
+                        fr["only_src"] = None
+                    if eff_bare and fr.get("taint") is not None and fr["row_table"] == table \
+                            and _taint_cleared(fr, idx):
+                        fr["taint"] = None
+
+    def _span_args(span):
+        args, depth, cur = [], 0, []
+        for u in span:
+            if u.kind == "op" and u.text in ("(", "{"):
+                depth += 1
+            elif u.kind == "op" and u.text in (")", "}"):
+                depth -= 1
+            if depth == 0 and u.kind == "op" and u.text == ",":
+                args.append(cur)
+                cur = []
+            else:
+                cur.append(u)
+        args.append(cur)
+        return args
+
+    _span_memo: dict = {}
+    _cyclic_vars: set = set()
+    for _nm, _rhss in var_rhs.items():
+        _deps = {u.text.lower() for _r in _rhss for u in _r
+                 if u.kind == "ident" and u.text.lower() in var_rhs}
+        _walk, _seen = list(_deps), set()
+        while _walk:
+            _x = _walk.pop()
+            if _x == _nm:
+                _cyclic_vars.add(_nm)
+                break
+            if _x not in _seen:
+                _seen.add(_x)
+                _walk.extend({u.text.lower() for _r in var_rhs.get(_x, []) for u in _r
+                              if u.kind == "ident" and u.text.lower() in var_rhs})
+
+    def _span_table(span, seen=frozenset()):
+        while len(span) >= 2 and span[0].kind == "op" and span[0].text == "(" \
+                and _call_span(span, 0) == len(span) - 1:
+            span = span[1:-1]
+        if not span:
+            return None, None
+        if len(span) == 1:
+            u = span[0]
+            if u.kind == "table":
+                return (res.table(u.value) or u.value), None
+            if u.kind == "ident":
+                if res.table(u.text):
+                    return res.table(u.text), None
+                low = u.text.lower()
+                if low in seen:
+                    return None, None
+                if low in _span_memo:
+                    return _span_memo[low]
+                rhss = var_rhs.get(low)
+                if rhss:
+                    vals = {_span_table(r, seen | {low}) for r in rhss}
+                    result = vals.pop() if len(vals) == 1 else (None, None)
+                    if low not in _cyclic_vars:
+                        _span_memo[low] = result
+                    return result
+            return None, None
+        if span[0].kind == "ident" and span[1].kind == "op" and span[1].text == "(" \
+                and _call_span(span, 1) == len(span) - 1:
+            fn = span[0].text.upper()
+            args = _span_args(span[2:-1])
+            if fn in ("FILTER", "CALCULATETABLE", "KEEPFILTERS"):
+                return _span_table(args[0], seen) if args else (None, None)
+            if fn in ("VALUES", "DISTINCT", "FILTERS"):
+                return _span_table(args[0], seen) if args else (None, None)
+            if fn in ("ALL", "ALLSELECTED", "ALLNOBLANKROW"):
+                if len(args) == 1:
+                    return _span_table(args[0], seen)
+                tab, cols = None, set()
+                for a in args:
+                    t2, c2 = _span_table(a, seen)
+                    if t2 is None or (tab is not None and t2 != tab):
+                        return None, None
+                    tab = t2
+                    if c2 is None:
+                        return tab, None
+                    kind, s = c2
+                    if kind != "only":
+                        return None, None
+                    cols |= s
+                return tab, ("only", frozenset(cols))
+            if fn == "ALLEXCEPT":
+                return None, None
+            if fn in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+                return _span_table(args[1], seen) if len(args) > 1 else (None, None)
+            if fn in ("INTERSECT", "EXCEPT"):
+                return _span_table(args[0], seen) if args else (None, None)
+            if fn in ("CROSSJOIN", "NATURALINNERJOIN",
+                      "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
+                vals = {_span_table(a, seen) for a in args}
+                return vals.pop() if len(vals) == 1 else (None, None)
+            return None, None
+        if len(span) == 2 and span[1].kind == "bracket" \
+                and (span[0].kind == "table" or (span[0].kind == "ident" and res.table(span[0].text))):
+            tab = res.table(span[0].value if span[0].kind == "table" else span[0].text)
+            return tab, ("only", frozenset({span[1].value.lower()}))
+        return None, None
+
+    def _only_has(fr, name) -> bool:
+        cols = fr.get("only_columns")
+        return cols is None or name in cols
+
+    def _x_has(fr, name) -> bool:
+        cols = fr.get("x_cols")
+        if cols is None:
+            return True
+        kind, s = cols
+        return (name in s) if kind == "only" else (name not in s)
+
+    def _widens(idx) -> bool:
+        frames = stack[idx + 1:]
+        for j, p in enumerate(frames):
+            d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else stack[-1]["arg"]
+            if p["fn"] in CONDITIONALS or p["fn"] == "":
+                continue
+            if p["fn"] in ("INTERSECT", "EXCEPT", "UNION"):
+                if d != 0:
+                    return False
+                continue
+            if p["fn"] in ("CROSSJOIN", "NATURALINNERJOIN",
+                            "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
+                continue
+            if not _crossing_ok(p, d):
+                return False
+        return True
+
+    def poison_qualified(tab) -> None:
+        if not tab:
+            return
+        for idx, fr in enumerate(stack):
+            if fr["fn"] in deps.ITERATORS and _teaches_at(fr) and not fr["poisoned"] \
+                    and fr["row_table"] is not None and fr["row_table"] != tab:
+                frames = stack[idx + 1:]
+                if not frames:
+                    continue
+                bad = _first_nonsource(frames, stack[-1]["arg"], lineage="names")
+                if bad is None:
+                    fr["row_table"] = None
+                    fr["poisoned"] = True
+                else:
+                    p, d = bad
+                    if p["fn"] in PREDICATE_EXEMPT and d >= 1:
+                        continue
+                    if p["fn"] in ("INTERSECT", "EXCEPT"):
+                        continue
+                    if p["fn"] == "UNION":
+                        if any(g["fn"] in PREDICATE_EXEMPT and g["arg"] >= 1
+                               for g in stack[idx + 1:]):
+                            continue
+                        if stack[-1]["fn"] in SCALAR_FUNCS:
+                            continue
+                    if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+                        continue
+                    if p["fn"] in SCALAR_FUNCS or p["fn"] in X_ITERATORS or p["fn"] == "{":
+                        continue
+                    fr["row_table"] = None
+                    fr["poisoned"] = True
+
+    pending_vars: list = []
+    var_names_defined: dict[str, set] = {}
+
+    def _in_source(fr, first_d) -> bool:
+        if fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
+            return first_d == 1
+        if fr["fn"] == "RANK":
+            return first_d in (0, 1)
+        if fr["fn"] == "WINDOW":
+            return first_d in (2, 3, 4)
+        if fr["fn"] == "SUBSTITUTEWITHINDEX":
+            return first_d == 2
+        return first_d == 0
     i, n = 0, len(sig)
     while i < n:
         t = sig[i]
         nxt = sig[i + 1] if i + 1 < n else None
+        for fr in stack:
+            if fr.get("x_span") is not None and fr["arg"] == fr.get("span_arg", 0) \
+                    and not (t.kind == "op" and t.text in (",", ")") and stack[-1] is fr):
+                fr["x_span"].append(t)
+        if t.kind == "ident" and t.text.upper() == "VAR" \
+                and nxt is not None and nxt.kind == "ident":
+            _prev = sig[i - 1] if i else None
+            _sequential = _prev is not None and (
+                (_prev.kind == "op" and _prev.text in (")", "}"))
+                or (_prev.kind in ("ident", "bracket", "num", "str", "table", "pbztok")
+                    and not (_prev.kind == "ident" and _prev.text.upper() in (
+                        "RETURN", "VAR", "IN", "AND", "OR", "NOT"))))
+            if pending_vars and pending_vars[-1][1] == len(stack) and _sequential:
+                pending_vars.pop()
+            pending_vars.append((nxt.text.lower(), len(stack)))
+        elif t.kind == "ident" and t.text.upper() == "RETURN" \
+                and pending_vars and pending_vars[-1][1] == len(stack):
+            pending_vars.pop()
+        if t.kind == "op" and t.text in ("(", "{"):
+            prev = sig[i - 1] if i else None
+            fn = "{" if t.text == "{" else (prev.text.upper() if prev is not None and prev.kind == "ident" else "")
+            frame = {"fn": fn, "arg": 0, "row_table": None, "poisoned": False, "taint": None,
+                     "parent_arg": stack[-1]["arg"] if stack else None,
+                     "x_span": [] if fn in ("XNPV", "XIRR", "SUBSTITUTEWITHINDEX") else None,
+                     "x_skip": True,
+                     "span_arg": 2 if fn == "SUBSTITUTEWITHINDEX" else 0}
+            stack.append(frame)
+            if fn and fn not in SCALAR_FUNCS and fn not in CONDITIONALS:
+                for f_idx, fr in enumerate(stack[:-1]):
+                    if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
+                            and fr["row_table"] is not None and not fr["poisoned"]:
+                        if fr.get("taint") is None \
+                                and _first_nonsource(stack[f_idx + 1:-1], frame["parent_arg"],
+                                                     lineage="rows") is None:
+                            fr["taint"] = frame
+        elif t.kind == "op" and t.text in (")", "}"):
+            if stack:
+                closed = stack.pop()
+                _out_names = closed.get("names") or set()
+                if closed["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY"):
+                    _out_names = set(_out_names) | (closed.get("captured", set())
+                                                    & closed.get("refs", set()))
+                if _out_names:
+                    _proj = None
+                    for _cand in reversed(stack):
+                        if _cand["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS",
+                                           "SUMMARIZE", "GROUPBY"):
+                            _proj = _cand
+                            break
+                    _proj_idx = next((j for j, g in enumerate(stack) if g is _proj), None) \
+                        if _proj is not None else None
+                    if _proj is not None and closed["fn"] not in (
+                            "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY"):
+                        _proj.setdefault("captured", set()).update(_out_names)
+                        if closed["fn"] in ("ROLLUPADDISSUBTOTAL", "ROLLUP"):
+                            _proj.setdefault("refs", set()).update(_out_names)
+                    if True:
+                        for f_idx, fr in enumerate(stack):
+                            if _proj_idx is not None and f_idx < _proj_idx:
+                                continue
+                            path = stack[f_idx + 1:]
+                            first_d = path[0]["parent_arg"] if path else closed["parent_arg"]
+                            if not _in_source(fr, first_d):
+                                continue
+                            if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
+                                    and path[-1]["fn"] == "SUMMARIZECOLUMNS":
+                                ok = _first_nonsource(path[:-1], path[-1]["parent_arg"], lineage="names") is None
+                            else:
+                                ok = _first_nonsource(path, closed["parent_arg"], lineage="names") is None
+                            if ok:
+                                fr.setdefault("captured", set()).update(_out_names)
+                    if pending_vars and _first_nonsource(
+                            stack[pending_vars[-1][1]:], closed["parent_arg"], lineage="names") is None:
+                        var_names_defined.setdefault(pending_vars[-1][0], set()).update(_out_names)
+                if closed.get("x_span") is not None and closed["arg"] == closed.get("span_arg", 0) \
+                        and closed.get("x_table") is None:
+                    closed["x_table"], closed["x_cols"] = _span_table(closed["x_span"])
+                for fr in stack:
+                    if fr.get("taint") is closed:
+                        fr["taint"] = None
+                        fr["row_table"] = None
+                        fr["poisoned"] = True
+                if closed["fn"] and closed["fn"] not in SCALAR_FUNCS \
+                        and closed["fn"] not in CONDITIONALS:
+                    for f_idx, fr in enumerate(stack):
+                        if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
+                                and fr["row_table"] is None and not fr["poisoned"] \
+                                and _first_nonsource(stack[f_idx + 1:], closed["parent_arg"]) is None:
+                            fr["poisoned"] = True
+        elif t.kind == "op" and t.text == "," and stack:
+            top = stack[-1]
+            if top.get("expect") is not None:
+                if top["expect"] == "item":
+                    top["expect"] = "expr" if top.pop("item_named", False) else "item"
+                else:
+                    top["expect"] = "item"
+            if top.get("x_span") is not None and top["arg"] == top.get("span_arg", 0) \
+                    and top.get("x_table") is None:
+                top["x_table"], top["x_cols"] = _span_table(top["x_span"])
+            top["arg"] += 1
+        if stack and t.kind == "bracket" and stack[-1]["fn"] in (
+                "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY") \
+                and (i == 0 or (sig[i - 1].kind == "op" and sig[i - 1].text in (",", "("))) \
+                and (nxt is not None and nxt.kind == "op" and nxt.text in (",", ")")):
+            _pf = stack[-1]
+            if _pf["fn"] == "SELECTCOLUMNS" and _pf.get("expect") in (None, "item") \
+                    or _pf["fn"] != "SELECTCOLUMNS" and _pf.get("expect") is None:
+                _pf.setdefault("refs", set()).add(t.value.lower())
+        if stack and t.kind == "str" and stack[-1]["fn"] in (
+                "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "SUMMARIZE", "GROUPBY",
+                "ROLLUPADDISSUBTOTAL", "ROW", "DATATABLE") \
+                and (i == 0 or (sig[i - 1].kind == "op" and sig[i - 1].text in (",", "("))) \
+                and (nxt is not None and nxt.kind == "op" and nxt.text in (",", ")")):
+            fr0 = stack[-1]
+            if fr0["fn"] == "ROLLUPADDISSUBTOTAL":
+                fr0.setdefault("names", set()).add(t.value.lower())
+            elif fr0.get("expect") is None:
+                if fr0["fn"] not in ("SELECTCOLUMNS", "ADDCOLUMNS") or fr0["arg"] >= 1 \
+                        or fr0["fn"] in ("ROW", "DATATABLE"):
+                    fr0["expect"] = "item"
+                    fr0["item_named"] = True
+                    fr0.setdefault("names", set()).add(t.value.lower())
+            elif fr0["expect"] == "item":
+                fr0["item_named"] = True
+                fr0.setdefault("names", set()).add(t.value.lower())
         if t.kind in LIT_KINDS:
             val = _num(t.text) if t.kind == "num" else ("T" + t.text if t.kind == "pbztok" else "S" + t.value)
             toks.append(("LIT", "lit", val))
         elif t.kind in ("table", "ident") and nxt is not None and nxt.kind == "bracket" and (
                 t.kind == "table" or t.text.lower() in var_names or res.table(t.text)):
+            if stack and stack[-1]["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS",
+                                             "SUMMARIZE", "GROUPBY") \
+                    and (i == 0 or (sig[i - 1].kind == "op" and sig[i - 1].text in (",", "("))) \
+                    and (i + 2 >= n or (sig[i + 2].kind == "op" and sig[i + 2].text in (",", ")"))):
+                _pf = stack[-1]
+                if _pf["fn"] == "SELECTCOLUMNS" and _pf.get("expect") in (None, "item") \
+                        or _pf["fn"] != "SELECTCOLUMNS" and _pf.get("expect") is None:
+                    _pf.setdefault("refs", set()).add(nxt.value.lower())
+            binding = by_span.get((nxt.start, nxt.end))
+            if binding is not None:
+                uncertain |= binding.uncertain
+            else:
+                uncertain = True
             if t.kind == "ident" and t.text.lower() in var_names:
                 toks.append((f"{var_names[t.text.lower()]}[{nxt.value.lower()}]", "", ""))
             else:
@@ -93,16 +747,169 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if col:
                     lab = f"{tab}[{col}]"
                     toks.append((lab.lower(), "col", lab))
+                    learn(tab, column=nxt.value)
+                    poison_qualified(tab)
                 elif res.measure(nxt.value):
                     lab = f"[{res.measure(nxt.value)[1]}]"
                     toks.append((lab.lower(), "meas", lab))
                 else:
                     lab = f"{qual}[{nxt.value}]"
                     toks.append((lab.lower(), "col", lab))
+            for fr in stack:
+                if fr.get("x_span") is not None and fr["arg"] == fr.get("span_arg", 0):
+                    fr["x_span"].append(nxt)
             i += 2
             continue
         elif t.kind == "bracket":
-            ref = deps._bare(t.value, home, res, False, [], extension)
+            CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
+                           "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}
+
+            def _in_caller_args(g) -> bool:
+                ca = CALLER_ARGS.get(g["fn"])
+                return ca is not None and g["arg"] >= ca[0] and (ca[1] is None or g["arg"] <= ca[1])
+
+            binding = by_span.get((t.start, t.end))
+            if binding is not None:
+                ref = binding.ref
+                uncertain |= binding.uncertain
+            else:
+                uncertain = True
+                ref = deps._bare(t.value, home, res, False, [], extension)
+            def _governed_from(start):
+                if ref.kind != "column":
+                    return -1
+                for j in range(len(stack) - 1, start - 1, -1):
+                    g = stack[j]
+                    if g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1 \
+                            and not _in_caller_args(g):
+                        return j if (g["row_table"] == ref.table
+                                     and not g.get("projected")
+                                     and _only_has(g, ref.name.lower())) else -1
+                return -1
+
+            governed_idx = _governed_from(0)
+            governed = governed_idx >= 0
+            if not governed and any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
+                                    and fr["row_table"] is None
+                                    for fr in stack):
+                uncertain = True
+            for c_idx, fr in enumerate(stack):
+                if fr["fn"] == "{":
+                    ctor_governed = ref.kind == "column" and any(
+                        g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
+                        and not _in_caller_args(g) and g["row_table"] == ref.table
+                        and not g.get("projected") and _only_has(g, ref.name.lower())
+                        for g in stack[c_idx + 1:])
+                    if ctor_governed:
+                        continue
+                    ctx = None
+                    found = False
+                    for below in reversed(stack[:c_idx]):
+                        if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:
+                            ctx = below["row_table"]
+                            found = True
+                            break
+                    if found and (ctx is None
+                                  or (ref.kind == "column" and ctx != ref.table)):
+                        uncertain = True
+                    elif not found and ref.kind == "column":
+                        uncertain = True
+            if ref.kind == "column" and not governed and any(
+                    fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
+                    and (fr.get("projected") and fr["row_table"] == ref.table
+                         or not _only_has(fr, ref.name.lower()))
+                    for fr in stack):
+                uncertain = True
+            if any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
+                   and t.value.lower() in fr.get("captured", ())
+                   for fr in (stack[governed_idx:] if governed else stack)):
+                uncertain = True
+            for c_idx, fr in enumerate(stack):
+                if fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and fr["arg"] >= 2 \
+                        and _governed_from(c_idx + 1) < 0 \
+                        and (fr["row_table"] is None
+                             or (ref.kind == "column" and fr["row_table"] != ref.table)
+                             or (ref.kind == "measure" and fr["row_table"] is not None
+                                 and _only_has(fr, t.value.lower())
+                                 and res.column(fr["row_table"], t.value) is not None)
+                             or t.value.lower() in fr.get("captured", ())):
+                    uncertain = True
+            for c_idx, fr in enumerate(stack):
+                if fr["fn"] in ("ORDERBY", "PARTITIONBY", "MATCHBY") and c_idx > 0 \
+                        and _governed_from(c_idx + 1) < 0:
+                    parent = stack[c_idx - 1]
+                    if parent["row_table"] is None \
+                            or (ref.kind == "column" and parent["row_table"] != ref.table) \
+                            or (ref.kind == "measure" and parent["row_table"] is not None
+                                and _only_has(parent, t.value.lower())
+                                and res.column(parent["row_table"], t.value) is not None) \
+                            or t.value.lower() in parent.get("captured", ()):
+                        uncertain = True
+            for c_idx, fr in enumerate(stack):
+                if fr["fn"] == "SUBSTITUTEWITHINDEX" and fr["arg"] >= 3 and fr["arg"] % 2 == 1 \
+                        and ((ref.kind == "column" and fr.get("x_table") != ref.table
+                              and _x_has(fr, ref.name.lower()))
+                             or (ref.kind == "measure" and (fr.get("x_table") is None
+                                 or (_x_has(fr, t.value.lower())
+                                     and res.column(fr.get("x_table"), t.value) is not None)))
+                             or t.value.lower() in fr.get("captured", ())) \
+                        and not (ref.kind == "column" and any(
+                                    g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
+                                    and not _in_caller_args(g) and g["row_table"] == ref.table
+                                    and not g.get("projected")
+                                    and _only_has(g, ref.name.lower())
+                                    for g in stack[c_idx + 1:])):
+                    uncertain = True
+
+            for c_idx, fr in enumerate(stack):
+                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] in (1, 2) \
+                        and ((ref.kind == "column" and fr.get("x_table") != ref.table
+                              and _x_has(fr, ref.name.lower()))
+                             or (ref.kind == "measure" and (fr.get("x_table") is None
+                                 or (_x_has(fr, t.value.lower())
+                                     and res.column(fr.get("x_table"), t.value) is not None)))
+                             or t.value.lower() in fr.get("captured", ())) \
+                        and not (ref.kind == "column" and any(
+                                    g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
+                                    and not _in_caller_args(g) and g["row_table"] == ref.table
+                                    and not g.get("projected")
+                                    and _only_has(g, ref.name.lower())
+                                    for g in stack[c_idx + 1:])):
+                    uncertain = True
+                caller_args = CALLER_ARGS.get(fr["fn"])
+                if caller_args is not None and ref.kind == "column" \
+                        and fr["arg"] >= caller_args[0] \
+                        and (caller_args[1] is None or fr["arg"] <= caller_args[1]) \
+                        and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
+                                    and not _in_caller_args(g) and g["row_table"] == ref.table
+                                    and not g.get("projected")
+                                    and _only_has(g, ref.name.lower())
+                                    for g in stack[c_idx + 1:]):
+                    caller = None
+                    for below in reversed(stack[:c_idx]):
+                        if below["fn"] in ("XNPV", "XIRR") and below["arg"] in (1, 2):
+                            if not _x_has(below, t.value.lower()):
+                                continue
+                            caller = below.get("x_table")
+                            break
+                        if below["fn"] == "SUBSTITUTEWITHINDEX" and below["arg"] >= 3 \
+                                and below["arg"] % 2 == 1:
+                            if not _x_has(below, t.value.lower()):
+                                continue
+                            caller = below.get("x_table")
+                            break
+                        if below["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") \
+                                and below["arg"] >= 2 and not below.get("projected") \
+                                and _only_has(below, t.value.lower()):
+                            caller = below["row_table"]
+                            break
+                        if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:
+                            caller = below["row_table"]
+                            break
+                    if caller is None or caller != ref.table:
+                        uncertain = True
+            if ref.kind == "column":
+                learn(ref.table)
             if ref.kind == "measure":
                 lab = f"[{ref.name}]"
                 toks.append((lab.lower(), "meas", lab))
@@ -112,27 +919,84 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             else:
                 toks.append((f"[{t.value.lower()}]", "", ""))
         elif t.kind == "table":
+            binding = by_span.get((t.start, t.end))
+            if binding is not None:
+                uncertain |= binding.uncertain
             tab = res.table(t.value) or t.value
             toks.append(("t:" + tab.lower(), "", ""))
+            learn(res.table(t.value), bare=True)
         elif t.kind == "ident":
             low = t.text.lower()
             if nxt is not None and nxt.kind == "op" and nxt.text == "(":
                 toks.append(("fn:" + low if low in res.functions else t.text.upper(), "", ""))
             elif low in var_names:
                 toks.append((var_names[low], "", ""))
+                prev = sig[i - 1] if i else None
+                if low in var_names_defined and not (prev is not None and prev.kind == "ident"
+                                                     and prev.text.upper() == "VAR"):
+                    for f_idx, fr in enumerate(stack):
+                        first_d = stack[f_idx + 1]["parent_arg"] if len(stack) > f_idx + 1 \
+                            else fr["arg"]
+                        if _in_source(fr, first_d) and _first_nonsource(
+                                stack[f_idx + 1:],
+                                stack[-1]["arg"] if len(stack) > f_idx + 1 else 0,
+                                lineage="names") is None:
+                            fr.setdefault("captured", set()).update(var_names_defined[low])
+                    if pending_vars and pending_vars[-1][0] != low:
+                        _depth = pending_vars[-1][1]
+                        if _first_nonsource(stack[_depth:],
+                                            stack[-1]["arg"] if len(stack) > _depth else 0,
+                                            lineage="names") is None:
+                            var_names_defined.setdefault(pending_vars[-1][0], set()).update(
+                                var_names_defined[low])
+                if low in table_vars and not (prev is not None and prev.kind == "ident"
+                                              and prev.text.upper() == "VAR"):
+                    _def_depth = pending_vars[-1][1] if pending_vars else -1
+                    for f_idx, fr in enumerate(stack):
+                        if f_idx < _def_depth:
+                            continue
+                        if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
+                                and _in_source_region(f_idx, stack[-1]["arg"] if len(stack) > f_idx + 1 else 0):
+                            _rhss = var_rhs.get(low)
+                            _vt, _vcols = _span_table(_rhss[0]) if _rhss and len(_rhss) == 1 \
+                                else (None, None)
+                            if _vt is None or fr["row_table"] != _vt:
+                                fr["row_table"] = None
+                                fr["poisoned"] = True
+                            elif _widens(f_idx):
+                                _par = next((g for g in reversed(stack) if g["fn"]), None)
+                                _applies, _val = _combine(
+                                    fr, _par, _par["arg"] if _par else 0,
+                                    None if _vcols is None else set(_vcols[1]))
+                                if _applies:
+                                    fr["only_columns"] = _val
+                                    if _val is None:
+                                        fr["only_src"] = None
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
+                learn(res.table(t.text), bare=True)
             else:
+                if t.text.upper() not in ("ASC", "DESC", "DENSE", "SKIP", "AND", "OR", "NOT",
+                                          "IN", "TRUE", "FALSE", "BLANK", "ABS", "REL",
+                                          "VAR", "RETURN", "DAY", "MONTH", "QUARTER", "WEEK",
+                                          "YEAR", "HOUR", "MINUTE", "SECOND", "BOTH", "NONE",
+                                          "ONEWAY", "DEFAULT", "FIRST", "LAST", "KEEP"):
+                    uncertain = True
                 toks.append((t.text.upper(), "", ""))
         else:
             toks.append((t.text, "", ""))
         i += 1
+    if any(t.kind == "ident" and t.text.upper() == "COUNTROWS"
+           and j + 2 < n and sig[j + 1].kind == "op" and sig[j + 1].text == "("
+           and sig[j + 2].kind == "op" and sig[j + 2].text == ")"
+           for j, t in enumerate(sig)):
+        toks.append((f"home:{home.lower()}", "", ""))
     toks = _strip_parens(toks)
     words = [x[0] for x in toks]
     if words.count("VAR") == 1 and len(words) >= 6 and words[0] == "VAR" and words[-2] == "RETURN" \
             and words[-1] == words[1] and words[2] == "=":
         toks = _strip_parens(toks[3:-2])
-    return Canon(toks)
+    return Canon(toks, uncertain)
 
 
 def _close_of(toks, i: int) -> int:
@@ -166,7 +1030,7 @@ def discovery(c: Canon) -> Canon:
         if top_comma:
             break
         toks = _strip_parens(inner)
-    return Canon(toks)
+    return Canon(toks, c.uncertain)
 
 
 def _grams(words: list[str]) -> set:

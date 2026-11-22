@@ -47,6 +47,12 @@
       "argv": [
         "tests/test_dpapi_seam.py"
       ]
+    },
+    {
+      "id": "similar_scope",
+      "argv": [
+        "tests/test_similar_scope.py"
+      ]
     }
   ]
 }
