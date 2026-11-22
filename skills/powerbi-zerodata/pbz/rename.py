@@ -5,6 +5,7 @@ import json
 import ntpath
 import os
 import re
+import unicodedata
 
 from . import deps, lexers, mirror, pbir, tmdl
 from .common import PbzError, commit_bytes
@@ -428,10 +429,14 @@ def _path_extension(rest, old, tables=()):
     if re.search(pattern, _fold(rest)):
         return False
     for seg in rest.split("."):
-        seg = seg.strip()
-        if not seg or not all(ch.isalnum() or ch in "_ " for ch in seg):
+        # Classify the folded segment, and count combining marks as name
+        # characters: spellings that fold to the same string (a precomposed
+        # letter and its decomposed form) must classify identically.
+        seg = _fold(seg.strip())
+        if not seg or not all(ch.isalnum() or unicodedata.category(ch).startswith("M")
+                              or ch in "_ " for ch in seg):
             return False
-        if any(tok in _WORD_OPERATORS for tok in _fold(seg).split()):
+        if any(tok in _WORD_OPERATORS for tok in seg.split()):
             return False
     return True
 

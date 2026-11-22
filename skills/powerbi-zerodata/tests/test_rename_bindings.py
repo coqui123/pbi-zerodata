@@ -1066,6 +1066,17 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "Sales", "X")
         self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "X.İİİ.X.Y")
 
+    def test_column_rename_destination_extension_spelling_invariant(self):
+        for new_name in ("Region.Amount.\u0130", "Region.Amount.i\u0307"):
+            ws, project, mdef, path = self._report_project({"refs": []})
+            _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+                   "table Sales\n\tcolumn Cost\n\t\tdataType: int64\n")
+            _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+                   "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Cost", new_name, table="Sales")
+            self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
