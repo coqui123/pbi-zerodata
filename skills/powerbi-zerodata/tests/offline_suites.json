@@ -849,5 +849,13 @@
     ],
     "windows": false,
     "engine": false
+  },
+  {
+    "id": "dpapi_seam",
+    "argv": [
+      "tests/test_dpapi_seam.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]

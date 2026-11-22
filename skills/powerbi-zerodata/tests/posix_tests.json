@@ -1,0 +1,16 @@
+{
+  "tests": [
+    "test_mcp.GitHookTests.test_chain_bytes_args_stdin_and_status",
+    "test_mcp.GitHookTests.test_non_executable_host_is_ignored",
+    "test_mcp.InstallerTransactionTests.test_atomic_text_preserves_mode_and_symlink",
+    "test_mcp.InstallerTransactionTests.test_posix_lock_timeout_is_named_conflict",
+    "test_mcp.InstallerTransactionTests.test_absent_noop_holder_removes_parents_before_waiter_retries",
+    "test_mcp.InstallerTransactionTests.test_absent_noop_lock_unlinks_before_unlocking",
+    "test_mcp.InstallerTransactionTests.test_absent_noop_lock_waiter_retries_replaced_inode",
+    "test_mirror_recovery_honesty.MirrorEditJournalTests.test_recovery_guard_excludes_concurrent_recovery",
+    "test_mirror_recovery_honesty.RecoveryHonestyTests.test_open_editor_save_during_successful_quarantine_return_is_preserved",
+    "test_pbz_state_atomic.StateAtomicTests.test_allocator_path_swapped_during_acquisition_refused",
+    "test_pbz_state_atomic.StateAtomicTests.test_allocator_posix_deadline",
+    "test_pbz_state_atomic.StateAtomicTests.test_allocator_replaced_path_refused"
+  ]
+}

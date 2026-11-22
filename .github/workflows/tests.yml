@@ -165,6 +165,30 @@ jobs:
           python tests/test_components.py --require-validator
           if ($LASTEXITCODE -ne 0) { throw "required vendor validator acceptance failed" }
 
+  posix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: skills/powerbi-zerodata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check jsonschema
+      - name: POSIX-only tests (DPAPI test seam)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/run_posix.py --report ci-results/posix.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: posix
+          path: skills/powerbi-zerodata/ci-results/*.json
+          if-no-files-found: error
+
   live-synth:
     if: github.event_name == 'workflow_dispatch' && inputs.live_synth
     runs-on: [self-hosted, Windows, pbz-desktop]

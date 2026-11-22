@@ -41,6 +41,12 @@
       "argv": [
         "tests/test_rewrite_scopes.py"
       ]
+    },
+    {
+      "id": "dpapi_seam",
+      "argv": [
+        "tests/test_dpapi_seam.py"
+      ]
     }
   ]
 }

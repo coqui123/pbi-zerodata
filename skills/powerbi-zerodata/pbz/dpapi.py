@@ -10,11 +10,13 @@ import ctypes
 import ctypes.wintypes as wt
 import hashlib
 import hmac as _hmac
+import importlib.util
 import math
 import os
 import secrets
 import tempfile
 import unicodedata
+from pathlib import Path
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
@@ -39,7 +41,41 @@ def _bind_dpapi():
     return protect_fn, unprotect_fn, local_free
 
 
-_CRYPT_PROTECT, _CRYPT_UNPROTECT, _LOCAL_FREE = _bind_dpapi()
+_FNS = None
+
+
+def _fns():
+    global _FNS
+    if _FNS is None:
+        try:
+            _FNS = _bind_dpapi()
+        except AttributeError:
+            raise RuntimeError("DPAPI is only available on Windows") from None
+    return _FNS
+
+
+_FAKE = None
+
+
+def _fake_provider():
+    global _FAKE
+    if _FAKE is None:
+        path = Path(__file__).resolve().parent.parent / "tests" / "_fake_dpapi.py"
+        if not path.is_file():
+            raise RuntimeError("PBZ_FAKE_DPAPI requested but the test fake provider is not present in this install")
+        spec = importlib.util.spec_from_file_location("_pbz_fake_dpapi", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _FAKE = module
+    return _FAKE
+
+
+def _use_fake():
+    if os.environ.get("PBZ_FAKE_DPAPI") != "1":
+        return False
+    if os.environ.get("PBZ_TEST_HARNESS") != "1":
+        raise RuntimeError("PBZ_FAKE_DPAPI is set outside the test harness; refusing to substitute the DPAPI provider")
+    return True
 
 
 def _blob(data: bytes) -> _Blob:
@@ -52,7 +88,7 @@ def _blob(data: bytes) -> _Blob:
 
 def _free_out(out: _Blob) -> None:
     if out.pbData:
-        _LOCAL_FREE(ctypes.cast(out.pbData, ctypes.c_void_p))
+        _fns()[2](ctypes.cast(out.pbData, ctypes.c_void_p))
 
 
 def _call(fn, data: bytes) -> bytes:
@@ -67,9 +103,11 @@ def _call(fn, data: bytes) -> bytes:
 
 
 def protect(data: bytes) -> bytes:
+    if _use_fake():
+        return _fake_provider().protect(data)
     src = _blob(data)
     out = _Blob()
-    if not _CRYPT_PROTECT(ctypes.byref(src), None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out)):
+    if not _fns()[0](ctypes.byref(src), None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out)):
         raise OSError("CryptProtectData failed")
     try:
         return ctypes.string_at(out.pbData, out.cbData)
@@ -78,7 +116,9 @@ def protect(data: bytes) -> bytes:
 
 
 def unprotect(data: bytes) -> bytes:
-    return _call(_CRYPT_UNPROTECT, data)
+    if _use_fake():
+        return _fake_provider().unprotect(data)
+    return _call(_fns()[1], data)
 
 
 def _refuse_link(path: str) -> None:
