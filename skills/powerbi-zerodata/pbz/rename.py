@@ -40,7 +40,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         raise PbzError("NO_MIRROR", "run `pbz pull` first")
     model = tmdl.load_model(mdef, root=os.path.dirname(project.mirror_model))
     if kind == "measure":
-        m = model.measure(old)
+        m = next((mm for mm in model.all_measures() if _fold(mm.name) == _fold(old)), None)
         if not m:
             raise PbzError("NOT_FOUND", f"measure {old}")
         if _fold(new) != _fold(old) and (any(_fold(mm.name) == _fold(new) for mm in model.all_measures())
@@ -320,11 +320,22 @@ def _report_string_sites(root, model, fields=None):
 _AMBIGUOUS = object()
 
 
+def _find_table(model, name):
+    """The model table whose name folds equal to name, or None. The model's
+    own lookups use lower(), which splits the Greek sigma spellings."""
+    if model is None:
+        return None
+    for t in model.tables.values():
+        if _fold(t.name) == _fold(name):
+            return t
+    return None
+
+
 def _canonical_target(model, kind, home, old):
     """The model-resolved (table, name) for a rename target, in canonical spelling."""
     if model is None:
         return home, old
-    table = model.table(home)
+    table = _find_table(model, home)
     if table is None:
         return home, old
     if kind == "table":
@@ -348,7 +359,7 @@ def _table_qualified(model, old):
     """(table, {qualified object paths}) for a table rename, or (None, empty set)."""
     if model is None:
         return None, set()
-    table = model.table(old)
+    table = _find_table(model, old)
     if table is None:
         return None, set()
     qualified = {_fold(f"{table.name}.{obj.name}")
@@ -765,11 +776,13 @@ def translated_names(project) -> set[str]:
 
 
 def rename_table(ws, project, model, old: str, new: str) -> dict:
-    t = model.table(old)
+    t = _find_table(model, old)
     if t is None:
         raise PbzError("NOT_FOUND", f"table {old}")
     old = t.name
-    if _fold(new) != _fold(old) and any(_fold(t2.name) == _fold(new) for t2 in model.tables.values()):
+    if _fold(new) != _fold(old) and (any(_fold(t2.name) == _fold(new) for t2 in model.tables.values())
+                                     or any(_fold(nm) == _fold(new)
+                                            for nm in _extension_tables(project.mirror_report))):
         raise PbzError("NAME_TAKEN", new)
     if not new.strip() or new != new.strip() or any(c in new for c in "\r\n\t"):
         raise PbzError("BAD_REQUEST", "table names cannot be blank, padded or contain control characters")
@@ -839,9 +852,10 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                     names = json.loads(seg)
                 except ValueError:
                     names = None
-                if isinstance(names, list) and old in names:
-                    edits.append((reg.start, reg.end, json.dumps([new if n == old else n for n in names],
-                                                                 separators=(",", ":"), ensure_ascii=False)))
+                if isinstance(names, list) and any(isinstance(n, str) and _fold(n) == low for n in names):
+                    edits.append((reg.start, reg.end, json.dumps(
+                        [new if isinstance(n, str) and _fold(n) == low else n for n in names],
+                        separators=(",", ":"), ensure_ascii=False)))
         for m_ in re.finditer(r"(?m)^(\t*(?:fromColumn|toColumn|baseColumn|baseTable|defaultHierarchy)\s*:\s*)(.+?)\s*$", text):
             parts = tmdl.split_dotted(m_.group(2))
             if parts and _fold(parts[0]) == low:

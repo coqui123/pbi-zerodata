@@ -630,6 +630,32 @@ class RenameBindingsTests(unittest.TestCase):
                 rename.rename(ws, project, "table", "ΟΣ", "Revenue")
         self.assertEqual(caught.exception.code, "UNSUPPORTED")
 
+    def test_table_rename_into_extension_entity_name_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales", "measures": [{"name": "A", "expression": "1"}]},
+            {"name": "Revenue", "measures": [{"name": "B", "expression": "2"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_source_lookup_folds_sigma(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "ΟΣ.tmdl"),
+               "table 'ΟΣ'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "οσ", "Revenue")
+        self.assertTrue(os.path.isfile(os.path.join(mdef, "tables", "Revenue.tmdl")))
+
+    def test_table_rename_query_order_folds_sigma(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "ΟΣ.tmdl"),
+               "table 'ΟΣ'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        model_path = Path(mdef, "model.tmdl")
+        model_path.write_text(model_path.read_text() + '\nannotation PBI_QueryOrder = ["οσ"]\n')
+        rename.rename(ws, project, "table", "ΟΣ", "Revenue")
+        self.assertIn('"Revenue"', model_path.read_text())
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
