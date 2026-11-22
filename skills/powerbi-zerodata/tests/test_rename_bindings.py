@@ -1192,6 +1192,33 @@ class RenameBindingsTests(unittest.TestCase):
         ms = json.loads(ext_path.read_text())["entities"][1]["measures"]
         self.assertEqual(ms[0]["expression"], "SUMX(Sales, VAR x = 1 RETURN [Net] + x)")
 
+    def test_unanchored_bare_native_query_ref_with_two_owners_stays(self):
+        ws, project, mdef, path = self._report_project({"projections": [{"nativeQueryRef": "Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "NetAmount", table="Sales")
+        self.assertEqual(json.loads(path.read_text()),
+                         {"projections": [{"nativeQueryRef": "Amount"}]})
+
+    def test_table_rename_return_keyword_standalone_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Return.tmdl"),
+               "table Return\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "M", "expression": "VAR x = 1 RETURN x"}]}]}))
+        rename.rename(ws, project, "table", "Return", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "VAR x = 1 RETURN x")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

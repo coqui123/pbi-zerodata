@@ -275,7 +275,8 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
                                              extra_tables=_extension_tables(project.mirror_report),
                                              dest_owned=(ext_owned if kind == "table" else None),
                                              dest_extending=(_extension_owned_dest(project.mirror_report, old, new)
-                                                             if kind == "table" else None))
+                                                             if kind == "table" else None),
+                                             anchored=_doc_anchored(original_root, kind, home, old))
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         def _kind_of(r):
@@ -484,7 +485,8 @@ def _head_swap(value, table, new):
 
 
 def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
-                      extensions_any=False, extra_tables=(), head=None, dest_tables=None):
+                      extensions_any=False, extra_tables=(), head=None, dest_tables=None,
+                      bare_fields=False):
     """True when an unbound string is owned by another table: exactly a
     qualified path of any other table (Sales.Region.Amount beside the Sales
     column 'Region.Amount'), or an owned extension of a longer-named
@@ -519,6 +521,16 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
                 return True
     if model is None:
         return False
+    if bare_fields and "." not in value:
+        # A bare value with no anchor to its home anywhere in its
+        # document (a bare nativeQueryRef) is owned by any other table
+        # with a field of that name, not only by a qualified path.
+        for t in model.tables.values():
+            if _fold(t.name) == _fold(home):
+                continue
+            if any(_fold(o.name) == low
+                   for o in list(t.columns.values()) + list(t.measures.values())):
+                return True
     for t in model.tables.values():
         if _fold(t.name) == _fold(home):
             continue
@@ -695,12 +707,24 @@ def _extension_tables(report_dir):
     return [name for name, _measures in _extension_entities(report_dir)]
 
 
+def _doc_anchored(root, kind, home, old):
+    """True when the document itself anchors bare references to the rename
+    target: some string in it is the qualified home.old path. A bare
+    nativeQueryRef in an anchored document denotes the home field even
+    when another table has a field of the same name."""
+    if kind == "table":
+        return True
+    target = _fold(f"{home}.{old}")
+    return any(_fold(v) == target for _p, v in _report_strings(root))
+
+
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
                           extra_qualified=(), extra_owned=(), extra_extending=(),
-                          extra_tables=(), dest_owned=None, dest_extending=None):
+                          extra_tables=(), dest_owned=None, dest_extending=None,
+                          anchored=True):
     nv, wrapped_used = _report_string_rename_inner(key, value, kind, home, old, new, field, model,
                                                    extra_qualified, extra_owned, extra_extending,
-                                                   extra_tables)
+                                                   extra_tables, anchored)
     if nv != value and model is not None:
         # The emitted string, exactly as produced (extensions retained from
         # the source string, wrapper text included), must not be owned by
@@ -732,7 +756,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         for text in produced:
             if _other_table_owns(model, anchor, text, owned, extending,
                                  extensions_any=bare, extra_tables=dest_extra, head=head,
-                                 dest_tables=dest_tables):
+                                 dest_tables=dest_tables, bare_fields=not anchored):
                 raise PbzError("NAME_TAKEN", nv)
         if kind == "table":
             # The emitted path must stay recognizable as its own field's
@@ -791,7 +815,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
 
 def _report_string_rename_inner(key, value, kind, home, old, new, field=None, model=None,
                                 extra_qualified=(), extra_owned=(), extra_extending=(),
-                                extra_tables=()):
+                                extra_tables=(), anchored=True):
     if kind == "table":
         if field is _AMBIGUOUS:
             return value, False
@@ -897,7 +921,8 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
         return f"{home}.{new}", False
     if key == "nativeQueryRef" and _fold(value) == _fold(old) \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending,
-                                      extensions_any=True, extra_tables=extra_tables):
+                                      extensions_any=True, extra_tables=extra_tables,
+                                      bare_fields=not anchored):
         return new, False
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef") \
             and _other_table_owns(model, home, value, extra_owned, extra_extending,
@@ -1035,7 +1060,16 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
         tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
         return tok.kind == "ident" and _fold(tok.value or tok.text) in _DAX_KEYWORDS
 
-    raw_bindings = deps.dax_bindings(text, cur, res).bindings
+    def _keyword_self(binding):
+        # A binding whose own span is a bare DAX keyword token (RETURN in
+        # "VAR x = 1 RETURN x" with a table named Return) is the keyword,
+        # never a reference to that table.
+        toks = lexers.significant(lexers.lex_dax(text[binding.start:binding.end]))
+        return len(toks) == 1 and toks[0].kind == "ident" \
+            and _fold(toks[0].value or toks[0].text) in _DAX_KEYWORDS
+
+    raw_bindings = [b for b in deps.dax_bindings(text, cur, res).bindings
+                    if not _keyword_self(b)]
     spurious = [b for b in raw_bindings if _spurious_qualifier(b)]
     if spurious:
         # The resolver mis-read the keyword as a qualifier, which also
@@ -1170,10 +1204,11 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
 
         visit(root, {})
     home, old = _canonical_target(model, kind, home, old)
+    anchored = _doc_anchored(root, kind, home, old)
     for site, (node, field) in _report_string_sites(root, model, fields).items():
         nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
                                    extra_owned=extra_owned, extra_extending=extra_extending,
-                                   extra_tables=extra_tables)
+                                   extra_tables=extra_tables, anchored=anchored)
         if nv != node.value:
             edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
     edits.extend(_measure_expression_edits(root, model, kind, home, old, new))
