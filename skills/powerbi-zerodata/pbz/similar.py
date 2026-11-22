@@ -581,10 +581,11 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             or t.value.lower() in parent.get("captured", ()):
                         uncertain = True
             for fr in stack:
-                if fr["fn"] == "SUBSTITUTEWITHINDEX" and fr["arg"] == 3 \
+                if fr["fn"] == "SUBSTITUTEWITHINDEX" and fr["arg"] >= 3 and fr["arg"] % 2 == 1 \
                         and ((ref.kind == "column" and fr.get("x_table") != ref.table)
-                             or (ref.kind == "measure" and fr.get("x_table") is not None
-                                 and res.column(fr.get("x_table"), t.value) is not None)):
+                             or (ref.kind == "measure" and (fr.get("x_table") is None
+                                 or res.column(fr.get("x_table"), t.value) is not None))
+                             or t.value.lower() in fr.get("captured", ())):
                     uncertain = True
             CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
                            "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}

@@ -235,6 +235,10 @@ SALES = (
     "\tmeasure FmtNameB = 1\n\t\tformatStringDefinition = IF(SELECTEDMEASURENAME() = \"FmtNameA\", \"$#,0\", \"#,0\")\n\n"
     "\tmeasure SubstA = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, [Price], ASC)))\n\n"
     "\tmeasure SubstB = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, Sales[Price], ASC)))\n\n"
+    "\tmeasure SubstLateA = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, Other[ShadowM], ASC, [Price], ASC)))\n\n"
+    "\tmeasure SubstLateB = CONCATENATEX(Sales, TOCSV(SUBSTITUTEWITHINDEX(FILTER(Other, Other[Price] = 20), \"Idx\", Other, Other[ShadowM], ASC, Sales[Price], ASC)))\n\n"
+    "\tmeasure SubstUnkA = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", ADDCOLUMNS(Other, \"CtrlA\", Other[Price]), [CtrlA], ASC))\n\n"
+    "\tmeasure SubstUnkB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", ADDCOLUMNS(Other, \"CtrlA\", Other[Price]), Sales[CtrlA], ASC))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -334,7 +338,7 @@ class SimilarScopeTests(unittest.TestCase):
               "XnpvColShadowA", "XnpvColShadowB", "TopnColShadowA", "TopnColShadowB",
               "FnbColA", "FnbColB", "SpanChainCtrlA", "SpanChainCtrlB",
               "HomeCountA", "FmtShadowA", "FmtShadowB", "FmtNameA", "FmtNameB",
-              "SubstA", "SubstB")} | {("Other", "OtherRows")},
+              "SubstA", "SubstB", "SubstLateA", "SubstLateB", "SubstUnkA", "SubstUnkB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -526,11 +530,14 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "FORMAT_DIFFERS")
 
     def test_substitutewithindex_sort_bracket_is_uncertain(self):
-        self.assertEqual(self._key("SubstA"), self._key("SubstB"))
-        self.assertTrue(self._canon("SubstA").uncertain)
-        with self.assertRaises(PbzError) as caught:
-            consolidate.merge(self.ws, self.project, "SubstB", "SubstA", dry_run=True)
-        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+        for dup, into in (("SubstB", "SubstA"), ("SubstLateB", "SubstLateA"),
+                          ("SubstUnkB", "SubstUnkA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_span_chain_stays_certain(self):
         self.assertFalse(self._canon("SpanChainCtrlA").uncertain)
