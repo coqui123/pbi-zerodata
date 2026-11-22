@@ -1465,6 +1465,20 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
         self.assertEqual(m, "CALCULATE(COUNTROWS('Archive'), CROSSFILTER(A[K], B[K], OneWay_LeftFiltersRight))")
 
+    def test_column_rename_keyword_touching_bracket_still_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"},
+                                            {"name": "M", "expression": "SUMX(Sales, VAR x = 1 RETURN[Amount] + x)"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, "SUMX(Sales, VAR x = 1 RETURN[Net] + x)")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

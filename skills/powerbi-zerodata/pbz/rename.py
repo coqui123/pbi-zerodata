@@ -1104,6 +1104,16 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
     raw_bindings = deps.dax_bindings(text, cur, res).bindings
     mask_spans = [b.qualifier for b in raw_bindings if _spurious_qualifier(b)]
     mask_spans += [(b.start, b.end) for b in raw_bindings if _keyword_self(b)]
+    for b in raw_bindings:
+        if not b.uncertain:
+            continue
+        # A keyword touching the bracket (RETURN[Amount]) made the
+        # resolver mark a sound row-context binding uncertain although
+        # the keyword itself was never bound as a table.
+        toks = lexers.significant(lexers.lex_dax(text[:b.start]))
+        if toks and toks[-1].kind == "ident" and toks[-1].end == b.start \
+                and _fold(toks[-1].value or toks[-1].text) in _DAX_KEYWORDS:
+            mask_spans.append((toks[-1].start, toks[-1].end))
     if mask_spans:
         # A keyword the resolver mistook for a table (as a bracket's
         # qualifier, as a standalone binding, or as an iterator's row
