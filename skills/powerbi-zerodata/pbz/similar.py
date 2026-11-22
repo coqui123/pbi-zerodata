@@ -188,18 +188,20 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
 
     def learn(table, bare: bool = False) -> None:
         if table:
+            direct = not (stack and stack[-1]["fn"] in SCALAR_FUNCS)
+            eff_bare = bare and direct
             for idx, fr in enumerate(stack):
                 if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"]:
                     if fr["row_table"] is None:
                         fr["row_table"] = table
-                        if not bare:
+                        if not eff_bare:
                             g = _source_frame(idx)
-                            if g is not None and g["arg"] != 0:
+                            if g is not None and not (stack[-1] is g and g["arg"] == 0):
                                 fr["taint"] = g
-                    elif bare and fr["row_table"] != table:
+                    elif eff_bare and fr["row_table"] != table:
                         fr["row_table"] = None
                         fr["poisoned"] = True
-                    if bare and fr.get("taint") is not None and fr["row_table"] == table:
+                    if eff_bare and fr.get("taint") is not None and fr["row_table"] == table:
                         fr["taint"] = None
 
     def poison_qualified(tab) -> None:
@@ -217,17 +219,17 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     while i < n:
         t = sig[i]
         nxt = sig[i + 1] if i + 1 < n else None
-        if t.kind == "op" and t.text == "(":
+        if t.kind == "op" and t.text in ("(", "{"):
             prev = sig[i - 1] if i else None
-            fn = prev.text.upper() if prev is not None and prev.kind == "ident" else ""
+            fn = "{" if t.text == "{" else (prev.text.upper() if prev is not None and prev.kind == "ident" else "")
             frame = {"fn": fn, "arg": 0, "row_table": None, "poisoned": False, "taint": None}
             stack.append(frame)
-            if fn and fn not in SCALAR_FUNCS:
+            if fn and fn not in SCALAR_FUNCS and fn not in ("IF", "IFERROR", "SWITCH", "COALESCE"):
                 for fr in stack[:-1]:
                     if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
                             and fr["row_table"] is not None and not fr["poisoned"]:
                         fr["taint"] = frame
-        elif t.kind == "op" and t.text == ")":
+        elif t.kind == "op" and t.text in (")", "}"):
             if stack:
                 closed = stack.pop()
                 for fr in stack:

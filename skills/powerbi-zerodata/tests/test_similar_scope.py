@@ -75,6 +75,12 @@ SALES = (
     "\tmeasure Gen2B = SUMX(GENERATESERIES(1, MAX(Sales[Price])), Sales[Price])\n\n"
     "\tmeasure NestCtrlA = SUMX(CALCULATETABLE(FILTER(Sales, Sales[Price] > MAX(Other[Price]))), [Price])\n\n"
     "\tmeasure NestCtrlB = SUMX(CALCULATETABLE(FILTER(Sales, Sales[Price] > MAX(Other[Price]))), [Price])\n\n"
+    "\tmeasure Gen3A = SUMX(GENERATESERIES(MAX(Sales[Price]), 3), [Price])\n\n"
+    "\tmeasure Gen3B = SUMX(GENERATESERIES(MAX(Sales[Price]), 3), Sales[Price])\n\n"
+    "\tmeasure ConsA = SUMX(TOPN(MAX(Sales[Price]), { 1, 2 }), [Price])\n\n"
+    "\tmeasure ConsB = SUMX(TOPN(MAX(Sales[Price]), { 1, 2 }), Sales[Price])\n\n"
+    "\tmeasure IfCtrlA = SUMX(FILTER(Sales, IF(Sales[Price] > 0, TRUE(), FALSE())), [Price])\n\n"
+    "\tmeasure IfCtrlB = SUMX(FILTER(Sales, IF(Sales[Price] > 0, TRUE(), FALSE())), [Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -124,7 +130,8 @@ class SimilarScopeTests(unittest.TestCase):
               "DerivedA", "DerivedB", "ScalarQA", "ScalarQB", "CrossA", "CrossB",
               "CtorA", "CtorB", "CountA", "CountB", "ScopeA", "ScopeB", "InlineA", "InlineB",
               "QualA", "QualB", "GenA", "GenB", "TopNCtrlA", "TopNCtrlB",
-              "SumzA", "SumzB", "Gen2A", "Gen2B", "NestCtrlA", "NestCtrlB")},
+              "SumzA", "SumzB", "Gen2A", "Gen2B", "NestCtrlA", "NestCtrlB",
+              "Gen3A", "Gen3B", "ConsA", "ConsB", "IfCtrlA", "IfCtrlB")},
         )
 
     def _canon(self, name):
@@ -266,6 +273,20 @@ class SimilarScopeTests(unittest.TestCase):
                 with self.assertRaises(PbzError) as caught:
                     consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_scalar_bound_and_constructor_sources_still_poison(self):
+        for dup, into in (("Gen3B", "Gen3A"), ("ConsB", "ConsA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_conditional_predicate_source_stays_certain(self):
+        self.assertFalse(self._canon("IfCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "IfCtrlB", "IfCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
 
     def test_nested_predicate_source_stays_certain(self):
         self.assertFalse(self._canon("NestCtrlA").uncertain)
