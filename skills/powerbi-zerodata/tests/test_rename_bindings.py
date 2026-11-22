@@ -272,7 +272,7 @@ class RenameBindingsTests(unittest.TestCase):
     def test_table_rename_expression_metadata_unchanged(self):
         for value in ("Sales.Amount.Share IN { 2025 }", "Sales.Amount.Share % Sales.Total",
                       "Sales.Amount.Share || Sales.Amount", "Sales.Amount.Share AND Sales.Total",
-                      "Sales.Amount.Share IN AllowedYears"):
+                      "Sales.Amount.Share IN AllowedYears", "Sales.Amount.Share vs Other.Amount"):
             with self.subTest(value=value):
                 ws, project, _mdef, path = self._report_project({"refs": [{"metadata": value}]})
                 before = path.read_bytes()
@@ -365,6 +365,19 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "Sales", "Revenue")
         after = json.loads(path.read_text())["projections"][0]
         self.assertEqual(after["queryRef"], "Sum(Revenue.Region.Amount.Share)")
+
+    def test_column_rename_ambiguous_unbound_string_unchanged(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount"}]})
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Region.Amount", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_casefold_length_mismatch(self):
+        from unittest.mock import Mock
+        field = Mock(table="İ", name="Amount", kind="column")
+        out = rename._report_string_rename("queryRef", "i̇.Amount", "table", "", "İ", "Revenue",
+                                           field=field, model=None)
+        self.assertEqual(out, "Revenue.Amount")
 
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})

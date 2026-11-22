@@ -337,15 +337,17 @@ def _table_qualified(model, old):
 _WORD_OPERATORS = {"and", "in", "not", "or"}
 
 
-def _path_extension(rest, old):
+def _path_extension(rest, old, tables=()):
     """True when rest is only dotted name segments extending a qualified path
     (hierarchy levels, variations), never an expression fragment. An allowlist,
     so a new operator character cannot reopen a partial rewrite; a word
-    operator or a fresh reference to the renamed table also disqualifies the
+    operator or a fresh reference to any known table also disqualifies the
     remainder, since either means the string holds more than one reference."""
     if not rest:
         return False
-    if re.search(rf"(?<![\w]){re.escape(old.lower())}\.", rest.lower()):
+    names = {old.lower()} | {t.lower() for t in tables}
+    pattern = rf"(?<![\w])(?:{'|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True))})\."
+    if re.search(pattern, rest.lower()):
         return False
     for seg in rest.split("."):
         seg = seg.strip()
@@ -354,6 +356,32 @@ def _path_extension(rest, old):
         if any(tok in _WORD_OPERATORS for tok in seg.lower().split()):
             return False
     return True
+
+
+def _head_swap(value, table, new):
+    """Replace the leading table segment of a dotted value with new, slicing
+    at the value's own boundary dot: the written segment can differ in length
+    from the canonical name when case folding changes code points."""
+    for i, ch in enumerate(value):
+        if ch == "." and value[:i].lower() == table.lower():
+            return new + value[i:]
+    return new + value[len(table):]
+
+
+def _other_table_owns(model, home, value):
+    """True when value is exactly the qualified path of an object on another
+    table whose dotted name extends home (Sales.Region.Amount beside the
+    Sales column 'Region.Amount'): the unbound string is ambiguous and the
+    other table's reading wins, so it stays unchanged."""
+    if model is None:
+        return False
+    low = value.lower()
+    for t in model.tables.values():
+        if t.name.lower().startswith(home.lower() + "."):
+            pool = list(t.columns.values()) + list(t.measures.values())
+            if any(low == f"{t.name}.{o.name}".lower() for o in pool):
+                return True
+    return False
 
 
 def _table_rewrite(value, old, new, qualified, table=None, model=None):
@@ -381,11 +409,13 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None):
             at = text.index(".", at + 1)
         return new + text[at:]
 
+    _tables = [t.name for t in model.tables.values()] if model is not None else ()
+
     def _extends(text):
         for q in qualified:
             if text.lower().startswith(q + "."):
                 rest = text[len(q) + 1:]
-                if _path_extension(rest, old):
+                if _path_extension(rest, old, _tables):
                     return True
         return False
 
@@ -461,20 +491,24 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                 probe = wrapped[1] if wrapped else value
                 if probe.lower() == base.lower() \
                         or (probe.lower().startswith(base.lower() + ".")
-                            and _path_extension(probe[len(base) + 1:], old)):
+                            and _path_extension(probe[len(base) + 1:], old,
+                                                [t.name for t in model.tables.values()]
+                                                if model is not None else ())):
                     if field.table.lower() != old.lower():
                         return value
-                    swapped = new + probe[len(field.table):]
+                    swapped = _head_swap(probe, field.table, new)
                     return f"{wrapped[0]}({swapped})" if wrapped else swapped
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
                 return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model)
             if value.lower().startswith(old.lower() + "."):
-                return new + value[len(old):]
+                return _head_swap(value, old, new)
             wrapped = _single_wrapped(value)
             if wrapped and wrapped[1].lower().startswith(old.lower() + ".") \
-                    and _path_extension(wrapped[1][len(old) + 1:], old):
-                return f"{wrapped[0]}({new}{wrapped[1][len(old):]})"
+                    and _path_extension(wrapped[1][len(old) + 1:], old,
+                                        [t.name for t in model.tables.values()]
+                                        if model is not None else ()):
+                return f"{wrapped[0]}({_head_swap(wrapped[1], old, new)})"
         return value
     if key == "queryName":
         return value
@@ -494,13 +528,15 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                     f"{field.table}.{field.name}".lower(), f"{home}.{old}".lower()):
                 return f"{wrapped.group(1)}({home}.{new})"
         return value
-    if key in ("queryRef", "metadata", "nativeQueryRef") and value.lower() == f"{home}.{old}".lower():
+    if key in ("queryRef", "metadata", "nativeQueryRef") and value.lower() == f"{home}.{old}".lower() \
+            and not _other_table_owns(model, home, value):
         return f"{home}.{new}"
     if key == "nativeQueryRef" and value.lower() == old.lower():
         return new
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
         wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
-        if wrapped and wrapped.group(2).lower() == f"{home}.{old}".lower():
+        if wrapped and wrapped.group(2).lower() == f"{home}.{old}".lower() \
+                and not _other_table_owns(model, home, wrapped.group(2)):
             return f"{wrapped.group(1)}({home}.{new})"
     return value
 
