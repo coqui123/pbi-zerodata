@@ -1150,6 +1150,31 @@ class RenameBindingsTests(unittest.TestCase):
         ms = json.loads(ext_path.read_text())["entities"][1]["measures"]
         self.assertEqual(ms[0]["expression"], "SUMX(Sales, VAR x = 1 RETURN [Net] + x)")
 
+    def test_table_rename_keyword_qualifier_untouched_quoted_follows(self):
+        def fresh(expr):
+            ws, project, mdef, path = self._report_project({"refs": []})
+            for f in os.listdir(os.path.join(mdef, "tables")):
+                os.remove(os.path.join(mdef, "tables", f))
+            _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+                   "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+            _write(os.path.join(mdef, "tables", "Return.tmdl"),
+                   "table Return\n\tcolumn Code\n\t\tdataType: string\n")
+            ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+            ext_path.write_text(json.dumps({"name": "extension", "entities": [
+                {"name": "Return", "measures": [{"name": "Amount", "expression": "7"}]},
+                {"name": "Budget", "measures": [{"name": "M", "expression": expr}]}]}))
+            return ws, project, ext_path
+
+        ws, project, ext_path = fresh("SUMX(Sales, VAR x = 1 RETURN [Amount] + x)")
+        rename.rename(ws, project, "table", "Return", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][1]["measures"][0]["expression"]
+        self.assertEqual(m, "SUMX(Sales, VAR x = 1 RETURN [Amount] + x)")
+
+        ws, project, ext_path = fresh("SUM('Return' [Amount])")
+        rename.rename(ws, project, "table", "Return", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][1]["measures"][0]["expression"]
+        self.assertEqual(m, "SUM('Archive' [Amount])")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

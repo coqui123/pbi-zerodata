@@ -1,6 +1,7 @@
 """Structured rename of a measure or column across the mirror's TMDL and PBIR files."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import ntpath
 import os
@@ -1024,7 +1025,18 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
             return False
         return _fold(binding.ref.name) in ext_names
 
-    bindings = deps.dax_bindings(text, cur, res).bindings
+    def _spurious_qualifier(binding):
+        # An unquoted DAX keyword in qualifier position (RETURN [Amount]
+        # with a table named Return in the model) is the keyword, never a
+        # qualifier; a quoted name is a real qualifier.
+        if not binding.qualifier:
+            return False
+        a, b = binding.qualifier
+        tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
+        return tok.kind == "ident" and _fold(tok.value or tok.text) in _DAX_KEYWORDS
+
+    bindings = [dataclasses.replace(b, qualifier=None) if _spurious_qualifier(b) else b
+                for b in deps.dax_bindings(text, cur, res).bindings]
     if kind == "table":
         low = _fold(old)
         out = []
