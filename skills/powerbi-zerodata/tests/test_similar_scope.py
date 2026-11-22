@@ -139,6 +139,8 @@ SALES = (
     "\tmeasure TopnExcB = SUMX(Sales, SUMX(TOPN(MAX(Sales[Price]), EXCEPT(ROW(\"Price\", 1), Sales)), Sales[Price]))\n\n"
     "\tmeasure NestUnionA = SUMX(Sales, SUMX(UNION(Sales, FILTER(UNION(ROW(\"Price\", Sales[Price] + 1), ALL(Sales)), TRUE())), [Price]))\n\n"
     "\tmeasure NestUnionB = SUMX(Sales, SUMX(UNION(Sales, FILTER(UNION(ROW(\"Price\", Sales[Price] + 1), ALL(Sales)), TRUE())), Sales[Price]))\n\n"
+    "\tmeasure SelColA = SUMX(Sales, SUMX(UNION(Sales, SELECTCOLUMNS(Sales, \"Adjusted\", Sales[Price] + 1)), [Price]))\n\n"
+    "\tmeasure SelColB = SUMX(Sales, SUMX(UNION(Sales, SELECTCOLUMNS(Sales, \"Adjusted\", Sales[Price] + 1)), Sales[Price]))\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -201,7 +203,7 @@ class SimilarScopeTests(unittest.TestCase):
               "FailA", "FailB", "ExcA", "ExcB", "MissingA", "MissingB",
               "PoisA", "PoisB", "UnionRowA", "UnionRowB", "WinOptA", "WinOptB",
               "UnionWrapA", "UnionWrapB", "UnionAllA", "UnionAllB", "YearCtrlA", "YearCtrlB",
-              "TopnExcA", "TopnExcB", "NestUnionA", "NestUnionB")},
+              "TopnExcA", "TopnExcB", "NestUnionA", "NestUnionB", "SelColA", "SelColB")},
         )
 
     def _canon(self, name):
@@ -400,7 +402,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("FailB", "FailA"), ("ExcB", "ExcA"), ("MissingB", "MissingA"),
                           ("PoisB", "PoisA"), ("UnionRowB", "UnionRowA"), ("WinOptB", "WinOptA"),
                           ("UnionWrapB", "UnionWrapA"), ("UnionAllB", "UnionAllA"),
-                          ("TopnExcB", "TopnExcA"), ("NestUnionB", "NestUnionA")):
+                          ("TopnExcB", "TopnExcA"), ("NestUnionB", "NestUnionA"),
+                          ("SelColB", "SelColA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
