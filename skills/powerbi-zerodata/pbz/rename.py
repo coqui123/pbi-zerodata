@@ -85,6 +85,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
                 model, home, new,
                 _extension_owned_others(project.mirror_report, home),
                 _extension_owned(project.mirror_report, home),
+                extensions_any=True,
                 extra_tables=_extension_tables(project.mirror_report))):
         raise PbzError("NAME_TAKEN", f"{home}.{new}")
     ext = _external_users(ws, project, kind, home, old)
@@ -463,7 +464,7 @@ def _head_swap(value, table, new):
 
 
 def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
-                      extensions_any=False, extra_tables=()):
+                      extensions_any=False, extra_tables=(), head=None):
     """True when an unbound string is owned by another table: exactly a
     qualified path of any other table (Sales.Region.Amount beside the Sales
     column 'Region.Amount'), or an owned extension of a longer-named
@@ -474,6 +475,8 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
     owning entity, not by the flattened path. extensions_any extends the
     extension test to every other table, for values with no home anchor
     (a bare nativeQueryRef)."""
+    if head is None:
+        head = home
     low = _fold(value)
     tables = tuple(t.name for t in model.tables.values()) if model is not None else ()
     tables = tables + tuple(extra_tables)
@@ -484,12 +487,12 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
         if low == pl:
             return True
         rest = _rest_after(value, pl)
-        if rest is not None and _path_extension(rest, home, tables):
+        if rest is not None and _path_extension(rest, head, tables):
             return True
     if extensions_any:
         for p in extra_owned:
             rest = _rest_after(value, _fold(p))
-            if rest is not None and _path_extension(rest, home, tables):
+            if rest is not None and _path_extension(rest, head, tables):
                 return True
     if model is None:
         return False
@@ -502,10 +505,10 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
             paths |= {_fold(f"{t.name}.{hname}.{lvl}") for lvl in levels}
         if low in paths:
             return True
-        if extensions_any or _fold(t.name).startswith(_fold(home) + "."):
+        if extensions_any or _fold(t.name).startswith(_fold(head) + "."):
             for q in paths:
                 rest = _rest_after(value, q)
-                if rest is not None and _path_extension(rest, home, tables):
+                if rest is not None and _path_extension(rest, head, tables):
                     return True
     return False
 
@@ -655,6 +658,25 @@ def _extension_tables(report_dir):
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
                           extra_qualified=(), extra_owned=(), extra_extending=(),
                           extra_tables=()):
+    nv = _report_string_rename_inner(key, value, kind, home, old, new, field, model,
+                                     extra_qualified, extra_owned, extra_extending,
+                                     extra_tables)
+    if nv != value and model is not None:
+        # The emitted string, exactly as produced (extensions retained from
+        # the source string, wrapper text included), must not be owned by
+        # another table in the destination namespace.
+        anchor = old if kind == "table" else home
+        head = new if kind == "table" else home
+        bare = key == "nativeQueryRef" and _fold(value) == _fold(old)
+        if _other_table_owns(model, anchor, nv, extra_owned, extra_extending,
+                             extensions_any=bare, extra_tables=extra_tables, head=head):
+            raise PbzError("NAME_TAKEN", nv)
+    return nv
+
+
+def _report_string_rename_inner(key, value, kind, home, old, new, field=None, model=None,
+                                extra_qualified=(), extra_owned=(), extra_extending=(),
+                                extra_tables=()):
     if kind == "table":
         if field is _AMBIGUOUS:
             return value
@@ -1043,7 +1065,8 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
             if _other_table_owns(model, old, f"{new}.{rest}",
                                  _extension_owned_others(project.mirror_report, old),
                                  _extension_owned(project.mirror_report, old),
-                                 extra_tables=_extension_tables(project.mirror_report)):
+                                 extra_tables=_extension_tables(project.mirror_report),
+                                 head=new):
                 raise PbzError("NAME_TAKEN", f"{new}.{rest}")
     ext = _external_users(ws, project, "table", "", old)
     mdef = os.path.join(project.mirror_model, "definition")

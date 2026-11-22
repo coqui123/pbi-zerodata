@@ -861,6 +861,44 @@ class RenameBindingsTests(unittest.TestCase):
             rename.rename(ws, project, "column", "Amount", "Other.Amount", table="Sales")
         self.assertEqual(caught.exception.code, "NAME_TAKEN")
 
+    def test_column_rename_bare_destination_extending_other_path_refused(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"},
+               "nativeQueryRef": "Amount"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        _write(os.path.join(mdef, "tables", "Other.tmdl"),
+               "table Other\n\tcolumn Metric\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "Other.Metric.Level", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_destination_extending_new_namespace_path_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Orders.Region.Amount.Level"}]})
+        _write(os.path.join(mdef, "tables", "Orders.tmdl"),
+               "table Orders\n\tcolumn 'Region.Amount.Level'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Orders", "Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_retained_suffix_destination_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "A.X.Level"}]})
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "B.X.tmdl"),
+               "table 'B.X'\n\tcolumn Level\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "A", "B")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_column_rename_wrapped_destination_owned_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sum(Sales.Amount)"}]})
+        _write(os.path.join(mdef, "tables", "Odd.tmdl"),
+               "table 'Sum(Sales'\n\tcolumn 'Revenue)'\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "Revenue", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
