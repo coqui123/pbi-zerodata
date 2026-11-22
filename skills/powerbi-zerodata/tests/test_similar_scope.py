@@ -28,6 +28,7 @@ SALES = (
     "\tmeasure UnresA = SUMX(Sales, [Nope])\n\n"
     "\tmeasure UnresB = SUMX(Sales, [Nope])\n\n"
     "\tmeasure CtrlA = SUM(Sales[Price])\n\n"
+    "\tmeasure ShadowM = SUM(Sales[Price])\n\n"
     "\tmeasure CtrlB = SUM(Sales[Price])\n\n"
     "\tmeasure VarA = VAR v = Other RETURN SUMX(v, [Price])\n\n"
     "\tmeasure VarB = VAR v = Other RETURN SUMX(v, Sales[Price])\n\n"
@@ -213,12 +214,20 @@ SALES = (
     "\tmeasure RollupWrapB = SUMX(FILTER(SUMMARIZECOLUMNS(Dates[Day], ROLLUPADDISSUBTOTAL(Dates[Day], \"CtrlA\")), TRUE()), Sales[CtrlA])\n\n"
     "\tmeasure XnpvNestShadowA = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), SUMX(Sales, [CtrlA]), DATE(2026, 1, 1), 0)\n\n"
     "\tmeasure XnpvNestShadowB = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), SUMX(Sales, Sales[CtrlA]), DATE(2026, 1, 1), 0)\n\n"
-    "\tmeasure VarAliasA = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) VAR u = t RETURN XNPV(u, [CtrlA], DATE(2026, 1, 1), 0)\n\n"
-    "\tmeasure VarAliasB = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) VAR u = t RETURN XNPV(u, Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
-    "\tmeasure VarNestA = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", VAR x = 1 RETURN x) RETURN XNPV(t, [CtrlA], DATE(2026, 1, 1), 0)\n\n"
-    "\tmeasure VarNestB = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", VAR x = 1 RETURN x) RETURN XNPV(t, Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
-    "\tmeasure WinXnpvA = XNPV(WINDOW(1, ABS, 3, ABS, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY(Sales[Price])), [CtrlA], DATE(2026, 1, 1), 0)\n\n"
-    "\tmeasure WinXnpvB = XNPV(WINDOW(1, ABS, 3, ABS, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY(Sales[Price])), Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure VarAliasA = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) VAR u = FILTER(t, TRUE()) RETURN SUMX(u, [CtrlA] + Sales[Price])\n\n"
+    "\tmeasure VarAliasB = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", 1) VAR u = FILTER(t, TRUE()) RETURN SUMX(u, Sales[CtrlA] + Sales[Price])\n\n"
+    "\tmeasure VarNestA = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", VAR x = 1 RETURN x) RETURN SUMX(t, [CtrlA] + Sales[Price])\n\n"
+    "\tmeasure VarNestB = VAR t = ADDCOLUMNS(Dates, \"CtrlA\", VAR x = 1 RETURN x) RETURN SUMX(t, Sales[CtrlA] + Sales[Price])\n\n"
+    "\tmeasure WinXnpvA = SUMX(WINDOW(1, ABS, 3, ABS, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY(Sales[Price])), [CtrlA] + Sales[Price])\n\n"
+    "\tmeasure WinXnpvB = SUMX(WINDOW(1, ABS, 3, ABS, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY(Sales[Price])), Sales[CtrlA] + Sales[Price])\n\n"
+    "\tmeasure XnpvColShadowA = XNPV(Other, [ShadowM], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure XnpvColShadowB = XNPV(Other, Sales[ShadowM], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure TopnColShadowA = COUNTROWS(TOPN(1, Other, [ShadowM]))\n\n"
+    "\tmeasure TopnColShadowB = COUNTROWS(TOPN(1, Other, Sales[ShadowM]))\n\n"
+    "\tmeasure FnbColA = SUMX(Sales, FIRSTNONBLANK(Wide[Qty], [Price]))\n\n"
+    "\tmeasure FnbColB = SUMX(Sales, FIRSTNONBLANK(Wide[Qty], Wide[Price]))\n\n"
+    "\tmeasure SpanChainCtrlA = VAR __a = Sales VAR __b = INTERSECT(__a, __a) VAR __c = INTERSECT(__b, __b) RETURN XNPV(__c, [Price], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure SpanChainCtrlB = VAR __a = Sales VAR __b = INTERSECT(__a, __a) VAR __c = INTERSECT(__b, __b) RETURN XNPV(__c, Sales[Price], DATE(2026, 1, 1), 0)\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -226,6 +235,7 @@ SALES = (
 OTHER = (
     "table Other\n\n"
     "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
+    "\tcolumn ShadowM\n\t\tdataType: int64\n\t\tsourceColumn: ShadowM\n\n"
 )
 WIDE = (
     "table Wide\n\n"
@@ -275,7 +285,7 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertEqual(
             {(m.table, m.name) for m in self.model.all_measures()},
             {("Sales", name) for name in
-             ("IterA", "IterB", "IterC", "IterD", "UnresA", "UnresB", "CtrlA", "CtrlB",
+             ("IterA", "IterB", "IterC", "IterD", "UnresA", "UnresB", "CtrlA", "CtrlB", "ShadowM",
               "VarA", "VarB", "AliasUnres", "AliasOk", "WrapA", "WrapB",
               "TabA", "TabB", "TabCtrlA", "TabCtrlB", "TopA", "TopB", "ScalarA", "ScalarB",
               "ExprA", "ExprB", "ChainA", "ChainB", "ValuesA", "ValuesB",
@@ -312,7 +322,9 @@ class SimilarScopeTests(unittest.TestCase):
               "XnpvShadowA", "XnpvShadowB", "RankCapA", "RankCapB",
               "RowXnpvA", "RowXnpvB", "VarXnpvA", "VarXnpvB",
               "RollupWrapA", "RollupWrapB", "XnpvNestShadowA", "XnpvNestShadowB",
-              "VarAliasA", "VarAliasB", "VarNestA", "VarNestB", "WinXnpvA", "WinXnpvB")},
+              "VarAliasA", "VarAliasB", "VarNestA", "VarNestB", "WinXnpvA", "WinXnpvB",
+              "XnpvColShadowA", "XnpvColShadowB", "TopnColShadowA", "TopnColShadowB",
+              "FnbColA", "FnbColB", "SpanChainCtrlA", "SpanChainCtrlB")},
         )
 
     def _canon(self, name):
@@ -486,6 +498,11 @@ class SimilarScopeTests(unittest.TestCase):
                     consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
+    def test_span_chain_stays_certain(self):
+        self.assertFalse(self._canon("SpanChainCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "SpanChainCtrlB", "SpanChainCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
     def test_xnpv_rate_argument_stays_certain(self):
         self.assertFalse(self._canon("XnpvRateCtrlA").uncertain)
         result = consolidate.merge(self.ws, self.project, "XnpvRateCtrlB", "XnpvRateCtrlA", dry_run=True)
@@ -546,7 +563,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("RollupWrapB", "RollupWrapA"),
                           ("XnpvNestShadowB", "XnpvNestShadowA"),
                           ("VarAliasB", "VarAliasA"), ("VarNestB", "VarNestA"),
-                          ("WinXnpvB", "WinXnpvA")):
+                          ("WinXnpvB", "WinXnpvA"), ("XnpvColShadowB", "XnpvColShadowA"),
+                          ("TopnColShadowB", "TopnColShadowA"), ("FnbColB", "FnbColA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

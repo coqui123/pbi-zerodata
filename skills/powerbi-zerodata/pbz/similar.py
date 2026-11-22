@@ -296,6 +296,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         if not bare and column and src_fr is not None \
                                 and src_fr["fn"] in NARROWING:
                             fr["only_column"] = column.lower()
+                        if not bare and column and fr["fn"] in (
+                                "FIRSTNONBLANK", "LASTNONBLANK",
+                                "FIRSTNONBLANKVALUE", "LASTNONBLANKVALUE"):
+                            fr["only_column"] = column.lower()
                         if not eff_bare:
                             g = _source_frame(idx)
                             exempt = trusted and g is not None and stack[-1] is g \
@@ -327,6 +331,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         args.append(cur)
         return args
 
+    _span_memo: dict = {}
+    _span_taint = [False]
+
     def _span_table(span, seen=frozenset()):
         while len(span) >= 2 and span[0].kind == "op" and span[0].text == "(" \
                 and _call_span(span, 0) == len(span) - 1:
@@ -342,11 +349,17 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     return res.table(u.text)
                 low = u.text.lower()
                 if low in seen:
+                    _span_taint[0] = True
                     return None
+                if low in _span_memo:
+                    return _span_memo[low]
                 rhss = var_rhs.get(low)
                 if rhss:
                     vals = {_span_table(r, seen | {low}) for r in rhss}
-                    return vals.pop() if len(vals) == 1 else None
+                    result = vals.pop() if len(vals) == 1 else None
+                    if not _span_taint[0]:
+                        _span_memo[low] = result
+                    return result
             return None
         if span[0].kind == "ident" and span[1].kind == "op" and span[1].text == "(" \
                 and _call_span(span, 1) == len(span) - 1:
@@ -445,6 +458,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         var_names_defined.setdefault(pending_vars[-1][0], set()).update(closed["names"])
                 if closed.get("x_span") is not None and closed["arg"] == 0 \
                         and closed.get("x_table") is None:
+                    _span_taint[0] = False
                     closed["x_table"] = _span_table(closed["x_span"])
                 for fr in stack:
                     if fr.get("taint") is closed:
@@ -539,6 +553,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             if any(fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and fr["arg"] >= 2
                    and (fr["row_table"] is None
                         or (ref.kind == "column" and fr["row_table"] != ref.table)
+                        or (ref.kind == "measure" and fr["row_table"] is not None
+                            and res.column(fr["row_table"], t.value) is not None)
                         or t.value.lower() in fr.get("captured", ()))
                    for fr in stack):
                 uncertain = True
@@ -547,6 +563,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     parent = stack[c_idx - 1]
                     if parent["row_table"] is None \
                             or (ref.kind == "column" and parent["row_table"] != ref.table) \
+                            or (ref.kind == "measure" and parent["row_table"] is not None
+                                and res.column(parent["row_table"], t.value) is not None) \
                             or t.value.lower() in parent.get("captured", ()):
                         uncertain = True
             CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
@@ -559,7 +577,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             for c_idx, fr in enumerate(stack):
                 if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] in (1, 2) \
                         and ((ref.kind == "column" and fr.get("x_table") != ref.table)
-                             or (ref.kind == "measure" and fr.get("x_table") is None)
+                             or (ref.kind == "measure" and (fr.get("x_table") is None
+                                 or res.column(fr.get("x_table"), t.value) is not None))
                              or t.value.lower() in fr.get("captured", ())) \
                         and not (ref.kind == "column" and any(
                                     g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
