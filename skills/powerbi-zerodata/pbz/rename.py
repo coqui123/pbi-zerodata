@@ -733,13 +733,17 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                 if _fold(q).startswith(_fold(old) + "."):
                     bases.append(new + q[len(_fold(old)):])
             names = list(dest_tables or ()) + list(dest_extra or ())
+            # Recognizability is judged on the path the rewrite produced:
+            # the inner path for a wrapped emission, the string itself
+            # otherwise. The wrapper text is not a path.
+            recog = produced[1:] if wrapped_used else produced[:1]
             own_base = None
             if field is not None and field is not _AMBIGUOUS:
                 if field.kind == "hierarchy" and field.hierarchy and not field.variation:
                     own_base = f"{new}.{field.hierarchy}.{field.level}"
                 else:
                     own_base = f"{new}.{field.name}"
-            for text in produced:
+            for text in recog:
                 if own_base is not None:
                     rest = _rest_after(text, _fold(own_base))
                     if _fold(text) != _fold(own_base) and rest is None:

@@ -1045,6 +1045,17 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "Sum(Old", "Sum(New")
         self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Sum(New.Amount)")
 
+    def test_table_rename_wrapped_emission_recognizability_on_inner_path(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"metadata": "Sum(Sales.Amount.Level)"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "SumRevenue.tmdl"),
+               "table 'Sum(Revenue'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["metadata"], "Sum(Revenue.Amount.Level)")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
