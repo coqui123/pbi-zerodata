@@ -1,7 +1,6 @@
 """Structured rename of a measure or column across the mirror's TMDL and PBIR files."""
 from __future__ import annotations
 
-import dataclasses
 import json
 import ntpath
 import os
@@ -1007,16 +1006,16 @@ def _pvs_property_node(node):
 
 
 # The DAX reserved words, plus the bare enum values that appear as
-# standalone arguments (ASC, DESC, SKIP, DENSE, and the DATEADD
-# intervals DAY, MONTH, QUARTER, YEAR): an unquoted token with one of
+# standalone arguments (ASC, DESC, SKIP, DENSE, and the date interval
+# units SECOND through YEAR): an unquoted token with one of
 # these texts is the keyword, never a table reference, since DAX itself
 # requires such table names to be quoted.
 _DAX_KEYWORDS = {_fold(w) for w in (
     "and", "asc", "break", "by", "column", "day", "define", "densify",
-    "dense", "desc", "else", "evaluate", "false", "group", "in", "index",
-    "matchby", "measure", "month", "mparameter", "not", "or", "order",
-    "quarter", "return", "row", "skip", "table", "then", "total", "true",
-    "var", "window", "year")}
+    "dense", "desc", "else", "evaluate", "false", "group", "hour", "in",
+    "index", "matchby", "measure", "minute", "month", "mparameter", "not",
+    "or", "order", "quarter", "return", "row", "second", "skip", "table",
+    "then", "total", "true", "var", "week", "window", "year")}
 
 
 def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None):
@@ -1100,24 +1099,21 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
         return len(toks) == 1 and toks[0].kind == "ident" \
             and _fold(toks[0].value or toks[0].text) in _DAX_KEYWORDS
 
-    raw_bindings = [b for b in deps.dax_bindings(text, cur, res).bindings
-                    if not _keyword_self(b)]
-    spurious = [b for b in raw_bindings if _spurious_qualifier(b)]
-    if spurious:
-        # The resolver mis-read the keyword as a qualifier, which also
-        # short-circuits its row-context analysis of the bracket. Mask the
-        # keyword (same length, offsets preserved) and take the bracket's
-        # binding from a second pass over the masked text.
+    raw_bindings = deps.dax_bindings(text, cur, res).bindings
+    mask_spans = [b.qualifier for b in raw_bindings if _spurious_qualifier(b)]
+    mask_spans += [(b.start, b.end) for b in raw_bindings if _keyword_self(b)]
+    if mask_spans:
+        # A keyword the resolver mistook for a table (as a bracket's
+        # qualifier, as a standalone binding, or as an iterator's row
+        # table) poisons the bindings around it. Mask every such token
+        # numerically (same length, offsets preserved; spaces would let
+        # the preceding name become a spaced qualifier) and take the
+        # bindings from a second pass over the masked text, where the
+        # keyword can no longer be misread.
         chars = list(text)
-        for b in spurious:
-            a, z = b.qualifier
-            # A numeric mask: spaces would let the preceding name become
-            # the bracket's spaced qualifier in the second pass.
+        for a, z in mask_spans:
             chars[a:z] = "1" * (z - a)
-        masked = deps.dax_bindings("".join(chars), cur, res).bindings
-        by_span = {(b.start, b.end): b for b in masked}
-        bindings = [by_span.get((b.start, b.end), dataclasses.replace(b, qualifier=None))
-                    if b in spurious else b for b in raw_bindings]
+        bindings = deps.dax_bindings("".join(chars), cur, res).bindings
     else:
         bindings = raw_bindings
     if kind == "table":

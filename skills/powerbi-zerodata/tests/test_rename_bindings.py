@@ -1395,6 +1395,38 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
         self.assertEqual(m, "COUNTROWS(DATEADD('Calendar'[Date], -1, YEAR)) + COUNTROWS('Archive')")
 
+    def test_table_rename_datediff_interval_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Hour.tmdl"),
+               "table Hour\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "DATEDIFF(DATE(2024,1,1), DATE(2024,1,2), HOUR) + COUNTROWS('Hour')"}]}]}))
+        rename.rename(ws, project, "table", "Hour", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "DATEDIFF(DATE(2024,1,1), DATE(2024,1,2), HOUR) + COUNTROWS('Archive')")
+
+    def test_column_rename_keyword_row_context_poison_masked(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Return.tmdl"),
+               "table Return\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "SUMX(VAR x = 1 RETURN Sales, [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "SUMX(VAR x = 1 RETURN Sales, [Net])")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
