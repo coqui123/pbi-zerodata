@@ -1604,6 +1604,35 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
         self.assertEqual(m, "COUNTROWS(DATEADD(FiscalCalendar, -1, MONTH, PRECISE, ANCHORED)) + COUNTROWS('Archive')")
 
+    def test_table_rename_endaligned_and_text_type_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "FiscalCalendar.tmdl"),
+               "table FiscalCalendar\n\tcolumn Date\n\t\tdataType: dateTime\n")
+        _write(os.path.join(mdef, "tables", "EndAligned.tmdl"),
+               "table EndAligned\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATEADD(FiscalCalendar, 1, MONTH, ENDALIGNED)) + COUNTROWS('EndAligned')"}]}]}))
+        rename.rename(ws, project, "table", "EndAligned", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATEADD(FiscalCalendar, 1, MONTH, ENDALIGNED)) + COUNTROWS('Archive')")
+
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Text.tmdl"),
+               "table Text\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATATABLE(\"K\", TEXT, {{\"x\"}})) + COUNTROWS('Text')"}]}]}))
+        rename.rename(ws, project, "table", "Text", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATATABLE(\"K\", TEXT, {{\"x\"}})) + COUNTROWS('Archive')")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
