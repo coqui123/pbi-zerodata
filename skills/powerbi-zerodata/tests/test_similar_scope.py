@@ -110,6 +110,10 @@ SALES = (
     "\tmeasure ExcQualCtrlB = SUMX(EXCEPT(Sales, VALUES(Other[Price])), Sales[CtrlA])\n\n"
     "\tmeasure SumzGroupA = SUMX(SUMMARIZE(ADDCOLUMNS(Sales, \"CtrlA\", 1), [CtrlA]), [CtrlA])\n\n"
     "\tmeasure SumzGroupB = SUMX(SUMMARIZE(ADDCOLUMNS(Sales, \"CtrlA\", 1), [CtrlA]), Sales[CtrlA])\n\n"
+    "\tmeasure JoinShadowVarA = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), v), [ShadowM]))\n\n"
+    "\tmeasure JoinShadowVarB = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), v), Sales[ShadowM]))\n\n"
+    "\tmeasure UnionPredCtrlA = SUMX(UNION(Sales, FILTER(Sales, Sales[Price] > MAX(Other[Price]))), [Price])\n\n"
+    "\tmeasure UnionPredCtrlB = SUMX(UNION(Sales, FILTER(Sales, Sales[Price] > MAX(Other[Price]))), Sales[Price])\n\n"
     "\tmeasure TopnCountCtrlA = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
@@ -377,7 +381,8 @@ class SimilarScopeTests(unittest.TestCase):
               "PredCountCtrlA", "PredCountCtrlB", "MaxxCtrlA", "MaxxCtrlB",
               "PredMaxxA", "PredMaxxB", "PredValuesA", "PredValuesB", "PredVarA", "PredVarB",
               "JoinA", "JoinB", "JoinInlA", "JoinInlB", "ExcQualCtrlA", "ExcQualCtrlB",
-              "SumzGroupA", "SumzGroupB",
+              "SumzGroupA", "SumzGroupB", "JoinShadowVarA", "JoinShadowVarB",
+              "UnionPredCtrlA", "UnionPredCtrlB",
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
               "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
@@ -595,7 +600,8 @@ class SimilarScopeTests(unittest.TestCase):
 
     def test_shared_lineage_joins_stay_certain(self):
         for name, dup in (("JoinA", "JoinB"), ("JoinInlA", "JoinInlB"),
-                          ("ExcQualCtrlA", "ExcQualCtrlB")):
+                          ("ExcQualCtrlA", "ExcQualCtrlB"),
+                          ("UnionPredCtrlA", "UnionPredCtrlB")):
             with self.subTest(name=name):
                 self.assertFalse(self._canon(name).uncertain)
                 result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
@@ -665,6 +671,13 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertTrue(self._canon("CapSelfA").uncertain)
         with self.assertRaises(PbzError) as caught:
             consolidate.merge(self.ws, self.project, "CapSelfB", "CapSelfA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_var_join_shadow_is_refused(self):
+        self.assertEqual(self._key("JoinShadowVarA"), self._key("JoinShadowVarB"))
+        self.assertTrue(self._canon("JoinShadowVarA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "JoinShadowVarB", "JoinShadowVarA", dry_run=True)
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_projection_drop_and_span_except_stay_certain(self):

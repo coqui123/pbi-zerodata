@@ -478,6 +478,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         continue
                     if p["fn"] in ("INTERSECT", "EXCEPT"):
                         continue
+                    if p["fn"] == "UNION":
+                        g = _source_frame(idx)
+                        if g is not None and g["fn"] in PREDICATE_EXEMPT and g["arg"] >= 1:
+                            continue
+                        if stack[-1]["fn"] in SCALAR_FUNCS:
+                            continue
                     if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
                         continue
                     if p["fn"] in SCALAR_FUNCS or p["fn"] in X_ITERATORS or p["fn"] == "{":
@@ -534,33 +540,38 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         elif t.kind == "op" and t.text in (")", "}"):
             if stack:
                 closed = stack.pop()
-                if closed.get("names"):
-                    for f_idx, fr in enumerate(stack):
-                        path = stack[f_idx + 1:]
-                        first_d = path[0]["parent_arg"] if path else closed["parent_arg"]
-                        if not _in_source(fr, first_d):
-                            continue
-                        chain = path + [closed]
-                        _names = set()
-                        for _nm in closed["names"]:
-                            if not any(chain[j]["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS",
-                                                          "SUMMARIZE", "GROUPBY")
-                                       and chain[j + 1]["fn"] not in ("ROLLUPADDISSUBTOTAL", "ROLLUP")
-                                       and _nm not in chain[j].get("refs", ())
-                                       for j in range(len(chain) - 1)):
-                                _names.add(_nm)
-                        if not _names:
-                            continue
-                        if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
-                                and path[-1]["fn"] == "SUMMARIZECOLUMNS":
-                            ok = _first_nonsource(path[:-1], path[-1]["parent_arg"], lineage="names") is None
-                        else:
-                            ok = _first_nonsource(path, closed["parent_arg"], lineage="names") is None
-                        if ok:
-                            fr.setdefault("captured", set()).update(_names)
+                _out_names = closed.get("names") or set()
+                if closed["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY"):
+                    _out_names = set(_out_names) | (closed.get("captured", set())
+                                                    & closed.get("refs", set()))
+                if _out_names:
+                    _proj = None
+                    for _cand in reversed(stack):
+                        if _cand["fn"] in ("SELECTCOLUMNS", "SUMMARIZECOLUMNS",
+                                           "SUMMARIZE", "GROUPBY"):
+                            _proj = _cand
+                            break
+                    if _proj is not None and closed["fn"] not in (
+                            "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "SUMMARIZE", "GROUPBY"):
+                        _proj.setdefault("captured", set()).update(_out_names)
+                        if closed["fn"] in ("ROLLUPADDISSUBTOTAL", "ROLLUP"):
+                            _proj.setdefault("refs", set()).update(_out_names)
+                    else:
+                        for f_idx, fr in enumerate(stack):
+                            path = stack[f_idx + 1:]
+                            first_d = path[0]["parent_arg"] if path else closed["parent_arg"]
+                            if not _in_source(fr, first_d):
+                                continue
+                            if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
+                                    and path[-1]["fn"] == "SUMMARIZECOLUMNS":
+                                ok = _first_nonsource(path[:-1], path[-1]["parent_arg"], lineage="names") is None
+                            else:
+                                ok = _first_nonsource(path, closed["parent_arg"], lineage="names") is None
+                            if ok:
+                                fr.setdefault("captured", set()).update(_out_names)
                     if pending_vars and _first_nonsource(
                             stack[pending_vars[-1][1]:], closed["parent_arg"], lineage="names") is None:
-                        var_names_defined.setdefault(pending_vars[-1][0], set()).update(closed["names"])
+                        var_names_defined.setdefault(pending_vars[-1][0], set()).update(_out_names)
                 if closed.get("x_span") is not None and closed["arg"] == closed.get("span_arg", 0) \
                         and closed.get("x_table") is None:
                     closed["x_table"], closed["x_cols"] = _span_table(closed["x_span"])
@@ -851,6 +862,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             if _vt is None or fr["row_table"] != _vt:
                                 fr["row_table"] = None
                                 fr["poisoned"] = True
+                            elif fr.get("only_columns") is not None:
+                                fr["only_columns"] = None
+                                fr["only_src"] = None
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
                 learn(res.table(t.text), bare=True)
