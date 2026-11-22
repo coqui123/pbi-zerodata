@@ -521,15 +521,23 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
                 return True
     if model is None:
         return False
-    if bare_fields and "." not in value:
+    if bare_fields:
         # A bare value with no anchor to its home anywhere in its
         # document (a bare nativeQueryRef) is owned by any other table
-        # with a field of that name, not only by a qualified path.
+        # with a field of that whole name, not only by a qualified path:
+        # model fields of any other table, and report-extension measures
+        # of any entity (their qualified paths arrive in extra_owned and
+        # extra_extending, and only the name segment is bare here). The
+        # value is the whole field name by construction at these call
+        # sites, dots included.
         for t in model.tables.values():
             if _fold(t.name) == _fold(home):
                 continue
             if any(_fold(o.name) == low
                    for o in list(t.columns.values()) + list(t.measures.values())):
+                return True
+        for p in tuple(extra_owned) + tuple(extra_extending):
+            if _fold(p.rsplit(".", 1)[-1]) == low:
                 return True
     for t in model.tables.values():
         if _fold(t.name) == _fold(home):
