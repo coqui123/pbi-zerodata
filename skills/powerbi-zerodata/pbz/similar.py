@@ -244,7 +244,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         if fr["fn"] == "RANK":
             return fr["arg"] in (0, 1)
         if fr["fn"] == "WINDOW":
-            return fr["arg"] in (0, 4)
+            return fr["arg"] == 4
         return fr["arg"] == 0
 
     def learn(table, bare: bool = False) -> None:
@@ -273,7 +273,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         if not tab:
             return
         for idx, fr in enumerate(stack):
-            if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"] \
+            if fr["fn"] in deps.ITERATORS and _teaches_at(fr) and not fr["poisoned"] \
                     and fr["row_table"] is not None and fr["row_table"] != tab:
                 frames = stack[idx + 1:]
                 if not frames:
@@ -305,7 +305,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             stack.append(frame)
             if fn and fn not in SCALAR_FUNCS and fn not in CONDITIONALS:
                 for f_idx, fr in enumerate(stack[:-1]):
-                    if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
+                    if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
                             and fr["row_table"] is not None and not fr["poisoned"]:
                         if _first_nonsource(stack[f_idx + 1:-1], frame["parent_arg"]) is None:
                             fr["taint"] = frame
@@ -320,7 +320,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if closed["fn"] and closed["fn"] not in SCALAR_FUNCS \
                         and closed["fn"] not in CONDITIONALS:
                     for f_idx, fr in enumerate(stack):
-                        if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
+                        if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
                                 and fr["row_table"] is None and not fr["poisoned"] \
                                 and _first_nonsource(stack[f_idx + 1:], closed["parent_arg"]) is None:
                             fr["poisoned"] = True
@@ -404,7 +404,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if low in table_vars and not (prev is not None and prev.kind == "ident"
                                               and prev.text.upper() == "VAR"):
                     for f_idx, fr in enumerate(stack):
-                        if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
+                        if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
                                 and _in_source_region(f_idx, stack[-1]["arg"] if len(stack) > f_idx + 1 else 0):
                             fr["row_table"] = None
                             fr["poisoned"] = True

@@ -117,6 +117,10 @@ SALES = (
     "\tmeasure TopnCntB = SUMX(Sales, SUMX(TOPN(Sales[Price], Other, Sales[Price]), Other[Price]))\n\n"
     "\tmeasure RankBareA = SUMX(Sales, RANK(DENSE, Other, ORDERBY([Price])))\n\n"
     "\tmeasure RankBareB = SUMX(Sales, RANK(DENSE, Other, ORDERBY(Sales[Price])))\n\n"
+    "\tmeasure FailA = SUMX(Sales, SUMX(TOPN(1, SUMMARIZE(Sales, Other[Price]), [Price]), Other[Price]))\n\n"
+    "\tmeasure FailB = SUMX(Sales, SUMX(TOPN(1, SUMMARIZE(Sales, Other[Price]), Sales[Price]), Other[Price]))\n\n"
+    "\tmeasure ExcA = VAR v = Other RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), [Price], ASC)))\n\n"
+    "\tmeasure ExcB = VAR v = Other RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), Sales[Price], ASC)))\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -175,7 +179,8 @@ class SimilarScopeTests(unittest.TestCase):
               "JoinA", "JoinB", "JoinInlA", "JoinInlB",
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
-              "TopnCntA", "TopnCntB", "RankBareA", "RankBareB")},
+              "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
+              "FailA", "FailB", "ExcA", "ExcB")},
         )
 
     def _canon(self, name):
@@ -365,7 +370,8 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_count_taught_and_clause_brackets_are_uncertain(self):
-        for dup, into in (("TopnCntB", "TopnCntA"), ("RankBareB", "RankBareA")):
+        for dup, into in (("TopnCntB", "TopnCntA"), ("RankBareB", "RankBareA"),
+                          ("FailB", "FailA"), ("ExcB", "ExcA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
