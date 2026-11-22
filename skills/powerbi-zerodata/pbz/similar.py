@@ -435,22 +435,24 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                 and _first_nonsource(stack[f_idx + 1:], closed["parent_arg"]) is None:
                             fr["poisoned"] = True
         elif t.kind == "op" and t.text == "," and stack:
-            if stack[-1].get("x_span") is not None and stack[-1]["arg"] == 0 \
-                    and stack[-1].get("x_table") is None:
-                stack[-1]["x_table"] = _span_table(stack[-1]["x_span"])
-            stack[-1]["arg"] += 1
+            top = stack[-1]
+            if top.get("expect") is not None:
+                top["expect"] = "expr" if top["expect"] == "item" else "item"
+            if top.get("x_span") is not None and top["arg"] == 0 \
+                    and top.get("x_table") is None:
+                top["x_table"] = _span_table(top["x_span"])
+            top["arg"] += 1
         if stack and t.kind == "str" and stack[-1]["fn"] in (
-                "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "SUMMARIZE", "GROUPBY"):
+                "SELECTCOLUMNS", "SUMMARIZECOLUMNS", "ADDCOLUMNS", "SUMMARIZE", "GROUPBY",
+                "ROLLUPADDISSUBTOTAL"):
             fr0 = stack[-1]
-            if fr0.get("ext_parity") is None:
-                if fr0["fn"] in ("SELECTCOLUMNS", "ADDCOLUMNS"):
-                    if fr0["arg"] % 2 == 1:
-                        fr0["ext_parity"] = fr0["arg"]
-                        fr0.setdefault("names", set()).add(t.value.lower())
-                else:
-                    fr0["ext_parity"] = fr0["arg"]
+            if fr0["fn"] == "ROLLUPADDISSUBTOTAL":
+                fr0.setdefault("names", set()).add(t.value.lower())
+            elif fr0.get("expect") is None:
+                if fr0["fn"] not in ("SELECTCOLUMNS", "ADDCOLUMNS") or fr0["arg"] >= 1:
+                    fr0["expect"] = "item"
                     fr0.setdefault("names", set()).add(t.value.lower())
-            elif (fr0["arg"] - fr0["ext_parity"]) % 2 == 0:
+            elif fr0["expect"] == "item":
                 fr0.setdefault("names", set()).add(t.value.lower())
         if t.kind in LIT_KINDS:
             val = _num(t.text) if t.kind == "num" else ("T" + t.text if t.kind == "pbztok" else "S" + t.value)
