@@ -899,6 +899,27 @@ class RenameBindingsTests(unittest.TestCase):
             rename.rename(ws, project, "column", "Amount", "Revenue", table="Sales")
         self.assertEqual(caught.exception.code, "NAME_TAKEN")
 
+    def test_table_rename_destination_extending_new_entity_extension_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "A.X.Y.Level"}]})
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn 'X.Y.Level'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "B.X", "measures": [{"name": "Y", "expression": "1"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "A", "B")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_wrapped_destination_inner_path_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sum(A.X.Level)"}]})
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "B.X.tmdl"),
+               "table 'B.X'\n\tcolumn Level\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "A", "B")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
