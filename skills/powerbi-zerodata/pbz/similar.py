@@ -289,6 +289,39 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     NARROWING = ("VALUES", "DISTINCT", "ALL", "ALLEXCEPT", "ALLSELECTED", "ALLNOBLANKROW",
                  "FILTERS")
 
+    COMBINING_UNION = ("CROSSJOIN", "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN",
+                       "GENERATE", "GENERATEALL")
+    FIRST_OPERAND = ("INTERSECT", "EXCEPT", "UNION")
+
+    def _combine(fr, parent, pos, cols):
+        """Combine a contributing teaching's column set into fr's exposure.
+
+        Returns (applies, value): value is the new only_columns (None means
+        unrestricted). cols is the teaching's exposed set, or None when the
+        teaching exposes the whole table."""
+        if "only_columns" not in fr:
+            if parent is not None and (parent["fn"] in FIRST_OPERAND
+                                       or parent["fn"] in ("FILTER", "CALCULATETABLE")) \
+                    and pos != 0:
+                return False, None
+            return True, cols
+        if parent is not None and parent["fn"] in COMBINING_UNION:
+            if fr["only_columns"] is None or cols is None:
+                return True, None
+            return True, fr["only_columns"] | cols
+        if parent is not None and (parent["fn"] in FIRST_OPERAND
+                                   or parent["fn"] in ("FILTER", "CALCULATETABLE")):
+            if pos != 0:
+                return False, fr.get("only_columns")
+            if fr["only_columns"] is None or cols is None:
+                return True, None
+            return True, fr["only_columns"] | cols
+        if fr.get("only_src") is not None and parent is not fr.get("only_src"):
+            return False, fr.get("only_columns")
+        if fr["only_columns"] is None or cols is None:
+            return True, None
+        return True, fr["only_columns"] | cols
+
     def learn(table, bare: bool = False, column=None) -> None:
         if table:
             for idx, fr in enumerate(stack):
@@ -304,8 +337,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         if not bare and column and src_fr is not None \
                                 and src_fr["fn"] in NARROWING:
                             _si = next(j for j, g in enumerate(stack) if g is src_fr)
-                            fr["only_columns"] = {column.lower()}
-                            fr["only_src"] = stack[_si - 1] if _si > 0 else src_fr
+                            _par = stack[_si - 1] if _si > 0 else src_fr
+                            _applies, _val = _combine(fr, _par, src_fr["parent_arg"],
+                                                      {column.lower()})
+                            if _applies:
+                                fr["only_columns"] = _val
+                                fr["only_src"] = _par
                         if not bare and column and fr["fn"] in (
                                 "FIRSTNONBLANK", "LASTNONBLANK",
                                 "FIRSTNONBLANKVALUE", "LASTNONBLANKVALUE"):
@@ -328,8 +365,11 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         _sf = _source_frame(idx)
                         _si = next((j for j, g in enumerate(stack) if g is _sf), None)
                         _par = stack[_si - 1] if _si else None
-                        if _par is not None and _par is fr.get("only_src"):
-                            fr["only_columns"].add(column.lower())
+                        if _par is not None:
+                            _applies, _val = _combine(fr, _par, _sf["parent_arg"],
+                                                      {column.lower()})
+                            if _applies:
+                                fr["only_columns"] = _val
                     if eff_bare and fr["row_table"] == table and fr.get("only_columns") is not None \
                             and _widens(idx):
                         fr["only_columns"] = None
@@ -873,13 +913,14 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                 fr["row_table"] = None
                                 fr["poisoned"] = True
                             elif _widens(f_idx):
-                                if _vcols is None:
-                                    fr["only_columns"] = None
-                                    fr["only_src"] = None
-                                elif _vcols[0] == "only":
-                                    fr["only_columns"] = set(_vcols[1]) \
-                                        if fr.get("only_columns") is None \
-                                        else fr["only_columns"] & set(_vcols[1])
+                                _par = stack[-1] if stack else None
+                                _applies, _val = _combine(
+                                    fr, _par, _par["arg"] if _par else 0,
+                                    None if _vcols is None else set(_vcols[1]))
+                                if _applies:
+                                    fr["only_columns"] = _val
+                                    if _val is None:
+                                        fr["only_src"] = None
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
                 learn(res.table(t.text), bare=True)
