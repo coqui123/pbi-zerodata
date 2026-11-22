@@ -318,8 +318,26 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             and _source_frame(idx) is fr.get("only_src"):
                         fr["only_columns"].add(column.lower())
                     if eff_bare and fr["row_table"] == table and fr.get("only_columns") is not None:
-                        fr["only_columns"] = None
-                        fr["only_src"] = None
+                        frames = stack[idx + 1:]
+                        widens = True
+                        for j, p in enumerate(frames):
+                            d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else stack[-1]["arg"]
+                            if p["fn"] in CONDITIONALS or p["fn"] == "":
+                                continue
+                            if p["fn"] in ("INTERSECT", "EXCEPT"):
+                                if d != 0:
+                                    widens = False
+                                    break
+                                continue
+                            if p["fn"] in ("UNION", "CROSSJOIN", "NATURALINNERJOIN",
+                                            "NATURALLEFTOUTERJOIN", "GENERATE", "GENERATEALL"):
+                                continue
+                            if not _crossing_ok(p, d):
+                                widens = False
+                                break
+                        if widens:
+                            fr["only_columns"] = None
+                            fr["only_src"] = None
                     if eff_bare and fr.get("taint") is not None and fr["row_table"] == table \
                             and _taint_cleared(fr, idx):
                         fr["taint"] = None
@@ -590,6 +608,18 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             if any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1 and fr["row_table"] is None
                    for fr in stack):
                 uncertain = True
+            for c_idx, fr in enumerate(stack):
+                if fr["fn"] == "{":
+                    ctx = None
+                    found = False
+                    for below in reversed(stack[:c_idx]):
+                        if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:
+                            ctx = below["row_table"]
+                            found = True
+                            break
+                    if found and (ctx is None
+                                  or (ref.kind == "column" and ctx != ref.table)):
+                        uncertain = True
             if ref.kind == "column" and any(
                     fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
                     and (fr.get("projected") and fr["row_table"] == ref.table

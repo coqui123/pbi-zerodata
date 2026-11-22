@@ -263,6 +263,10 @@ SALES = (
     "\tmeasure TopnAllB = COUNTROWS(TOPN(1, ALL(Other[Price], Other[ShadowM]), Sales[ShadowM]))\n\n"
     "\tmeasure JoinShadowA = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), Other), [ShadowM]))\n\n"
     "\tmeasure JoinShadowB = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), Other), Sales[ShadowM]))\n\n"
+    "\tmeasure PadA = SUMX(Sales, SUMX(INTERSECT(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), Wide), [Price]))\n\n"
+    "\tmeasure PadB = SUMX(Sales, SUMX(INTERSECT(ADDCOLUMNS(VALUES(Wide[Qty]), \"Z\", 1), Wide), Wide[Price]))\n\n"
+    "\tmeasure CtorCommaA = SUMX(Sales, SUMX(Other, COUNTROWS(DISTINCT(FILTER({ Sales[Price], [Price] }, TRUE())))))\n\n"
+    "\tmeasure CtorCommaB = SUMX(Sales, SUMX(Other, COUNTROWS(DISTINCT(FILTER({ Sales[Price], Sales[Price] }, TRUE())))))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -369,7 +373,8 @@ class SimilarScopeTests(unittest.TestCase):
               "AllMultiA", "AllMultiB", "AllExcSpanA", "AllExcSpanB",
               "NarrowMeasCtrlA", "NarrowMeasCtrlB", "AllNbA", "AllNbB",
               "AllExcDirectA", "AllExcDirectB", "TopnAllA", "TopnAllB",
-              "JoinShadowA", "JoinShadowB")} | {("Other", "OtherRows")},
+              "JoinShadowA", "JoinShadowB", "PadA", "PadB",
+              "CtorCommaA", "CtorCommaB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -569,7 +574,8 @@ class SimilarScopeTests(unittest.TestCase):
         for dup, into in (("SwiNarrowB", "SwiNarrowA"), ("AllMultiB", "AllMultiA"),
                           ("AllExcSpanB", "AllExcSpanA"), ("AllNbB", "AllNbA"),
                           ("AllExcDirectB", "AllExcDirectA"), ("TopnAllB", "TopnAllA"),
-                          ("JoinShadowB", "JoinShadowA")):
+                          ("JoinShadowB", "JoinShadowA"), ("PadB", "PadA"),
+                          ("CtorCommaB", "CtorCommaA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
