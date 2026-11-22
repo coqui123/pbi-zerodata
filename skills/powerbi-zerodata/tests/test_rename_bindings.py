@@ -1032,6 +1032,19 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "Totals", "Sum(Sales")
         self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Sum(Sales.Amount)")
 
+    def test_table_rename_literal_paths_looking_like_wrappers_follow(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sum(Old"}}, "Property": "Amount)"},
+               "queryRef": "Sum(Old.Amount)"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "SumOld.tmdl"),
+               "table 'Sum(Old'\n\tcolumn 'Amount)'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "New.tmdl"),
+               "table New\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sum(Old", "Sum(New")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Sum(New.Amount)")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

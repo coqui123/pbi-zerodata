@@ -522,8 +522,8 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
 _BLOCKED = object()
 
 
-def _table_rewrite(value, old, new, qualified, table=None, model=None, other_owned=(),
-                   other_extending=(), other_tables=()):
+def _table_rewrite_flagged(value, old, new, qualified, table=None, model=None, other_owned=(),
+                           other_extending=(), other_tables=()):
     """Rewrite one table reference in a report string, or return the value unchanged.
 
     A value rewrites when it is exactly a qualified object path of the old
@@ -568,15 +568,21 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
 
     out = _rewrite(value)
     if out is _BLOCKED:
-        return value
+        return value, False
     if out is not None:
-        return out
+        return out, False
     wrapped = _wrapped_inner(value)
     if wrapped:
         inner = _rewrite(wrapped[1])
         if inner is not None and inner is not _BLOCKED:
-            return f"{wrapped[0]}({inner})"
-    return value
+            return f"{wrapped[0]}({inner})", True
+    return value, False
+
+
+def _table_rewrite(value, old, new, qualified, table=None, model=None, other_owned=(),
+                   other_extending=(), other_tables=()):
+    return _table_rewrite_flagged(value, old, new, qualified, table, model, other_owned,
+                                  other_extending, other_tables)[0]
 
 
 def _single_wrapped(value):
@@ -675,9 +681,9 @@ def _extension_tables(report_dir):
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
                           extra_qualified=(), extra_owned=(), extra_extending=(),
                           extra_tables=(), dest_owned=None, dest_extending=None):
-    nv = _report_string_rename_inner(key, value, kind, home, old, new, field, model,
-                                     extra_qualified, extra_owned, extra_extending,
-                                     extra_tables)
+    nv, wrapped_used = _report_string_rename_inner(key, value, kind, home, old, new, field, model,
+                                                   extra_qualified, extra_owned, extra_extending,
+                                                   extra_tables)
     if nv != value and model is not None:
         # The emitted string, exactly as produced (extensions retained from
         # the source string, wrapper text included), must not be owned by
@@ -699,9 +705,10 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                            for t in model.tables.values()]
             dest_extra = [new if _fold(e) == _fold(old) else e for e in extra_tables]
         produced = [nv]
-        if _wrapped_inner(value):
-            # An inner path is checked only for an actual wrapped emission,
-            # never when the literal output merely parses as a wrapper.
+        if wrapped_used:
+            # An inner path is checked only when the rewrite actually used
+            # the wrapped reading, never when a literal output merely
+            # parses as a wrapper.
             wrapped = _wrapped_inner(nv)
             if wrapped:
                 produced.append(wrapped[1])
@@ -756,7 +763,7 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
                                 extra_tables=()):
     if kind == "table":
         if field is _AMBIGUOUS:
-            return value
+            return value, False
         if key in ("queryRef", "metadata", "queryName", "nativeQueryRef"):
             if field is not None:
                 # The resolved field settles ownership of a string naming its
@@ -780,32 +787,32 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
                                                     ([t.name for t in model.tables.values()]
                                                      if model is not None else []) + list(extra_tables))):
                         if _fold(field.table) != _fold(old):
-                            return value
+                            return value, False
                         swapped = _head_swap(probe, field.table, new)
-                        return f"{wrap_name}({swapped})" if wrap_name else swapped
+                        return (f"{wrap_name}({swapped})" if wrap_name else swapped), wrap_name is not None
                 # A resolved binding owns the string even when its text does
                 # not match the field's own path: never fall through to the
                 # unbound rewrite and desync it from its field.
-                return value
+                return value, False
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
-                return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model,
+                return _table_rewrite_flagged(value, old, new, qualified | set(extra_qualified), _tbl, model,
                                       other_owned=extra_owned, other_extending=extra_extending,
                                       other_tables=extra_tables)
             if _fold(value).startswith(_fold(old) + "."):
-                return _head_swap(value, old, new)
+                return _head_swap(value, old, new), False
             wrapped = _single_wrapped(value)
             _rest = _rest_after(wrapped[1], _fold(old)) if wrapped else None
             if wrapped and _rest is not None \
                     and _path_extension(_rest, old,
                                         ([t.name for t in model.tables.values()]
                                          if model is not None else []) + list(extra_tables)):
-                return f"{wrapped[0]}({_head_swap(wrapped[1], old, new)})"
-        return value
+                return f"{wrapped[0]}({_head_swap(wrapped[1], old, new)})", True
+        return value, False
     if key == "queryName":
-        return value
+        return value, False
     if field is _AMBIGUOUS:
-        return value
+        return value, False
     if field is not None:
         if kind == "column" and field.variation \
                 and _fold(field.table) == _fold(home) and _fold(field.name) == _fold(old):
@@ -816,9 +823,9 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
             # check tests table names, not the column's own name.
             base = f"{field.table}.{field.name}"
             if _fold(value) == _fold(base):
-                return f"{home}.{new}"
+                return f"{home}.{new}", False
             if key == "nativeQueryRef" and _fold(value) == _fold(field.name):
-                return new
+                return new, False
 
             def _follow(text):
                 if _fold(text) == _fold(base):
@@ -833,45 +840,45 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
 
             out = _follow(value)
             if out is not None:
-                return out
+                return out, False
             wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
             if wrapped:
                 inner = _follow(wrapped.group(2))
                 if inner is not None:
-                    return f"{wrapped.group(1)}({inner})"
-            return value
+                    return f"{wrapped.group(1)}({inner})", True
+            return value, False
         field_kind = "column" if field.kind == "aggregation" else field.kind
         if field_kind != kind or _fold(field.table) != _fold(home) or _fold(field.name) != _fold(old):
-            return value
+            return value, False
         if _fold(value) in (_fold(f"{field.table}.{field.name}"), _fold(f"{home}.{old}")):
-            return f"{home}.{new}"
+            return f"{home}.{new}", False
         if key == "nativeQueryRef" and _fold(value) == _fold(field.name):
-            return new
+            return new, False
         if field_kind == "column":
             wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
             if wrapped and _fold(wrapped.group(2)) in (
                     _fold(f"{field.table}.{field.name}"), _fold(f"{home}.{old}")):
-                return f"{wrapped.group(1)}({home}.{new})"
-        return value
+                return f"{wrapped.group(1)}({home}.{new})", True
+        return value, False
     if key in ("queryRef", "metadata", "nativeQueryRef") and _fold(value) == _fold(f"{home}.{old}") \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending,
                                       extra_tables=extra_tables):
-        return f"{home}.{new}"
+        return f"{home}.{new}", False
     if key == "nativeQueryRef" and _fold(value) == _fold(old) \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending,
                                       extensions_any=True, extra_tables=extra_tables):
-        return new
+        return new, False
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef") \
             and _other_table_owns(model, home, value, extra_owned, extra_extending,
                                   extra_tables=extra_tables):
-        return value
+        return value, False
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
         wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
         if wrapped and _fold(wrapped.group(2)) == _fold(f"{home}.{old}") \
                 and not _other_table_owns(model, home, wrapped.group(2), extra_owned, extra_extending,
                                           extra_tables=extra_tables):
-            return f"{wrapped.group(1)}({home}.{new})"
-    return value
+            return f"{wrapped.group(1)}({home}.{new})", True
+    return value, False
 
 
 def _binding_edits(bindings, kind, home, old, new, text):
