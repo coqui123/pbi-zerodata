@@ -172,8 +172,30 @@ class SkipCaptureTests(unittest.TestCase):
                 'test': '__main__.GitHookTests.test_unapproved',
                 'reason': 'unapproved',
             })]})
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, 'mcp: unexpected skip'):
             compare(reference, shards)
+
+    def test_relative_output_sidecar_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, 'suite.py')
+            path.write_text(
+                "import unittest\n"
+                "class PassFixtureTests(unittest.TestCase):\n"
+                " def test_pass(self): pass\n"
+                "unittest.main()\n", encoding='utf-8')
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with patch.object(run_offline, 'identity', return_value={}), patch.object(run_offline.subprocess, 'check_output', return_value='fixture'), contextlib.redirect_stdout(io.StringIO()):
+                    report = run_offline.execute(
+                        [{'id': 'control', 'argv': [str(path)]}], output=Path('out'),
+                        scanner=lambda roots: {'completed': True, 'ok': True})
+            finally:
+                os.chdir(previous)
+            row = report['executed'][0]
+            self.assertIsNone(row['error'])
+            self.assertEqual(row['skip_reasons'], [])
+            self.assertTrue(Path(tmp, 'out', 'control.skips.jsonl').exists())
 
     def test_compare_rejects_error_on_expected_failure(self):
         reference, shards = _reports({})
