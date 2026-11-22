@@ -268,6 +268,15 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
             after_ref = following.get(site)
             table_name = new if kind == "table" else ref.table
             object_name = ref.name if kind == "table" else new
+            if after_ref is not None and ref.kind == "hierarchy" and after_ref.kind == "hierarchy" \
+                    and after_ref.table == table_name and after_ref.hierarchy == ref.hierarchy \
+                    and after_ref.level == ref.level \
+                    and (_fold(ref.name) == _fold(ref.hierarchy)
+                         or _fold(after_ref.name) == _fold(after_ref.hierarchy)):
+                # The backing column was resolved by exact table lookup on
+                # one side only (a case-variant entity defeats it), so the
+                # name is not comparable; the hierarchy path identity is.
+                continue
             if (after_ref is None or _kind_of(after_ref) != k
                     or after_ref.table != table_name or after_ref.name != object_name):
                 raise PbzError("REFUSED", "a report binding did not follow the rename; nothing renamed")
@@ -631,7 +640,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
     if kind == "table":
         if field is _AMBIGUOUS:
             return value
-        if key in ("queryRef", "metadata", "queryName"):
+        if key in ("queryRef", "metadata", "queryName", "nativeQueryRef"):
             if field is not None:
                 # The resolved field settles ownership of a string naming its
                 # own qualified path (exact or pure extension, raw or wrapped):
@@ -794,6 +803,58 @@ def _pvs_property_node(node):
     return None
 
 
+def _dax_string_edits(text, model, kind, home, old, new, cur):
+    """Binding edits renaming the target inside one DAX expression string,
+    under the same rules as the TMDL editors."""
+    res = deps.Resolver(model)
+    if kind == "table":
+        low = _fold(old)
+        out = []
+        for binding in deps.dax_bindings(text, cur, res).bindings:
+            ref = binding.ref
+            if binding.uncertain and _fold(ref.table) == low:
+                raise PbzError("AMBIGUOUS", f"cannot safely bind a reference to {old}")
+            if ref.kind == "table" and _fold(ref.name) == low:
+                quoted = text[binding.start:binding.start + 1] == "'"
+                out.append((binding.start, binding.end, _dax_table(new, quoted)))
+            elif binding.qualifier and ref.kind in {"column", "measure"}:
+                a, b = binding.qualifier
+                tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
+                if _fold(tok.value or tok.text) == low:
+                    out.append((a, b, _dax_table(new, tok.kind == "table")))
+        return out
+    return _binding_edits(deps.dax_bindings(text, cur, res).bindings, kind, home, old, new, text)
+
+
+def _measure_expression_edits(root, model, kind, home, old, new):
+    """Span edits for the DAX expression strings of report-extension
+    measures: a measure object (a name and an expression string) under an
+    entity object, whose name is the resolution context for bare refs."""
+    edits = []
+
+    def visit(node, entity=""):
+        if isinstance(node, pbir.JArr):
+            for v in node.items:
+                visit(v, entity)
+            return
+        if not isinstance(node, pbir.JObj):
+            return
+        nm = node.get("name")
+        if isinstance(nm, pbir.JStr) and isinstance(node.get("measures"), pbir.JArr):
+            entity = nm.value
+        expr = node.get("expression")
+        if isinstance(expr, pbir.JStr) and isinstance(nm, pbir.JStr):
+            sub = _dax_string_edits(expr.value, model, kind, home, old, new, entity)
+            if sub:
+                edits.append((expr.start, expr.end,
+                              json.dumps(apply_edits(expr.value, sub), ensure_ascii=False)))
+        for _k, v in node.pairs:
+            visit(v, entity)
+
+    visit(root)
+    return edits
+
+
 def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
                    extra_owned=(), extra_extending=(), extra_tables=()) -> list[tuple[int, int, str]]:
     """Edits renaming measure / column `old` of table `home` in one parsed PBIR document: every field
@@ -841,6 +902,7 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
                                    extra_tables=extra_tables)
         if nv != node.value:
             edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
+    edits.extend(_measure_expression_edits(root, model, kind, home, old, new))
     return edits
 
 
@@ -1009,7 +1071,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
             ext_q = _extension_qualified(project.mirror_report, old)
             ext_owned = _extension_owned_others(project.mirror_report, old)
             for site, (node, field) in _report_string_sites(root, model).items():
-                if site[-1] in ("queryRef", "metadata", "queryName"):
+                if site[-1] in ("queryRef", "metadata", "queryName", "nativeQueryRef"):
                     nv = _report_string_rename(site[-1], node.value, "table", "", old, new,
                                                field, model, extra_qualified=ext_q,
                                                extra_owned=ext_owned,
@@ -1017,6 +1079,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                                                extra_tables=_extension_tables(project.mirror_report))
                     if nv != node.value:
                         edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
+            edits.extend(_measure_expression_edits(root, model, "table", "", old, new))
         return edits, False
 
     from .move import plan_pbir

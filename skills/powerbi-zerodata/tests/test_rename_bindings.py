@@ -717,6 +717,25 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "Sales", "Revenue")
         self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Revenue.Ext")
         self.assertEqual(json.loads(ext_path.read_text())["entities"][0]["name"], "Revenue")
+        self.assertEqual(json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"],
+                         "SUM(Revenue[Amount])")
+
+    def test_table_rename_qualified_native_query_ref_follows(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"},
+               "nativeQueryRef": "Sales.Amount"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["nativeQueryRef"], "Revenue.Amount")
+
+    def test_table_rename_case_variant_hierarchy_entity_not_refused(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {"Expression": {"SourceRef": {"Entity": "sales"}},
+                                                              "Hierarchy": "Geo"}}, "Level": "City"},
+              "queryRef": "Sales.Geo.City"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn CityName\n\t\tdataType: string\n\n\thierarchy Geo\n\n\t\tlevel City\n\t\t\tcolumn: CityName\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Revenue.Geo.City")
 
     def test_verify_report_parse_failure_refuses_and_pbzerror_passes_through(self):
         ws, project, mdef, _path = self._report_project({})
