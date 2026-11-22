@@ -201,6 +201,10 @@ SALES = (
     "\tmeasure ShadowB = SUMX(ADDCOLUMNS(Dates, \"CtrlA\", 1), Sales[CtrlA])\n\n"
     "\tmeasure TopnCapA = COUNTROWS(TOPN(1, Sales, IF(Sales[Price] = 10, COUNTROWS(TOPN(1, SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), [Price], DESC)), 1), DESC))\n\n"
     "\tmeasure TopnCapB = COUNTROWS(TOPN(1, Sales, IF(Sales[Price] = 10, COUNTROWS(TOPN(1, SELECTCOLUMNS(Sales, \"Price\", Sales[Price] + 1), Sales[Price], DESC)), 1), DESC))\n\n"
+    "\tmeasure XnpvShadowA = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), [CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure XnpvShadowB = XNPV(ADDCOLUMNS(Dates, \"CtrlA\", 1), Sales[CtrlA], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure RankCapA = RANK(DENSE, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY([CtrlA]))\n\n"
+    "\tmeasure RankCapB = RANK(DENSE, ADDCOLUMNS(Sales, \"CtrlA\", 1), ORDERBY(Sales[CtrlA]))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -290,7 +294,8 @@ class SimilarScopeTests(unittest.TestCase):
               "AddColA", "AddColB", "ProjCapA", "ProjCapB",
               "SumzCapA", "SumzCapB", "SumzColA", "SumzColB",
               "SelOptA", "SelOptB", "RollupA", "RollupB", "SelMidA", "SelMidB",
-              "SelStrA", "SelStrB", "ShadowA", "ShadowB", "TopnCapA", "TopnCapB")},
+              "SelStrA", "SelStrB", "ShadowA", "ShadowB", "TopnCapA", "TopnCapB",
+              "XnpvShadowA", "XnpvShadowB", "RankCapA", "RankCapB")},
         )
 
     def _canon(self, name):
@@ -518,7 +523,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("SumzCapB", "SumzCapA"), ("SumzColB", "SumzColA"),
                           ("SelOptB", "SelOptA"), ("RollupB", "RollupA"),
                           ("SelMidB", "SelMidA"), ("SelStrB", "SelStrA"),
-                          ("ShadowB", "ShadowA"), ("TopnCapB", "TopnCapA")):
+                          ("ShadowB", "ShadowA"), ("TopnCapB", "TopnCapA"),
+                          ("XnpvShadowB", "XnpvShadowA"), ("RankCapB", "RankCapA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

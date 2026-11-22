@@ -416,8 +416,14 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             if stack:
                 closed = stack.pop()
                 if closed.get("names"):
-                    for fr in stack:
-                        if fr["fn"] in deps.ITERATORS:
+                    for f_idx, fr in enumerate(stack):
+                        path = stack[f_idx + 1:]
+                        if closed["fn"] == "ROLLUPADDISSUBTOTAL" and path \
+                                and path[-1]["fn"] == "SUMMARIZECOLUMNS":
+                            ok = _first_nonsource(path[:-1], closed["parent_arg"]) is None
+                        else:
+                            ok = _first_nonsource(path, closed["parent_arg"]) is None
+                        if ok:
                             fr.setdefault("captured", set()).update(closed["names"])
                 if closed.get("x_span") is not None and closed["arg"] == 0 \
                         and closed.get("x_table") is None:
@@ -521,7 +527,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 if fr["fn"] in ("ORDERBY", "PARTITIONBY", "MATCHBY") and c_idx > 0:
                     parent = stack[c_idx - 1]
                     if parent["row_table"] is None \
-                            or (ref.kind == "column" and parent["row_table"] != ref.table):
+                            or (ref.kind == "column" and parent["row_table"] != ref.table) \
+                            or t.value.lower() in parent.get("captured", ()):
                         uncertain = True
             CALLER_ARGS = {"RANKX": (2, None), "PERCENTILEX.INC": (2, None),
                            "PERCENTILEX.EXC": (2, None), "CONCATENATEX": (2, 2)}
@@ -531,8 +538,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 return ca is not None and g["arg"] >= ca[0] and (ca[1] is None or g["arg"] <= ca[1])
 
             for c_idx, fr in enumerate(stack):
-                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] in (1, 2) and ref.kind == "column" \
-                        and fr.get("x_table") != ref.table \
+                if fr["fn"] in ("XNPV", "XIRR") and fr["arg"] in (1, 2) \
+                        and ((ref.kind == "column" and fr.get("x_table") != ref.table)
+                             or t.value.lower() in fr.get("captured", ())) \
                         and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
                                     and not _in_caller_args(g) and g["row_table"] == ref.table
                                     and not g.get("projected")
