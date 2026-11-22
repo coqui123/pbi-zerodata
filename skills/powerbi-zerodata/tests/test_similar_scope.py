@@ -249,6 +249,12 @@ SALES = (
     "\tmeasure RankNestCtrlB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], SUMX(Sales, Sales[Price])), ASC))\n\n"
     "\tmeasure TopnCallerCtrlA = SUMX(Sales, COUNTROWS(TOPN(1, Other, RANKX(Other, Other[Price], [Price]))))\n\n"
     "\tmeasure TopnCallerCtrlB = SUMX(Sales, COUNTROWS(TOPN(1, Other, RANKX(Other, Other[Price], Other[Price]))))\n\n"
+    "\tmeasure AllMultiA = SUMX(Sales, XNPV(ALL(Wide[Qty], Wide[Price]), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllMultiB = SUMX(Sales, XNPV(ALL(Wide[Qty], Wide[Price]), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllExcSpanA = SUMX(Other, SUMX(Sales, XNPV(ALLEXCEPT(Other, Other[Price]), RANKX(Other, Other[Price], [Price]), DATE(2026, 1, 1), 0)))\n\n"
+    "\tmeasure AllExcSpanB = SUMX(Other, SUMX(Sales, XNPV(ALLEXCEPT(Other, Other[Price]), RANKX(Other, Other[Price], Other[Price]), DATE(2026, 1, 1), 0)))\n\n"
+    "\tmeasure NarrowMeasCtrlA = XNPV(VALUES(Other[Price]), [ShadowM], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure NarrowMeasCtrlB = XNPV(VALUES(Other[Price]), Sales[ShadowM], DATE(2026, 1, 1), 0)\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -351,7 +357,9 @@ class SimilarScopeTests(unittest.TestCase):
               "SubstA", "SubstB", "SubstLateA", "SubstLateB", "SubstUnkA", "SubstUnkB",
               "SubstNestCtrlA", "SubstNestCtrlB",
               "SubstRankCtrlA", "SubstRankCtrlB", "SwiNarrowA", "SwiNarrowB",
-              "RankNestCtrlA", "RankNestCtrlB", "TopnCallerCtrlA", "TopnCallerCtrlB")} | {("Other", "OtherRows")},
+              "RankNestCtrlA", "RankNestCtrlB", "TopnCallerCtrlA", "TopnCallerCtrlB",
+              "AllMultiA", "AllMultiB", "AllExcSpanA", "AllExcSpanB",
+              "NarrowMeasCtrlA", "NarrowMeasCtrlB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -548,11 +556,19 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertEqual(result["equivalence"], "identical")
 
     def test_narrowed_swi_caller_is_refused(self):
-        self.assertEqual(self._key("SwiNarrowA"), self._key("SwiNarrowB"))
-        self.assertTrue(self._canon("SwiNarrowA").uncertain)
-        with self.assertRaises(PbzError) as caught:
-            consolidate.merge(self.ws, self.project, "SwiNarrowB", "SwiNarrowA", dry_run=True)
-        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+        for dup, into in (("SwiNarrowB", "SwiNarrowA"), ("AllMultiB", "AllMultiA"),
+                          ("AllExcSpanB", "AllExcSpanA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_measure_outside_narrowed_source_stays_certain(self):
+        self.assertFalse(self._canon("NarrowMeasCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "NarrowMeasCtrlB", "NarrowMeasCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
 
     def test_rankx_nested_and_topn_callers_stay_certain(self):
         for name, dup in (("RankNestCtrlA", "RankNestCtrlB"),
