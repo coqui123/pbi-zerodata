@@ -362,12 +362,14 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     elif eff_bare and fr["row_table"] != table:
                         fr["row_table"] = None
                         fr["poisoned"] = True
+                    _acc_path = stack[idx + 1:]
                     _acc_ok = not bare and column and fr.get("only_src") is not None \
                         and fr["row_table"] == table \
-                        and not any(g["fn"] in SCALAR_FUNCS for g in stack[idx + 1:]) \
+                        and not any(g["fn"] in SCALAR_FUNCS for g in _acc_path) \
                         and not any(g["fn"] in ("FILTER", "CALCULATETABLE")
-                                    and g["parent_arg"] not in (None, 0)
-                                    for g in stack[idx + 1:])
+                                    and (_acc_path[j + 1]["parent_arg"] if j + 1 < len(_acc_path)
+                                         else stack[-1]["arg"]) != 0
+                                    for j, g in enumerate(_acc_path))
                     if _acc_ok:
                         _sf = _source_frame(idx)
                         if _sf is None or _sf["fn"] not in NARROWING:
