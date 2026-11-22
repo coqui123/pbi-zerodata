@@ -113,6 +113,10 @@ SALES = (
     "\tmeasure TopnBareB = SUMX(Sales, SUMX(TOPN(1, Other, Sales[Price]), Other[Price]))\n\n"
     "\tmeasure TopnCountCtorCtrlA = SUMX(TOPN(COUNTROWS({ 1, 2 }), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnCountCtorCtrlB = SUMX(TOPN(COUNTROWS({ 1, 2 }), Sales, Sales[Price], DESC), [Price])\n\n"
+    "\tmeasure TopnCntA = SUMX(Sales, SUMX(TOPN(Sales[Price], Other, [Price]), Other[Price]))\n\n"
+    "\tmeasure TopnCntB = SUMX(Sales, SUMX(TOPN(Sales[Price], Other, Sales[Price]), Other[Price]))\n\n"
+    "\tmeasure RankBareA = SUMX(Sales, RANK(DENSE, Other, ORDERBY([Price])))\n\n"
+    "\tmeasure RankBareB = SUMX(Sales, RANK(DENSE, Other, ORDERBY(Sales[Price])))\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -170,7 +174,8 @@ class SimilarScopeTests(unittest.TestCase):
               "PredMaxxA", "PredMaxxB", "PredValuesA", "PredValuesB", "PredVarA", "PredVarB",
               "JoinA", "JoinB", "JoinInlA", "JoinInlB",
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
-              "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB")},
+              "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
+              "TopnCntA", "TopnCntB", "RankBareA", "RankBareB")},
         )
 
     def _canon(self, name):
@@ -358,6 +363,15 @@ class SimilarScopeTests(unittest.TestCase):
         with self.assertRaises(PbzError) as caught:
             consolidate.merge(self.ws, self.project, "TopnBareB", "TopnBareA", dry_run=True)
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_count_taught_and_clause_brackets_are_uncertain(self):
+        for dup, into in (("TopnCntB", "TopnCntA"), ("RankBareB", "RankBareA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_unlisted_scalar_wrapper_still_poisons(self):
         self.assertEqual(self._key("ContainsA"), self._key("ContainsB"))

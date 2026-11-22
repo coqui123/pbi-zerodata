@@ -236,10 +236,21 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             return True
         return _first_nonsource(frames, last_d) is None
 
+    TOPN_LIKE = ("TOPN", "SAMPLE", "INDEX", "OFFSET")
+
+    def _teaches_at(fr) -> bool:
+        if fr["fn"] in TOPN_LIKE:
+            return fr["arg"] == 1
+        if fr["fn"] == "RANK":
+            return fr["arg"] in (0, 1)
+        if fr["fn"] == "WINDOW":
+            return fr["arg"] in (0, 4)
+        return fr["arg"] == 0
+
     def learn(table, bare: bool = False) -> None:
         if table:
             for idx, fr in enumerate(stack):
-                if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"]:
+                if fr["fn"] in deps.ITERATORS and _teaches_at(fr) and not fr["poisoned"]:
                     trusted = _in_source_region(idx, stack[-1]["arg"] if len(stack) > idx + 1 else 0)
                     eff_bare = bare and trusted
                     if fr["row_table"] is None:
@@ -360,6 +371,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         or (ref.kind == "column" and fr["row_table"] != ref.table))
                    for fr in stack):
                 uncertain = True
+            for c_idx, fr in enumerate(stack):
+                if fr["fn"] in ("ORDERBY", "PARTITIONBY", "MATCHBY") and c_idx > 0:
+                    parent = stack[c_idx - 1]
+                    if parent["row_table"] is None \
+                            or (ref.kind == "column" and parent["row_table"] != ref.table):
+                        uncertain = True
             if ref.kind == "column":
                 learn(ref.table)
             if ref.kind == "measure":
