@@ -636,7 +636,15 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         uncertain = True
                     elif not found and ref.kind == "column":
                         uncertain = True
-            if ref.kind == "column" and any(
+            governed = False
+            if ref.kind == "column":
+                for g in reversed(stack):
+                    if g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1 \
+                            and not _in_caller_args(g):
+                        governed = g["row_table"] == ref.table \
+                            and not g.get("projected") and _only_has(g, ref.name.lower())
+                        break
+            if ref.kind == "column" and not governed and any(
                     fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
                     and (fr.get("projected") and fr["row_table"] == ref.table
                          or not _only_has(fr, ref.name.lower()))

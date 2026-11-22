@@ -273,6 +273,8 @@ SALES = (
     "\tmeasure ShadowCtorB = COUNTROWS(FILTER({ MAX(Other[Price]), Other[ShadowM] }, TRUE()))\n\n"
     "\tmeasure CtorNestCtrlA = SUMX(Sales, COUNTROWS({ SUMX(Other, [Price]) }))\n\n"
     "\tmeasure CtorNestCtrlB = SUMX(Sales, COUNTROWS({ SUMX(Other, Other[Price]) }))\n\n"
+    "\tmeasure CtorNarrowCtrlA = SUMX(VALUES(Wide[Qty]), COUNTROWS({ SUMX(Other, [Price]) }))\n\n"
+    "\tmeasure CtorNarrowCtrlB = SUMX(VALUES(Wide[Qty]), COUNTROWS({ SUMX(Other, Other[Price]) }))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -381,7 +383,8 @@ class SimilarScopeTests(unittest.TestCase):
               "AllExcDirectA", "AllExcDirectB", "TopnAllA", "TopnAllB",
               "JoinShadowA", "JoinShadowB", "PadA", "PadB",
               "CtorCommaA", "CtorCommaB", "UnionPadA", "UnionPadB",
-              "ShadowCtorA", "ShadowCtorB", "CtorNestCtrlA", "CtorNestCtrlB")} | {("Other", "OtherRows")},
+              "ShadowCtorA", "ShadowCtorB", "CtorNestCtrlA", "CtorNestCtrlB",
+              "CtorNarrowCtrlA", "CtorNarrowCtrlB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -607,6 +610,11 @@ class SimilarScopeTests(unittest.TestCase):
     def test_constructor_nested_iterator_stays_certain(self):
         self.assertFalse(self._canon("CtorNestCtrlA").uncertain)
         result = consolidate.merge(self.ws, self.project, "CtorNestCtrlB", "CtorNestCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_constructor_narrowed_outer_stays_certain(self):
+        self.assertFalse(self._canon("CtorNarrowCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "CtorNarrowCtrlB", "CtorNarrowCtrlA", dry_run=True)
         self.assertEqual(result["equivalence"], "identical")
 
     def test_identity_dependent_format_is_refused(self):
