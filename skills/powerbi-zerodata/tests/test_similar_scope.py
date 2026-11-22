@@ -39,6 +39,10 @@ SALES = (
     "\tmeasure TabB = COUNTROWS('Missing')\n\n"
     "\tmeasure TabCtrlA = COUNTROWS(Sales)\n\n"
     "\tmeasure TabCtrlB = COUNTROWS(Sales)\n\n"
+    "\tmeasure TopA = VAR v = Other RETURN SUMX(TOPN(MAX(Sales[Price]), v), [Price])\n\n"
+    "\tmeasure TopB = VAR v = Other RETURN SUMX(TOPN(MAX(Sales[Price]), v), Sales[Price])\n\n"
+    "\tmeasure ScalarA = VAR n = 0 RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure ScalarB = VAR n = 0 RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -83,7 +87,7 @@ class SimilarScopeTests(unittest.TestCase):
             {("Sales", name) for name in
              ("IterA", "IterB", "IterC", "IterD", "UnresA", "UnresB", "CtrlA", "CtrlB",
               "VarA", "VarB", "AliasUnres", "AliasOk", "WrapA", "WrapB",
-              "TabA", "TabB", "TabCtrlA", "TabCtrlB")},
+              "TabA", "TabB", "TabCtrlA", "TabCtrlB", "TopA", "TopB", "ScalarA", "ScalarB")},
         )
 
     def _canon(self, name):
@@ -163,6 +167,18 @@ class SimilarScopeTests(unittest.TestCase):
             consolidate.merge(self.ws, self.project, "TabB", "TabA", dry_run=True)
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
         result = consolidate.merge(self.ws, self.project, "TabCtrlB", "TabCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_table_var_after_reference_still_poisons(self):
+        self.assertEqual(self._key("TopA"), self._key("TopB"))
+        self.assertTrue(self._canon("TopA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "TopB", "TopA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_scalar_var_does_not_block_learned_row_table(self):
+        self.assertFalse(self._canon("ScalarA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "ScalarB", "ScalarA", dry_run=True)
         self.assertEqual(result["equivalence"], "identical")
 
     def test_similar_run_does_not_group_scoped_pair(self):

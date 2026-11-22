@@ -73,9 +73,15 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     bindings = deps.dax_bindings(expr, home, res)
     by_span = {(b.start, b.end): b for b in bindings.bindings}
     var_names: dict[str, str] = {}
+    table_vars: set[str] = set()
     for i, t in enumerate(sig):
         if t.kind == "ident" and t.text.upper() == "VAR" and i + 1 < len(sig) and sig[i + 1].kind == "ident":
             var_names.setdefault(sig[i + 1].text.lower(), f"$v{len(var_names) + 1}")
+            if i + 4 < len(sig) and sig[i + 2].kind == "op" and sig[i + 2].text == "=" \
+                    and (sig[i + 3].kind == "table" or
+                         (sig[i + 3].kind == "ident" and res.table(sig[i + 3].text))) \
+                    and sig[i + 4].kind == "ident" and sig[i + 4].text.upper() in ("RETURN", "VAR"):
+                table_vars.add(sig[i + 1].text.lower())
     extension = {t.value.lower() for t in sig if t.kind == "str"}
     toks: list[tuple[str, str, str]] = []
     uncertain = False
@@ -163,9 +169,13 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 toks.append(("fn:" + low if low in res.functions else t.text.upper(), "", ""))
             elif low in var_names:
                 toks.append((var_names[low], "", ""))
-                for fr in stack:
-                    if fr["fn"] in deps.ITERATORS and fr["arg"] == 0:
-                        fr["poisoned"] = True
+                prev = sig[i - 1] if i else None
+                if low in table_vars and not (prev is not None and prev.kind == "ident"
+                                              and prev.text.upper() == "VAR"):
+                    for fr in stack:
+                        if fr["fn"] in deps.ITERATORS and fr["arg"] == 0:
+                            fr["row_table"] = None
+                            fr["poisoned"] = True
             elif res.table(t.text):
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
                 learn(res.table(t.text))
