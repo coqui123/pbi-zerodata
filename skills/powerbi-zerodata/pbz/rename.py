@@ -68,6 +68,9 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             raise PbzError("NAME_TAKEN", new)
         if _fold(new) != _fold(old) and _fold(f"{home}.{new}") in _extension_qualified(project.mirror_report, home):
             raise PbzError("NAME_TAKEN", new)
+        ext_names = {_fold(mn) for _e, ms in _extension_entities(project.mirror_report) for mn in ms}
+        if _fold(new) != _fold(old) and _fold(new) in ext_names:
+            raise PbzError("NAME_TAKEN", new)
     elif kind == "table":
         return rename_table(ws, project, model, old, new)
     else:
