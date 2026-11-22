@@ -1014,8 +1014,8 @@ _DAX_KEYWORDS = {_fold(w) for w in (
     "and", "asc", "both", "break", "by", "column", "day", "define",
     "densify", "dense", "desc", "else", "evaluate", "false", "group",
     "hour", "in", "index", "matchby", "measure", "minute", "month",
-    "mparameter", "none", "not", "oneway", "oneway_leftfilters",
-    "oneway_rightfilters", "or", "order", "quarter", "return", "row",
+    "mparameter", "none", "not", "oneway", "oneway_leftfiltersright",
+    "oneway_rightfiltersleft", "or", "order", "quarter", "return", "row",
     "second", "skip", "table", "then", "total", "true", "var", "week",
     "window", "year")}
 

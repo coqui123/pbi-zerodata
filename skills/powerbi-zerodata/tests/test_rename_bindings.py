@@ -1447,6 +1447,24 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
         self.assertEqual(m, "CALCULATE(COUNTROWS('Archive'), CROSSFILTER(Sales[ProductKey], Product[ProductKey], BOTH))")
 
+    def test_table_rename_crossfilter_directional_spelling_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn K\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "B.tmdl"),
+               "table B\n\tcolumn K\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "OneWay_LeftFiltersRight.tmdl"),
+               "table OneWay_LeftFiltersRight\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "CALCULATE(COUNTROWS('OneWay_LeftFiltersRight'), CROSSFILTER(A[K], B[K], OneWay_LeftFiltersRight))"}]}]}))
+        rename.rename(ws, project, "table", "OneWay_LeftFiltersRight", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "CALCULATE(COUNTROWS('Archive'), CROSSFILTER(A[K], B[K], OneWay_LeftFiltersRight))")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
