@@ -13,6 +13,7 @@ sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.dirname(__file__))
 
 from pbz import rewrite, suggest  # noqa: E402
+from pbz.common import PbzError  # noqa: E402
 
 
 class RewriteScopeTests(unittest.TestCase):
@@ -45,6 +46,38 @@ class RewriteScopeTests(unittest.TestCase):
     def test_unused_vars_reports_spelling_for_display(self):
         expr = '(VAR x = 1 VAR a = 2 RETURN x + a) + (VAR x = 3 VAR b = 4 RETURN b)'
         self.assertEqual(suggest._unused_vars(expr), ['x'])
+
+    def test_argument_boundary_binds_use_to_outer_declaration(self):
+        expr = 'VAR x = 1 VAR k = 2 RETURN IF(k, VAR x = 2 RETURN x, x)'
+        self.assertIsNone(rewrite._unused(expr))
+
+    def test_argument_boundary_dead_inner_declaration_is_refused_not_corrupting(self):
+        expr = 'VAR x = 1 VAR k = 2 RETURN IF(k, VAR x = 2 RETURN 5, x)'
+        with self.assertRaises(PbzError) as caught:
+            rewrite._unused(expr)
+        self.assertEqual(caught.exception.code, 'REFUSED')
+
+    def test_constructor_element_boundary_keeps_outer_declaration(self):
+        expr = 'VAR x = 10 VAR k = 1 RETURN { VAR x = 2 RETURN x, x + k }'
+        self.assertIsNone(rewrite._unused(expr))
+
+    def test_unparenthesized_nested_initializer_span_covers_block(self):
+        expr = 'VAR a = VAR b = 1 RETURN b VAR c = 2 RETURN c'
+        self.assertEqual(rewrite._unused(expr), 'VAR c = 2 RETURN c')
+
+    def test_self_reference_in_initializer_binds_outer(self):
+        expr = 'VAR x = 1 VAR y = (VAR x = x + 1 RETURN x) RETURN y'
+        self.assertIsNone(rewrite._unused(expr))
+
+    def test_display_spelling_contract_unchanged(self):
+        self.assertEqual(suggest._unused_vars('VAR x = 1 VAR y = x RETURN 5'), ['y'])
+        self.assertEqual(suggest._unused_vars('VAR x = 1'), ['x'])
+
+    def test_fixpoint_reduction_that_would_strand_return_is_refused(self):
+        expr = 'VAR x = 1 VAR y = x RETURN (VAR z = 2 RETURN z)'
+        with self.assertRaises(PbzError) as caught:
+            rewrite._unused(expr)
+        self.assertEqual(caught.exception.code, 'REFUSED')
 
 
 if __name__ == '__main__':

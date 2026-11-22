@@ -11,6 +11,62 @@ TEXT_VISUALS = {"textbox", "image", "shape", "basicShape", "actionButton", "page
                 "group", ""}
 
 
+def _block_return_end(sig, keys, var_index):
+    """Index just after the RETURN token that closes the VAR block starting at var_index, or None."""
+    key = keys[var_index]
+    j = var_index
+    while True:
+        # Skip declaration j's initializer.
+        k = j + 2
+        if (k + 1 < len(sig) and sig[k].kind == "op" and sig[k].text == "="
+                and sig[k + 1].kind == "ident" and sig[k + 1].text.upper() == "VAR"
+                and keys[k + 1] == key):
+            after = _block_return_end(sig, keys, k + 1)
+            if after is None:
+                return None
+            # The nested block's body follows its RETURN; the next VAR or
+            # RETURN at this key after the body is the sibling or the closer.
+            k = next((m for m in range(after, len(sig))
+                      if keys[m] == key and sig[m].kind == "ident"
+                      and sig[m].text.upper() in ("VAR", "RETURN")), None)
+            if k is None:
+                return None
+        else:
+            k = next((m for m in range(j + 2, len(sig))
+                      if keys[m] == key and sig[m].kind == "ident"
+                      and sig[m].text.upper() in ("VAR", "RETURN")), None)
+            if k is None:
+                return None
+        if sig[k].text.upper() == "RETURN":
+            return k + 1
+        j = k  # sibling declaration inside this block
+
+
+def _decl_end(sig, keys, var_index):
+    """Start offset of the token that ends the declaration at var_index (the next sibling VAR or the block RETURN at its key), or None."""
+    key = keys[var_index]
+    k = var_index + 2
+    if (k + 1 < len(sig) and sig[k].kind == "op" and sig[k].text == "="
+            and sig[k + 1].kind == "ident" and sig[k + 1].text.upper() == "VAR"
+            and keys[k + 1] == key):
+        after = _block_return_end(sig, keys, k + 1)
+        if after is None:
+            return None
+        # The nested block's body follows its RETURN; the declaration's span
+        # ends at the next VAR or RETURN at this key after the body, or where
+        # the enclosing group closes.
+        for m in range(after, len(sig)):
+            if keys[m] == key and sig[m].kind == "ident" and sig[m].text.upper() in ("VAR", "RETURN"):
+                return sig[m].start
+            if len(keys[m]) < len(key):
+                return sig[m].start
+        return sig[-1].end
+    nxt = next((sig[m].start for m in range(var_index + 2, len(sig))
+                if keys[m] == key and sig[m].kind == "ident"
+                and sig[m].text.upper() in ("VAR", "RETURN")), None)
+    return nxt
+
+
 def _unused_decls(expr: str) -> list[dict]:
     """Bind uses by scope, then discard declarations with no live uses."""
     sig = lexers.significant(lexers.lex_dax(expr))
@@ -24,12 +80,16 @@ def _unused_decls(expr: str) -> list[dict]:
             elif tok.text in (")", "}") and stack:
                 stack.pop()
 
+    commas = {}
+    for i, tok in enumerate(sig):
+        if tok.kind == "op" and tok.text == ",":
+            commas.setdefault(keys[i], []).append(i)
+
     decls = []
     name_indices = set()
     for i, t in enumerate(sig):
         if t.kind == "ident" and t.text.upper() == "VAR" and i + 1 < len(sig) and sig[i + 1].kind == "ident":
-            end = next((sig[j].start for j in range(i + 2, len(sig))
-                        if keys[j] == keys[i] and sig[j].text.upper() in ("VAR", "RETURN")), None)
+            end = _decl_end(sig, keys, i)
             decls.append({"name": sig[i + 1].text, "lower": sig[i + 1].text.lower(),
                           "index": i, "start": t.start, "end": end, "key": keys[i], "used": True})
             name_indices.add(i + 1)
@@ -40,7 +100,9 @@ def _unused_decls(expr: str) -> list[dict]:
             continue
         bound = next((d for d in reversed(decls)
                       if d["index"] < i and d["lower"] == tok.text.lower()
-                      and d["key"] == keys[i][:len(d["key"])]), None)
+                      and d["key"] == keys[i][:len(d["key"])]
+                      and not any(d["index"] < comma < i for comma in commas.get(d["key"], ()))
+                      and not (d["start"] <= tok.start < (d["end"] if d["end"] is not None else float("inf")))), None)
         if bound is not None:
             bindings.append((tok.start, bound["index"]))
 
@@ -59,7 +121,15 @@ def _unused_decls(expr: str) -> list[dict]:
 
 
 def _unused_vars(expr: str) -> list[str]:
-    return [d["name"] for d in _unused_decls(expr) if not d["used"]]
+    sig = lexers.significant(lexers.lex_dax(expr))
+    out = []
+    for i, t in enumerate(sig):
+        if t.kind == "ident" and t.text.upper() == "VAR" and i + 1 < len(sig) and sig[i + 1].kind == "ident":
+            name = sig[i + 1].text.lower()
+            later = [x for x in sig[i + 2:] if x.kind == "ident" and x.text.lower() == name]
+            if not later:
+                out.append(sig[i + 1].text)
+    return out
 
 
 def run(ws, project, extra_reports=()) -> dict:
