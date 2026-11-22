@@ -53,6 +53,9 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         old = m.name
         if _fold(new) != _fold(old) and _fold(f"{home}.{new}") in _extension_qualified(project.mirror_report, home):
             raise PbzError("NAME_TAKEN", new)
+        ext_names = {_fold(mn) for _e, ms in _extension_entities(project.mirror_report) for mn in ms}
+        if _fold(new) != _fold(old) and _fold(new) in ext_names:
+            raise PbzError("NAME_TAKEN", new)
     elif kind == "column":
         hits = [c for c in model.all_columns() if _fold(c.name) == _fold(old) and (not table or _fold(c.table) == _fold(table))]
         if len(hits) != 1:
@@ -803,15 +806,43 @@ def _pvs_property_node(node):
     return None
 
 
-def _dax_string_edits(text, model, kind, home, old, new, cur):
+def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None):
     """Binding edits renaming the target inside one DAX expression string,
-    under the same rules as the TMDL editors."""
+    under the same rules as the TMDL editors. The model-only resolver does
+    not know report-extension measures, so a binding denoting one (a bare
+    reference naming one, or a qualified reference to one on its entity)
+    is never edited through it: a qualified reference to an extension
+    measure on the renamed table still follows that table's qualifier."""
+    ext_measures = ext_measures or {}
+    ext_names = set().union(*ext_measures.values()) if ext_measures else set()
     res = deps.Resolver(model)
+
+    def _qualifier_entity(binding):
+        if not binding.qualifier:
+            return None
+        a, b = binding.qualifier
+        tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
+        return tok.value or tok.text
+
+    def _ext_bound(binding):
+        ent = _qualifier_entity(binding)
+        if ent is not None:
+            return _fold(binding.ref.name) in ext_measures.get(_fold(ent), set())
+        return _fold(binding.ref.name) in ext_names
+
+    bindings = deps.dax_bindings(text, cur, res).bindings
     if kind == "table":
         low = _fold(old)
         out = []
-        for binding in deps.dax_bindings(text, cur, res).bindings:
+        for binding in bindings:
             ref = binding.ref
+            if _ext_bound(binding):
+                ent = _qualifier_entity(binding)
+                if ent is not None and _fold(ent) == low:
+                    a, b = binding.qualifier
+                    tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
+                    out.append((a, b, _dax_table(new, tok.kind == "table")))
+                continue
             if binding.uncertain and _fold(ref.table) == low:
                 raise PbzError("AMBIGUOUS", f"cannot safely bind a reference to {old}")
             if ref.kind == "table" and _fold(ref.name) == low:
@@ -823,7 +854,8 @@ def _dax_string_edits(text, model, kind, home, old, new, cur):
                 if _fold(tok.value or tok.text) == low:
                     out.append((a, b, _dax_table(new, tok.kind == "table")))
         return out
-    return _binding_edits(deps.dax_bindings(text, cur, res).bindings, kind, home, old, new, text)
+    kept = [b for b in bindings if not _ext_bound(b)]
+    return _binding_edits(kept, kind, home, old, new, text)
 
 
 def _measure_expression_edits(root, model, kind, home, old, new):
@@ -831,6 +863,28 @@ def _measure_expression_edits(root, model, kind, home, old, new):
     measures: a measure object (a name and an expression string) under an
     entity object, whose name is the resolution context for bare refs."""
     edits = []
+    ext_measures = {}
+
+    def collect(node):
+        if isinstance(node, pbir.JArr):
+            for v in node.items:
+                collect(v)
+            return
+        if not isinstance(node, pbir.JObj):
+            return
+        nm = node.get("name")
+        measures = node.get("measures")
+        if isinstance(nm, pbir.JStr) and isinstance(measures, pbir.JArr):
+            names = set()
+            for m in measures.items:
+                mn = m.get("name") if isinstance(m, pbir.JObj) else None
+                if isinstance(mn, pbir.JStr):
+                    names.add(_fold(mn.value))
+            ext_measures[_fold(nm.value)] = names
+        for _k, v in node.pairs:
+            collect(v)
+
+    collect(root)
 
     def visit(node, entity=""):
         if isinstance(node, pbir.JArr):
@@ -844,7 +898,7 @@ def _measure_expression_edits(root, model, kind, home, old, new):
             entity = nm.value
         expr = node.get("expression")
         if isinstance(expr, pbir.JStr) and isinstance(nm, pbir.JStr):
-            sub = _dax_string_edits(expr.value, model, kind, home, old, new, entity)
+            sub = _dax_string_edits(expr.value, model, kind, home, old, new, entity, ext_measures)
             if sub:
                 edits.append((expr.start, expr.end,
                               json.dumps(apply_edits(expr.value, sub), ensure_ascii=False)))

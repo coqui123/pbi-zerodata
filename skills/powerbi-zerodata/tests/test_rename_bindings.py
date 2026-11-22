@@ -737,6 +737,39 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "Sales", "Revenue")
         self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Revenue.Geo.City")
 
+    def test_column_rename_extension_measure_bare_ref_not_retargeted(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"},
+                                            {"name": "Twice", "expression": "2 * [Amount]"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        twice = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(twice, "2 * [Amount]")
+
+    def test_table_rename_extension_qualified_ref_follows_qualifier(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"},
+                                            {"name": "Twice", "expression": "2 * 'Budget'[Amount]"}]}]}))
+        rename.rename(ws, project, "table", "Budget", "Plan")
+        twice = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(twice, "2 * 'Plan'[Amount]")
+
+    def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tmeasure Net = 1\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Total", "expression": "2"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "measure", "Net", "Total")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
     def test_verify_report_parse_failure_refuses_and_pbzerror_passes_through(self):
         ws, project, mdef, _path = self._report_project({})
         model = tmdl.load_model(mdef)
