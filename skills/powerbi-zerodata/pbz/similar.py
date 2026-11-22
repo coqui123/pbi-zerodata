@@ -362,10 +362,18 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     elif eff_bare and fr["row_table"] != table:
                         fr["row_table"] = None
                         fr["poisoned"] = True
-                    if not bare and column and fr.get("only_src") is not None \
-                            and fr["row_table"] == table:
+                    _acc_ok = not bare and column and fr.get("only_src") is not None \
+                        and fr["row_table"] == table \
+                        and not any(g["fn"] in SCALAR_FUNCS for g in stack[idx + 1:]) \
+                        and not any(g["fn"] in ("FILTER", "CALCULATETABLE")
+                                    and g["parent_arg"] not in (None, 0)
+                                    for g in stack[idx + 1:])
+                    if _acc_ok:
                         _sf = _source_frame(idx)
                         if _sf is None or _sf["fn"] not in NARROWING:
+                            _sf = None
+                        elif _sf["fn"] in ("FILTER", "CALCULATETABLE") \
+                                and stack[-1] is _sf and _sf["arg"] >= 1:
                             _sf = None
                         _si = next((j for j, g in enumerate(stack) if g is _sf), None) \
                             if _sf is not None else None
@@ -918,7 +926,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                 fr["row_table"] = None
                                 fr["poisoned"] = True
                             elif _widens(f_idx):
-                                _par = stack[-1] if stack else None
+                                _par = next((g for g in reversed(stack) if g["fn"]), None)
                                 _applies, _val = _combine(
                                     fr, _par, _par["arg"] if _par else 0,
                                     None if _vcols is None else set(_vcols[1]))

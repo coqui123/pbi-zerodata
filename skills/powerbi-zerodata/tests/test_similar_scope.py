@@ -126,6 +126,10 @@ SALES = (
     "\tmeasure JoinBareVarB = VAR v = VALUES(Other[Price]) RETURN COUNTROWS(TOPN(1, NATURALLEFTOUTERJOIN(Other, v), Sales[ShadowM]))\n\n"
     "\tmeasure CalcPredA = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(FILTER(VALUES(Wide[Qty]), Wide[Price] > 0)), [Price])))\n\n"
     "\tmeasure CalcPredB = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(FILTER(VALUES(Wide[Qty]), Wide[Price] > 0)), Wide[Price])))\n\n"
+    "\tmeasure CalcPred2A = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), [Price])))\n\n"
+    "\tmeasure CalcPred2B = SUMX(Wide, SUMX(Sales, SUMX(CALCULATETABLE(VALUES(Wide[Qty]), FILTER(VALUES(Wide[Price]), TRUE())), Wide[Price])))\n\n"
+    "\tmeasure ParenVarA = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), (v)), [ShadowM]))\n\n"
+    "\tmeasure ParenVarB = VAR v = CALCULATETABLE(Other, Other[Price] > 0) RETURN COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), (v)), Sales[ShadowM]))\n\n"
     "\tmeasure TopnCountCtrlA = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
@@ -398,6 +402,7 @@ class SimilarScopeTests(unittest.TestCase):
               "UnionPredCtrlA", "UnionPredCtrlB",
               "UnionScalarCtrlA", "UnionScalarCtrlB", "CrossJoinNarrowA", "CrossJoinNarrowB",
               "JoinBareVarA", "JoinBareVarB", "CalcPredA", "CalcPredB",
+              "CalcPred2A", "CalcPred2B", "ParenVarA", "ParenVarB",
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
               "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
@@ -692,7 +697,8 @@ class SimilarScopeTests(unittest.TestCase):
     def test_var_union_and_intermediate_consumers_are_refused(self):
         for dup, into in (("VarUnionPadB", "VarUnionPadA"), ("IntermB", "IntermA"),
                           ("CrossJoinNarrowB", "CrossJoinNarrowA"),
-                          ("JoinBareVarB", "JoinBareVarA"), ("CalcPredB", "CalcPredA")):
+                          ("JoinBareVarB", "JoinBareVarA"), ("CalcPredB", "CalcPredA"),
+                          ("CalcPred2B", "CalcPred2A"), ("ParenVarB", "ParenVarA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
