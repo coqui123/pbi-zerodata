@@ -295,11 +295,13 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         src_fr = _source_frame(idx)
                         if not bare and column and src_fr is not None \
                                 and src_fr["fn"] in NARROWING:
-                            fr["only_column"] = column.lower()
+                            fr["only_columns"] = {column.lower()}
+                            fr["only_src"] = src_fr
                         if not bare and column and fr["fn"] in (
                                 "FIRSTNONBLANK", "LASTNONBLANK",
                                 "FIRSTNONBLANKVALUE", "LASTNONBLANKVALUE"):
-                            fr["only_column"] = column.lower()
+                            fr["only_columns"] = {column.lower()}
+                            fr["only_src"] = fr
                         if not eff_bare:
                             g = _source_frame(idx)
                             exempt = trusted and g is not None and stack[-1] is g \
@@ -312,6 +314,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     elif eff_bare and fr["row_table"] != table:
                         fr["row_table"] = None
                         fr["poisoned"] = True
+                    if not bare and column and fr.get("only_src") is not None \
+                            and _source_frame(idx) is fr.get("only_src"):
+                        fr["only_columns"].add(column.lower())
                     if eff_bare and fr.get("taint") is not None and fr["row_table"] == table \
                             and _taint_cleared(fr, idx):
                         fr["taint"] = None
@@ -379,9 +384,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             args = _span_args(span[2:-1])
             if fn in ("FILTER", "CALCULATETABLE", "KEEPFILTERS"):
                 return _span_table(args[0], seen) if args else (None, None)
-            if fn in ("VALUES", "DISTINCT", "ALLNOBLANKROW", "FILTERS"):
+            if fn in ("VALUES", "DISTINCT", "FILTERS"):
                 return _span_table(args[0], seen) if args else (None, None)
-            if fn in ("ALL", "ALLSELECTED"):
+            if fn in ("ALL", "ALLSELECTED", "ALLNOBLANKROW"):
                 if len(args) == 1:
                     return _span_table(args[0], seen)
                 tab, cols = None, set()
@@ -398,18 +403,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     cols |= s
                 return tab, ("only", frozenset(cols))
             if fn == "ALLEXCEPT":
-                if not args:
-                    return None, None
-                tab, cols = _span_table(args[0], seen)
-                if tab is None or cols is not None:
-                    return None, None
-                excluded = set()
-                for a in args[1:]:
-                    t2, c2 = _span_table(a, seen)
-                    if t2 != tab or c2 is None or c2[0] != "only" or len(c2[1]) != 1:
-                        return None, None
-                    excluded |= c2[1]
-                return tab, ("except", frozenset(excluded))
+                return None, None
             if fn in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
                 return _span_table(args[1], seen) if len(args) > 1 else (None, None)
             if fn in ("INTERSECT", "EXCEPT", "CROSSJOIN", "NATURALINNERJOIN",
@@ -422,6 +416,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             tab = res.table(span[0].value if span[0].kind == "table" else span[0].text)
             return tab, ("only", frozenset({span[1].value.lower()}))
         return None, None
+
+    def _only_has(fr, name) -> bool:
+        cols = fr.get("only_columns")
+        return cols is None or name in cols
 
     def _x_has(fr, name) -> bool:
         cols = fr.get("x_cols")
@@ -592,7 +590,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             if ref.kind == "column" and any(
                     fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
                     and (fr.get("projected") and fr["row_table"] == ref.table
-                         or fr.get("only_column") not in (None, ref.name.lower()))
+                         or not _only_has(fr, ref.name.lower()))
                     for fr in stack):
                 uncertain = True
             if any(fr["fn"] in deps.ROW_CONTEXT and fr["arg"] >= 1
@@ -603,7 +601,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                    and (fr["row_table"] is None
                         or (ref.kind == "column" and fr["row_table"] != ref.table)
                         or (ref.kind == "measure" and fr["row_table"] is not None
-                            and fr.get("only_column") in (None, t.value.lower())
+                            and _only_has(fr, t.value.lower())
                             and res.column(fr["row_table"], t.value) is not None)
                         or t.value.lower() in fr.get("captured", ()))
                    for fr in stack):
@@ -621,7 +619,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     if parent["row_table"] is None \
                             or (ref.kind == "column" and parent["row_table"] != ref.table) \
                             or (ref.kind == "measure" and parent["row_table"] is not None
-                                and parent.get("only_column") in (None, t.value.lower())
+                                and _only_has(parent, t.value.lower())
                                 and res.column(parent["row_table"], t.value) is not None) \
                             or t.value.lower() in parent.get("captured", ()):
                         uncertain = True
@@ -637,7 +635,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                     g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
                                     and not _in_caller_args(g) and g["row_table"] == ref.table
                                     and not g.get("projected")
-                                    and g.get("only_column") in (None, ref.name.lower())
+                                    and _only_has(g, ref.name.lower())
                                     for g in stack[c_idx + 1:])):
                     uncertain = True
 
@@ -653,7 +651,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                     g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
                                     and not _in_caller_args(g) and g["row_table"] == ref.table
                                     and not g.get("projected")
-                                    and g.get("only_column") in (None, ref.name.lower())
+                                    and _only_has(g, ref.name.lower())
                                     for g in stack[c_idx + 1:])):
                     uncertain = True
                 caller_args = CALLER_ARGS.get(fr["fn"])
@@ -663,7 +661,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         and not any(g["fn"] in deps.ROW_CONTEXT and g["arg"] >= 1
                                     and not _in_caller_args(g) and g["row_table"] == ref.table
                                     and not g.get("projected")
-                                    and g.get("only_column") in (None, ref.name.lower())
+                                    and _only_has(g, ref.name.lower())
                                     for g in stack[c_idx + 1:]):
                     caller = None
                     for below in reversed(stack[:c_idx]):
@@ -680,7 +678,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             break
                         if below["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") \
                                 and below["arg"] >= 2 and not below.get("projected") \
-                                and below.get("only_column") in (None, t.value.lower()):
+                                and _only_has(below, t.value.lower()):
                             caller = below["row_table"]
                             break
                         if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:

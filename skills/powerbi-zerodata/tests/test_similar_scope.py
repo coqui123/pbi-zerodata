@@ -255,6 +255,12 @@ SALES = (
     "\tmeasure AllExcSpanB = SUMX(Other, SUMX(Sales, XNPV(ALLEXCEPT(Other, Other[Price]), RANKX(Other, Other[Price], Other[Price]), DATE(2026, 1, 1), 0)))\n\n"
     "\tmeasure NarrowMeasCtrlA = XNPV(VALUES(Other[Price]), [ShadowM], DATE(2026, 1, 1), 0)\n\n"
     "\tmeasure NarrowMeasCtrlB = XNPV(VALUES(Other[Price]), Sales[ShadowM], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure AllNbA = SUMX(Sales, XNPV(ALLNOBLANKROW(Wide[Qty], Wide[Price]), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllNbB = SUMX(Sales, XNPV(ALLNOBLANKROW(Wide[Qty], Wide[Price]), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllExcDirectA = SUMX(Sales, XNPV(ALLEXCEPT(Other, Other[Price]), [Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure AllExcDirectB = SUMX(Sales, XNPV(ALLEXCEPT(Other, Other[Price]), Sales[Price], DATE(2026, 1, 1), 0))\n\n"
+    "\tmeasure TopnAllA = COUNTROWS(TOPN(1, ALL(Other[Price], Other[ShadowM]), [ShadowM]))\n\n"
+    "\tmeasure TopnAllB = COUNTROWS(TOPN(1, ALL(Other[Price], Other[ShadowM]), Sales[ShadowM]))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -359,7 +365,8 @@ class SimilarScopeTests(unittest.TestCase):
               "SubstRankCtrlA", "SubstRankCtrlB", "SwiNarrowA", "SwiNarrowB",
               "RankNestCtrlA", "RankNestCtrlB", "TopnCallerCtrlA", "TopnCallerCtrlB",
               "AllMultiA", "AllMultiB", "AllExcSpanA", "AllExcSpanB",
-              "NarrowMeasCtrlA", "NarrowMeasCtrlB")} | {("Other", "OtherRows")},
+              "NarrowMeasCtrlA", "NarrowMeasCtrlB", "AllNbA", "AllNbB",
+              "AllExcDirectA", "AllExcDirectB", "TopnAllA", "TopnAllB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -557,7 +564,8 @@ class SimilarScopeTests(unittest.TestCase):
 
     def test_narrowed_swi_caller_is_refused(self):
         for dup, into in (("SwiNarrowB", "SwiNarrowA"), ("AllMultiB", "AllMultiA"),
-                          ("AllExcSpanB", "AllExcSpanA")):
+                          ("AllExcSpanB", "AllExcSpanA"), ("AllNbB", "AllNbA"),
+                          ("AllExcDirectB", "AllExcDirectA"), ("TopnAllB", "TopnAllA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
