@@ -275,6 +275,10 @@ SALES = (
     "\tmeasure CtorNestCtrlB = SUMX(Sales, COUNTROWS({ SUMX(Other, Other[Price]) }))\n\n"
     "\tmeasure CtorNarrowCtrlA = SUMX(VALUES(Wide[Qty]), COUNTROWS({ SUMX(Other, [Price]) }))\n\n"
     "\tmeasure CtorNarrowCtrlB = SUMX(VALUES(Wide[Qty]), COUNTROWS({ SUMX(Other, Other[Price]) }))\n\n"
+    "\tmeasure NestTopnA = COUNTROWS(TOPN(1, Other, SUMX(Sales, [Price])))\n\n"
+    "\tmeasure NestTopnB = COUNTROWS(TOPN(1, Other, SUMX(Sales, Sales[Price])))\n\n"
+    "\tmeasure CapNestCtrlA = SUMX(ADDCOLUMNS(Dates, \"Price\", 1), SUMX(Other, [Price]))\n\n"
+    "\tmeasure CapNestCtrlB = SUMX(ADDCOLUMNS(Dates, \"Price\", 1), SUMX(Other, Other[Price]))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -384,7 +388,8 @@ class SimilarScopeTests(unittest.TestCase):
               "JoinShadowA", "JoinShadowB", "PadA", "PadB",
               "CtorCommaA", "CtorCommaB", "UnionPadA", "UnionPadB",
               "ShadowCtorA", "ShadowCtorB", "CtorNestCtrlA", "CtorNestCtrlB",
-              "CtorNarrowCtrlA", "CtorNarrowCtrlB")} | {("Other", "OtherRows")},
+              "CtorNarrowCtrlA", "CtorNarrowCtrlB", "NestTopnA", "NestTopnB",
+              "CapNestCtrlA", "CapNestCtrlB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -616,6 +621,13 @@ class SimilarScopeTests(unittest.TestCase):
         self.assertFalse(self._canon("CtorNarrowCtrlA").uncertain)
         result = consolidate.merge(self.ws, self.project, "CtorNarrowCtrlB", "CtorNarrowCtrlA", dry_run=True)
         self.assertEqual(result["equivalence"], "identical")
+
+    def test_nested_owner_exempts_sort_and_capture_guards(self):
+        for name, dup in (("NestTopnA", "NestTopnB"), ("CapNestCtrlA", "CapNestCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
 
     def test_identity_dependent_format_is_refused(self):
         with self.assertRaises(PbzError) as caught:
