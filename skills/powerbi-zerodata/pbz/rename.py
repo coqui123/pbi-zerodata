@@ -754,7 +754,17 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                              if _fold(text) == _fold(b) or _rest_after(text, _fold(b)) is not None]
                     if not cands:
                         continue
-                    cands = [max(cands, key=len)]
+
+                    def _consumed(b):
+                        # The candidate consuming the most of the emitted
+                        # path wins: folding can change code point counts,
+                        # so raw string length does not measure the match.
+                        if _fold(text) == _fold(b):
+                            return -1
+                        r = _rest_after(text, _fold(b))
+                        return len(_fold(r)) if r is not None else 1 << 30
+
+                    cands = [min(cands, key=_consumed)]
                 rest = _rest_after(text, _fold(cands[0]))
                 if rest is not None and not _path_extension(rest, new, names):
                     raise PbzError("AMBIGUOUS",

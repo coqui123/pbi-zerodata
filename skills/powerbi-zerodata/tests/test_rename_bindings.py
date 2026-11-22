@@ -1056,6 +1056,16 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "Sales", "Revenue")
         self.assertEqual(json.loads(path.read_text())["refs"][0]["metadata"], "Sum(Revenue.Amount.Level)")
 
+    def test_table_rename_recognizability_picks_most_consuming_base(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.İİİ.X.Y"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        col1 = "i\u0307" * 3
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn '" + col1 + "'\n\t\tdataType: string\n\tcolumn 'İİİ.X'\n\t\tdataType: string\n")
+        rename.rename(ws, project, "table", "Sales", "X")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "X.İİİ.X.Y")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
