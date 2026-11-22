@@ -254,9 +254,17 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         frames = stack[idx + 1:]
         for j, p in enumerate(frames):
             if p is g:
-                d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else stack[-1]["arg"]
-                lineage = 1 if g["fn"] in TOPN_LIKE else (4 if g["fn"] == "WINDOW" else 0)
-                return d == lineage
+                path = frames[j:]
+                for k, q in enumerate(path):
+                    d = path[k + 1]["parent_arg"] if k + 1 < len(path) else stack[-1]["arg"]
+                    if q["fn"] in CONDITIONALS or q["fn"] == "":
+                        continue
+                    if not _is_table_frame(q):
+                        return False
+                    lineage = 1 if q["fn"] in TOPN_LIKE else (4 if q["fn"] == "WINDOW" else 0)
+                    if d != lineage:
+                        return False
+                return True
         return False
 
     def learn(table, bare: bool = False) -> None:
