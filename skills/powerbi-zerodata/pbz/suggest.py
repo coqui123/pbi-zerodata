@@ -11,6 +11,122 @@ TEXT_VISUALS = {"textbox", "image", "shape", "basicShape", "actionButton", "page
                 "group", ""}
 
 
+def _ends_expression(tok) -> bool:
+    if tok.kind in ("bracket", "num", "str", "table", "qident", "pbztok"):
+        return True
+    if tok.kind == "ident":
+        return tok.text.upper() not in ("VAR", "RETURN", "NOT", "IN")
+    return tok.kind == "op" and tok.text in (")", "}")
+
+
+def _scan_boundary(sig, keys, pos, key):
+    """Index of the VAR or RETURN identifier at key that ends the expression
+    region starting at pos, or None when the enclosing group closes first.
+
+    A VAR whose previous token cannot end an expression starts a nested block
+    inside the region; that block is consumed whole instead of being mistaken
+    for the boundary."""
+    while pos < len(sig):
+        if len(keys[pos]) < len(key):
+            return None
+        tok = sig[pos]
+        if keys[pos] == key and tok.kind == "ident" and tok.text.upper() in ("VAR", "RETURN"):
+            if tok.text.upper() == "RETURN":
+                return pos
+            prev = sig[pos - 1] if pos > 0 else None
+            if prev is None or _ends_expression(prev):
+                return pos
+            after = _block_return_end(sig, keys, pos)
+            if after is None:
+                return None
+            pos = after
+            continue
+        pos += 1
+    return None
+
+
+def _block_return_end(sig, keys, var_index):
+    """Index just after the RETURN token that closes the VAR block starting at var_index, or None."""
+    key = keys[var_index]
+    j = var_index
+    while True:
+        m = _scan_boundary(sig, keys, j + 2, key)
+        if m is None:
+            return None
+        if sig[m].text.upper() == "RETURN":
+            return m + 1
+        j = m  # sibling declaration inside this block
+
+
+def _decl_end(sig, keys, var_index):
+    """Start offset of the token that ends the declaration at var_index (the next sibling VAR or the block RETURN at its key), or None."""
+    m = _scan_boundary(sig, keys, var_index + 2, keys[var_index])
+    return sig[m].start if m is not None else None
+
+
+def _unused_decls(expr: str) -> list[dict]:
+    """Bind uses by scope, then discard declarations with no live uses."""
+    sig = lexers.significant(lexers.lex_dax(expr))
+    keys = []
+    stack = []
+    for tok in sig:
+        keys.append(tuple(stack))
+        if tok.kind == "op":
+            if tok.text in ("(", "{"):
+                stack.append(tok.start)
+            elif tok.text in (")", "}") and stack:
+                stack.pop()
+
+    commas = {}
+    for i, tok in enumerate(sig):
+        if tok.kind == "op" and tok.text == ",":
+            commas.setdefault(keys[i], []).append(i)
+
+    decls = []
+    name_indices = set()
+    for i, t in enumerate(sig):
+        if t.kind == "ident" and t.text.upper() == "VAR" and i + 1 < len(sig) and sig[i + 1].kind == "ident":
+            end = _decl_end(sig, keys, i)
+            decls.append({"name": sig[i + 1].text, "lower": sig[i + 1].text.lower(),
+                          "index": i, "start": t.start, "end": end, "key": keys[i], "used": True})
+            name_indices.add(i + 1)
+
+    # A declaration nested inside another declaration's span at the same key
+    # (an unparenthesized VAR block used as an initializer) must not bind a
+    # use at or after the enclosing declaration's end.
+    for d in decls:
+        caps = [e["end"] for e in decls
+                if e is not d and e["key"] == d["key"] and e["end"] is not None
+                and e["start"] < d["start"] < e["end"]]
+        d["cap"] = min(caps) if caps else None
+
+    bindings = []
+    for i, tok in enumerate(sig):
+        if tok.kind != "ident" or tok.text.upper() == "VAR" or i in name_indices:
+            continue
+        bound = next((d for d in reversed(decls)
+                      if d["index"] < i and d["lower"] == tok.text.lower()
+                      and d["key"] == keys[i][:len(d["key"])]
+                      and (d["cap"] is None or tok.start < d["cap"])
+                      and not any(d["index"] < comma < i for comma in commas.get(d["key"], ()))
+                      and not (d["start"] <= tok.start < (d["end"] if d["end"] is not None else float("inf")))), None)
+        if bound is not None:
+            bindings.append((tok.start, bound["index"]))
+
+    dead = set()
+    while True:
+        dead_spans = [(d["start"], d["end"]) for d in decls if d["index"] in dead]
+        live = {index for start, index in bindings
+                if not any(begin <= start < end for begin, end in dead_spans)}
+        newly_dead = {d["index"] for d in decls if d["end"] is not None and d["index"] not in live}
+        if newly_dead <= dead:
+            break
+        dead.update(newly_dead)
+    for d in decls:
+        d["used"] = d["index"] not in dead
+    return decls
+
+
 def _unused_vars(expr: str) -> list[str]:
     sig = lexers.significant(lexers.lex_dax(expr))
     out = []

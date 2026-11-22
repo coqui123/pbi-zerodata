@@ -143,26 +143,14 @@ def _return_without_var(sig) -> bool:
 
 
 def _unused(expr: str) -> str | None:
-    names = set(suggest._unused_vars(expr))
-    if not names:
-        return None
-    sig = lexers.significant(lexers.lex_dax(expr))
-    # Drop each unused `VAR name = <simple>` that ends before RETURN or the next VAR.
+    # Merge dead declarations in original coordinates before deleting them.
     spans = []
-    for i, tok in enumerate(sig):
-        if not (tok.kind == "ident" and tok.text.upper() == "VAR" and i + 1 < len(sig)):
-            continue
-        name = sig[i + 1]
-        if name.text not in names:
-            continue
-        end = None
-        for later in sig[i + 2:]:
-            if later.kind == "ident" and later.text.upper() in ("RETURN", "VAR"):
-                end = later.start
-                break
-        if end is None:
-            continue
-        spans.append((tok.start, end))
+    for start, end in sorted((d["start"], d["end"]) for d in suggest._unused_decls(expr)
+                             if not d["used"] and d["end"] is not None):
+        if spans and start <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+        else:
+            spans.append((start, end))
     if not spans:
         return None
     out = expr
@@ -171,7 +159,7 @@ def _unused(expr: str) -> str | None:
     sig2 = lexers.significant(lexers.lex_dax(out))
     # Drop a leading RETURN only when no VAR remains.
     if sig2 and sig2[0].text.upper() == "RETURN" and not any(t.text.upper() == "VAR" for t in sig2):
-        out = out[:sig2[0].start] + out[sig2[0].end:]
+        out = out[:sig2[0].start] + out[sig2[0].end:].lstrip()
         sig2 = lexers.significant(lexers.lex_dax(out))
     # A nested VAR does not make a leading RETURN valid: `RETURN SUMX(..., VAR y = ...)` is refused.
     # A RETURN left inside a call, such as `SUMX(T, RETURN [M])`, is refused the same way.
