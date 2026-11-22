@@ -481,6 +481,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     top["expect"] = "item"
             if top.get("x_span") is not None and top["arg"] == 0 \
                     and top.get("x_table") is None:
+                _span_taint[0] = False
                 top["x_table"] = _span_table(top["x_span"])
             top["arg"] += 1
         if stack and t.kind == "str" and stack[-1]["fn"] in (
@@ -655,6 +656,11 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         else:
             toks.append((t.text, "", ""))
         i += 1
+    if any(t.kind == "ident" and t.text.upper() == "COUNTROWS"
+           and j + 2 < n and sig[j + 1].kind == "op" and sig[j + 1].text == "("
+           and sig[j + 2].kind == "op" and sig[j + 2].text == ")"
+           for j, t in enumerate(sig)):
+        toks.append((f"home:{home.lower()}", "", ""))
     toks = _strip_parens(toks)
     words = [x[0] for x in toks]
     if words.count("VAR") == 1 and len(words) >= 6 and words[0] == "VAR" and words[-2] == "RETURN" \

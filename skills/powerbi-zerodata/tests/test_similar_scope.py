@@ -228,12 +228,16 @@ SALES = (
     "\tmeasure FnbColB = SUMX(Sales, FIRSTNONBLANK(Wide[Qty], Wide[Price]))\n\n"
     "\tmeasure SpanChainCtrlA = VAR __a = Sales VAR __b = INTERSECT(__a, __a) VAR __c = INTERSECT(__b, __b) RETURN XNPV(__c, [Price], DATE(2026, 1, 1), 0)\n\n"
     "\tmeasure SpanChainCtrlB = VAR __a = Sales VAR __b = INTERSECT(__a, __a) VAR __c = INTERSECT(__b, __b) RETURN XNPV(__c, Sales[Price], DATE(2026, 1, 1), 0)\n\n"
+    "\tmeasure HomeCountA = COUNTROWS()\n\n"
+    "\tmeasure FmtShadowA = 1\n\t\tformatStringDefinition = IF(XNPV(Other, [ShadowM], DATE(2026, 1, 1), 0) > 0, \"0.0\", \"0%\")\n\n"
+    "\tmeasure FmtShadowB = 1\n\t\tformatStringDefinition = IF(XNPV(Other, Sales[ShadowM], DATE(2026, 1, 1), 0) > 0, \"0.0\", \"0%\")\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
 )
 OTHER = (
     "table Other\n\n"
+    "\tmeasure OtherRows = COUNTROWS()\n\n"
     "\tcolumn Price\n\t\tdataType: int64\n\t\tsourceColumn: Price\n\n"
     "\tcolumn ShadowM\n\t\tdataType: int64\n\t\tsourceColumn: ShadowM\n\n"
 )
@@ -324,7 +328,8 @@ class SimilarScopeTests(unittest.TestCase):
               "RollupWrapA", "RollupWrapB", "XnpvNestShadowA", "XnpvNestShadowB",
               "VarAliasA", "VarAliasB", "VarNestA", "VarNestB", "WinXnpvA", "WinXnpvB",
               "XnpvColShadowA", "XnpvColShadowB", "TopnColShadowA", "TopnColShadowB",
-              "FnbColA", "FnbColB", "SpanChainCtrlA", "SpanChainCtrlB")},
+              "FnbColA", "FnbColB", "SpanChainCtrlA", "SpanChainCtrlB",
+              "HomeCountA", "FmtShadowA", "FmtShadowB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -497,6 +502,18 @@ class SimilarScopeTests(unittest.TestCase):
                 with self.assertRaises(PbzError) as caught:
                     consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_zero_argument_countrows_keys_include_home(self):
+        self.assertNotEqual(self._key("HomeCountA"),
+                            similar.canon("COUNTROWS()", "Other", self.resolver).words("hash"))
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "OtherRows", "HomeCountA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_uncertain_dynamic_format_is_refused(self):
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "FmtShadowB", "FmtShadowA", dry_run=True)
+        self.assertEqual(caught.exception.code, "FORMAT_DIFFERS")
 
     def test_span_chain_stays_certain(self):
         self.assertFalse(self._canon("SpanChainCtrlA").uncertain)

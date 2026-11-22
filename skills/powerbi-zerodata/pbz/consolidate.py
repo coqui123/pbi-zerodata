@@ -155,6 +155,16 @@ def _format_of(model, m, res) -> tuple:
     return static, dyn
 
 
+def _format_uncertain(model, m, res) -> bool:
+    """True when the measure's dynamic format canon cannot be verified."""
+    fsd = next((c for c in (m.node.children if m.node else []) if c.kind == "formatStringDefinition"), None)
+    if fsd is None:
+        return False
+    doc = model.docs[m.node.file]
+    text = "".join(doc.text[r.start:r.end] for r in doc.regions_for(fsd))
+    return similar.canon(text, m.table, res).uncertain
+
+
 def _measure_closure(model, res, start) -> set[str]:
     """Lower-case names of the measures `start` reaches through DAX (expression, formats, KPI, detail rows)."""
     seen: set[str] = set()
@@ -296,6 +306,9 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
     else:
         raise PbzError("NOT_EQUIVALENT", f"[{d.name}] and [{t.name}] differ after normalization (pbz similar shows "
                                          "how); pass --force only if you have checked they agree")
+    if not force and (_format_uncertain(model, d, res) or _format_uncertain(model, t, res)):
+        raise PbzError("FORMAT_DIFFERS", "a dynamic format string cannot be verified as equivalent "
+                                         "(unresolved or ambiguous references); align them or pass --force")
     if _format_of(model, d, res) != _format_of(model, t, res) and not force:
         raise PbzError("FORMAT_DIFFERS", f"[{d.name}] and [{t.name}] have different format strings: references would "
                                          f"show [{t.name}]'s format. Align them (pbz set / pbz format-expr) or pass --force")
