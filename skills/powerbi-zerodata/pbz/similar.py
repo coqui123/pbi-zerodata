@@ -623,6 +623,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         if below["fn"] in ("XNPV", "XIRR") and below["arg"] in (1, 2):
                             caller = below.get("x_table")
                             break
+                        if below["fn"] == "SUBSTITUTEWITHINDEX" and below["arg"] >= 3 \
+                                and below["arg"] % 2 == 1:
+                            caller = below.get("x_table")
+                            break
                         if below["fn"] in deps.ROW_CONTEXT and below["arg"] >= 1:
                             caller = below["row_table"]
                             break

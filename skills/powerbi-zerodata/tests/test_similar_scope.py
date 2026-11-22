@@ -241,6 +241,8 @@ SALES = (
     "\tmeasure SubstUnkB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", ADDCOLUMNS(Other, \"CtrlA\", Other[Price]), Sales[CtrlA], ASC))\n\n"
     "\tmeasure SubstNestCtrlA = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, Other[Price] + SUMX(Sales, [Price]), ASC))\n\n"
     "\tmeasure SubstNestCtrlB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, Other[Price] + SUMX(Sales, Sales[Price]), ASC))\n\n"
+    "\tmeasure SubstRankCtrlA = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], [Price]), ASC))\n\n"
+    "\tmeasure SubstRankCtrlB = TOCSV(SUBSTITUTEWITHINDEX(Other, \"Idx\", Other, RANKX(Other, Other[Price], Other[Price]), ASC))\n\n"
 
     "\tmeasure ConcatxSortCtrlA = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", [Price], ASC))))\n\n"
     "\tmeasure ConcatxSortCtrlB = SUMX(Other, SUMX(Sales, LEN(CONCATENATEX(Other, Other[Price], \",\", Other[Price], ASC))))\n\n"
@@ -341,7 +343,8 @@ class SimilarScopeTests(unittest.TestCase):
               "FnbColA", "FnbColB", "SpanChainCtrlA", "SpanChainCtrlB",
               "HomeCountA", "FmtShadowA", "FmtShadowB", "FmtNameA", "FmtNameB",
               "SubstA", "SubstB", "SubstLateA", "SubstLateB", "SubstUnkA", "SubstUnkB",
-              "SubstNestCtrlA", "SubstNestCtrlB")} | {("Other", "OtherRows")},
+              "SubstNestCtrlA", "SubstNestCtrlB",
+              "SubstRankCtrlA", "SubstRankCtrlB")} | {("Other", "OtherRows")},
         )
 
     def _canon(self, name):
@@ -530,6 +533,11 @@ class SimilarScopeTests(unittest.TestCase):
     def test_substitutewithindex_nested_iterator_stays_certain(self):
         self.assertFalse(self._canon("SubstNestCtrlA").uncertain)
         result = consolidate.merge(self.ws, self.project, "SubstNestCtrlB", "SubstNestCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
+    def test_substitutewithindex_rankx_value_stays_certain(self):
+        self.assertFalse(self._canon("SubstRankCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "SubstRankCtrlB", "SubstRankCtrlA", dry_run=True)
         self.assertEqual(result["equivalence"], "identical")
 
     def test_identity_dependent_format_is_refused(self):
