@@ -81,6 +81,14 @@ SALES = (
     "\tmeasure ConsB = SUMX(TOPN(MAX(Sales[Price]), { 1, 2 }), Sales[Price])\n\n"
     "\tmeasure IfCtrlA = SUMX(FILTER(Sales, IF(Sales[Price] > 0, TRUE(), FALSE())), [Price])\n\n"
     "\tmeasure IfCtrlB = SUMX(FILTER(Sales, IF(Sales[Price] > 0, TRUE(), FALSE())), [Price])\n\n"
+    "\tmeasure CalcA = SUMX(CALCULATETABLE({ 1, 2 }, Other), [Price])\n\n"
+    "\tmeasure CalcB = SUMX(CALCULATETABLE({ 1, 2 }, Other), Other[Price])\n\n"
+    "\tmeasure AllCountA = SUMX(GENERATESERIES(1, COUNTROWS(ALL(Sales))), [Price])\n\n"
+    "\tmeasure AllCountB = SUMX(GENERATESERIES(1, COUNTROWS(ALL(Sales))), Sales[Price])\n\n"
+    "\tmeasure FiltCountA = SUMX(GENERATESERIES(1, COUNTROWS(FILTER(Other, TRUE()))), [Price])\n\n"
+    "\tmeasure FiltCountB = SUMX(GENERATESERIES(1, COUNTROWS(FILTER(Other, TRUE()))), Sales[Price])\n\n"
+    "\tmeasure IfPredCtrlA = SUMX(FILTER(Sales, IF(Sales[Price] > MAX(Other[Price]), TRUE(), FALSE())), [Price])\n\n"
+    "\tmeasure IfPredCtrlB = SUMX(FILTER(Sales, IF(Sales[Price] > MAX(Other[Price]), TRUE(), FALSE())), [Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -131,7 +139,9 @@ class SimilarScopeTests(unittest.TestCase):
               "CtorA", "CtorB", "CountA", "CountB", "ScopeA", "ScopeB", "InlineA", "InlineB",
               "QualA", "QualB", "GenA", "GenB", "TopNCtrlA", "TopNCtrlB",
               "SumzA", "SumzB", "Gen2A", "Gen2B", "NestCtrlA", "NestCtrlB",
-              "Gen3A", "Gen3B", "ConsA", "ConsB", "IfCtrlA", "IfCtrlB")},
+              "Gen3A", "Gen3B", "ConsA", "ConsB", "IfCtrlA", "IfCtrlB",
+              "CalcA", "CalcB", "AllCountA", "AllCountB", "FiltCountA", "FiltCountB",
+              "IfPredCtrlA", "IfPredCtrlB")},
         )
 
     def _canon(self, name):
@@ -282,6 +292,24 @@ class SimilarScopeTests(unittest.TestCase):
                 with self.assertRaises(PbzError) as caught:
                     consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_silent_source_and_scalar_wrapped_teachings_still_poison(self):
+        for dup, into in (("CalcB", "CalcA"), ("AllCountB", "AllCountA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+        self.assertTrue(self._canon("FiltCountA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "FiltCountB", "FiltCountA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_conditional_predicate_with_lookup_stays_certain(self):
+        self.assertFalse(self._canon("IfPredCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "IfPredCtrlB", "IfPredCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
 
     def test_conditional_predicate_source_stays_certain(self):
         self.assertFalse(self._canon("IfCtrlA").uncertain)

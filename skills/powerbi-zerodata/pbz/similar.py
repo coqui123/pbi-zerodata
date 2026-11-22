@@ -100,7 +100,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     "NOW", "UTCNOW", "EDATE", "EOMONTH", "DATEDIFF", "YEARFRAC", "WEEKDAY",
                     "WEEKNUM", "NETWORKDAYS", "BLANK", "TRUE", "FALSE", "ISBLANK", "ISERROR",
                     "ISNUMBER", "ISTEXT", "ISLOGICAL", "ISNONTEXT", "ISEMPTY", "HASONEVALUE",
-                    "HASONEFILTER", "SELECTEDVALUE", "USERNAME", "USERPRINCIPALNAME", "CUSTOMDATA"}
+                    "HASONEFILTER", "SELECTEDVALUE", "USERNAME", "USERPRINCIPALNAME", "CUSTOMDATA",
+                    "CALCULATE", "RAND", "RANDBETWEEN", "PI", "CURRENCY"}
 
     def _call_span(rhs, open_idx):
         depth = 0
@@ -179,24 +180,32 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     stack: list[dict] = []   # {"fn", "arg", "row_table"}: mirrors the deps.dax_bindings frames
 
     PREDICATE_EXEMPT = {"FILTER", "CALCULATETABLE", "ADDCOLUMNS"}
+    CONDITIONALS = {"IF", "IFERROR", "SWITCH", "COALESCE"}
+    TABLE_INPUT_ARG0 = {"VALUES", "DISTINCT", "ALL", "ALLEXCEPT", "ALLNOBLANKROW", "ALLSELECTED",
+                        "FILTER", "CALCULATETABLE", "SUMMARIZE", "SUMMARIZECOLUMNS", "ADDCOLUMNS",
+                        "SELECTCOLUMNS", "GENERATE", "UNION", "INTERSECT", "EXCEPT", "CROSSJOIN",
+                        "TREATAS", "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN", "GROUPBY",
+                        "KEEPFILTERS", "FILTERS"}
 
     def _source_frame(idx):
         for g in reversed(stack[idx + 1:]):
-            if g["fn"] and g["fn"] not in SCALAR_FUNCS:
+            if g["fn"] and g["fn"] not in SCALAR_FUNCS and g["fn"] not in CONDITIONALS:
                 return g
         return None
 
     def learn(table, bare: bool = False) -> None:
         if table:
-            direct = not (stack and stack[-1]["fn"] in SCALAR_FUNCS)
-            eff_bare = bare and direct
             for idx, fr in enumerate(stack):
                 if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"]:
+                    trusted = not any(g["fn"] in SCALAR_FUNCS for g in stack[idx + 1:])
+                    eff_bare = bare and trusted
                     if fr["row_table"] is None:
                         fr["row_table"] = table
                         if not eff_bare:
                             g = _source_frame(idx)
-                            if g is not None and not (stack[-1] is g and g["arg"] == 0):
+                            exempt = trusted and g is not None and stack[-1] is g \
+                                and g["arg"] == 0 and g["fn"] in TABLE_INPUT_ARG0
+                            if g is not None and not exempt:
                                 fr["taint"] = g
                     elif eff_bare and fr["row_table"] != table:
                         fr["row_table"] = None
@@ -237,6 +246,12 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         fr["taint"] = None
                         fr["row_table"] = None
                         fr["poisoned"] = True
+                if closed["fn"] and closed["fn"] not in SCALAR_FUNCS \
+                        and closed["fn"] not in CONDITIONALS:
+                    for fr in stack:
+                        if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
+                                and fr["row_table"] is None and not fr["poisoned"]:
+                            fr["poisoned"] = True
         elif t.kind == "op" and t.text == "," and stack:
             stack[-1]["arg"] += 1
         if t.kind in LIT_KINDS:
