@@ -178,6 +178,15 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     uncertain = False
     stack: list[dict] = []   # {"fn", "arg", "row_table"}: mirrors the deps.dax_bindings frames
 
+    TABLE_FUNCS = {"VALUES", "DISTINCT", "ALL", "ALLEXCEPT", "ALLNOBLANKROW", "ALLSELECTED",
+                   "FILTER", "CALCULATETABLE", "SUMMARIZE", "SUMMARIZECOLUMNS", "ADDCOLUMNS",
+                   "SELECTCOLUMNS", "TOPN", "GENERATE", "GENERATEALL", "GENERATESERIES",
+                   "UNION", "INTERSECT", "EXCEPT", "TREATAS", "CROSSJOIN", "NATURALINNERJOIN",
+                   "NATURALLEFTOUTERJOIN", "GROUPBY", "ROW", "DATATABLE", "SAMPLE", "INDEX",
+                   "OFFSET", "WINDOW", "CALENDAR", "CALENDARAUTO", "DATEADD", "DATESYTD",
+                   "DATESMTD", "DATESQTD", "DATESBETWEEN", "SAMEPERIODLASTYEAR", "KEEPFILTERS",
+                   "FILTERS", "DETAILROWS"}
+
     def learn(table, bare: bool = False) -> None:
         if table:
             for fr in stack:
@@ -187,6 +196,18 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     elif bare and fr["row_table"] != table:
                         fr["row_table"] = None
                         fr["poisoned"] = True
+                    if fr.get("taint") is not None and fr["row_table"] == table:
+                        fr["taint"] = None
+
+    def poison_qualified(tab) -> None:
+        if not tab:
+            return
+        for idx, fr in enumerate(stack):
+            if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"] \
+                    and fr["row_table"] is not None and fr["row_table"] != tab:
+                if any(g["fn"] in TABLE_FUNCS and g["arg"] == 0 for g in stack[idx + 1:]):
+                    fr["row_table"] = None
+                    fr["poisoned"] = True
 
     i, n = 0, len(sig)
     while i < n:
@@ -195,10 +216,21 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         if t.kind == "op" and t.text == "(":
             prev = sig[i - 1] if i else None
             fn = prev.text.upper() if prev is not None and prev.kind == "ident" else ""
-            stack.append({"fn": fn, "arg": 0, "row_table": None, "poisoned": False})
+            frame = {"fn": fn, "arg": 0, "row_table": None, "poisoned": False, "taint": None}
+            stack.append(frame)
+            if fn in TABLE_FUNCS:
+                for fr in stack[:-1]:
+                    if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
+                            and fr["row_table"] is not None and not fr["poisoned"]:
+                        fr["taint"] = frame
         elif t.kind == "op" and t.text == ")":
             if stack:
-                stack.pop()
+                closed = stack.pop()
+                for fr in stack:
+                    if fr.get("taint") is closed:
+                        fr["taint"] = None
+                        fr["row_table"] = None
+                        fr["poisoned"] = True
         elif t.kind == "op" and t.text == "," and stack:
             stack[-1]["arg"] += 1
         if t.kind in LIT_KINDS:
@@ -221,6 +253,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     lab = f"{tab}[{col}]"
                     toks.append((lab.lower(), "col", lab))
                     learn(tab)
+                    poison_qualified(tab)
                 elif res.measure(nxt.value):
                     lab = f"[{res.measure(nxt.value)[1]}]"
                     toks.append((lab.lower(), "meas", lab))
