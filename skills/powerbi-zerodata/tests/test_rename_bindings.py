@@ -965,6 +965,18 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "A", "A.B.C")
         self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "A.B.C.X")
 
+    def test_table_rename_destination_suffix_classified_post_rename(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Old.Sub.X.Old.Level"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Old.tmdl"),
+               "table Old\n\tcolumn 'Sub.X.Old.Level'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Dest.Sub.tmdl"),
+               "table 'Dest.Sub'\n\tcolumn X\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Old", "Dest")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
