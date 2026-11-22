@@ -671,6 +671,22 @@ class RenameBindingsTests(unittest.TestCase):
         pvs = proj["HierarchyLevel"]["Expression"]["Hierarchy"]["Expression"]["PropertyVariationSource"]
         self.assertEqual(pvs["Property"], "BookedDate")
 
+    def test_column_rename_variation_wrapped_and_bare_follow(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+                "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                           "Property": "OrderDate"}},
+                "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}}
+        for key, given, expected in (("queryRef", "Min(Sales.OrderDate)", "Min(Sales.BookedDate)"),
+                                     ("nativeQueryRef", "OrderDate", "BookedDate"),
+                                     ("queryRef", "Sales.OrderDate.OrderDate.Year",
+                                      "Sales.BookedDate.OrderDate.Year")):
+            with self.subTest(given=given):
+                ws, project, mdef, path = self._report_project({"projections": [dict(hl, **{key: given})]})
+                _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+                       "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+                rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+                self.assertEqual(json.loads(path.read_text())["projections"][0][key], expected)
+
     def test_measure_rename_fold_spelling_keeps_culture(self):
         ws, project, mdef = self._column_project()
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

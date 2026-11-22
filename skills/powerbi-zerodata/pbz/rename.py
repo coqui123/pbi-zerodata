@@ -685,16 +685,34 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                 and _fold(field.table) == _fold(home) and _fold(field.name) == _fold(old):
             # An auto date/time variation field names its base column: a
             # string naming that column, or a pure extension of its path
-            # (the variation and hierarchy segments), follows the rename.
+            # (the variation and hierarchy segments), follows the rename,
+            # raw or wrapped, as does a bare nativeQueryRef. The remainder
+            # check tests table names, not the column's own name.
             base = f"{field.table}.{field.name}"
             if _fold(value) == _fold(base):
                 return f"{home}.{new}"
-            rest = _rest_after(value, _fold(base))
-            if rest is not None and _path_extension(
-                    rest, old,
-                    ([t.name for t in model.tables.values()] if model is not None else [])
-                    + list(extra_tables)):
-                return _prefix_swap(value, base, f"{home}.{new}")
+            if key == "nativeQueryRef" and _fold(value) == _fold(field.name):
+                return new
+
+            def _follow(text):
+                if _fold(text) == _fold(base):
+                    return f"{home}.{new}"
+                rest = _rest_after(text, _fold(base))
+                if rest is not None and _path_extension(
+                        rest, home,
+                        ([t.name for t in model.tables.values()] if model is not None else [])
+                        + list(extra_tables)):
+                    return _prefix_swap(text, base, f"{home}.{new}")
+                return None
+
+            out = _follow(value)
+            if out is not None:
+                return out
+            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
+            if wrapped:
+                inner = _follow(wrapped.group(2))
+                if inner is not None:
+                    return f"{wrapped.group(1)}({inner})"
             return value
         field_kind = "column" if field.kind == "aggregation" else field.kind
         if field_kind != kind or _fold(field.table) != _fold(home) or _fold(field.name) != _fold(old):
