@@ -299,15 +299,33 @@ def _canonical_target(model, kind, home, old):
     return table.name, old
 
 
+def _single_wrapped(value):
+    """(wrapper, inner) when value is exactly one Name(...) call, else None."""
+    m = re.match(r"([A-Za-z_][\w]*)\(", value)
+    if not m:
+        return None
+    depth = 0
+    for i in range(m.end() - 1, len(value)):
+        if value[i] == "(":
+            depth += 1
+        elif value[i] == ")":
+            depth -= 1
+            if depth == 0:
+                if i != len(value) - 1:
+                    return None
+                return m.group(1), value[m.end():i]
+    return None
+
+
 def _report_string_rename(key, value, kind, home, old, new, field=None):
     if kind == "table":
         if key in ("queryRef", "metadata", "queryName"):
             if value.lower().startswith(old.lower() + "."):
                 return new + value[len(old):]
-            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\(([^()]*)\)", value)
-            if wrapped and wrapped.group(2).lower().startswith(old.lower() + "."):
-                inner = wrapped.group(2)
-                return f"{wrapped.group(1)}({new}{inner[len(old):]})"
+            wrapped = _single_wrapped(value)
+            if wrapped and wrapped[1].lower().startswith(old.lower() + ".") \
+                    and not re.search(r"[+\-*/^&=<>]", wrapped[1][len(old) + 1:]):
+                return f"{wrapped[0]}({new}{wrapped[1][len(old):]})"
         return value
     if key == "queryName":
         return value
@@ -322,7 +340,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None):
         if key == "nativeQueryRef" and value.lower() == field.name.lower():
             return new
         if field.kind == "aggregation":
-            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\(([^()]*)\)", value)
+            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
             if wrapped and wrapped.group(2).lower() in (
                     f"{field.table}.{field.name}".lower(), f"{home}.{old}".lower()):
                 return f"{wrapped.group(1)}({home}.{new})"
@@ -332,7 +350,7 @@ def _report_string_rename(key, value, kind, home, old, new, field=None):
     if key == "nativeQueryRef" and value.lower() == old.lower():
         return new
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
-        wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\(([^()]*)\)", value)
+        wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
         if wrapped and wrapped.group(2).lower() == f"{home}.{old}".lower():
             return f"{wrapped.group(1)}({home}.{new})"
     return value
@@ -543,11 +561,11 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                 if node.value.lower().startswith(low + "."):
                     edits.append((node.start, node.end, json.dumps(new + node.value[len(old):], ensure_ascii=False)))
                 else:
-                    wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\(([^()]*)\)", node.value)
-                    if wrapped and wrapped.group(2).lower().startswith(low + "."):
-                        inner = wrapped.group(2)
+                    wrapped = _single_wrapped(node.value)
+                    if wrapped and wrapped[1].lower().startswith(low + ".") \
+                            and not re.search(r"[+\-*/^&=<>]", wrapped[1][len(old) + 1:]):
                         edits.append((node.start, node.end, json.dumps(
-                            f"{wrapped.group(1)}({new}{inner[len(old):]})", ensure_ascii=False)))
+                            f"{wrapped[0]}({new}{wrapped[1][len(old):]})", ensure_ascii=False)))
         return edits, False
 
     from .move import plan_pbir
