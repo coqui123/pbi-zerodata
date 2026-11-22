@@ -973,6 +973,9 @@ class RenameBindingsTests(unittest.TestCase):
                "table Old\n\tcolumn 'Sub.X.Old.Level'\n\t\tdataType: int64\n")
         _write(os.path.join(mdef, "tables", "Dest.Sub.tmdl"),
                "table 'Dest.Sub'\n\tcolumn X\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Old", "measures": [{"name": "M", "expression": "1"}]}]}))
         with self.assertRaises(PbzError) as caught:
             rename.rename(ws, project, "table", "Old", "Dest")
         self.assertEqual(caught.exception.code, "NAME_TAKEN")

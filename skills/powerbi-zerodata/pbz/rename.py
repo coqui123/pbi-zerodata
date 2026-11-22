@@ -690,18 +690,21 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         owned = extra_owned if dest_owned is None else dest_owned
         extending = extra_extending if dest_extending is None else dest_extending
         dest_tables = None
+        dest_extra = extra_tables
         if kind == "table":
             # Suffixes are classified against the post-rename table names:
-            # the old name no longer exists in the destination namespace.
+            # the old name no longer exists in the destination namespace,
+            # in the model or in the report-extension entities.
             dest_tables = [new if _fold(t.name) == _fold(old) else t.name
                            for t in model.tables.values()]
+            dest_extra = [new if _fold(e) == _fold(old) else e for e in extra_tables]
         produced = [nv]
         wrapped = _wrapped_inner(nv)
         if wrapped:
             produced.append(wrapped[1])
         for text in produced:
             if _other_table_owns(model, anchor, text, owned, extending,
-                                 extensions_any=bare, extra_tables=extra_tables, head=head,
+                                 extensions_any=bare, extra_tables=dest_extra, head=head,
                                  dest_tables=dest_tables):
                 raise PbzError("NAME_TAKEN", nv)
     return nv
@@ -1098,7 +1101,8 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
             if _other_table_owns(model, old, f"{new}.{rest}",
                                  _extension_owned_others(project.mirror_report, old),
                                  _extension_owned_dest(project.mirror_report, old, new),
-                                 extra_tables=_extension_tables(project.mirror_report),
+                                 extra_tables=[new if _fold(e) == _fold(old) else e
+                                               for e in _extension_tables(project.mirror_report)],
                                  head=new,
                                  dest_tables=[new if _fold(t2.name) == _fold(old) else t2.name
                                               for t2 in model.tables.values()]):
