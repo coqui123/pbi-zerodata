@@ -216,8 +216,9 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
         original = pbir.walk_fields_with_path(original_root, model)
         following = dict((site, ref) for ref, site in pbir.walk_fields_with_path(following_root, planned))
         after_strings = dict(_report_strings(following_root))
-        for site, value in _report_strings(original_root):
-            expected = _report_string_rename(site[-1], value, kind, home, old, new)
+        home, old = _canonical_target(model, kind, home, old)
+        for site, (node, field) in _report_string_sites(original_root, model, original).items():
+            expected = _report_string_rename(site[-1], node.value, kind, home, old, new, field)
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         for ref, site in original:
@@ -235,29 +236,83 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
 
 
 def _report_strings(node, path=()):
-    """Standalone query references retain their full, index-bearing JSON paths."""
+    """Report reference values retain their full, index-bearing JSON paths."""
+    for site, value in _report_string_nodes(node, path):
+        yield site, value.value
+
+
+def _report_string_nodes(node, path=()):
+    """Report reference nodes with paths for both verification and span edits."""
     if isinstance(node, pbir.JObj):
         for key, value in node.pairs:
             here = path + (key.value,)
             if key.value in ("queryRef", "nativeQueryRef", "metadata", "queryName") and isinstance(value, pbir.JStr):
-                yield here, value.value
-            yield from _report_strings(value, here)
+                yield here, value
+            yield from _report_string_nodes(value, here)
     elif isinstance(node, pbir.JArr):
         for i, value in enumerate(node.items):
-            yield from _report_strings(value, path + (i,))
+            yield from _report_string_nodes(value, path + (i,))
 
 
-def _report_string_rename(key, value, kind, home, old, new):
+def _report_string_sites(root, model, fields=None):
+    """Map each string site to its node and longest containing resolved field."""
+    if fields is None:
+        fields = pbir.walk_fields_with_path(root, model)
+    owners = {site: ref for ref, site in fields}
+    siblings = {}
+    for ref, site in fields:
+        parent = site[:-1]
+        siblings[parent] = ref if parent not in siblings else None
+    sites = {}
+    for site, node in _report_string_nodes(root):
+        field = None
+        for length in range(len(site) - 1, -1, -1):
+            field = owners.get(site[:length])
+            if field is not None:
+                break
+        if field is None:
+            field = siblings.get(site[:-1])
+        sites[site] = (node, field)
+    return sites
+
+
+def _canonical_target(model, kind, home, old):
+    """The model-resolved (table, name) for a rename target, in canonical spelling."""
+    if model is None:
+        return home, old
+    table = model.table(home)
+    if table is None:
+        return home, old
+    if kind == "table":
+        return table.name, old
+    pool = table.columns if kind == "column" else table.measures
+    for obj in pool.values():
+        if obj.name.lower() == old.lower():
+            return table.name, obj.name
+    return table.name, old
+
+
+def _report_string_rename(key, value, kind, home, old, new, field=None):
     if kind == "table":
         if key in ("queryRef", "metadata", "queryName") and value.lower().startswith(old.lower() + "."):
             return new + value[len(old):]
         return value
     if key == "queryName":
         return value
-    rewritten = re.sub(rf"(?i)(?<![\w]){re.escape(home)}\.{re.escape(old)}(?![\w])", f"{home}.{new}", value)
-    if key == "nativeQueryRef" and value.lower() == old.lower():
+    if field is not None:
+        field_kind = "column" if field.kind == "aggregation" else field.kind
+        if field_kind != kind or field.table.lower() != home.lower() or field.name.lower() != old.lower():
+            return value
+        if value == f"{field.table}.{field.name}":
+            return f"{field.table}.{new}"
+        if key == "nativeQueryRef" and value == field.name:
+            return new
+        return value
+    if key in ("queryRef", "metadata", "nativeQueryRef") and value == f"{home}.{old}":
+        return f"{home}.{new}"
+    if key == "nativeQueryRef" and value == old:
         return new
-    return rewritten
+    return value
 
 
 def _binding_edits(bindings, kind, home, old, new, text):
@@ -290,16 +345,16 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str) -> lis
     reference's Property, and queryRef / nativeQueryRef / metadata strings."""
     edits = []
     want = "measure" if kind == "measure" else "column"
-    for ref in pbir.walk_fields(root, model):
+    fields = pbir.walk_fields_with_path(root, model)
+    for ref, _site in fields:
         k = "column" if ref.kind == "aggregation" else ref.kind
         if k == want and ref.name.lower() == old.lower() and ref.table.lower() == home.lower() and ref.prop_node:
             edits.append((ref.prop_node.start, ref.prop_node.end, json.dumps(new, ensure_ascii=False)))
-    for key, node in pbir.string_nodes(root):
-        if key in ("queryRef", "nativeQueryRef", "metadata") and old.lower() in node.value.lower():
-            v = node.value
-            nv = _report_string_rename(key, v, kind, home, old, new)
-            if nv != v:
-                edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
+    home, old = _canonical_target(model, kind, home, old)
+    for site, (node, field) in _report_string_sites(root, model, fields).items():
+        nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field)
+        if nv != node.value:
+            edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
     return edits
 
 
