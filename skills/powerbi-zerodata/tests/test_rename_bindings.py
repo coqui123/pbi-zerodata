@@ -656,6 +656,43 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "table", "ΟΣ", "Revenue")
         self.assertIn('"Revenue"', model_path.read_text())
 
+    def test_column_rename_variation_hierarchy_follows(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+                "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                           "Property": "OrderDate"}},
+                "Hierarchy": "Date Hierarchy"}}, "Level": "Year"},
+              "queryRef": "Sales.OrderDate.Date Hierarchy.Year"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+        proj = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(proj["queryRef"], "Sales.BookedDate.Date Hierarchy.Year")
+        pvs = proj["HierarchyLevel"]["Expression"]["Hierarchy"]["Expression"]["PropertyVariationSource"]
+        self.assertEqual(pvs["Property"], "BookedDate")
+
+    def test_measure_rename_fold_spelling_keeps_culture(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tmeasure 'ΟΣ' = 1\n")
+        cult = Path(mdef, "cultures", "en-US.tmdl")
+        cult.parent.mkdir(parents=True, exist_ok=True)
+        cult.write_text("cultureInfo en-US\n\ttranslations\n\t\ttable Sales\n\t\t\tmeasure 'ΟΣ'\n\t\t\t\tcaption: Sigma\n")
+        rename.rename(ws, project, "measure", "οσ", "Total")
+        self.assertNotIn("ΟΣ", cult.read_text())
+        self.assertIn("Total", cult.read_text())
+
+    def test_measure_rename_into_extension_measure_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Net"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tmeasure Net = 1\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales", "measures": [{"name": "Total", "expression": "2"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "measure", "Net", "Total")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")

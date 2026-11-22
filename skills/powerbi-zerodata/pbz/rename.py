@@ -50,14 +50,20 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         if any(_fold(c.name) == _fold(old) for c in model.all_columns()):
             raise PbzError("AMBIGUOUS", f"a column is also named {old}; rename it in Desktop")
         home = m.table
+        old = m.name
+        if _fold(new) != _fold(old) and _fold(f"{home}.{new}") in _extension_qualified(project.mirror_report, home):
+            raise PbzError("NAME_TAKEN", new)
     elif kind == "column":
         hits = [c for c in model.all_columns() if _fold(c.name) == _fold(old) and (not table or _fold(c.table) == _fold(table))]
         if len(hits) != 1:
             raise PbzError("AMBIGUOUS" if hits else "NOT_FOUND", f"column {old}; pass --table")
         home = hits[0].table
+        old = hits[0].name
         if _fold(new) != _fold(old) and (any(_fold(c.name) == _fold(new) and c.table == home
                                               for c in model.all_columns())
                                          or any(_fold(mm.name) == _fold(new) for mm in model.all_measures())):
+            raise PbzError("NAME_TAKEN", new)
+        if _fold(new) != _fold(old) and _fold(f"{home}.{new}") in _extension_qualified(project.mirror_report, home):
             raise PbzError("NAME_TAKEN", new)
     elif kind == "table":
         return rename_table(ws, project, model, old, new)
@@ -248,8 +254,13 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
                                              extra_tables=_extension_tables(project.mirror_report))
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
+        def _kind_of(r):
+            if r.kind == "aggregation" or (r.kind == "hierarchy" and r.variation):
+                return "column"
+            return r.kind
+
         for ref, site in original:
-            k = "column" if ref.kind == "aggregation" else ref.kind
+            k = _kind_of(ref)
             target = (_fold(ref.table) == _fold(old)) if kind == "table" else (
                 k == kind and _fold(ref.table) == _fold(home) and _fold(ref.name) == _fold(old))
             if not target:
@@ -257,7 +268,7 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
             after_ref = following.get(site)
             table_name = new if kind == "table" else ref.table
             object_name = ref.name if kind == "table" else new
-            if (after_ref is None or ("column" if after_ref.kind == "aggregation" else after_ref.kind) != k
+            if (after_ref is None or _kind_of(after_ref) != k
                     or after_ref.table != table_name or after_ref.name != object_name):
                 raise PbzError("REFUSED", "a report binding did not follow the rename; nothing renamed")
 
@@ -405,14 +416,23 @@ def _rest_after(text, prefix_lower):
     return None
 
 
+def _prefix_swap(value, base, new_base):
+    """Replace a leading dotted base path in value with new_base, slicing at
+    the value's own boundary: the written base can differ in length from the
+    canonical spelling when case folding changes code points."""
+    for i, ch in enumerate(value):
+        if ch == "." and _fold(value[:i]) == _fold(base):
+            return new_base + value[i:]
+    if _fold(value) == _fold(base):
+        return new_base
+    return new_base + value[len(base):]
+
+
 def _head_swap(value, table, new):
     """Replace the leading table segment of a dotted value with new, slicing
     at the value's own boundary dot: the written segment can differ in length
     from the canonical name when case folding changes code points."""
-    for i, ch in enumerate(value):
-        if ch == "." and _fold(value[:i]) == _fold(table):
-            return new + value[i:]
-    return new + value[len(table):]
+    return _prefix_swap(value, table, new)
 
 
 def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
@@ -661,6 +681,21 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
     if field is _AMBIGUOUS:
         return value
     if field is not None:
+        if kind == "column" and field.variation \
+                and _fold(field.table) == _fold(home) and _fold(field.name) == _fold(old):
+            # An auto date/time variation field names its base column: a
+            # string naming that column, or a pure extension of its path
+            # (the variation and hierarchy segments), follows the rename.
+            base = f"{field.table}.{field.name}"
+            if _fold(value) == _fold(base):
+                return f"{home}.{new}"
+            rest = _rest_after(value, _fold(base))
+            if rest is not None and _path_extension(
+                    rest, old,
+                    ([t.name for t in model.tables.values()] if model is not None else [])
+                    + list(extra_tables)):
+                return _prefix_swap(value, base, f"{home}.{new}")
+            return value
         field_kind = "column" if field.kind == "aggregation" else field.kind
         if field_kind != kind or _fold(field.table) != _fold(home) or _fold(field.name) != _fold(old):
             return value
@@ -720,6 +755,27 @@ def dax_ref_edits(text: str, start: int, end: int, kind: str, home: str, old: st
     return _binding_edits(bindings, kind, home, old, new, text)
 
 
+def _pvs_property_node(node):
+    """The PropertyVariationSource Property string node of a field object, or
+    None: the node naming the base column of an auto date/time variation."""
+    if not isinstance(node, pbir.JObj):
+        return None
+    agg = node.get("Aggregation")
+    if isinstance(agg, pbir.JObj):
+        return _pvs_property_node(agg.get("Expression"))
+    for key in ("Column", "HierarchyLevel"):
+        inner = node.get(key)
+        if isinstance(inner, pbir.JObj):
+            expr = inner.get("Expression")
+            if key == "HierarchyLevel" and isinstance(expr, pbir.JObj):
+                h = expr.get("Hierarchy")
+                expr = h.get("Expression") if isinstance(h, pbir.JObj) else None
+            pvs = expr.get("PropertyVariationSource") if isinstance(expr, pbir.JObj) else None
+            prop = pvs.get("Property") if isinstance(pvs, pbir.JObj) else None
+            return prop if isinstance(prop, pbir.JStr) else None
+    return None
+
+
 def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
                    extra_owned=(), extra_extending=(), extra_tables=()) -> list[tuple[int, int, str]]:
     """Edits renaming measure / column `old` of table `home` in one parsed PBIR document: every field
@@ -731,6 +787,35 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
         k = "column" if ref.kind == "aggregation" else ref.kind
         if k == want and _fold(ref.name) == _fold(old) and _fold(ref.table) == _fold(home) and ref.prop_node:
             edits.append((ref.prop_node.start, ref.prop_node.end, json.dumps(new, ensure_ascii=False)))
+    if kind == "column":
+        # A variation field carries no prop_node for its base column: the
+        # base lives in the PropertyVariationSource Property, found by
+        # walking the document with the same From-alias scoping the field
+        # walker uses.
+        def visit(node, aliases):
+            if isinstance(node, pbir.JArr):
+                for v in node.items:
+                    visit(v, aliases)
+                return
+            if not isinstance(node, pbir.JObj):
+                return
+            frm = node.get("From")
+            if isinstance(frm, pbir.JArr):
+                aliases = dict(aliases)
+                for e in frm.items:
+                    if isinstance(e, pbir.JObj) and isinstance(e.get("Name"), pbir.JStr) \
+                            and isinstance(e.get("Entity"), pbir.JStr):
+                        aliases[e.get("Name").value] = e.get("Entity").value
+            ref = pbir.field_of(node, aliases, model)
+            if ref is not None and ref.variation and _fold(ref.table) == _fold(home) \
+                    and _fold(ref.name) == _fold(old):
+                prop = _pvs_property_node(node)
+                if prop is not None:
+                    edits.append((prop.start, prop.end, json.dumps(new, ensure_ascii=False)))
+            for _k, v in node.pairs:
+                visit(v, aliases)
+
+        visit(root, {})
     home, old = _canonical_target(model, kind, home, old)
     for site, (node, field) in _report_string_sites(root, model, fields).items():
         nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
