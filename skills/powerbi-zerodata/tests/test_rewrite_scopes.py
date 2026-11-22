@@ -61,6 +61,26 @@ class RewriteScopeTests(unittest.TestCase):
         expr = 'VAR x = 10 VAR k = 1 RETURN { VAR x = 2 RETURN x, x + k }'
         self.assertIsNone(rewrite._unused(expr))
 
+    def test_nested_block_declaration_does_not_capture_later_use(self):
+        expr = 'VAR x = 1 VAR a = VAR x = 2 RETURN x RETURN x + a'
+        self.assertIsNone(rewrite._unused(expr))
+
+    def test_nested_block_declaration_does_not_shadow_outer_value(self):
+        # The later use binds the outer b, so the outer declaration is not
+        # deleted. The dead inner b cannot be removed without emptying its
+        # block, so the rewrite refuses instead of emitting a candidate.
+        expr = 'VAR b = 5 VAR a = VAR b = 1 RETURN 7 VAR c = b RETURN a + c'
+        with self.assertRaises(PbzError) as caught:
+            rewrite._unused(expr)
+        self.assertEqual(caught.exception.code, 'REFUSED')
+
+    def test_nested_block_body_block_span_covers_whole_initializer(self):
+        expr = 'VAR a = VAR b = 1 RETURN VAR c = b RETURN c VAR keep = 2 RETURN keep'
+        self.assertEqual(rewrite._unused(expr), 'VAR keep = 2 RETURN keep')
+
+    def test_parenthesized_block_as_whole_expression_is_unchanged(self):
+        self.assertIsNone(rewrite._unused('(VAR a = VAR b = 1 RETURN b) + 1'))
+
     def test_unparenthesized_nested_initializer_span_covers_block(self):
         expr = 'VAR a = VAR b = 1 RETURN b VAR c = 2 RETURN c'
         self.assertEqual(rewrite._unused(expr), 'VAR c = 2 RETURN c')

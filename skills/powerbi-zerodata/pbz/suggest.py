@@ -11,60 +11,57 @@ TEXT_VISUALS = {"textbox", "image", "shape", "basicShape", "actionButton", "page
                 "group", ""}
 
 
+def _ends_expression(tok) -> bool:
+    if tok.kind in ("bracket", "num", "str"):
+        return True
+    if tok.kind == "ident":
+        return tok.text.upper() not in ("VAR", "RETURN")
+    return tok.kind == "op" and tok.text in (")", "}")
+
+
+def _scan_boundary(sig, keys, pos, key):
+    """Index of the VAR or RETURN identifier at key that ends the expression
+    region starting at pos, or None when the enclosing group closes first.
+
+    A VAR whose previous token cannot end an expression starts a nested block
+    inside the region; that block is consumed whole instead of being mistaken
+    for the boundary."""
+    while pos < len(sig):
+        if len(keys[pos]) < len(key):
+            return None
+        tok = sig[pos]
+        if keys[pos] == key and tok.kind == "ident" and tok.text.upper() in ("VAR", "RETURN"):
+            if tok.text.upper() == "RETURN":
+                return pos
+            prev = sig[pos - 1] if pos > 0 else None
+            if prev is None or _ends_expression(prev):
+                return pos
+            after = _block_return_end(sig, keys, pos)
+            if after is None:
+                return None
+            pos = after
+            continue
+        pos += 1
+    return None
+
+
 def _block_return_end(sig, keys, var_index):
     """Index just after the RETURN token that closes the VAR block starting at var_index, or None."""
     key = keys[var_index]
     j = var_index
     while True:
-        # Skip declaration j's initializer.
-        k = j + 2
-        if (k + 1 < len(sig) and sig[k].kind == "op" and sig[k].text == "="
-                and sig[k + 1].kind == "ident" and sig[k + 1].text.upper() == "VAR"
-                and keys[k + 1] == key):
-            after = _block_return_end(sig, keys, k + 1)
-            if after is None:
-                return None
-            # The nested block's body follows its RETURN; the next VAR or
-            # RETURN at this key after the body is the sibling or the closer.
-            k = next((m for m in range(after, len(sig))
-                      if keys[m] == key and sig[m].kind == "ident"
-                      and sig[m].text.upper() in ("VAR", "RETURN")), None)
-            if k is None:
-                return None
-        else:
-            k = next((m for m in range(j + 2, len(sig))
-                      if keys[m] == key and sig[m].kind == "ident"
-                      and sig[m].text.upper() in ("VAR", "RETURN")), None)
-            if k is None:
-                return None
-        if sig[k].text.upper() == "RETURN":
-            return k + 1
-        j = k  # sibling declaration inside this block
+        m = _scan_boundary(sig, keys, j + 2, key)
+        if m is None:
+            return None
+        if sig[m].text.upper() == "RETURN":
+            return m + 1
+        j = m  # sibling declaration inside this block
 
 
 def _decl_end(sig, keys, var_index):
     """Start offset of the token that ends the declaration at var_index (the next sibling VAR or the block RETURN at its key), or None."""
-    key = keys[var_index]
-    k = var_index + 2
-    if (k + 1 < len(sig) and sig[k].kind == "op" and sig[k].text == "="
-            and sig[k + 1].kind == "ident" and sig[k + 1].text.upper() == "VAR"
-            and keys[k + 1] == key):
-        after = _block_return_end(sig, keys, k + 1)
-        if after is None:
-            return None
-        # The nested block's body follows its RETURN; the declaration's span
-        # ends at the next VAR or RETURN at this key after the body, or where
-        # the enclosing group closes.
-        for m in range(after, len(sig)):
-            if keys[m] == key and sig[m].kind == "ident" and sig[m].text.upper() in ("VAR", "RETURN"):
-                return sig[m].start
-            if len(keys[m]) < len(key):
-                return sig[m].start
-        return sig[-1].end
-    nxt = next((sig[m].start for m in range(var_index + 2, len(sig))
-                if keys[m] == key and sig[m].kind == "ident"
-                and sig[m].text.upper() in ("VAR", "RETURN")), None)
-    return nxt
+    m = _scan_boundary(sig, keys, var_index + 2, keys[var_index])
+    return sig[m].start if m is not None else None
 
 
 def _unused_decls(expr: str) -> list[dict]:
@@ -94,6 +91,15 @@ def _unused_decls(expr: str) -> list[dict]:
                           "index": i, "start": t.start, "end": end, "key": keys[i], "used": True})
             name_indices.add(i + 1)
 
+    # A declaration nested inside another declaration's span at the same key
+    # (an unparenthesized VAR block used as an initializer) must not bind a
+    # use at or after the enclosing declaration's end.
+    for d in decls:
+        caps = [e["end"] for e in decls
+                if e is not d and e["key"] == d["key"] and e["end"] is not None
+                and e["start"] < d["start"] < e["end"]]
+        d["cap"] = min(caps) if caps else None
+
     bindings = []
     for i, tok in enumerate(sig):
         if tok.kind != "ident" or tok.text.upper() == "VAR" or i in name_indices:
@@ -101,6 +107,7 @@ def _unused_decls(expr: str) -> list[dict]:
         bound = next((d for d in reversed(decls)
                       if d["index"] < i and d["lower"] == tok.text.lower()
                       and d["key"] == keys[i][:len(d["key"])]
+                      and (d["cap"] is None or tok.start < d["cap"])
                       and not any(d["index"] < comma < i for comma in commas.get(d["key"], ()))
                       and not (d["start"] <= tok.start < (d["end"] if d["end"] is not None else float("inf")))), None)
         if bound is not None:
