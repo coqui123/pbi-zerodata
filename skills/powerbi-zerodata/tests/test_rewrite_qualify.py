@@ -32,9 +32,16 @@ class QualifyUnitTests(unittest.TestCase):
             "tables/Other.tmdl": (
                 "table Other\n\n"
                 "\tcolumn Amount\n\t\tdataType: double\n\n"
+                "\tcolumn Margin\n\t\tdataType: double\n\n"
                 "\tcolumn K\n\t\tdataType: int64\n"
             ),
+            "tables/BobsSales.tmdl": (
+                "table 'Bob''s Sales'\n\n"
+                "\tmeasure 'Bob Margin' = SUM([Amount])\n\n"
+                "\tcolumn Amount\n\t\tdataType: double\n"
+            ),
         })
+        self.assertEqual(self.model.measure("Bob Margin").table, "Bob's Sales")
         self.measure_m = self.model.measure("M")
 
     def q(self, expr):
@@ -61,14 +68,28 @@ class QualifyUnitTests(unittest.TestCase):
 
     def test_constructed_table_row_contexts_unchanged(self):
         for expr in (
-            'SUMX(ADDCOLUMNS(VALUES(Other[K]), "Amount", 1), [Amount])',
+            'SUMX(ADDCOLUMNS(VALUES(Sales[K]), "X", 1), [Amount])',
             'VAR t = SELECTCOLUMNS(Other, "Amount", Other[K]) RETURN SUMX(t, [Amount])',
+            'SUMX(ADDCOLUMNS(VALUES(Other[K]), "Amount", 1), [Amount])',
         ):
             with self.subTest(expr=expr):
                 self.assertEqual(self.q(expr), expr)
 
     def test_qualified_measure_reference_is_stripped(self):
         self.assertEqual(self.q("'Sales'[Margin]"), "[Margin]")
+
+    def test_unquoted_measure_qualifier_is_not_stripped(self):
+        expr = "SUMX(Other, Sales[Margin])"
+        self.assertEqual(self.q(expr), expr)
+
+    def test_strip_decodes_escaped_apostrophes(self):
+        self.assertEqual(self.q("'Bob''s Sales'[Bob Margin]"), "[Bob Margin]")
+
+    def test_strip_preserves_intervening_comment(self):
+        self.assertEqual(self.q("'Sales' /* why */ [Margin]"), " /* why */ [Margin]")
+
+    def test_constructed_name_without_call_still_qualifies(self):
+        self.assertEqual(self.q("SUM([Amount]) + ADDCOLUMNS"), "SUM(Sales[Amount]) + ADDCOLUMNS")
 
 
 class QualifyRunValidationTests(unittest.TestCase):
@@ -114,13 +135,32 @@ class QualifyRunValidationTests(unittest.TestCase):
     def test_failed_candidate_validation_leaves_bytes_untouched(self):
         self._insert_measure("Qual Target", "SUM([Amount])", "10000000-0000-0000-0000-0000000001a1")
         before = self._tree_bytes(self.ws.mirror)
+        calls = []
+
+        def fail_candidate(*args):
+            calls.append(args)
+            return {"status": "FAIL", "errors": 1}
+
         with self._closed_desktop(), patch.object(
-            rewrite, "compile_candidate", return_value={"status": "FAIL", "errors": 1}, create=True
+            rewrite, "compile_candidate", side_effect=fail_candidate, create=True
         ):
             with self.assertRaises(PbzError) as caught:
                 rewrite.run(self.ws, self.project, "qualify", "[Qual Target]")
             self.assertEqual(caught.exception.code, "REFUSED")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][:2], (self.ws, self.project))
+            self.assertEqual(calls[0][2].name, "Qual Target")
+            self.assertEqual(calls[0][3], "SUM(Sales[Amount])")
         self.assertEqual(self._tree_bytes(self.ws.mirror), before)
+
+    def test_passing_candidate_validation_writes(self):
+        self._insert_measure("Qual Target", "SUM([Amount])", "10000000-0000-0000-0000-0000000001a3")
+        with self._closed_desktop(), patch.object(
+            rewrite, "compile_candidate", return_value={"status": "PASS"}, create=True
+        ):
+            out = rewrite.run(self.ws, self.project, "qualify", "[Qual Target]")
+        self.assertEqual(out["result"], "CHANGED")
+        self.assertEqual(self._model().measure("Qual Target").expression.strip(), "SUM(Sales[Amount])")
 
     def test_unavailable_validation_proceeds_and_reports_not_compiled(self):
         self._insert_measure("Qual Target", "SUM([Amount])", "10000000-0000-0000-0000-0000000001a2")

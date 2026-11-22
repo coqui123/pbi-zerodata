@@ -184,7 +184,11 @@ def _unused(expr: str) -> str | None:
 
 def _qualify(expr: str, measure, model) -> str:
     sig = lexers.significant(lexers.lex_dax(expr))
-    if any(tok.kind == "ident" and tok.text.upper() in ("ADDCOLUMNS", "SELECTCOLUMNS") for tok in sig):
+    if any(
+        tok.kind == "ident" and tok.text.upper() in ("ADDCOLUMNS", "SELECTCOLUMNS")
+        and following.kind == "op" and following.text == "("
+        for tok, following in zip(sig, sig[1:])
+    ):
         return expr
     res = deps.Resolver(model)
     bindings = deps.dax_bindings(expr, measure.table, res, row_home=False).bindings
@@ -197,10 +201,10 @@ def _qualify(expr: str, measure, model) -> str:
             edits.append((b.start, b.start, lexers.tmdl_name(measure.table)))
         if b.ref.kind == "measure" and b.qualifier is not None:
             name = expr[b.qualifier[0]:b.qualifier[1]]
-            if name.startswith("'") and name.endswith("'"):
-                name = name[1:-1]
-            if name.lower() == b.ref.table.lower():
-                edits.append((b.qualifier[0], b.start, ""))
+            if name.startswith("'"):
+                name = name[1:-1].replace("''", "'")
+                if name.lower() == b.ref.table.lower():
+                    edits.append((b.qualifier[0], b.qualifier[1], ""))
     if not edits:
         return expr
     out = expr
