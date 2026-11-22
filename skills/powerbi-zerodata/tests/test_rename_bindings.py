@@ -1479,6 +1479,25 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
         self.assertEqual(m, "SUMX(Sales, VAR x = 1 RETURN[Net] + x)")
 
+    def test_table_rename_window_boundary_modes_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Abs.tmdl"),
+               "table Abs\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(WINDOW(1, ABS, 0, REL, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC)))"},
+                {"name": "N", "expression": "SUM('Abs'[Amount])"}]}]}))
+        rename.rename(ws, project, "table", "Abs", "Archive")
+        ms = {m["name"]: m["expression"]
+              for m in json.loads(ext_path.read_text())["entities"][0]["measures"]}
+        self.assertEqual(ms["M"], "COUNTROWS(WINDOW(1, ABS, 0, REL, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC)))")
+        self.assertEqual(ms["N"], "SUM('Archive'[Amount])")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

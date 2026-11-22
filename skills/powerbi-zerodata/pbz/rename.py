@@ -1011,11 +1011,12 @@ def _pvs_property_node(node):
 # token with one of these texts is the keyword, never a table
 # reference, since DAX itself requires such table names to be quoted.
 _DAX_KEYWORDS = {_fold(w) for w in (
-    "and", "asc", "both", "break", "by", "column", "day", "define",
+    "abs", "and", "asc", "both", "break", "by", "column", "day", "define",
     "densify", "dense", "desc", "else", "evaluate", "false", "group",
     "hour", "in", "index", "matchby", "measure", "minute", "month",
     "mparameter", "none", "not", "oneway", "oneway_leftfiltersright",
-    "oneway_rightfiltersleft", "or", "order", "quarter", "return", "row",
+    "oneway_rightfiltersleft", "or", "order", "quarter", "rel", "return",
+    "row",
     "second", "skip", "table", "then", "total", "true", "var", "week",
     "window", "year")}
 
