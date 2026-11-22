@@ -1498,6 +1498,22 @@ class RenameBindingsTests(unittest.TestCase):
         self.assertEqual(ms["M"], "COUNTROWS(WINDOW(1, ABS, 0, REL, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC)))")
         self.assertEqual(ms["N"], "SUM('Archive'[Amount])")
 
+    def test_table_rename_rank_blank_option_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Last.tmdl"),
+               "table Last\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "RANK(DENSE, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC), LAST) + COUNTROWS('Last')"}]}]}))
+        rename.rename(ws, project, "table", "Last", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "RANK(DENSE, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC), LAST) + COUNTROWS('Archive')")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
