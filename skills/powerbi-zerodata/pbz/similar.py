@@ -178,25 +178,28 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     uncertain = False
     stack: list[dict] = []   # {"fn", "arg", "row_table"}: mirrors the deps.dax_bindings frames
 
-    TABLE_FUNCS = {"VALUES", "DISTINCT", "ALL", "ALLEXCEPT", "ALLNOBLANKROW", "ALLSELECTED",
-                   "FILTER", "CALCULATETABLE", "SUMMARIZE", "SUMMARIZECOLUMNS", "ADDCOLUMNS",
-                   "SELECTCOLUMNS", "TOPN", "GENERATE", "GENERATEALL", "GENERATESERIES",
-                   "UNION", "INTERSECT", "EXCEPT", "TREATAS", "CROSSJOIN", "NATURALINNERJOIN",
-                   "NATURALLEFTOUTERJOIN", "GROUPBY", "ROW", "DATATABLE", "SAMPLE", "INDEX",
-                   "OFFSET", "WINDOW", "CALENDAR", "CALENDARAUTO", "DATEADD", "DATESYTD",
-                   "DATESMTD", "DATESQTD", "DATESBETWEEN", "SAMEPERIODLASTYEAR", "KEEPFILTERS",
-                   "FILTERS", "DETAILROWS"}
+    PREDICATE_EXEMPT = {"FILTER", "CALCULATETABLE", "ADDCOLUMNS"}
+
+    def _source_frame(idx):
+        for g in reversed(stack[idx + 1:]):
+            if g["fn"] and g["fn"] not in SCALAR_FUNCS:
+                return g
+        return None
 
     def learn(table, bare: bool = False) -> None:
         if table:
-            for fr in stack:
+            for idx, fr in enumerate(stack):
                 if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"]:
                     if fr["row_table"] is None:
                         fr["row_table"] = table
+                        if not bare:
+                            g = _source_frame(idx)
+                            if g is not None and g["arg"] != 0:
+                                fr["taint"] = g
                     elif bare and fr["row_table"] != table:
                         fr["row_table"] = None
                         fr["poisoned"] = True
-                    if fr.get("taint") is not None and fr["row_table"] == table:
+                    if bare and fr.get("taint") is not None and fr["row_table"] == table:
                         fr["taint"] = None
 
     def poison_qualified(tab) -> None:
@@ -205,7 +208,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         for idx, fr in enumerate(stack):
             if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"] \
                     and fr["row_table"] is not None and fr["row_table"] != tab:
-                if any(g["fn"] in TABLE_FUNCS and g["arg"] == 0 for g in stack[idx + 1:]):
+                g = _source_frame(idx)
+                if g is not None and not (g["fn"] in PREDICATE_EXEMPT and g["arg"] >= 1):
                     fr["row_table"] = None
                     fr["poisoned"] = True
 
@@ -218,7 +222,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             fn = prev.text.upper() if prev is not None and prev.kind == "ident" else ""
             frame = {"fn": fn, "arg": 0, "row_table": None, "poisoned": False, "taint": None}
             stack.append(frame)
-            if fn in TABLE_FUNCS:
+            if fn and fn not in SCALAR_FUNCS:
                 for fr in stack[:-1]:
                     if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
                             and fr["row_table"] is not None and not fr["poisoned"]:
