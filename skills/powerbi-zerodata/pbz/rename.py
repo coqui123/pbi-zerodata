@@ -210,7 +210,7 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     writes = {op[1]: op[2] for op in ops if op[0] == "write"}
     ext_q = _extension_qualified(project.mirror_report, old) if kind == "table" else set()
     ext_owned = _extension_owned_others(project.mirror_report, home) if kind != "table" \
-        else _extension_owned(project.mirror_report, old)
+        else _extension_owned_others(project.mirror_report, old)
     ext_ext = _extension_owned(project.mirror_report, home) if kind != "table" else set()
     for path in pbir.report_files(project.mirror_report):
         text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
@@ -410,6 +410,11 @@ def _other_table_owns(model, home, value, extra_owned=(), extra_extending=(),
         rest = _rest_after(value, pl)
         if rest is not None and _path_extension(rest, home, tables):
             return True
+    if extensions_any:
+        for p in extra_owned:
+            rest = _rest_after(value, p.lower())
+            if rest is not None and _path_extension(rest, home, tables):
+                return True
     if model is None:
         return False
     for t in model.tables.values():
@@ -448,7 +453,7 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
     other_q = {p.lower() for p in other_owned}
     if model is not None:
         for other in model.tables.values():
-            if other.name.lower().startswith(old.lower() + "."):
+            if other.name.lower() != old.lower():
                 other_q |= _table_qualified(model, other.name)[1]
 
     def _extends(text, qset):
@@ -575,6 +580,10 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                         return value
                     swapped = _head_swap(probe, field.table, new)
                     return f"{wrapped[0]}({swapped})" if wrapped else swapped
+                # A resolved binding owns the string even when its text does
+                # not match the field's own path: never fall through to the
+                # unbound rewrite and desync it from its field.
+                return value
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
                 return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model,
@@ -827,7 +836,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         _tbl, _qualified = _table_qualified(model, old)
         if _tbl is not None:
             ext_q = _extension_qualified(project.mirror_report, old)
-            ext_owned = _extension_owned(project.mirror_report, old)
+            ext_owned = _extension_owned_others(project.mirror_report, old)
             for site, (node, field) in _report_string_sites(root, model).items():
                 if site[-1] in ("queryRef", "metadata", "queryName"):
                     nv = _report_string_rename(site[-1], node.value, "table", "", old, new,

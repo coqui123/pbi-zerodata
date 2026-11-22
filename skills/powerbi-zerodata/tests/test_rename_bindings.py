@@ -373,8 +373,8 @@ class RenameBindingsTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
     def test_table_rename_casefold_length_mismatch(self):
-        from unittest.mock import Mock
-        field = Mock(table="İ", name="Amount", kind="column")
+        from types import SimpleNamespace as NS
+        field = NS(table="İ", name="Amount", kind="column")
         out = rename._report_string_rename("queryRef", "i̇.Amount", "table", "", "İ", "Revenue",
                                            field=field, model=None)
         self.assertEqual(out, "Revenue.Amount")
@@ -422,9 +422,37 @@ class RenameBindingsTests(unittest.TestCase):
     def test_table_rename_longer_table_not_blocked_by_prefix_table(self):
         ws, project, mdef, path = self._colliding_project(
             {"refs": [{"queryRef": "Sales.Region.Amount"}, {"queryRef": "Sum(Sales.Region.Amount)"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Total\n\t\tdataType: int64\n")
         rename.rename(ws, project, "table", "Sales.Region", "Territory")
         refs = [r["queryRef"] for r in json.loads(path.read_text())["refs"]]
         self.assertEqual(refs, ["Territory.Amount", "Sum(Territory.Amount)"])
+
+    def test_table_rename_exact_string_owned_by_shorter_table_stays(self):
+        ws, project, mdef, path = self._colliding_project(
+            {"refs": [{"queryRef": "Sales.Region.Amount"}, {"queryRef": "Sum(Sales.Region.Amount)"}]})
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales.Region", "Territory")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_bound_string_of_other_table_unchanged(self):
+        field = {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"},
+                 "queryRef": "Sales.Amount"}
+        ws, project, mdef, path = self._report_project({"projections": [field]})
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_bare_native_query_ref_extension_measure_of_other(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"nativeQueryRef": "Other.Ext.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Other.Ext.Share'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Other", "measures": [{"name": "Ext", "expression": "1"}]}]}))
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Other.Ext.Share", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
 
     def test_table_rename_own_column_under_longer_prefix(self):
         ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Budget"}]})
