@@ -1013,7 +1013,8 @@ def _pvs_property_node(node):
 # table reference, since DAX itself requires such table names to be
 # quoted.
 _DAX_KEYWORDS = {_fold(w) for w in (
-    "abs", "and", "asc", "blanks", "boolean", "both", "break", "by",
+    "abs", "anchored", "and", "asc", "blanks", "boolean", "both", "break",
+    "by",
     "column", "currency", "datetime", "day", "default", "define",
     "densify", "dense", "desc", "double", "else", "evaluate", "extending",
     "false",
