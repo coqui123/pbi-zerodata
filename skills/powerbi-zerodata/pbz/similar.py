@@ -324,7 +324,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
 
     def learn(table, bare: bool = False, column=None) -> None:
         if table:
+            _def_depth = pending_vars[-1][1] if pending_vars else -1
             for idx, fr in enumerate(stack):
+                if idx < _def_depth:
+                    continue
                 if fr["fn"] in deps.ITERATORS and _teaches_at(fr) and not fr["poisoned"]:
                     trusted = _in_source_region(idx, stack[-1]["arg"] if len(stack) > idx + 1 else 0) \
                         and not any(g["fn"] == "TREATAS" for g in stack[idx + 1:])
@@ -410,7 +413,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             if _applies:
                                 fr["only_columns"] = _val
                     if eff_bare and fr["row_table"] == table and fr.get("only_columns") is not None \
-                            and not pending_vars and _widens(idx):
+                            and _widens(idx):
                         fr["only_columns"] = None
                         fr["only_src"] = None
                     if eff_bare and fr.get("taint") is not None and fr["row_table"] == table \
@@ -598,7 +601,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 fr["x_span"].append(t)
         if t.kind == "ident" and t.text.upper() == "VAR" \
                 and nxt is not None and nxt.kind == "ident":
-            if pending_vars and pending_vars[-1][1] == len(stack):
+            _prev = sig[i - 1] if i else None
+            if pending_vars and pending_vars[-1][1] == len(stack) \
+                    and not (_prev is not None and _prev.kind == "op" and _prev.text == "="):
                 pending_vars.pop()
             pending_vars.append((nxt.text.lower(), len(stack)))
         elif t.kind == "ident" and t.text.upper() == "RETURN" \
@@ -951,7 +956,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             if _vt is None or fr["row_table"] != _vt:
                                 fr["row_table"] = None
                                 fr["poisoned"] = True
-                            elif not pending_vars and _widens(f_idx):
+                            elif _widens(f_idx):
                                 _par = next((g for g in reversed(stack) if g["fn"]), None)
                                 _applies, _val = _combine(
                                     fr, _par, _par["arg"] if _par else 0,
