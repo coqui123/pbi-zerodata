@@ -204,6 +204,7 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     # Inventory report field sites before editing too, even when a missed rewrite
     # produced no write operation for the containing file.
     writes = {op[1]: op[2] for op in ops if op[0] == "write"}
+    ext_q = _extension_qualified(project.mirror_report, old) if kind == "table" else set()
     for path in pbir.report_files(project.mirror_report):
         text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
         try:
@@ -218,7 +219,8 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
         after_strings = dict(_report_strings(following_root))
         home, old = _canonical_target(model, kind, home, old)
         for site, (node, field) in _report_string_sites(original_root, model, original).items():
-            expected = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model)
+            expected = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
+                                             extra_qualified=ext_q)
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
         for ref, site in original:
@@ -275,7 +277,10 @@ def _report_string_sites(root, model, fields=None):
                                  for length in range(len(site) - 1, -1, -1)):
             field = _AMBIGUOUS
         if field is None:
-            field = siblings.get(site[:-1])
+            for length in range(len(site) - 1, -1, -1):
+                field = siblings.get(site[:length])
+                if field is not None:
+                    break
         sites[site] = (node, field)
     return sites
 
@@ -322,6 +327,19 @@ def _table_qualified(model, old):
     return table, qualified
 
 
+def _path_extension(rest):
+    """True when rest is only dotted name segments extending a qualified path
+    (hierarchy levels, variations), never an expression fragment. An allowlist,
+    so a new operator character cannot reopen a partial rewrite."""
+    if not rest:
+        return False
+    for seg in rest.split("."):
+        seg = seg.strip()
+        if not seg or not all(ch.isalnum() or ch in "_ " for ch in seg):
+            return False
+    return True
+
+
 def _table_rewrite(value, old, new, qualified, table=None, model=None):
     """Rewrite one table reference in a report string, or return the value unchanged.
 
@@ -351,7 +369,7 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None):
         for q in qualified:
             if text.lower().startswith(q + "."):
                 rest = text[len(q) + 1:]
-                if not re.search(r"[+\-*/^&=<>(),|]", rest):
+                if _path_extension(rest):
                     return True
         return False
 
@@ -381,17 +399,50 @@ def _single_wrapped(value):
     return None
 
 
-def _report_string_rename(key, value, kind, home, old, new, field=None, model=None):
+def _extension_qualified(report_dir, old):
+    """Qualified paths of the report-extension measures defined for a table.
+
+    reportExtensions.json can attach measures to a model table inside the
+    report. They are not model objects, but reference strings naming them
+    belong to the table and must follow its rename like model measures do."""
+    path = os.path.join(report_dir, "definition", "reportExtensions.json")
+    if not os.path.isfile(path):
+        return set()
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            root = pbir.parse_json(fh.read())
+    except Exception:
+        return set()
+    qualified = set()
+    ents = root.get("entities") if isinstance(root, pbir.JObj) else None
+    if isinstance(ents, pbir.JArr):
+        for ent in ents.items:
+            if not isinstance(ent, pbir.JObj):
+                continue
+            nm = ent.get("name")
+            if not isinstance(nm, pbir.JStr) or nm.value.lower() != old.lower():
+                continue
+            measures = ent.get("measures")
+            if isinstance(measures, pbir.JArr):
+                for m in measures.items:
+                    mn = m.get("name") if isinstance(m, pbir.JObj) else None
+                    if isinstance(mn, pbir.JStr):
+                        qualified.add(f"{nm.value}.{mn.value}".lower())
+    return qualified
+
+
+def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
+                          extra_qualified=()):
     if kind == "table":
         if key in ("queryRef", "metadata", "queryName"):
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
-                return _table_rewrite(value, old, new, qualified, _tbl, model)
+                return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model)
             if value.lower().startswith(old.lower() + "."):
                 return new + value[len(old):]
             wrapped = _single_wrapped(value)
             if wrapped and wrapped[1].lower().startswith(old.lower() + ".") \
-                    and not re.search(r"[+\-*/^&=<>]", wrapped[1][len(old) + 1:]):
+                    and _path_extension(wrapped[1][len(old) + 1:]):
                 return f"{wrapped[0]}({new}{wrapped[1][len(old):]})"
         return value
     if key == "queryName":
@@ -624,6 +675,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
 
         visit(root)
         _tbl, _qualified = _table_qualified(model, old)
+        _qualified = _qualified | _extension_qualified(project.mirror_report, old)
         for key, node in pbir.string_nodes(root):
             if key in ("queryRef", "metadata", "queryName") and _tbl is not None:
                 nv = _table_rewrite(node.value, old, new, _qualified, _tbl, model)

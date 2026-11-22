@@ -269,6 +269,39 @@ class RenameBindingsTests(unittest.TestCase):
                         self.assertEqual(after[1], obj["refs"][1])
                         self.assertEqual(after[2]["nativeQueryRef"], "Sales" if kind == "table" else "Value")
 
+    def test_table_rename_expression_metadata_unchanged(self):
+        for value in ("Sales.Amount.Share IN { 2025 }", "Sales.Amount.Share % Sales.Total",
+                      "Sales.Amount.Share || Sales.Amount"):
+            with self.subTest(value=value):
+                ws, project, _mdef, path = self._report_project({"refs": [{"metadata": value}]})
+                before = path.read_bytes()
+                rename.rename(ws, project, "table", "Sales", "Revenue")
+                self.assertEqual(path.read_bytes(), before)
+        # A pure dotted extension of a qualified path still follows.
+        ws, project, _mdef, path = self._report_project({"refs": [{"metadata": "Sales.Amount.Share"}]})
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["metadata"], "Revenue.Amount.Share")
+
+    def test_nested_string_follows_owning_projection(self):
+        def proj(entity):
+            return {"field": {"Column": {"Expression": {"SourceRef": {"Entity": entity}},
+                                         "Property": "Amount"}},
+                    "details": {"nativeQueryRef": "Amount"}}
+        ws, project, _mdef, path = self._report_project({"projections": [proj("Other"), proj("Sales")]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        after = json.loads(path.read_text())["projections"]
+        self.assertEqual(after[0]["details"]["nativeQueryRef"], "Amount")
+        self.assertEqual(after[1]["details"]["nativeQueryRef"], "Value")
+
+    def test_table_rename_report_extension_measure_follows(self):
+        ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales", "measures": [{"name": "Ext", "expression": "SUM(Sales[Amount])"}]}]}))
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Revenue.Ext")
+        self.assertEqual(json.loads(ext_path.read_text())["entities"][0]["name"], "Revenue")
+
     def test_verify_report_parse_failure_refuses_and_pbzerror_passes_through(self):
         ws, project, mdef, _path = self._report_project({})
         model = tmdl.load_model(mdef)
