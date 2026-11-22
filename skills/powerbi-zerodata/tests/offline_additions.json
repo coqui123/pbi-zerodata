@@ -23,6 +23,12 @@
       "argv": [
         "tests/test_evidence.py"
       ]
+    },
+    {
+      "id": "skip_capture",
+      "argv": [
+        "tests/test_skip_capture.py"
+      ]
     }
   ]
 }

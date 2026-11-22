@@ -825,5 +825,13 @@
     "windows": true,
     "engine": true,
     "weight": 37.6
+  },
+  {
+    "id": "skip_capture",
+    "argv": [
+      "tests/test_skip_capture.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]
