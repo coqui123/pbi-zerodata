@@ -63,7 +63,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             raise PbzError("AMBIGUOUS" if hits else "NOT_FOUND", f"column {old}; pass --table")
         home = hits[0].table
         old = hits[0].name
-        if _fold(new) != _fold(old) and (any(_fold(c.name) == _fold(new) and c.table == home
+        if _fold(new) != _fold(old) and (any(_fold(c.name) == _fold(new)
                                               for c in model.all_columns())
                                          or any(_fold(mm.name) == _fold(new) for mm in model.all_measures())):
             raise PbzError("NAME_TAKEN", new)
@@ -963,6 +963,10 @@ def _pvs_property_node(node):
     return None
 
 
+_DAX_KEYWORDS = {_fold(w) for w in (
+    "return", "var", "in", "then", "else", "true", "false", "not", "and", "or")}
+
+
 def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None):
     """Binding edits renaming the target inside one DAX expression string,
     under the same rules as the TMDL editors. The model-only resolver does
@@ -972,6 +976,15 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
     measure on the renamed table still follows that table's qualifier."""
     ext_measures = ext_measures or {}
     ext_names = set().union(*ext_measures.values()) if ext_measures else set()
+    if kind == "table":
+        # The emitted table name must not capture a DAX variable defined in
+        # the expression: the rewritten reference would bind the variable.
+        toks = lexers.significant(lexers.lex_dax(text))
+        for i, tok in enumerate(toks[:-1]):
+            if tok.kind == "ident" and tok.text.upper() == "VAR" \
+                    and toks[i + 1].kind == "ident" and _fold(toks[i + 1].text) == _fold(new):
+                raise PbzError("AMBIGUOUS",
+                               f"a variable named {new} is defined in a report expression; nothing renamed")
     res = deps.Resolver(model)
     if kind == "column" and _fold(old) in ext_names:
         # An extension measure bears the target's name, so a bare reference
@@ -996,9 +1009,11 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
         if binding.qualifier is None:
             # A spaced qualifier (Budget [Amount]) is still a qualified
             # reference to that entity's extension measure, although the
-            # resolver leaves the binding bare.
+            # resolver leaves the binding bare. A DAX keyword in that
+            # position (RETURN [Amount]) is not a qualifier.
             toks = lexers.significant(lexers.lex_dax(text[:binding.start]))
-            if toks and toks[-1].kind in ("ident", "table"):
+            if toks and toks[-1].kind in ("ident", "table") \
+                    and _fold(toks[-1].value or toks[-1].text) not in _DAX_KEYWORDS:
                 prev_name = toks[-1].value or toks[-1].text
                 if _fold(binding.ref.name) in ext_measures.get(_fold(prev_name), set()):
                     return True
