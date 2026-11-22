@@ -73,15 +73,40 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
     bindings = deps.dax_bindings(expr, home, res)
     by_span = {(b.start, b.end): b for b in bindings.bindings}
     var_names: dict[str, str] = {}
-    table_vars: set[str] = set()
+    var_rhs: dict[str, list] = {}
     for i, t in enumerate(sig):
         if t.kind == "ident" and t.text.upper() == "VAR" and i + 1 < len(sig) and sig[i + 1].kind == "ident":
             var_names.setdefault(sig[i + 1].text.lower(), f"$v{len(var_names) + 1}")
-            if i + 4 < len(sig) and sig[i + 2].kind == "op" and sig[i + 2].text == "=" \
-                    and (sig[i + 3].kind == "table" or
-                         (sig[i + 3].kind == "ident" and res.table(sig[i + 3].text))) \
-                    and sig[i + 4].kind == "ident" and sig[i + 4].text.upper() in ("RETURN", "VAR"):
-                table_vars.add(sig[i + 1].text.lower())
+            if i + 2 < len(sig) and sig[i + 2].kind == "op" and sig[i + 2].text == "=":
+                rhs, depth = [], 0
+                for u in sig[i + 3:]:
+                    if u.kind == "op" and u.text in ("(", "{"):
+                        depth += 1
+                    elif u.kind == "op" and u.text in (")", "}"):
+                        depth -= 1
+                    if depth == 0 and u.kind == "ident" and u.text.upper() in ("RETURN", "VAR"):
+                        break
+                    rhs.append(u)
+                var_rhs[sig[i + 1].text.lower()] = rhs
+
+    def _rhs_is_table(rhs) -> bool:
+        for j, u in enumerate(rhs):
+            nxt = rhs[j + 1] if j + 1 < len(rhs) else None
+            if u.kind == "table":
+                return True
+            if u.kind == "ident" and res.table(u.text) and not (nxt is not None and nxt.kind == "bracket"):
+                return True
+        return False
+
+    table_vars = {name for name, rhs in var_rhs.items() if _rhs_is_table(rhs)}
+    changed = True
+    while changed:
+        changed = False
+        for name, rhs in var_rhs.items():
+            if name not in table_vars and len(rhs) == 1 and rhs[0].kind == "ident" \
+                    and rhs[0].text.lower() in table_vars:
+                table_vars.add(name)
+                changed = True
     extension = {t.value.lower() for t in sig if t.kind == "str"}
     toks: list[tuple[str, str, str]] = []
     uncertain = False

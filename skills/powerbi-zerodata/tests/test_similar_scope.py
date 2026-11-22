@@ -43,6 +43,10 @@ SALES = (
     "\tmeasure TopB = VAR v = Other RETURN SUMX(TOPN(MAX(Sales[Price]), v), Sales[Price])\n\n"
     "\tmeasure ScalarA = VAR n = 0 RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
     "\tmeasure ScalarB = VAR n = 0 RETURN SUMX(FILTER(Sales, Sales[Price] > n), [Price])\n\n"
+    "\tmeasure ExprA = VAR v = FILTER(Other, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure ExprB = VAR v = FILTER(Other, TRUE()) RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
+    "\tmeasure ChainA = VAR a = Other VAR v = a RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), [Price])\n\n"
+    "\tmeasure ChainB = VAR a = Other VAR v = a RETURN SUMX(CALCULATETABLE(v, Sales[Price] > 0), Sales[Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -87,7 +91,8 @@ class SimilarScopeTests(unittest.TestCase):
             {("Sales", name) for name in
              ("IterA", "IterB", "IterC", "IterD", "UnresA", "UnresB", "CtrlA", "CtrlB",
               "VarA", "VarB", "AliasUnres", "AliasOk", "WrapA", "WrapB",
-              "TabA", "TabB", "TabCtrlA", "TabCtrlB", "TopA", "TopB", "ScalarA", "ScalarB")},
+              "TabA", "TabB", "TabCtrlA", "TabCtrlB", "TopA", "TopB", "ScalarA", "ScalarB",
+              "ExprA", "ExprB", "ChainA", "ChainB")},
         )
 
     def _canon(self, name):
@@ -175,6 +180,15 @@ class SimilarScopeTests(unittest.TestCase):
         with self.assertRaises(PbzError) as caught:
             consolidate.merge(self.ws, self.project, "TopB", "TopA", dry_run=True)
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_expression_defined_table_var_still_poisons(self):
+        for dup, into in (("ExprB", "ExprA"), ("ChainB", "ChainA")):
+            with self.subTest(into=into):
+                self.assertEqual(self._key(dup), self._key(into))
+                self.assertTrue(self._canon(into).uncertain)
+                with self.assertRaises(PbzError) as caught:
+                    consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
+                self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
     def test_scalar_var_does_not_block_learned_row_table(self):
         self.assertFalse(self._canon("ScalarA").uncertain)
