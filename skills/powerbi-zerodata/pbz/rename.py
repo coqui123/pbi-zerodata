@@ -793,6 +793,12 @@ def _pvs_property_node(node):
     agg = node.get("Aggregation")
     if isinstance(agg, pbir.JObj):
         return _pvs_property_node(agg.get("Expression"))
+    grp = node.get("GroupRef")
+    if isinstance(grp, pbir.JObj):
+        expr = grp.get("Expression")
+        pvs = expr.get("PropertyVariationSource") if isinstance(expr, pbir.JObj) else None
+        prop = pvs.get("Property") if isinstance(pvs, pbir.JObj) else None
+        return prop if isinstance(prop, pbir.JStr) else None
     for key in ("Column", "HierarchyLevel"):
         inner = node.get(key)
         if isinstance(inner, pbir.JObj):
@@ -865,20 +871,29 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
 
 def _measure_expression_edits(root, model, kind, home, old, new):
     """Span edits for the DAX expression strings of report-extension
-    measures: a measure object (a name and an expression string) under an
-    entity object, whose name is the resolution context for bare refs."""
+    measures. Only direct measure entries of an entities array (the
+    reportExtensions.json shape) qualify; a name and expression object
+    anywhere else is not a measure and is never edited."""
     edits = []
-    ext_measures = {}
+    entities = []
 
-    def collect(node):
+    def find_entities(node):
         if isinstance(node, pbir.JArr):
             for v in node.items:
-                collect(v)
+                find_entities(v)
             return
         if not isinstance(node, pbir.JObj):
             return
-        nm = node.get("name")
-        measures = node.get("measures")
+        for k, v in node.pairs:
+            if k.value == "entities" and isinstance(v, pbir.JArr):
+                entities.extend(item for item in v.items if isinstance(item, pbir.JObj))
+            find_entities(v)
+
+    find_entities(root)
+    ext_measures = {}
+    for ent in entities:
+        nm = ent.get("name")
+        measures = ent.get("measures")
         if isinstance(nm, pbir.JStr) and isinstance(measures, pbir.JArr):
             names = set()
             for m in measures.items:
@@ -886,31 +901,21 @@ def _measure_expression_edits(root, model, kind, home, old, new):
                 if isinstance(mn, pbir.JStr):
                     names.add(_fold(mn.value))
             ext_measures[_fold(nm.value)] = names
-        for _k, v in node.pairs:
-            collect(v)
-
-    collect(root)
-
-    def visit(node, entity=""):
-        if isinstance(node, pbir.JArr):
-            for v in node.items:
-                visit(v, entity)
-            return
-        if not isinstance(node, pbir.JObj):
-            return
-        nm = node.get("name")
-        if isinstance(nm, pbir.JStr) and isinstance(node.get("measures"), pbir.JArr):
-            entity = nm.value
-        expr = node.get("expression")
-        if isinstance(expr, pbir.JStr) and isinstance(nm, pbir.JStr):
-            sub = _dax_string_edits(expr.value, model, kind, home, old, new, entity, ext_measures)
-            if sub:
-                edits.append((expr.start, expr.end,
-                              json.dumps(apply_edits(expr.value, sub), ensure_ascii=False)))
-        for _k, v in node.pairs:
-            visit(v, entity)
-
-    visit(root)
+    for ent in entities:
+        nm = ent.get("name")
+        measures = ent.get("measures")
+        if not (isinstance(nm, pbir.JStr) and isinstance(measures, pbir.JArr)):
+            continue
+        for m in measures.items:
+            if not isinstance(m, pbir.JObj):
+                continue
+            mn = m.get("name")
+            expr = m.get("expression")
+            if isinstance(expr, pbir.JStr) and isinstance(mn, pbir.JStr):
+                sub = _dax_string_edits(expr.value, model, kind, home, old, new, nm.value, ext_measures)
+                if sub:
+                    edits.append((expr.start, expr.end,
+                                  json.dumps(apply_edits(expr.value, sub), ensure_ascii=False)))
     return edits
 
 

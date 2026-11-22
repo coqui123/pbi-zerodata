@@ -779,6 +779,26 @@ class RenameBindingsTests(unittest.TestCase):
         tot = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
         self.assertEqual(tot, "SUMX('Sales', [Net])")
 
+    def test_column_rename_variation_under_group_ref_follows(self):
+        grp = {"GroupRef": {"Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                                      "Name": "Variation",
+                                                                      "Property": "OrderDate"}},
+                            "Property": "Year"},
+               "queryRef": "Sales.OrderDate.Variation.Year"}
+        ws, project, mdef, path = self._report_project({"refs": [grp]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+        pvs = json.loads(path.read_text())["refs"][0]["GroupRef"]["Expression"]["PropertyVariationSource"]
+        self.assertEqual(pvs["Property"], "BookedDate")
+
+    def test_column_rename_unrelated_expression_object_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"name": "example", "expression": "'Sales'[Amount]"}))
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(other.read_text())["expression"], "'Sales'[Amount]")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
