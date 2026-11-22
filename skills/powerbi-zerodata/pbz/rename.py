@@ -75,11 +75,17 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
         return rename_table(ws, project, model, old, new)
     else:
         raise PbzError("UNSUPPORTED", "rename supports measure, column and table")
-    if _fold(new) != _fold(old) and _other_table_owns(
-            model, home, f"{home}.{new}",
-            _extension_owned(project.mirror_report, home),
-            _extension_owned_others(project.mirror_report, home),
-            extra_tables=_extension_tables(project.mirror_report)):
+    if _fold(new) != _fold(old) and (
+            _other_table_owns(
+                model, home, f"{home}.{new}",
+                _extension_owned_others(project.mirror_report, home),
+                _extension_owned(project.mirror_report, home),
+                extra_tables=_extension_tables(project.mirror_report))
+            or _other_table_owns(
+                model, home, new,
+                _extension_owned_others(project.mirror_report, home),
+                _extension_owned(project.mirror_report, home),
+                extra_tables=_extension_tables(project.mirror_report))):
         raise PbzError("NAME_TAKEN", f"{home}.{new}")
     ext = _external_users(ws, project, kind, home, old)
 
@@ -1028,6 +1034,17 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         raise PbzError("UNSUPPORTED", "cultures not in this mirror: run pbz pull")
     if any(_fold(e) == _fold(old) for e in model.expressions):
         raise PbzError("AMBIGUOUS", f"a shared query is also named {old}")
+    if _fold(new) != _fold(old):
+        rests = [o.name for o in list(t.columns.values()) + list(t.measures.values())]
+        rests += [f"{h}.{lvl}" for h, levels in t.hierarchies.items() for lvl in levels]
+        rests += [mn for ent, ms in _extension_entities(project.mirror_report)
+                  if _fold(ent) == _fold(old) for mn in ms]
+        for rest in rests:
+            if _other_table_owns(model, old, f"{new}.{rest}",
+                                 _extension_owned_others(project.mirror_report, old),
+                                 _extension_owned(project.mirror_report, old),
+                                 extra_tables=_extension_tables(project.mirror_report)):
+                raise PbzError("NAME_TAKEN", f"{new}.{rest}")
     ext = _external_users(ws, project, "table", "", old)
     mdef = os.path.join(project.mirror_model, "definition")
     src = os.path.join(mdef, *t.file.split("/"))
