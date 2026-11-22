@@ -1035,8 +1035,23 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
         tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
         return tok.kind == "ident" and _fold(tok.value or tok.text) in _DAX_KEYWORDS
 
-    bindings = [dataclasses.replace(b, qualifier=None) if _spurious_qualifier(b) else b
-                for b in deps.dax_bindings(text, cur, res).bindings]
+    raw_bindings = deps.dax_bindings(text, cur, res).bindings
+    spurious = [b for b in raw_bindings if _spurious_qualifier(b)]
+    if spurious:
+        # The resolver mis-read the keyword as a qualifier, which also
+        # short-circuits its row-context analysis of the bracket. Mask the
+        # keyword (same length, offsets preserved) and take the bracket's
+        # binding from a second pass over the masked text.
+        chars = list(text)
+        for b in spurious:
+            a, z = b.qualifier
+            chars[a:z] = " " * (z - a)
+        masked = deps.dax_bindings("".join(chars), cur, res).bindings
+        by_span = {(b.start, b.end): b for b in masked}
+        bindings = [by_span.get((b.start, b.end), dataclasses.replace(b, qualifier=None))
+                    if b in spurious else b for b in raw_bindings]
+    else:
+        bindings = raw_bindings
     if kind == "table":
         low = _fold(old)
         out = []
