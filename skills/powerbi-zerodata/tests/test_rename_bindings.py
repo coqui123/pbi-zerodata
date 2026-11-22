@@ -468,6 +468,24 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "column", "Region.Amount.Share", "Value", table="Sales")
         self.assertEqual(path.read_bytes(), before)
 
+    def test_column_rename_bare_native_query_ref_extension_of_unrelated_table(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"nativeQueryRef": "Other.Amount.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Other.Amount.Share'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Other.Amount.Share", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_prefix_table_extension_measure_does_not_block(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn 'Amount.Share'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales", "measures": [{"name": "Region.Amount", "expression": "1"}]}]}))
+        rename.rename(ws, project, "column", "Amount.Share", "Value", table="Sales.Region")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Sales.Region.Value")
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
