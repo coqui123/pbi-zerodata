@@ -148,6 +148,10 @@ SALES = (
     "\tmeasure VarRefPadB = VAR WholeRows = Wide VAR QtyRows = VALUES(Wide[Qty]) RETURN SUMX(Wide, SUMX(Sales, SUMX(NATURALINNERJOIN(VALUES(Wide[Qty]), VAR UnusedRows = WholeRows RETURN QtyRows), Wide[Price])))\n\n"
     "\tmeasure VarSeqA = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = VAR Dummy = 1 RETURN VAR Dummy2 = 2 RETURN Wide RETURN QtyRows, [Price])))\n\n"
     "\tmeasure VarSeqB = SUMX(Wide, SUMX(Sales, SUMX(VAR QtyRows = VALUES(Wide[Qty]) VAR UnusedRows = VAR Dummy = 1 RETURN VAR Dummy2 = 2 RETURN Wide RETURN QtyRows, Wide[Price])))\n\n"
+    "\tmeasure IterStaleA = SUMX(CROSSJOIN(Sales, VAR a = ABS(1) VAR b = 2 RETURN Other), [Price])\n\n"
+    "\tmeasure IterStaleB = SUMX(CROSSJOIN(Sales, VAR a = ABS(1) VAR b = 2 RETURN Other), Sales[Price])\n\n"
+    "\tmeasure VarParenSeqA = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), VAR A = (1) VAR B = 2 RETURN Other), [ShadowM]))\n\n"
+    "\tmeasure VarParenSeqB = COUNTROWS(TOPN(1, NATURALINNERJOIN(VALUES(Other[Price]), VAR A = (1) VAR B = 2 RETURN Other), Sales[ShadowM]))\n\n"
     "\tmeasure TopnCountCtrlA = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnCountCtrlB = VAR v = Other RETURN SUMX(TOPN(COUNTX(v, 1), Sales, Sales[Price], DESC), [Price])\n\n"
     "\tmeasure TopnSortCtrlA = SUMX(TOPN(1, Sales, Sales[Price] + MAX(Other[Price]), DESC), [Price])\n\n"
@@ -425,7 +429,8 @@ class SimilarScopeTests(unittest.TestCase):
               "ExcAccA", "ExcAccB", "ScopeVarA", "ScopeVarB",
               "ScopeNestA", "ScopeNestB", "ScopeOrderA", "ScopeOrderB",
               "VarTopnCtrlA", "VarTopnCtrlB", "VarRefPadA", "VarRefPadB",
-              "VarSeqA", "VarSeqB",
+              "VarSeqA", "VarSeqB", "IterStaleA", "IterStaleB",
+              "VarParenSeqA", "VarParenSeqB",
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
               "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
@@ -726,7 +731,8 @@ class SimilarScopeTests(unittest.TestCase):
                           ("TopnFilterAllB", "TopnFilterAllA"),
                           ("ExcAccB", "ExcAccA"), ("ScopeVarB", "ScopeVarA"),
                           ("ScopeNestB", "ScopeNestA"), ("ScopeOrderB", "ScopeOrderA"),
-                          ("VarRefPadB", "VarRefPadA"), ("VarSeqB", "VarSeqA")):
+                          ("VarRefPadB", "VarRefPadA"), ("VarSeqB", "VarSeqA"),
+                          ("IterStaleB", "IterStaleA"), ("VarParenSeqB", "VarParenSeqA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

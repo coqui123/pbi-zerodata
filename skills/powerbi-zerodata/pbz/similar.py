@@ -580,6 +580,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
 
     pending_vars: list = []
     var_names_defined: dict[str, set] = {}
+    _paren_block: list = []
 
     def _in_source(fr, first_d) -> bool:
         if fr["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET"):
@@ -599,14 +600,25 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             if fr.get("x_span") is not None and fr["arg"] == fr.get("span_arg", 0) \
                     and not (t.kind == "op" and t.text in (",", ")") and stack[-1] is fr):
                 fr["x_span"].append(t)
+        if t.kind == "op" and t.text in ("(", "{"):
+            _paren_block.append(False)
+        elif t.kind == "op" and t.text in (")", "}"):
+            _contained = _paren_block.pop() if _paren_block else False
         if t.kind == "ident" and t.text.upper() == "VAR" \
                 and nxt is not None and nxt.kind == "ident":
             _prev = sig[i - 1] if i else None
-            _sequential = _prev is not None and _prev.kind in ("ident", "bracket", "num", "str", "table") \
-                and not (_prev.kind == "ident" and _prev.text.upper() in ("RETURN", "VAR"))
+            if _prev is not None and _prev.kind == "op" and _prev.text in (")", "}"):
+                _sequential = not _contained
+            else:
+                _sequential = _prev is not None and _prev.kind in (
+                    "ident", "bracket", "num", "str", "table") \
+                    and not (_prev.kind == "ident" and _prev.text.upper() in (
+                        "RETURN", "VAR", "IN", "AND", "OR", "NOT"))
             if pending_vars and pending_vars[-1][1] == len(stack) and _sequential:
                 pending_vars.pop()
             pending_vars.append((nxt.text.lower(), len(stack)))
+            if _paren_block:
+                _paren_block[-1] = True
         elif t.kind == "ident" and t.text.upper() == "RETURN" \
                 and pending_vars and pending_vars[-1][1] == len(stack):
             pending_vars.pop()
