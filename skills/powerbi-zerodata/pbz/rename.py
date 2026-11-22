@@ -699,9 +699,12 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                            for t in model.tables.values()]
             dest_extra = [new if _fold(e) == _fold(old) else e for e in extra_tables]
         produced = [nv]
-        wrapped = _wrapped_inner(nv)
-        if wrapped:
-            produced.append(wrapped[1])
+        if _wrapped_inner(value):
+            # An inner path is checked only for an actual wrapped emission,
+            # never when the literal output merely parses as a wrapper.
+            wrapped = _wrapped_inner(nv)
+            if wrapped:
+                produced.append(wrapped[1])
         for text in produced:
             if _other_table_owns(model, anchor, text, owned, extending,
                                  extensions_any=bare, extra_tables=dest_extra, head=head,

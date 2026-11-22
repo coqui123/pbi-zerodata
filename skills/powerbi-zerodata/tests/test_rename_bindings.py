@@ -1019,6 +1019,19 @@ class RenameBindingsTests(unittest.TestCase):
             rename.rename(ws, project, "table", "İ", "Calendar")
         self.assertEqual(caught.exception.code, "AMBIGUOUS")
 
+    def test_table_rename_literal_destination_not_reparsed_as_wrapper(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Totals"}}, "Property": "Amount)"},
+               "queryRef": "Totals.Amount)"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Totals.tmdl"),
+               "table Totals\n\tcolumn 'Amount)'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Totals", "Sum(Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Sum(Sales.Amount)")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
