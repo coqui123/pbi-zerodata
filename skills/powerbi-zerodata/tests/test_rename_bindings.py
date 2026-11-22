@@ -441,6 +441,33 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "column", "Sales.Region.Amount", "Value", table="Sales")
         self.assertEqual(path.read_bytes(), before)
 
+    def test_table_rename_extension_measure_on_longer_table_stays(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Ext"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Ext'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales.Region", "measures": [{"name": "Ext", "expression": "1"}]}]}))
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_bare_native_query_ref_owned_by_unrelated_table(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"nativeQueryRef": "Other.Amount"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Other.Amount'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Other.Amount", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_owned_extension_string_unchanged(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Amount.Share'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Region.Amount.Share", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
     def test_table_rename_report_extension_measure_follows(self):
         ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
         ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")

@@ -90,7 +90,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             ops.append(("write", path, apply_edits(text, edits), bom))
             changed.append(f"{project.name}.SemanticModel/definition/{rel}")
     from .move import plan_pbir
-    ext_owned = _extension_owned(project.mirror_report, home)
+    ext_owned = _extension_owned_others(project.mirror_report, home)
     for path, text, bom, rel in plan_pbir(
             ws, project.mirror_report,
             lambda root, _text: (pbir_ref_edits(root, model, kind, home, old, new,
@@ -207,7 +207,8 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     # produced no write operation for the containing file.
     writes = {op[1]: op[2] for op in ops if op[0] == "write"}
     ext_q = _extension_qualified(project.mirror_report, old) if kind == "table" else set()
-    ext_owned = _extension_owned(project.mirror_report, home) if kind != "table" else set()
+    ext_owned = _extension_owned_others(project.mirror_report, home) if kind != "table" \
+        else _extension_owned(project.mirror_report, old)
     for path in pbir.report_files(project.mirror_report):
         text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
         try:
@@ -383,28 +384,42 @@ def _head_swap(value, table, new):
 
 
 def _other_table_owns(model, home, value, extra_owned=()):
-    """True when value is exactly the qualified path of an object on another
-    table whose dotted name extends home (Sales.Region.Amount beside the
-    Sales column 'Region.Amount'): the unbound string is ambiguous and the
-    other table's reading wins, so it stays unchanged. extra_owned carries
-    the report-extension measure paths owned by such tables."""
-    if value.lower() in {p.lower() for p in extra_owned}:
-        return True
+    """True when an unbound string is owned by another table: exactly a
+    qualified path of any other table (Sales.Region.Amount beside the Sales
+    column 'Region.Amount'), or an owned extension of a longer-named
+    table's path. The string is ambiguous and the other table's reading
+    wins, so it stays unchanged. extra_owned carries the report-extension
+    measure paths owned by other tables."""
+    low = value.lower()
+    tables = tuple(t.name for t in model.tables.values()) if model is not None else ()
+    for p in extra_owned:
+        pl = p.lower()
+        if low == pl:
+            return True
+        if pl.startswith(home.lower() + "."):
+            rest = _rest_after(value, pl)
+            if rest is not None and _path_extension(rest, home, tables):
+                return True
     if model is None:
         return False
-    low = value.lower()
     for t in model.tables.values():
+        if t.name.lower() == home.lower():
+            continue
+        paths = {f"{t.name}.{o.name}".lower()
+                 for o in list(t.columns.values()) + list(t.measures.values())}
+        for hname, levels in t.hierarchies.items():
+            paths |= {f"{t.name}.{hname}.{lvl}".lower() for lvl in levels}
+        if low in paths:
+            return True
         if t.name.lower().startswith(home.lower() + "."):
-            pool = list(t.columns.values()) + list(t.measures.values())
-            if any(low == f"{t.name}.{o.name}".lower() for o in pool):
-                return True
-            for hname, levels in t.hierarchies.items():
-                if any(low == f"{t.name}.{hname}.{lvl}".lower() for lvl in levels):
+            for q in paths:
+                rest = _rest_after(value, q)
+                if rest is not None and _path_extension(rest, home, tables):
                     return True
     return False
 
 
-def _table_rewrite(value, old, new, qualified, table=None, model=None):
+def _table_rewrite(value, old, new, qualified, table=None, model=None, other_owned=()):
     """Rewrite one table reference in a report string, or return the value unchanged.
 
     A value rewrites when it is exactly a qualified object path of the old
@@ -420,7 +435,7 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None):
         return new + text[at:]
 
     _tables = [t.name for t in model.tables.values()] if model is not None else ()
-    other_q = set()
+    other_q = {p.lower() for p in other_owned}
     if model is not None:
         for other in model.tables.values():
             if other.name.lower().startswith(old.lower() + "."):
@@ -520,6 +535,14 @@ def _extension_owned(report_dir, home):
             if name.lower().startswith(home.lower() + ".") for m in measures}
 
 
+def _extension_owned_others(report_dir, home):
+    """Qualified paths of report-extension measures on any entity other
+    than home: strings another table's reading owns."""
+    return {f"{name}.{m}".lower()
+            for name, measures in _extension_entities(report_dir)
+            if name.lower() != home.lower() for m in measures}
+
+
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
                           extra_qualified=(), extra_owned=()):
     if kind == "table":
@@ -544,7 +567,8 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
                     return f"{wrapped[0]}({swapped})" if wrapped else swapped
             _tbl, qualified = _table_qualified(model, old)
             if _tbl is not None:
-                return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model)
+                return _table_rewrite(value, old, new, qualified | set(extra_qualified), _tbl, model,
+                                      other_owned=extra_owned)
             if value.lower().startswith(old.lower() + "."):
                 return _head_swap(value, old, new)
             wrapped = _single_wrapped(value)
@@ -792,10 +816,12 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
         _tbl, _qualified = _table_qualified(model, old)
         if _tbl is not None:
             ext_q = _extension_qualified(project.mirror_report, old)
+            ext_owned = _extension_owned(project.mirror_report, old)
             for site, (node, field) in _report_string_sites(root, model).items():
                 if site[-1] in ("queryRef", "metadata", "queryName"):
                     nv = _report_string_rename(site[-1], node.value, "table", "", old, new,
-                                               field, model, extra_qualified=ext_q)
+                                               field, model, extra_qualified=ext_q,
+                                               extra_owned=ext_owned)
                     if nv != node.value:
                         edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
         return edits, False
