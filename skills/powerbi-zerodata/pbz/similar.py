@@ -186,10 +186,26 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                         "SELECTCOLUMNS", "GENERATE", "UNION", "INTERSECT", "EXCEPT", "CROSSJOIN",
                         "TREATAS", "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN", "GROUPBY",
                         "KEEPFILTERS", "FILTERS"}
+    KNOWN_TABLE_FRAMES = TABLE_INPUT_ARG0 | {"TOPN", "SAMPLE", "INDEX", "OFFSET", "GENERATEALL",
+                                              "DATEADD", "DATESYTD", "DATESMTD", "DATESQTD",
+                                              "DATESBETWEEN", "SAMEPERIODLASTYEAR"}
+
+    X_ITERATORS = {"SUMX", "AVERAGEX", "MINX", "MAXX", "COUNTX", "COUNTAX", "PRODUCTX",
+                   "CONCATENATEX", "RANKX", "MEDIANX", "PERCENTILEX.INC", "PERCENTILEX.EXC",
+                   "GEOMEANX", "STDEVX.P", "STDEVX.S", "VARX.P", "VARX.S"}
+
+    def _is_table_frame(g) -> bool:
+        return g["fn"] in KNOWN_TABLE_FRAMES or g["fn"] in X_ITERATORS
 
     def _source_frame(idx):
         for g in reversed(stack[idx + 1:]):
-            if g["fn"] and g["fn"] not in SCALAR_FUNCS and g["fn"] not in CONDITIONALS:
+            if _is_table_frame(g):
+                return g
+        return None
+
+    def _taint_frame(idx):
+        for g in reversed(stack[idx + 1:]):
+            if g["fn"] and g["fn"] not in CONDITIONALS:
                 return g
         return None
 
@@ -197,7 +213,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         if table:
             for idx, fr in enumerate(stack):
                 if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 and not fr["poisoned"]:
-                    trusted = not any(g["fn"] in SCALAR_FUNCS for g in stack[idx + 1:])
+                    trusted = all(_is_table_frame(g) or g["fn"] in CONDITIONALS or g["fn"] == ""
+                                  for g in stack[idx + 1:])
                     eff_bare = bare and trusted
                     if fr["row_table"] is None:
                         fr["row_table"] = table
@@ -205,8 +222,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                             g = _source_frame(idx)
                             exempt = trusted and g is not None and stack[-1] is g \
                                 and g["arg"] == 0 and g["fn"] in TABLE_INPUT_ARG0
-                            if g is not None and not exempt:
-                                fr["taint"] = g
+                            if not exempt:
+                                target = g if g is not None else _taint_frame(idx)
+                                if target is not None:
+                                    fr["taint"] = target
                     elif eff_bare and fr["row_table"] != table:
                         fr["row_table"] = None
                         fr["poisoned"] = True
@@ -231,13 +250,35 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         if t.kind == "op" and t.text in ("(", "{"):
             prev = sig[i - 1] if i else None
             fn = "{" if t.text == "{" else (prev.text.upper() if prev is not None and prev.kind == "ident" else "")
-            frame = {"fn": fn, "arg": 0, "row_table": None, "poisoned": False, "taint": None}
+            frame = {"fn": fn, "arg": 0, "row_table": None, "poisoned": False, "taint": None,
+                     "parent_arg": stack[-1]["arg"] if stack else None}
             stack.append(frame)
-            if fn and fn not in SCALAR_FUNCS and fn not in ("IF", "IFERROR", "SWITCH", "COALESCE"):
-                for fr in stack[:-1]:
+            if fn and fn not in SCALAR_FUNCS and fn not in CONDITIONALS:
+                for f_idx, fr in enumerate(stack[:-1]):
                     if fr["fn"] in deps.ITERATORS and fr["arg"] == 0 \
                             and fr["row_table"] is not None and not fr["poisoned"]:
-                        fr["taint"] = frame
+                        path = stack[f_idx + 1:-1]
+                        in_region = True
+                        for j, p in enumerate(path):
+                            d = path[j + 1]["parent_arg"] if j + 1 < len(path) else frame["parent_arg"]
+                            if p["fn"] in SCALAR_FUNCS:
+                                in_region = False
+                                break
+                            if p["fn"] in CONDITIONALS or p["fn"] == "":
+                                continue
+                            if p["fn"] in ("UNION", "INTERSECT", "EXCEPT", "CROSSJOIN",
+                                            "GENERATE", "GENERATEALL"):
+                                continue
+                            if p["fn"] in TABLE_INPUT_ARG0 and d == 0:
+                                continue
+                            if p["fn"] in ("TOPN", "SAMPLE", "INDEX", "OFFSET") and d == 1:
+                                continue
+                            if _is_table_frame(p) and d == 0:
+                                continue
+                            in_region = False
+                            break
+                        if in_region:
+                            fr["taint"] = frame
         elif t.kind == "op" and t.text in (")", "}"):
             if stack:
                 closed = stack.pop()

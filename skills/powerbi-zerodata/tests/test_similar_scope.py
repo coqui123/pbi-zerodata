@@ -89,6 +89,12 @@ SALES = (
     "\tmeasure FiltCountB = SUMX(GENERATESERIES(1, COUNTROWS(FILTER(Other, TRUE()))), Sales[Price])\n\n"
     "\tmeasure IfPredCtrlA = SUMX(FILTER(Sales, IF(Sales[Price] > MAX(Other[Price]), TRUE(), FALSE())), [Price])\n\n"
     "\tmeasure IfPredCtrlB = SUMX(FILTER(Sales, IF(Sales[Price] > MAX(Other[Price]), TRUE(), FALSE())), [Price])\n\n"
+    "\tmeasure ContainsA = SUMX(GENERATESERIES(1, IF(CONTAINS(Sales, Sales[Price], 1), 2, 3)), [Price])\n\n"
+    "\tmeasure ContainsB = SUMX(GENERATESERIES(1, IF(CONTAINS(Sales, Sales[Price], 1), 2, 3)), Sales[Price])\n\n"
+    "\tmeasure PredCountCtrlA = SUMX(FILTER(Sales, COUNTROWS(ALL(Other)) > 0), [Price])\n\n"
+    "\tmeasure PredCountCtrlB = SUMX(FILTER(Sales, COUNTROWS(ALL(Other)) > 0), [Price])\n\n"
+    "\tmeasure MaxxCtrlA = SUMX(FILTER(Sales, Sales[Price] > MAXX(ALL(Sales), Sales[Price])), [Price])\n\n"
+    "\tmeasure MaxxCtrlB = SUMX(FILTER(Sales, Sales[Price] > MAXX(ALL(Sales), Sales[Price])), [Price])\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -141,7 +147,8 @@ class SimilarScopeTests(unittest.TestCase):
               "SumzA", "SumzB", "Gen2A", "Gen2B", "NestCtrlA", "NestCtrlB",
               "Gen3A", "Gen3B", "ConsA", "ConsB", "IfCtrlA", "IfCtrlB",
               "CalcA", "CalcB", "AllCountA", "AllCountB", "FiltCountA", "FiltCountB",
-              "IfPredCtrlA", "IfPredCtrlB")},
+              "IfPredCtrlA", "IfPredCtrlB", "ContainsA", "ContainsB",
+              "PredCountCtrlA", "PredCountCtrlB", "MaxxCtrlA", "MaxxCtrlB")},
         )
 
     def _canon(self, name):
@@ -305,6 +312,20 @@ class SimilarScopeTests(unittest.TestCase):
         with self.assertRaises(PbzError) as caught:
             consolidate.merge(self.ws, self.project, "FiltCountB", "FiltCountA", dry_run=True)
         self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_unlisted_scalar_wrapper_still_poisons(self):
+        self.assertEqual(self._key("ContainsA"), self._key("ContainsB"))
+        self.assertTrue(self._canon("ContainsA").uncertain)
+        with self.assertRaises(PbzError) as caught:
+            consolidate.merge(self.ws, self.project, "ContainsB", "ContainsA", dry_run=True)
+        self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
+
+    def test_predicate_table_calls_stay_certain(self):
+        for name, dup in (("PredCountCtrlA", "PredCountCtrlB"), ("MaxxCtrlA", "MaxxCtrlB")):
+            with self.subTest(name=name):
+                self.assertFalse(self._canon(name).uncertain)
+                result = consolidate.merge(self.ws, self.project, dup, name, dry_run=True)
+                self.assertEqual(result["equivalence"], "identical")
 
     def test_conditional_predicate_with_lookup_stays_certain(self):
         self.assertFalse(self._canon("IfPredCtrlA").uncertain)
