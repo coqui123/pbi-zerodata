@@ -973,6 +973,14 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
     ext_measures = ext_measures or {}
     ext_names = set().union(*ext_measures.values()) if ext_measures else set()
     res = deps.Resolver(model)
+    if kind == "column" and _fold(old) in ext_names:
+        # An extension measure bears the target's name, so a bare reference
+        # denotes that measure under DAX rules, never the model column.
+        # Remove the resolver's unique-column fallback for this name so the
+        # binding surfaces as unresolved instead of a firm column binding;
+        # row-context and home bindings do not use that index.
+        res.by_column.pop(old.lower(), None)
+        res.by_column.pop(_fold(old), None)
 
     def _qualifier_entity(binding):
         if not binding.qualifier:
@@ -985,6 +993,15 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
         ent = _qualifier_entity(binding)
         if ent is not None:
             return _fold(binding.ref.name) in ext_measures.get(_fold(ent), set())
+        if binding.qualifier is None:
+            # A spaced qualifier (Budget [Amount]) is still a qualified
+            # reference to that entity's extension measure, although the
+            # resolver leaves the binding bare.
+            toks = lexers.significant(lexers.lex_dax(text[:binding.start]))
+            if toks and toks[-1].kind in ("ident", "table"):
+                prev_name = toks[-1].value or toks[-1].text
+                if _fold(binding.ref.name) in ext_measures.get(_fold(prev_name), set()):
+                    return True
         if binding.ref.kind == "table" or not (binding.uncertain or binding.ref.kind == "unresolved"):
             # A firm binding (a table reference, or a row-context column)
             # is the resolver's answer and is honored; only an unresolved
