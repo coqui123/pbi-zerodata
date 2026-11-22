@@ -1016,11 +1016,12 @@ _DAX_KEYWORDS = {_fold(w) for w in (
     "abs", "and", "asc", "blanks", "boolean", "both", "break", "by",
     "column", "currency", "datetime", "day", "default", "define",
     "densify", "dense", "desc", "double", "else", "evaluate", "false",
-    "first", "group", "hour", "in", "index", "integer", "last", "matchby",
+    "first", "group", "hour", "in", "index", "int64", "integer", "last",
+    "matchby",
     "measure", "minute", "month", "mparameter", "none", "not", "oneway",
     "oneway_leftfiltersright",
-    "oneway_rightfiltersleft", "or", "order", "quarter", "rel", "return",
-    "row", "string", "variant",
+    "oneway_rightfiltersleft", "or", "order", "precise", "quarter", "rel",
+    "return", "row", "string", "variant",
     "second", "skip", "table", "then", "total", "true", "var", "week",
     "window", "year")}
 
