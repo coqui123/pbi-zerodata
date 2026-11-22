@@ -121,6 +121,14 @@ SALES = (
     "\tmeasure FailB = SUMX(Sales, SUMX(TOPN(1, SUMMARIZE(Sales, Other[Price]), Sales[Price]), Other[Price]))\n\n"
     "\tmeasure ExcA = VAR v = Other RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), [Price], ASC)))\n\n"
     "\tmeasure ExcB = VAR v = Other RETURN SUMX(Sales, COUNTROWS(TOPN(1, EXCEPT(v, Sales), Sales[Price], ASC)))\n\n"
+    "\tmeasure MissingA = COUNTROWS(Missing)\n\n"
+    "\tmeasure MissingB = COUNTROWS(Missing)\n\n"
+    "\tmeasure PoisA = SUMX(Sales, SUMX(EXCEPT(GENERATESERIES(1, MAX(Other[Price])), Other), [Price]))\n\n"
+    "\tmeasure PoisB = SUMX(Sales, SUMX(EXCEPT(GENERATESERIES(1, MAX(Other[Price])), Other), Other[Price]))\n\n"
+    "\tmeasure UnionRowA = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), Sales), [Price]))\n\n"
+    "\tmeasure UnionRowB = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), Sales), Sales[Price]))\n\n"
+    "\tmeasure WinOptA = SUMX(Sales, COUNTROWS(WINDOW(1, ABS, 3, Other, ORDERBY(Sales[Price], [Price]))))\n\n"
+    "\tmeasure WinOptB = SUMX(Sales, COUNTROWS(WINDOW(1, ABS, 3, Other, ORDERBY(Sales[Price], Sales[Price]))))\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -180,7 +188,8 @@ class SimilarScopeTests(unittest.TestCase):
               "TopnCountCtrlA", "TopnCountCtrlB", "TopnSortCtrlA", "TopnSortCtrlB",
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
               "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
-              "FailA", "FailB", "ExcA", "ExcB")},
+              "FailA", "FailB", "ExcA", "ExcB", "MissingA", "MissingB",
+              "PoisA", "PoisB", "UnionRowA", "UnionRowB", "WinOptA", "WinOptB")},
         )
 
     def _canon(self, name):
@@ -371,7 +380,8 @@ class SimilarScopeTests(unittest.TestCase):
 
     def test_count_taught_and_clause_brackets_are_uncertain(self):
         for dup, into in (("TopnCntB", "TopnCntA"), ("RankBareB", "RankBareA"),
-                          ("FailB", "FailA"), ("ExcB", "ExcA")):
+                          ("FailB", "FailA"), ("ExcB", "ExcA"), ("MissingB", "MissingA"),
+                          ("PoisB", "PoisA"), ("UnionRowB", "UnionRowA"), ("WinOptB", "WinOptA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)

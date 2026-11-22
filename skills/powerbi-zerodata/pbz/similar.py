@@ -244,8 +244,20 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
         if fr["fn"] == "RANK":
             return fr["arg"] in (0, 1)
         if fr["fn"] == "WINDOW":
-            return fr["arg"] == 4
+            return fr["arg"] in (2, 3, 4)
         return fr["arg"] == 0
+
+    def _taint_cleared(fr, idx) -> bool:
+        g = fr.get("taint")
+        if g is None:
+            return False
+        frames = stack[idx + 1:]
+        for j, p in enumerate(frames):
+            if p is g:
+                d = frames[j + 1]["parent_arg"] if j + 1 < len(frames) else stack[-1]["arg"]
+                lineage = 1 if g["fn"] in TOPN_LIKE else (4 if g["fn"] == "WINDOW" else 0)
+                return d == lineage
+        return False
 
     def learn(table, bare: bool = False) -> None:
         if table:
@@ -266,7 +278,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                     elif eff_bare and fr["row_table"] != table:
                         fr["row_table"] = None
                         fr["poisoned"] = True
-                    if eff_bare and fr.get("taint") is not None and fr["row_table"] == table:
+                    if eff_bare and fr.get("taint") is not None and fr["row_table"] == table \
+                            and _taint_cleared(fr, idx):
                         fr["taint"] = None
 
     def poison_qualified(tab) -> None:
@@ -412,6 +425,10 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 toks.append(("t:" + res.table(t.text).lower(), "", ""))
                 learn(res.table(t.text), bare=True)
             else:
+                if t.text.upper() not in ("ASC", "DESC", "DENSE", "SKIP", "AND", "OR", "NOT",
+                                          "IN", "TRUE", "FALSE", "BLANK", "ABS", "REL",
+                                          "VAR", "RETURN"):
+                    uncertain = True
                 toks.append((t.text.upper(), "", ""))
         else:
             toks.append((t.text, "", ""))
