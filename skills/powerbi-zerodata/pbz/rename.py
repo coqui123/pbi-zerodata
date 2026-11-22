@@ -263,6 +263,7 @@ def _report_string_sites(root, model, fields=None):
     for ref, site in fields:
         parent = site[:-1]
         siblings[parent] = ref if parent not in siblings else _AMBIGUOUS
+    ambiguous = {parent for parent, ref in siblings.items() if ref is _AMBIGUOUS}
     sites = {}
     for site, node in _report_string_nodes(root):
         field = None
@@ -272,6 +273,9 @@ def _report_string_sites(root, model, fields=None):
                 break
         if field is None:
             field = siblings.get(site[:-1])
+        if field is None and any(site[:length] in ambiguous
+                                 for length in range(len(site) - 1, -1, -1)):
+            field = _AMBIGUOUS
         sites[site] = (node, field)
     return sites
 
@@ -308,14 +312,19 @@ def _report_string_rename(key, value, kind, home, old, new, field=None):
         field_kind = "column" if field.kind == "aggregation" else field.kind
         if field_kind != kind or field.table.lower() != home.lower() or field.name.lower() != old.lower():
             return value
-        if value == f"{field.table}.{field.name}" or value == f"{home}.{old}":
+        if value.lower() in (f"{field.table}.{field.name}".lower(), f"{home}.{old}".lower()):
             return f"{home}.{new}"
-        if key == "nativeQueryRef" and (value == field.name or value.lower() == old.lower()):
+        if key == "nativeQueryRef" and value.lower() == field.name.lower():
             return new
+        if field.kind == "aggregation":
+            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
+            if wrapped and wrapped.group(2).lower() in (
+                    f"{field.table}.{field.name}".lower(), f"{home}.{old}".lower()):
+                return f"{wrapped.group(1)}({home}.{new})"
         return value
-    if key in ("queryRef", "metadata", "nativeQueryRef") and value == f"{home}.{old}":
+    if key in ("queryRef", "metadata", "nativeQueryRef") and value.lower() == f"{home}.{old}".lower():
         return f"{home}.{new}"
-    if key == "nativeQueryRef" and value == old:
+    if key == "nativeQueryRef" and value.lower() == old.lower():
         return new
     return value
 
