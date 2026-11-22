@@ -9,9 +9,13 @@ import os
 
 from . import deps, lexers, suggest, tmdl
 from .common import PbzError, commit_bytes, read_text
-from .daxcatalog import compile_note
+from .daxcatalog import compile_candidate as _compile_candidate_imported, compile_note
 
 ACTIONS = ("unused-var", "qualify", "divide", "format", "description")
+
+
+def compile_candidate(ws, project, measure, candidate_expr):
+    return _compile_candidate_imported(ws, project, measure, candidate_expr)
 
 
 def _model(project):
@@ -179,24 +183,24 @@ def _unused(expr: str) -> str | None:
 
 
 def _qualify(expr: str, measure, model) -> str:
+    sig = lexers.significant(lexers.lex_dax(expr))
+    if any(tok.kind == "ident" and tok.text.upper() in ("ADDCOLUMNS", "SELECTCOLUMNS") for tok in sig):
+        return expr
     res = deps.Resolver(model)
-    info = deps.dax(expr, measure.table, res, row_home=False)
+    bindings = deps.dax_bindings(expr, measure.table, res, row_home=False).bindings
     # Bare column of the home table gains a qualifier. A qualified measure loses it.
-    sig = lexers.lex_dax(expr)
     edits = []
-    i = 0
-    while i < len(sig):
-        tok = sig[i]
-        if tok.kind == "bracket" and (i == 0 or sig[i - 1].kind != "table"):
-            col = res.column(measure.table, tok.value or tok.text.strip("[]"))
-            meas = res.measure(tok.value or tok.text.strip("[]"))
-            if col and not (meas and meas[0] != measure.table):
-                edits.append((tok.start, tok.start, lexers.tmdl_name(measure.table)))
-        if tok.kind == "table" and i + 1 < len(sig) and sig[i + 1].kind == "bracket":
-            meas = res.measure(sig[i + 1].value or sig[i + 1].text.strip("[]"))
-            if meas and tok.value.lower() == meas[0].lower():
-                edits.append((tok.start, sig[i + 1].start, ""))
-        i += 1
+    for b in bindings:
+        if b.uncertain:
+            continue
+        if b.ref.kind == "column" and b.qualifier is None and b.ref.table == measure.table:
+            edits.append((b.start, b.start, lexers.tmdl_name(measure.table)))
+        if b.ref.kind == "measure" and b.qualifier is not None:
+            name = expr[b.qualifier[0]:b.qualifier[1]]
+            if name.startswith("'") and name.endswith("'"):
+                name = name[1:-1]
+            if name.lower() == b.ref.table.lower():
+                edits.append((b.qualifier[0], b.start, ""))
     if not edits:
         return expr
     out = expr
@@ -236,6 +240,9 @@ def run(ws, project, action: str, target: str, *, accept_semantic: bool = False,
                 raise PbzError("REFUSED", "DIVIDE changes blank-divide semantics; pass --accept-semantic")
         if not new or new == expr:
             return {**out, "result": "NOTHING_TO_CHANGE"}
+        verdict = compile_candidate(ws, project, measure, new)
+        if verdict.get("status") == "FAIL":
+            raise PbzError("REFUSED", "candidate expression failed validation; no files changed")
         _write_expr(ws, project, model, measure, new, mdef)
         out["result"] = "CHANGED"
         out.update(_compile(ws, project, model))
