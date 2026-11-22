@@ -1007,7 +1007,8 @@ def _pvs_property_node(node):
 
 
 _DAX_KEYWORDS = {_fold(w) for w in (
-    "return", "var", "in", "then", "else", "true", "false", "not", "and", "or")}
+    "return", "var", "in", "then", "else", "true", "false", "not", "and", "or",
+    "asc", "desc")}
 
 
 def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None):
@@ -1102,7 +1103,9 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
         chars = list(text)
         for b in spurious:
             a, z = b.qualifier
-            chars[a:z] = " " * (z - a)
+            # A numeric mask: spaces would let the preceding name become
+            # the bracket's spaced qualifier in the second pass.
+            chars[a:z] = "1" * (z - a)
         masked = deps.dax_bindings("".join(chars), cur, res).bindings
         by_span = {(b.start, b.end): b for b in masked}
         bindings = [by_span.get((b.start, b.end), dataclasses.replace(b, qualifier=None))
