@@ -273,7 +273,7 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                                 and g["arg"] == 0 and g["fn"] in TABLE_INPUT_ARG0
                             if not exempt:
                                 target = g if g is not None else _taint_frame(idx)
-                                if target is not None:
+                                if target is not None and fr.get("taint") is None:
                                     fr["taint"] = target
                     elif eff_bare and fr["row_table"] != table:
                         fr["row_table"] = None
@@ -320,7 +320,8 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
                 for f_idx, fr in enumerate(stack[:-1]):
                     if fr["fn"] in deps.ITERATORS and _teaches_at(fr) \
                             and fr["row_table"] is not None and not fr["poisoned"]:
-                        if _first_nonsource(stack[f_idx + 1:-1], frame["parent_arg"]) is None:
+                        if fr.get("taint") is None \
+                                and _first_nonsource(stack[f_idx + 1:-1], frame["parent_arg"]) is None:
                             fr["taint"] = frame
         elif t.kind == "op" and t.text in (")", "}"):
             if stack:
@@ -427,7 +428,9 @@ def canon(expr: str, home: str, res: deps.Resolver) -> Canon:
             else:
                 if t.text.upper() not in ("ASC", "DESC", "DENSE", "SKIP", "AND", "OR", "NOT",
                                           "IN", "TRUE", "FALSE", "BLANK", "ABS", "REL",
-                                          "VAR", "RETURN"):
+                                          "VAR", "RETURN", "DAY", "MONTH", "QUARTER", "WEEK",
+                                          "YEAR", "HOUR", "MINUTE", "SECOND", "BOTH", "NONE",
+                                          "ONEWAY", "DEFAULT", "FIRST", "LAST", "KEEP"):
                     uncertain = True
                 toks.append((t.text.upper(), "", ""))
         else:

@@ -129,6 +129,12 @@ SALES = (
     "\tmeasure UnionRowB = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), Sales), Sales[Price]))\n\n"
     "\tmeasure WinOptA = SUMX(Sales, COUNTROWS(WINDOW(1, ABS, 3, Other, ORDERBY(Sales[Price], [Price]))))\n\n"
     "\tmeasure WinOptB = SUMX(Sales, COUNTROWS(WINDOW(1, ABS, 3, Other, ORDERBY(Sales[Price], Sales[Price]))))\n\n"
+    "\tmeasure UnionWrapA = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), FILTER(Sales, TRUE())), [Price]))\n\n"
+    "\tmeasure UnionWrapB = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), FILTER(Sales, TRUE())), Sales[Price]))\n\n"
+    "\tmeasure UnionAllA = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), ALL(Sales)), [Price]))\n\n"
+    "\tmeasure UnionAllB = SUMX(Sales, SUMX(UNION(ROW(\"Price\", Sales[Price] + 1), ALL(Sales)), Sales[Price]))\n\n"
+    "\tmeasure YearCtrlA = CALCULATE(SUM(Sales[Price]), DATEADD(Sales[Price], -1, YEAR))\n\n"
+    "\tmeasure YearCtrlB = CALCULATE(SUM(Sales[Price]), DATEADD(Sales[Price], -1, YEAR))\n\n"
 )
 OTHER = (
     "table Other\n\n"
@@ -189,7 +195,8 @@ class SimilarScopeTests(unittest.TestCase):
               "TopnBareA", "TopnBareB", "TopnCountCtorCtrlA", "TopnCountCtorCtrlB",
               "TopnCntA", "TopnCntB", "RankBareA", "RankBareB",
               "FailA", "FailB", "ExcA", "ExcB", "MissingA", "MissingB",
-              "PoisA", "PoisB", "UnionRowA", "UnionRowB", "WinOptA", "WinOptB")},
+              "PoisA", "PoisB", "UnionRowA", "UnionRowB", "WinOptA", "WinOptB",
+              "UnionWrapA", "UnionWrapB", "UnionAllA", "UnionAllB", "YearCtrlA", "YearCtrlB")},
         )
 
     def _canon(self, name):
@@ -363,6 +370,11 @@ class SimilarScopeTests(unittest.TestCase):
                     consolidate.merge(self.ws, self.project, dup, into, dry_run=True)
                 self.assertEqual(caught.exception.code, "NOT_EQUIVALENT")
 
+    def test_interval_keyword_argument_stays_certain(self):
+        self.assertFalse(self._canon("YearCtrlA").uncertain)
+        result = consolidate.merge(self.ws, self.project, "YearCtrlB", "YearCtrlA", dry_run=True)
+        self.assertEqual(result["equivalence"], "identical")
+
     def test_topn_scalar_arguments_stay_certain(self):
         for name, dup in (("TopnCountCtrlA", "TopnCountCtrlB"), ("TopnSortCtrlA", "TopnSortCtrlB"),
                           ("TopnCountCtorCtrlA", "TopnCountCtorCtrlB")):
@@ -381,7 +393,8 @@ class SimilarScopeTests(unittest.TestCase):
     def test_count_taught_and_clause_brackets_are_uncertain(self):
         for dup, into in (("TopnCntB", "TopnCntA"), ("RankBareB", "RankBareA"),
                           ("FailB", "FailA"), ("ExcB", "ExcA"), ("MissingB", "MissingA"),
-                          ("PoisB", "PoisA"), ("UnionRowB", "UnionRowA"), ("WinOptB", "WinOptA")):
+                          ("PoisB", "PoisA"), ("UnionRowB", "UnionRowA"), ("WinOptB", "WinOptA"),
+                          ("UnionWrapB", "UnionWrapA"), ("UnionAllB", "UnionAllA")):
             with self.subTest(into=into):
                 self.assertEqual(self._key(dup), self._key(into))
                 self.assertTrue(self._canon(into).uncertain)
