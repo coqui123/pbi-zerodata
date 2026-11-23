@@ -1468,13 +1468,13 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
     def _table_pbir(root, _text):
         edits = []
 
-        def visit(node, key=""):
+        def visit(node):
             if isinstance(node, pbir.JObj):
-                ents = node.get("entities") if key == "" else None
+                ents = node.get("entities") if node is root else None
                 for k, v in node.pairs:
                     if k.value == "Entity" and isinstance(v, pbir.JStr) and _fold(v.value) == low:
                         edits.append((v.start, v.end, json.dumps(new, ensure_ascii=False)))
-                    visit(v, k.value)
+                    visit(v)
                 if isinstance(ents, pbir.JArr):
                     for ent in ents.items:
                         nm = ent.get("name") if isinstance(ent, pbir.JObj) else None
@@ -1482,7 +1482,7 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                             edits.append((nm.start, nm.end, json.dumps(new, ensure_ascii=False)))
             elif isinstance(node, pbir.JArr):
                 for v in node.items:
-                    visit(v, key)
+                    visit(v)
 
         visit(root)
         _tbl, _qualified = _table_qualified(model, old)
