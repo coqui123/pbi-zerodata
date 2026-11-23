@@ -859,6 +859,14 @@
     "engine": false
   },
   {
+    "id": "formatstring_roundtrip",
+    "argv": [
+      "tests/test_formatstring_roundtrip.py"
+    ],
+    "windows": false,
+    "engine": false
+  },
+  {
     "id": "similar_scope",
     "argv": [
       "tests/test_similar_scope.py"
