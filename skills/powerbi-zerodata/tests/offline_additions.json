@@ -59,6 +59,12 @@
       "argv": [
         "tests/test_similar_scope.py"
       ]
+    },
+    {
+      "id": "dax_binding_alignment",
+      "argv": [
+        "tests/test_dax_binding_alignment.py"
+      ]
     }
   ]
 }
