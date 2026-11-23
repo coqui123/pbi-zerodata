@@ -338,24 +338,26 @@ def _report_string_sites(root, model, fields=None):
         siblings[parent] = ref if parent not in siblings else _AMBIGUOUS
     sites = {}
     for site, node in _report_string_nodes(root):
+        # Resolve ownership nearest-first across both maps: at each
+        # ancestor, a field whose object contains the string (owners)
+        # decides, else the fields held directly by that ancestor
+        # (siblings, _AMBIGUOUS for several) decide, and the search
+        # stops at whichever comes first, so a nearer ambiguous
+        # container fails closed before a farther unique field can
+        # claim the string, and a unique nearer field is not poisoned
+        # by a farther ambiguous container. The siblings lookup
+        # ascends only within the innermost array element on the path,
+        # so a sibling element's field is never inherited.
+        floor = 0
+        for i, part in enumerate(site):
+            if isinstance(part, int):
+                floor = i + 1
         field = None
         for length in range(len(site) - 1, -1, -1):
             field = owners.get(site[:length])
             if field is not None:
                 break
-        if field is None:
-            # Inherit the field of the containing element: ascend only within
-            # the innermost array element on the path, and let the nearest
-            # ancestor decide. siblings stores _AMBIGUOUS for a parent holding
-            # several fields, so an ambiguous container still fails closed,
-            # while a unique nearer field is not poisoned by a farther
-            # ambiguous container and a sibling element's field is never
-            # inherited.
-            floor = 0
-            for i, part in enumerate(site):
-                if isinstance(part, int):
-                    floor = i + 1
-            for length in range(len(site) - 1, floor - 1, -1):
+            if length >= floor:
                 field = siblings.get(site[:length])
                 if field is not None:
                     break

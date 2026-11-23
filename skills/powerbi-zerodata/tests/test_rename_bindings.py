@@ -1823,6 +1823,23 @@ class RenameBindingsTests(unittest.TestCase):
             got = json.loads(path.read_text())["refs"][0]["queryRef"]
             self.assertEqual(got, f"{wrap}(Sales.Net)")
 
+    def test_nearer_ambiguous_container_stops_field_inheritance(self):
+        def fld(entity):
+            return {"Column": {"Expression": {"SourceRef": {"Entity": entity}}, "Property": "Amount"}}
+        doc = {"projections": [{
+            **fld("Sales"),
+            "details": {"left": fld("Budget"), "right": fld("Forecast"),
+                        "nativeQueryRef": "Amount"}}]}
+        ws, project, mdef, path = self._report_project(doc)
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        for name in ("Sales", "Budget", "Forecast"):
+            _write(os.path.join(mdef, "tables", f"{name}.tmdl"),
+                   f"table {name}\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        got = json.loads(path.read_text())["projections"][0]["details"]["nativeQueryRef"]
+        self.assertEqual(got, "Amount")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
