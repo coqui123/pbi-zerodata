@@ -835,10 +835,15 @@ def _report_string_rename(key, value, kind, home, old, new, field=None, model=No
         if wrapped_used:
             # An inner path is checked only when the rewrite actually used
             # the wrapped reading, never when a literal output merely
-            # parses as a wrapper.
+            # parses as a wrapper. The emission must still parse as the
+            # same wrapper: a destination that breaks the wrapper (a
+            # parenthesis in a table name) would leave the reference
+            # unrecognizable to every later rename.
             wrapped = _wrapped_inner(nv)
-            if wrapped:
-                produced.append(wrapped[1])
+            source = _wrapped_inner(value)
+            if not wrapped or source is None or _fold(wrapped[0]) != _fold(source[0]):
+                raise PbzError("NAME_TAKEN", nv)
+            produced.append(wrapped[1])
         for text in produced:
             if _other_table_owns(model, anchor, text, owned, extending,
                                  extensions_any=bare, extra_tables=dest_extra, head=head,

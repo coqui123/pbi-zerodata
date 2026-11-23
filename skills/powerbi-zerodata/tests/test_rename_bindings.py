@@ -1869,6 +1869,15 @@ class RenameBindingsTests(unittest.TestCase):
         got = json.loads(path.read_text())["refs"][0]["metadata"]
         self.assertEqual(got, "SUM(Sales.A) + SUM(Sales.B)")
 
+    def test_table_rename_breaking_wrapper_refused(self):
+        ws, project, mdef, path = self._report_project(
+            {"refs": [{"queryRef": "Sum(Sales.Amount)"}]})
+        with self.assertRaises(PbzError) as ctx:
+            rename.rename(ws, project, "table", "Sales", "Sales(")
+        self.assertEqual(ctx.exception.code, "NAME_TAKEN")
+        got = json.loads(path.read_text())["refs"][0]["queryRef"]
+        self.assertEqual(got, "Sum(Sales.Amount)")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
