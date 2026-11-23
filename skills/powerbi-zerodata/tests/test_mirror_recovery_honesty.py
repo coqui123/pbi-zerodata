@@ -50,6 +50,184 @@ class RecoveryHonestyTests(unittest.TestCase):
         with open(os.path.join(directory, "journal.json"), "w", encoding="utf-8") as f:
             json.dump(body, f)
 
+    def _push_journal(self, before):
+        rel = self.project.name + ".Report/definition/restore.json"
+        target = mirror._real_path(self.ws, rel)
+        after = b"push bytes"
+        if before is not None:
+            common.replace_bytes(target, before, root=self.ws.root)
+        directory, journal = mirror._begin_transaction(
+            self.ws, self.project, "between-passes", [("workspace", rel, common.sha(after))])
+        common.replace_bytes(target, after, root=self.ws.root)
+        return rel, target, directory, journal
+
+    def _recover_with_between_passes_save(self, before, editor):
+        rel, target, directory, _journal = self._push_journal(before)
+        real_sha = mirror.file_sha
+        reads = 0
+
+        def save_before_second_read(path):
+            nonlocal reads
+            if path == target:
+                reads += 1
+                if reads == 2:
+                    if editor is None:
+                        os.remove(target)
+                    else:
+                        with open(target, "wb") as handle:
+                            handle.write(editor)
+            return real_sha(path)
+
+        with patch.object(mirror.desktop, "find_instance", return_value=None), patch.object(
+                mirror, "file_sha", side_effect=save_before_second_read):
+            out = mirror.recover(self.ws, self.project, "between-passes")
+        with open(os.path.join(directory, "journal.json")) as handle:
+            state = json.load(handle)["state"]
+        current = None
+        if os.path.exists(target):
+            with open(target, "rb") as handle:
+                current = handle.read()
+        self.maxDiff = None
+        self.assertEqual(
+            {"content": current, "recovery": out, "state": state,
+             "pending": mirror.pending_recovery(self.ws, self.project)},
+            {"content": editor, "recovery": {
+                "verb": "recover", "result": "RECOVERY_REQUIRED",
+                "transactions": [{"id": "between-passes", "result": "RECOVERY_CONFLICT",
+                                  "conflicts": [rel]}]},
+             "state": "RECOVERY_REQUIRED",
+             "pending": [{"id": "between-passes", "state": "RECOVERY_REQUIRED"}]})
+        self.assertEqual(reads, 2)
+
+    def test_recover_preserves_between_passes_save(self):
+        self._recover_with_between_passes_save(b"before bytes", b"editor bytes")
+
+    def test_recover_preserves_between_passes_save_to_added_target(self):
+        self._recover_with_between_passes_save(None, b"editor bytes")
+
+    def test_recover_preserves_between_passes_external_deletion(self):
+        self._recover_with_between_passes_save(b"before bytes", None)
+
+    def test_recover_retries_after_partway_between_passes_conflict(self):
+        rels = [self.project.name + ".Report/definition/" + name + ".json"
+                for name in ("racing", "owned")]
+        targets = [mirror._real_path(self.ws, rel) for rel in rels]
+        before = (b"racing before bytes", b"owned before bytes")
+        after, editor = b"push bytes", b"editor bytes"
+        for target, content in zip(targets, before):
+            common.replace_bytes(target, content, root=self.ws.root)
+        directory, _journal = mirror._begin_transaction(
+            self.ws, self.project, "partway-between-passes",
+            [("workspace", rel, common.sha(after)) for rel in rels])
+        for target in targets:
+            common.replace_bytes(target, after, root=self.ws.root)
+        real_sha = mirror.file_sha
+        reads = 0
+
+        def save_before_second_read(path):
+            nonlocal reads
+            if path == targets[0]:
+                reads += 1
+                if reads == 2:
+                    with open(targets[1], "rb") as handle:
+                        self.assertEqual(handle.read(), before[1])
+                    with open(path, "wb") as handle:
+                        handle.write(editor)
+            return real_sha(path)
+
+        with patch.object(mirror.desktop, "find_instance", return_value=None), patch.object(
+                mirror, "file_sha", side_effect=save_before_second_read):
+            out = mirror.recover(self.ws, self.project, "partway-between-passes")
+        for target, expected in zip(targets, (editor, before[1])):
+            with open(target, "rb") as handle:
+                self.assertEqual(handle.read(), expected)
+        self.assertEqual(reads, 2)
+        self.assertEqual(out, {"verb": "recover", "result": "RECOVERY_REQUIRED",
+                               "transactions": [{"id": "partway-between-passes",
+                                                 "result": "RECOVERY_CONFLICT",
+                                                 "conflicts": [rels[0]]}]})
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "RECOVERY_REQUIRED")
+        self.assertEqual(mirror.pending_recovery(self.ws, self.project),
+                         [{"id": "partway-between-passes", "state": "RECOVERY_REQUIRED"}])
+
+        common.replace_bytes(targets[0], after, root=self.ws.root)
+        with patch.object(mirror.desktop, "find_instance", return_value=None):
+            out = mirror.recover(self.ws, self.project, "partway-between-passes")
+        self.assertEqual(out, {"verb": "recover", "result": "RECOVERED",
+                               "transactions": [{"id": "partway-between-passes",
+                                                 "result": "ROLLED_BACK"}]})
+        for target, expected in zip(targets, before):
+            with open(target, "rb") as handle:
+                self.assertEqual(handle.read(), expected)
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "ROLLED_BACK")
+        self.assertFalse(mirror.pending_recovery(self.ws, self.project))
+
+    def test_recover_without_external_save_rolls_back(self):
+        before = b"before bytes"
+        _rel, target, directory, _journal = self._push_journal(before)
+        with patch.object(mirror.desktop, "find_instance", return_value=None):
+            out = mirror.recover(self.ws, self.project, "between-passes")
+        self.assertEqual(out, {"verb": "recover", "result": "RECOVERED",
+                               "transactions": [{"id": "between-passes", "result": "ROLLED_BACK"}]})
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "ROLLED_BACK")
+        self.assertFalse(mirror.pending_recovery(self.ws, self.project))
+
+    def test_recover_preserves_save_present_before_first_pass(self):
+        rel, target, directory, _journal = self._push_journal(b"before bytes")
+        editor = b"editor bytes"
+        with open(target, "wb") as handle:
+            handle.write(editor)
+        with patch.object(mirror.desktop, "find_instance", return_value=None):
+            out = mirror.recover(self.ws, self.project, "between-passes")
+        self.assertEqual(out, {"verb": "recover", "result": "RECOVERY_REQUIRED",
+                               "transactions": [{"id": "between-passes", "result": "RECOVERY_CONFLICT",
+                                                 "conflicts": [rel]}]})
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), editor)
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "RECOVERY_REQUIRED")
+        self.assertEqual(mirror.pending_recovery(self.ws, self.project),
+                         [{"id": "between-passes", "state": "RECOVERY_REQUIRED"}])
+
+    def test_live_restore_skips_between_passes_save_and_unapplied_entry(self):
+        rels = [self.project.name + ".Report/definition/" + name + ".json"
+                for name in ("owned", "racing", "unapplied")]
+        targets = [mirror._real_path(self.ws, rel) for rel in rels]
+        before, after, editor = b"before bytes", b"push bytes", b"editor bytes"
+        for target in targets:
+            common.replace_bytes(target, before, root=self.ws.root)
+        directory, journal = mirror._begin_transaction(
+            self.ws, self.project, "live-between-passes",
+            [("workspace", rel, common.sha(after)) for rel in rels])
+        for target in targets:
+            common.replace_bytes(target, after, root=self.ws.root)
+        real_sha = mirror.file_sha
+        reads = 0
+
+        def save_before_second_read(path):
+            nonlocal reads
+            if path == targets[1]:
+                reads += 1
+                if reads == 2:
+                    with open(path, "wb") as handle:
+                        handle.write(editor)
+            return real_sha(path)
+
+        with patch.object(mirror, "file_sha", side_effect=save_before_second_read):
+            out = mirror._restore_transaction(
+                self.ws, self.project, directory, journal, preserve_external=True,
+                applied={("workspace", rel) for rel in rels[:2]})
+        self.assertEqual(out, {"result": "ROLLED_BACK", "conflicts": [rels[1]]})
+        self.assertEqual(reads, 2)
+        for target, expected in zip(targets, (before, editor, after)):
+            with open(target, "rb") as handle:
+                self.assertEqual(handle.read(), expected)
+
     def _restore_with_editor_after_mutation(self, before):
         rel = self.project.name + ".Report/definition/restore.json"
         target = mirror._real_path(self.ws, rel)
