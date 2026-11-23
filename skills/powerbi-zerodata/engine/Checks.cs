@@ -492,11 +492,49 @@ public static class Checks
     public static bool ValuesEqual(object? a, object? b, double tol)
     {
         if (a == null || b == null) return a == null && b == null;
-        if (Norm.IsNumeric(a) && Norm.IsNumeric(b)) return NumEqual(Norm.ToDouble(a), Norm.ToDouble(b), tol);
+        if (Norm.IsNumeric(a) && Norm.IsNumeric(b))
+        {
+            if (tol == 0) return ExactNumEqual(a, b);
+            return NumEqual(Norm.ToDouble(a), Norm.ToDouble(b), tol);
+        }
         if (a is DateTime da && b is DateTime db) return da == db;
         if (a is string sa && b is string sb) return string.Equals(sa, sb, StringComparison.Ordinal);
         if (a is bool ba && b is bool bb) return ba == bb;
         return string.Equals(Norm.Value(a), Norm.Value(b), StringComparison.Ordinal);
+    }
+
+    static bool IsIntegerType(object v) => v is long or int or short or sbyte or byte or ulong or uint or ushort;
+    static bool IsExactType(object v) => IsIntegerType(v) || v is decimal;
+
+    static bool ExactNumEqual(object a, object b)
+    {
+        if (IsExactType(a) && IsExactType(b))
+        {
+            return Convert.ToDecimal(a, CultureInfo.InvariantCulture) == Convert.ToDecimal(b, CultureInfo.InvariantCulture);
+        }
+
+        double da = Norm.ToDouble(a);
+        double db = Norm.ToDouble(b);
+        if (double.IsNaN(da) || double.IsNaN(db)) return false;
+
+        if (IsIntegerType(a) ^ IsIntegerType(b))
+        {
+            object exact = IsIntegerType(a) ? a : b;
+            double d = IsIntegerType(a) ? db : da;
+            if (double.IsInfinity(d)) return false;
+
+            if (exact is ulong u)
+            {
+                if (d < 0.0 || d >= 18446744073709551616.0) return false;
+                return (double)(ulong)d == d && (ulong)d == u;
+            }
+
+            if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) return false;
+            long l = Convert.ToInt64(exact, CultureInfo.InvariantCulture);
+            return (double)(long)d == d && (long)d == l;
+        }
+
+        return da == db;
     }
 
     static bool NumEqual(double a, double b, double tol)

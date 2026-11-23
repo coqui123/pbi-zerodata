@@ -153,7 +153,7 @@ Request:
  ]}
 ```
 Kinds the engine implements: `executes`, `nonblank`, `nonempty` (table expr), `equal`
-(`left`, `right`, optional `by`, `where`, `tol` relative, BLANK equals BLANK only), `additive`
+(`left`, `right`, optional `by`, `where`, `tol` relative, BLANK equals BLANK only; at `tol: 0`, comparison is exact when both operands are integers or decimals, including mixed integer/decimal pairs; integer/floating-point pairs compare equal only when the floating-point value exactly represents the integer; decimal/floating-point pairs compare in double precision), `additive`
 (`expr`, `by`: total equals sum over `by` groups), `unique` (`column`), `no_orphans` (`from`, `to`),
 `no_blank_keys` (`column`), `sign` (`expr`, optional `expect` of `NEG`, `ZERO`, `POS`, or `BLANK`), `subset` (`column`, `of`), `rls`.
 Python rewrites `differs`, `filter_independent` and `compiles` into these before calling.

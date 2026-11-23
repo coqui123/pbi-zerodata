@@ -382,6 +382,53 @@ foreach (var pair in new[] {
     ("EVALUATE {\"a b\"}", "EVALUATE {\"ab\"}", false),
     ("EVALUATE {'a b'[x]}", "EVALUATE {'ab'[x]}", false)
 }) Assert((Normalize(pair.Item1) == Normalize(pair.Item2)) == pair.Item3, "query normalization: " + pair.Item1);
+// PR 4a: exact int64 and tol == 0 assertions on Checks.ValuesEqual
+Assert(!Checks.ValuesEqual(9007199254740993L, 9007199254740992L, 0.0), "exact int64 tol=0 inequality");
+Assert(Checks.ValuesEqual(9007199254740993L, 9007199254740993L, 0.0), "exact int64 tol=0 identity");
+Assert(!Checks.ValuesEqual(long.MaxValue, long.MaxValue - 1, 0.0), "int64 max tol=0 inequality");
+Assert(Checks.ValuesEqual(123, 123L, 0.0), "int vs long tol=0 identity");
+Assert(!Checks.ValuesEqual(123, 124L, 0.0), "int vs long tol=0 inequality");
+Assert(Checks.ValuesEqual(1L, 1.0, 0.0), "int vs float tol=0 identity");
+Assert(!Checks.ValuesEqual(1L, 1.5, 0.0), "int vs float tol=0 fractional inequality");
+Assert(!Checks.ValuesEqual(9007199254740993L, 9007199254740992.0, 0.0), "int vs float tol=0 precision inequality");
+Assert(!Checks.ValuesEqual(9007199254740992.0, 9007199254740993L, 0.0), "float vs int tol=0 precision inequality");
+Assert(Checks.ValuesEqual(9007199254740992L, 9007199254740992.0, 0.0), "int vs float tol=0 2^53 exact identity");
+Assert(Checks.ValuesEqual(9007199254740992.0, 9007199254740992L, 0.0), "float vs int tol=0 2^53 exact identity");
+Assert(!Checks.ValuesEqual(long.MaxValue, 9223372036854775808.0, 0.0), "long.MaxValue vs 2^63 double inequality");
+Assert(!Checks.ValuesEqual(9223372036854775808.0, long.MaxValue, 0.0), "2^63 double vs long.MaxValue inequality");
+Assert(Checks.ValuesEqual(long.MinValue, -9223372036854775808.0, 0.0), "long.MinValue vs -2^63 double identity");
+Assert(Checks.ValuesEqual(-9223372036854775808.0, long.MinValue, 0.0), "-2^63 double vs long.MinValue identity");
+Assert(Checks.ValuesEqual(9223372036854775808UL, 9223372036854775808.0, 0.0), "ulong 2^63 vs double identity");
+Assert(Checks.ValuesEqual(9223372036854775808.0, 9223372036854775808UL, 0.0), "double vs ulong 2^63 identity");
+Assert(!Checks.ValuesEqual(ulong.MaxValue, 18446744073709551616.0, 0.0), "ulong.MaxValue vs 2^64 double inequality");
+Assert(!Checks.ValuesEqual(18446744073709551616.0, ulong.MaxValue, 0.0), "2^64 double vs ulong.MaxValue inequality");
+Assert(Checks.ValuesEqual(ulong.MaxValue, ulong.MaxValue, 0.0), "ulong.MaxValue identity");
+Assert(!Checks.ValuesEqual(ulong.MaxValue, ulong.MaxValue - 1, 0.0), "ulong.MaxValue inequality");
+Assert(!Checks.ValuesEqual(double.PositiveInfinity, 1L, 0.0), "infinity vs long inequality");
+Assert(!Checks.ValuesEqual(1L, double.PositiveInfinity, 0.0), "long vs infinity inequality");
+Assert(!Checks.ValuesEqual(double.NaN, 1L, 0.0), "NaN vs long inequality");
+Assert(!Checks.ValuesEqual(1L, double.NaN, 0.0), "long vs NaN inequality");
+Assert(Checks.ValuesEqual(123.45m, 123.45m, 0.0), "decimal vs decimal identity");
+Assert(!Checks.ValuesEqual(123.45m, 123.46m, 0.0), "decimal vs decimal inequality");
+Assert(Checks.ValuesEqual(9007199254740993L, 9007199254740993m, 0.0), "long vs decimal 2^53 identity");
+Assert(Checks.ValuesEqual(9007199254740993m, 9007199254740993L, 0.0), "decimal vs long 2^53 identity");
+Assert(!Checks.ValuesEqual(9007199254740992L, 9007199254740993m, 0.0), "long vs decimal 2^53 inequality");
+Assert(!Checks.ValuesEqual(9007199254740993m, 9007199254740992L, 0.0), "decimal vs long 2^53 inequality");
+Assert(!Checks.ValuesEqual(9007199254740994L, 9007199254740993m, 0.0), "long vs decimal 2^53+1 inequality");
+Assert(!Checks.ValuesEqual(9007199254740993m, 9007199254740994L, 0.0), "decimal vs long 2^53+1 inequality");
+Assert(!Checks.ValuesEqual(9007199254740993m, 9007199254740992m, 0.0), "decimal vs decimal 2^53 inequality");
+Assert(Checks.ValuesEqual(9007199254740993m, 9007199254740993m, 0.0), "decimal vs decimal 2^53 identity");
+Assert(Checks.ValuesEqual(9007199254740993m, 9007199254740992.0, 0.0), "decimal vs double double-precision fallback identity");
+Assert(Checks.ValuesEqual(9007199254740992.0, 9007199254740993m, 0.0), "double vs decimal double-precision fallback identity");
+Assert(!Checks.ValuesEqual(1L, 1.000000000000000000001m, 0.0), "long vs decimal fractional inequality");
+Assert(!Checks.ValuesEqual(1.000000000000000000001m, 1L, 0.0), "decimal vs long fractional inequality");
+Assert(Checks.ValuesEqual(0.0, -0.0, 0.0), "signed zero float identity");
+Assert(Checks.ValuesEqual(0L, -0.0, 0.0), "signed zero int vs float identity");
+Assert(!Checks.ValuesEqual(double.NaN, double.NaN, 0.0), "NaN vs NaN inequality");
+Assert(!Checks.ValuesEqual(double.NaN, 0.0, 0.0), "NaN vs zero inequality");
+Assert(Checks.ValuesEqual(9007199254740993L, 9007199254740992L, 1e-9), "tol > 0 preserved for int64");
+Assert(Checks.ValuesEqual(100.0, 100.01, 0.01), "tol > 0 preserved for float");
+Assert(!Checks.ValuesEqual(100.0, 100.01, 0.00001), "tol > 0 tight tolerance");
 string directory = Path.Combine(Path.GetTempPath(), "pbz-grouped-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
 try {

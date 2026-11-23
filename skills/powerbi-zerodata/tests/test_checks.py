@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from pbz import checks, engine
+from pbz import checks, engine, synthtest
 from pbz.common import PbzError
 
 
@@ -36,6 +36,47 @@ class ProbeChecksTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "NOT_FOUND")
             self.assertEqual(called.call_count, before)
             self.assertEqual(checks.probe(ws, project, "unknown", ["Explicit"])["columns"][0]["column"], "Explicit")
+
+
+class ExactInt64EqualTests(unittest.TestCase):
+    def test_exact_int64_at_tol_zero(self):
+        # Numbers exceeding 2^53 (9007199254740992) lose precision when cast to double
+        a = 9007199254740993
+        b = 9007199254740992
+        self.assertFalse(synthtest._same(a, b, tol=0.0))
+        self.assertTrue(synthtest._same(a, a, tol=0.0))
+
+    def test_exact_int64_vs_float_at_tol_zero(self):
+        # Int vs float at tol == 0
+        self.assertTrue(synthtest._same(1, 1.0, tol=0.0))
+        self.assertFalse(synthtest._same(1, 1.5, tol=0.0))
+        self.assertFalse(synthtest._same(9007199254740993, 9007199254740992.0, tol=0.0))
+        self.assertTrue(synthtest._same(9007199254740992, 9007199254740992.0, tol=0.0))
+
+    def test_large_int_vs_float_no_overflow(self):
+        # Extremely large ints beyond float range must not raise OverflowError
+        self.assertFalse(synthtest._same(10**400, 1.0, tol=0.0))
+        self.assertFalse(synthtest._same(1.0, 10**400, tol=0.0))
+
+    def test_signed_zero_at_tol_zero(self):
+        # +0.0 and -0.0 compare equal
+        self.assertTrue(synthtest._same(0.0, -0.0, tol=0.0))
+        self.assertTrue(synthtest._same(0, -0.0, tol=0.0))
+
+    def test_nan_at_tol_zero(self):
+        # NaN is never equal to NaN or any other value
+        nan = float("nan")
+        self.assertFalse(synthtest._same(nan, nan, tol=0.0))
+        self.assertFalse(synthtest._same(nan, 0.0, tol=0.0))
+        self.assertFalse(synthtest._same(0.0, nan, tol=0.0))
+
+    def test_regression_tol_greater_than_zero_unchanged(self):
+        # For tol > 0, relative tolerance comparison is preserved
+        a = 9007199254740993
+        b = 9007199254740992
+        self.assertTrue(synthtest._same(a, b, tol=1e-9))
+        self.assertTrue(synthtest._same(100.0, 100.01, tol=0.01))
+        self.assertFalse(synthtest._same(100.0, 100.01, tol=0.00001))
 
 
 if __name__ == "__main__":

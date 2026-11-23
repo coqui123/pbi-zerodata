@@ -414,6 +414,8 @@ def _same(a, b, tol: float) -> bool:
     if a is None or b is None:
         return a is None and b is None
     if _number(a) and _number(b):
+        if tol == 0:
+            return a == b
         a, b = float(a), float(b)
         return a == b or abs(a - b) <= tol * max(abs(a), abs(b))
     return a == b
