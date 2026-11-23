@@ -188,10 +188,10 @@ There is no calendar year field.
 ### `snapshot-save` / `snapshot-compare`
 Request `{"private_dir", "port", "name": "before-refactor", "queries": [{"id": "q1",
 "dax": "EVALUATE SUMMARIZECOLUMNS(DimDate[Year], \"m\", [Total Hours])", "keys": ["DimDate[Year]"]}]}`
-- Save: run each query, store in `private_dir\snapshots\<name>.json` per query: map
+- Save: run each query, store in `private_dir\snapshots\results\<name>.json` per query: map
   `hmac(key tuple)` -> list of per-column `hmac(cell)`; no keys -> multiset of row hmacs. Also
   store `refreshed`: max `RefreshedTime` over TMSCHEMA_PARTITIONS (stored only, never printed).
-- Compare: rerun, respond per query `{"id": "q1", "result": "SAME"}` or
+- Compare: rerun, read from `private_dir\snapshots\results\<name>.json` (with shape-validated legacy read-only fallback to `private_dir\snapshots\<name>.json`), respond per query `{"id": "q1", "result": "SAME"}` or
   `{"id": "q1", "result": "DIFF", "columns": ["m"], "mismatch": "ONE"}`; `NEW` (no saved query),
   `MISSING` (saved query not in request), `STALE_DATA` (model refreshed since save).
 

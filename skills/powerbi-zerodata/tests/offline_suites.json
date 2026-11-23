@@ -897,5 +897,13 @@
     ],
     "windows": false,
     "engine": false
+  },
+  {
+    "id": "snapshot_store",
+    "argv": [
+      "tests/test_snapshot_store.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]

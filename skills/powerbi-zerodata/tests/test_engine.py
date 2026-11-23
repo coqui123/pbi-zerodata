@@ -1141,7 +1141,7 @@ def test_live(env: Env, key_holder: dict) -> None:
     expect("snapshot-save: SAVED x3, failing query ERROR with class only",
            [s.get(k, {}).get("result") for k in ("q1", "q2", "q3")] == ["SAVED"] * 3 and s.get("qerr", {}).get("result") == "ERROR"
            and s.get("qerr", {}).get("class") == "OTHER", r)
-    snap = json.loads((env.pd / "snapshots" / "t1.json").read_text("utf-8"))
+    snap = json.loads((env.pd / "snapshots" / "results" / "t1.json").read_text("utf-8"))
     expect("snapshot file: HMAC rows + refreshed stamp, no raw cells",
            all(re.fullmatch(r"[0-9a-f]{64}", k) for k in snap["queries"]["q1"]["rows"]) and "refreshed" in snap
            and all(re.fullmatch(r"[0-9a-f]{64}", k) for k in snap["queries"]["q2"]["multiset"]))
@@ -1167,6 +1167,46 @@ def test_live(env: Env, key_holder: dict) -> None:
     r = engine("snapshot-compare", env.req(name="t1", queries=[q1b]), "snapshot-stale-diff")
     s = {q["id"]: q for q in (r or {}).get("queries", [])}
     expect("snapshot-compare after refresh with a changed query: STALE_DATA", s.get("q1", {}).get("result") == "STALE_DATA", r)
+
+    # snapshot namespace: monthly and monthly.spec do not collide in results/
+    r_monthly = engine("snapshot-save", env.req(name="monthly", queries=[q1]), "snapshot-monthly")
+    r_spec = engine("snapshot-save", env.req(name="monthly.spec", queries=[q2]), "snapshot-monthly-spec")
+    expect("snapshot non-collision: both monthly and monthly.spec save successfully",
+           bool((r_monthly or {}).get("ok") and (r_spec or {}).get("ok")))
+    expect("snapshot results files: separate results/monthly.json and results/monthly.spec.json exist",
+           (env.pd / "snapshots" / "results" / "monthly.json").is_file()
+           and (env.pd / "snapshots" / "results" / "monthly.spec.json").is_file())
+    r_cmp_monthly = engine("snapshot-compare", env.req(name="monthly", queries=[q1]), "compare-monthly")
+    r_cmp_spec = engine("snapshot-compare", env.req(name="monthly.spec", queries=[q2]), "compare-monthly-spec")
+    expect("snapshot compare non-collision: both compare independently as SAME",
+           [q.get("result") for q in (r_cmp_monthly or {}).get("queries", [])] == ["SAME"]
+           and [q.get("result") for q in (r_cmp_spec or {}).get("queries", [])] == ["SAME"])
+
+    # snapshot legacy fallback: read-only fallback to private_dir/snapshots/<name>.json
+    # 1. Save fresh baseline named 'legacy' with [q1, q2, q3]
+    r_save_leg = engine("snapshot-save", env.req(name="legacy", queries=[q1, q2, q3]), "snapshot-save-legacy")
+    expect("snapshot save fresh legacy baseline -> ok", bool((r_save_leg or {}).get("ok")))
+    primary_leg_file = env.pd / "snapshots" / "results" / "legacy.json"
+    legacy_file = env.pd / "snapshots" / "legacy.json"
+    # 2. Move result file to snapshots/legacy.json (primary becomes absent)
+    primary_bytes = primary_leg_file.read_bytes()
+    legacy_file.write_bytes(primary_bytes)
+    primary_leg_file.unlink()
+    # 3. Compare without intervening refresh: should read from legacy fallback, leave legacy bytes untouched
+    r_legacy = engine("snapshot-compare", env.req(name="legacy", queries=[q1, q2, q3]), "compare-legacy-fallback")
+    leg_queries = (r_legacy or {}).get("queries", [])
+    expect("snapshot legacy fallback: reads from snapshots/legacy.json when results/ missing",
+           not primary_leg_file.exists()
+           and legacy_file.read_bytes() == primary_bytes
+           and [q.get("id") for q in leg_queries] == ["q1", "q2", "q3"]
+           and [q.get("result") for q in leg_queries] == ["SAME", "SAME", "SAME"])
+
+    # snapshot legacy fallback: does not misread a spec file as a result document
+    spec_only_file = env.pd / "snapshots" / "unmigrated.spec.json"
+    spec_only_file.write_text(json.dumps({"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}), encoding="utf-8")
+    r_spec_only = engine("snapshot-compare", env.req(name="unmigrated.spec", queries=[q1]), "compare-spec-only")
+    expect("snapshot legacy fallback: does not misread a spec file as a result document (reports NEW)",
+           [q.get("result") for q in (r_spec_only or {}).get("queries", [])] == ["NEW"])
 
     # smoke
     r = engine("smoke", env.req(visuals=[

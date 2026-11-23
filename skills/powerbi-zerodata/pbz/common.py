@@ -544,6 +544,25 @@ def preflight_regular(path: str, *, root: str | None) -> None:
 SIZE_CAP = "SIZE_CAP"
 
 
+def is_snapshot_result_doc(doc: object) -> bool:
+    """True if doc has the schema of a snapshot result baseline."""
+    return (
+        isinstance(doc, dict)
+        and isinstance(doc.get("queries"), dict)
+        and "refreshed" in doc
+        and (doc["refreshed"] is None or isinstance(doc["refreshed"], str))
+    )
+
+
+def is_snapshot_spec_doc(doc: object) -> bool:
+    """True if doc has the schema of a snapshot query specification."""
+    return (
+        isinstance(doc, dict)
+        and isinstance(doc.get("queries"), list)
+    )
+
+
+
 # Tests set this to swap the path between the open and the identity re-check. Production leaves it None.
 _read_checked_hook = None
 
