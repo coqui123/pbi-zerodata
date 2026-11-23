@@ -429,12 +429,24 @@ def _wrapper_head(value):
 
 
 def _wrapped_inner(value):
-    """(wrapper, inner) when value is Name(...) with the final character closing it."""
+    """(wrapper, inner) when value is Name(...) with the opening
+    parenthesis closing at the final character: two calls in a row
+    are not one wrapper."""
     head = _wrapper_head(value)
     if not head or not value.endswith(")"):
         return None
-    wrapper, i = head
-    return wrapper, value[i + 1:-1]
+    wrapper, start = head
+    depth = 0
+    for i in range(start, len(value)):
+        if value[i] == "(":
+            depth += 1
+        elif value[i] == ")":
+            depth -= 1
+            if depth == 0 and i != len(value) - 1:
+                return None
+    if depth != 0:
+        return None
+    return wrapper, value[start + 1:-1]
 
 
 def _wrapped_call(value):

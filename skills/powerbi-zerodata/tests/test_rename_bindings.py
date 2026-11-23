@@ -1857,6 +1857,18 @@ class RenameBindingsTests(unittest.TestCase):
         got = json.loads(path.read_text())["projections"][0]["details"]["refs"][0]["nativeQueryRef"]
         self.assertEqual(got, "Amount")
 
+    def test_two_calls_are_not_one_wrapper(self):
+        ws, project, mdef, path = self._report_project(
+            {"refs": [{"metadata": "SUM(Sales.A) + SUM(Sales.B)"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn A\n\t\tdataType: int64\n\tcolumn B\n\t\tdataType: int64\n"
+               "\tcolumn 'A) + SUM(Sales.B'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "A) + SUM(Sales.B", "Net", table="Sales")
+        got = json.loads(path.read_text())["refs"][0]["metadata"]
+        self.assertEqual(got, "SUM(Sales.A) + SUM(Sales.B)")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
