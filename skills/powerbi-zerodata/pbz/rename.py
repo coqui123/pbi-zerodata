@@ -755,16 +755,18 @@ def _extension_entities(report_dir):
         for ent in ents.items:
             if not isinstance(ent, pbir.JObj):
                 continue
-            nm = ent.get("name")
-            if not isinstance(nm, pbir.JStr):
-                continue
-            measures = []
             ms = ent.get("measures")
             if ms is not None and not isinstance(ms, pbir.JArr):
                 # A present, non-array measures container is a
                 # structurally unreadable inventory, like a non-array
                 # entities value: refuse rather than report it empty.
+                # The check runs before the name skip, so an unnamed
+                # entity cannot hide a malformed container.
                 raise PbzError("REFUSED", "definition/reportExtensions.json")
+            nm = ent.get("name")
+            if not isinstance(nm, pbir.JStr):
+                continue
+            measures = []
             if isinstance(ms, pbir.JArr):
                 for m in ms.items:
                     mn = m.get("name") if isinstance(m, pbir.JObj) else None

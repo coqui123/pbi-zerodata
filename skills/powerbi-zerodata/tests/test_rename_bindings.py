@@ -2024,6 +2024,13 @@ class RenameBindingsTests(unittest.TestCase):
         with self.assertRaises(PbzError):
             rename._extension_entities(project.mirror_report)
 
+    def test_extension_inventory_unnamed_entity_measures_not_array_refuses(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"entities": [{"measures": {"name": "Total", "expression": "2"}}]}))
+        with self.assertRaises(PbzError):
+            rename._extension_entities(project.mirror_report)
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
