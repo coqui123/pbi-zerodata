@@ -1693,6 +1693,20 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
         self.assertEqual(json.loads(path.read_text())["projections"][0]["nativeQueryRef"], "Net")
 
+    def test_table_rename_datatable_logical_alias_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Logical.tmdl"),
+               "table Logical\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATATABLE(\"Flag\", LOGICAL, {{TRUE()}})) + COUNTROWS('Logical')"}]}]}))
+        rename.rename(ws, project, "table", "Logical", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATATABLE(\"Flag\", LOGICAL, {{TRUE()}})) + COUNTROWS('Archive')")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

@@ -1032,7 +1032,7 @@ _DAX_KEYWORDS = {_fold(w) for w in (
     "densify", "dense", "desc", "double", "else", "endaligned", "evaluate",
     "extending", "false",
     "first", "group", "hour", "in", "index", "int64", "integer", "last",
-    "matchby",
+    "logical", "matchby",
     "measure", "minute", "month", "mparameter", "none", "not", "oneway",
     "oneway_leftfiltersright",
     "oneway_rightfiltersleft", "or", "order", "precise", "quarter", "rel",
