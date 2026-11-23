@@ -1160,13 +1160,16 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
         # A keyword the resolver mistook for a table (as a bracket's
         # qualifier, as a standalone binding, or as an iterator's row
         # table) poisons the bindings around it. Mask every such token
-        # numerically (same length, offsets preserved; spaces would let
-        # the preceding name become a spaced qualifier) and take the
-        # bindings from a second pass over the masked text, where the
-        # keyword can no longer be misread.
+        # as a parenthesized number (same length, offsets preserved;
+        # spaces would let the preceding name become a spaced
+        # qualifier, and bare digits would glue to a neighboring
+        # identifier and form a phantom token) and take the bindings
+        # from a second pass over the masked text, where the keyword
+        # can no longer be misread.
         chars = list(text)
         for a, z in mask_spans:
-            chars[a:z] = "1" * (z - a)
+            n = z - a
+            chars[a:z] = "(" + "1" * (n - 2) + ")" if n >= 2 else "1"
         bindings = deps.dax_bindings("".join(chars), cur, res).bindings
         # A masked span touching an identifier character glues into a
         # single phantom token (RETURN'B'[M] masks to RETURN111111);

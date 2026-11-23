@@ -1751,6 +1751,23 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
         self.assertEqual(m, "VAR x = 1 RETURN'B'[M]")
 
+    def test_column_rename_mask_glue_does_not_steer_row_inference(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn SortKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "RETURN111111.tmdl"),
+               "table RETURN111111\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        expr = "SUMX(TOPN(VAR x = 1 RETURN'B'[M], Sales, Sales[SortKey]), [Amount])"
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "B", "measures": [{"name": "M", "expression": "3"},
+                                       {"name": "N", "expression": expr}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="RETURN111111")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, expr)
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
