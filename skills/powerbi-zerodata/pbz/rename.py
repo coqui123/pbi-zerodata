@@ -1644,7 +1644,8 @@ def rename_table(ws, project, model, old: str, new: str) -> dict:
                                                extra_extending=_extension_owned(project.mirror_report, old),
                                                extra_tables=_extension_tables(project.mirror_report),
                                                dest_owned=ext_owned,
-                                               dest_extending=_extension_owned_dest(project.mirror_report, old, new))
+                                               dest_extending=_extension_owned_dest(project.mirror_report, old, new),
+                                               ext_bare=_extension_bare_names(project.mirror_report))
                     if nv != node.value:
                         edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
             edits.extend(_measure_expression_edits(root, model, "table", "", old, new))
