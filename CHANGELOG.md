@@ -6,6 +6,8 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- Offline CI shard weights use per-suite median seconds measured in hosted sharded runs, with sparse suites keeping their prior weights.
+
 - `pbz revert` takes the project transaction lock, refuses pending recovery, and preserves external object saves made during planning.
 
 - `pbz pull --rebase` preserves mirror deletions and reports upstream changes as conflicts without advancing their manifest or base.

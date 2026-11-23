@@ -4,8 +4,15 @@ The normal inventory is `skills/powerbi-zerodata/tests/offline_suites.json`.
 `offline_baseline.json` independently freezes the old hosted suite IDs and argv,
 including the separate synth provenance invocation. Do not regenerate the baseline
 from the manifest. Only `test_e2e.py` is excluded as a whole script. Timing weights
-are optional: the engine's 37.6 seconds comes from the plan's single measured run;
-other weights default to one until measurements are available. Allocation is
+are per-suite medians of executed seconds measured in the sharded context from
+hosted `offline-shadow.yml` sharded reports: seconds as allocated. To refresh,
+dispatch at least five sharded runs with the same SHA and environment identity,
+run `python tests/ci_weights.py REPORT...` on their shard reports, apply the
+computed weights with `apply_weights`, and verify allocation coverage. Only rows
+that launched, exited 0 and have no `source` key count. At least three eligible
+samples are required; three or four are flagged low-sample, and suites below
+three keep their prior weight (or the default of one if none exists). Medians
+are floored at 0.1 and rounded to tenths. Allocation is
 longest-first, serial inside each fresh Windows VM, with a separate publish per VM.
 No engine artifact transfer is used.
 

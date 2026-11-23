@@ -33,6 +33,9 @@ class CiWeightsTests(unittest.TestCase):
         reports.append(report('serial-run', 'serial', a=1))
         with self.assertRaisesRegex(ValueError, 'serial'):
             compute_weights(reports)
+        with self.assertRaisesRegex(ValueError, 'invalid shard'):
+            compute_weights([report(str(i), str(i % 2), a=1) for i in range(3)]
+                            + [report('extra', '2', a=1)])
 
     def test_refuses_mixed_sha(self):
         reports = [report(str(i), str(i % 2), a=1) for i in range(3)]
@@ -59,6 +62,27 @@ class CiWeightsTests(unittest.TestCase):
                     row = dict(id=name, seconds=500, launched=True, exit_code=0)
                     row.update(excluded)
                     data['executed'].append(row)
+        self.assertEqual(compute_weights(reports), {'a': 2.0})
+
+    def test_refuses_duplicate_report_and_duplicate_rows(self):
+        reports = [report('one', '0', a=1), report('one', '1', b=2),
+                   report('two', '0', a=3), report('three', '0', a=5)]
+        with self.assertRaisesRegex(ValueError, 'duplicate report'):
+            compute_weights(reports + [reports[0]])
+        doubled = [report('one', '0', a=1), report('one', '1', a=2, b=2),
+                   report('two', '0', a=3), report('three', '0', a=5)]
+        with self.assertRaisesRegex(ValueError, 'duplicate eligible row'):
+            compute_weights(doubled)
+
+    def test_rows_missing_outcome_keys_contribute_nothing(self):
+        reports = [report(str(i), str(i % 2), a=value)
+                   for i, value in enumerate((1, 2, 3))]
+        for data in reports:
+            for incomplete in ({'launched': None}, {'exit_code': None}):
+                row = dict(id='a', seconds=500, launched=True, exit_code=0)
+                key = next(iter(incomplete))
+                del row[key]
+                data['executed'].append(row)
         self.assertEqual(compute_weights(reports), {'a': 2.0})
 
     def test_floor_and_rounding(self):
