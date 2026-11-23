@@ -659,6 +659,14 @@ def _table_rewrite_flagged(value, old, new, qualified, table=None, model=None, o
             return _swap(text)
         return None
 
+    if key == "nativeQueryRef" and model is not None \
+            and _other_table_owns(model, old, value, other_owned, other_extending,
+                                  extensions_any=True, extra_tables=other_tables,
+                                  bare_fields=True, ext_bare=ext_bare):
+        # The literal string names another table's field: that
+        # reading is probed before every other, so neither the raw
+        # extension acceptance nor the wrapper retry runs on it.
+        return value, False
     out = _rewrite(value)
     if out is _BLOCKED:
         return value, False
@@ -666,14 +674,6 @@ def _table_rewrite_flagged(value, old, new, qualified, table=None, model=None, o
         return out, False
     wrapped = _wrapped_inner(value)
     if wrapped:
-        if key == "nativeQueryRef" and model is not None \
-                and _other_table_owns(model, old, value, other_owned, other_extending,
-                                      extensions_any=True, extra_tables=other_tables,
-                                      bare_fields=True, ext_bare=ext_bare):
-            # The literal string names another table's field: that
-            # reading is probed before the wrapped one, so the
-            # wrapper retry never runs on it.
-            return value, False
         inner = _rewrite(wrapped[1])
         if inner is not None and inner is not _BLOCKED:
             return f"{wrapped[0]}({inner})", True

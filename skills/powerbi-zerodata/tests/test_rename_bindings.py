@@ -2041,6 +2041,19 @@ class RenameBindingsTests(unittest.TestCase):
         got = json.loads(path.read_text())["projections"][0]["nativeQueryRef"]
         self.assertEqual(got, "Sum(Sales.Amount)")
 
+    def test_table_rename_bare_native_query_ref_dotted_field_name_stays(self):
+        ws, project, mdef, path = self._report_project(
+            {"projections": [{"nativeQueryRef": "Sales.Amount.Year"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn 'Sales.Amount.Year'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        got = json.loads(path.read_text())["projections"][0]["nativeQueryRef"]
+        self.assertEqual(got, "Sales.Amount.Year")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
