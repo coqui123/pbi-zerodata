@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1907,6 +1908,24 @@ class RenameBindingsTests(unittest.TestCase):
         recs = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["references"]["measures"]
         self.assertEqual(recs[0]["entity"], "Revenue")
         self.assertEqual(recs[1]["entity"], "Sales")
+
+    def test_extension_inventory_symlink_escape_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        outside = Path(tempfile.mkdtemp()) / "outside-ext.json"
+        outside.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Margin", "expression": "1"}]}]}))
+        try:
+            ext_path.symlink_to(outside)
+        except OSError:
+            outside.unlink(missing_ok=True)
+            return  # Windows may not grant symlink creation.
+        try:
+            with self.assertRaises(PbzError) as ctx:
+                rename.rename(ws, project, "measure", "Keep", "Margin")
+            self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+        finally:
+            outside.unlink(missing_ok=True)
 
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})

@@ -700,11 +700,15 @@ def _single_wrapped(value):
 def _extension_entities(report_dir):
     """(entity name, [measure names]) pairs from reportExtensions.json."""
     path = os.path.join(report_dir, "definition", "reportExtensions.json")
-    if not os.path.isfile(path):
+    if not os.path.lexists(path):
         return []
+    # The inventory is mirror content: load it through the mirror read
+    # guard, so a path escaping the mirror (a symlink to an external
+    # file) refuses instead of being read; only a genuinely absent
+    # file is an empty inventory.
+    text, _bom = mirror.read_mirror_text(path, root=os.path.dirname(report_dir))
     try:
-        with open(path, encoding="utf-8-sig") as fh:
-            root = pbir.parse_json(fh.read())
+        root = pbir.parse_json(text)
     except Exception:
         return []
     out = []
