@@ -77,6 +77,12 @@
       "argv": [
         "tests/test_rebase_deletes.py"
       ]
+    },
+    {
+      "id": "ci_weights",
+      "argv": [
+        "tests/test_ci_weights.py"
+      ]
     }
   ]
 }

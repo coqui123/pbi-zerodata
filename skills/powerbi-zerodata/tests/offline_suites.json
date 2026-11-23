@@ -897,5 +897,13 @@
     ],
     "windows": false,
     "engine": false
+  },
+  {
+    "id": "ci_weights",
+    "argv": [
+      "tests/test_ci_weights.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]
