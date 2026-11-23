@@ -795,8 +795,12 @@ def _restore_transaction(ws, project, directory, journal, *, preserve_external=F
             continue
         target = _transaction_path(ws, project, entry)
         current = file_sha(target)
-        if preserve_external and current not in (entry["before"], entry["after"]):
+        if current not in (entry["before"], entry["after"]):
             conflicts.append(entry["path"])
+            if not preserve_external:
+                journal["state"] = "RECOVERY_REQUIRED"
+                _journal_save(directory, journal)
+                return {"result": "RECOVERY_CONFLICT", "conflicts": conflicts}
             continue
         if current == entry["before"]:
             continue
