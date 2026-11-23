@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -22,6 +23,870 @@ from test_modeling_atomic import _bytes, _write
 class RenameBindingsTests(unittest.TestCase):
     _project = fixtures.ModelingAtomicTests._project
     _column_project = fixtures.ModelingAtomicTests._column_project
+
+    def test_column_rename_to_other_tables_column_name_succeeds(self):
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": table}}, "Property": name},
+             "queryRef": f"{table}.{name}", "nativeQueryRef": name}
+            for table, name in (("Sales", "Region"), ("Other", "City"))]}
+        ws, project, mdef, path = self._report_project(obj)
+        sales, other = Path(mdef, "tables", "Sales.tmdl"), Path(mdef, "tables", "Other.tmdl")
+        sales.write_text("table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+        other.write_text("table Other\n\tcolumn City\n\t\tdataType: string\n")
+        before_other = other.read_bytes()
+        result = rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(result["to"], "City")
+        projections = json.loads(path.read_text())["projections"]
+        self.assertEqual(projections[0]["queryRef"], "Sales.City")
+        self.assertEqual(projections[0]["nativeQueryRef"], "City")
+        self.assertEqual(projections[0]["Column"]["Property"], "City")
+        self.assertEqual(projections[1], obj["projections"][1])
+        self.assertEqual(other.read_bytes(), before_other)
+        self.assertEqual(sales.read_text(), "table Sales\n\tcolumn City\n\t\tdataType: string\n")
+
+    def test_column_rename_same_table_collision_refused(self):
+        ws, project, mdef, _path = self._report_project({"refs": []})
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n\tcolumn City\n\t\tdataType: string\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_measure_name_conflict_refused(self):
+        ws, project, mdef, _path = self._report_project({"refs": []})
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+        other = Path(mdef, "tables", "Other.tmdl")
+        other.write_text(other.read_text() + "\tmeasure City = 1\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_variation_selector_metadata_follows(self):
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}],
+            "objects": {"dataPoint": [{"selector": {"metadata": old}}]}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+        after = json.loads(path.read_text())
+        expected = "Sales.Order Date.Variation.Date Hierarchy.Year"
+        self.assertEqual(after["projections"][0]["queryRef"], expected)
+        self.assertEqual(after["objects"]["dataPoint"][0]["selector"]["metadata"], expected)
+        pvs = after["projections"][0]["HierarchyLevel"]["Expression"]["Hierarchy"]["Expression"]["PropertyVariationSource"]
+        self.assertEqual(pvs["Property"], "Order Date")
+        self.assertEqual(Path(mdef, "tables", "Sales.tmdl").read_text(),
+                         "table Sales\n\tcolumn 'Order Date'\n\t\tdataType: dateTime\n")
+
+    def test_column_rename_destination_queryref_collision_refused(self):
+        # Another table's projection already answers to the destination
+        # queryRef text: rewriting the target's queryRef onto it would
+        # leave the selector naming that string pointing at either one.
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Region"},
+             "queryRef": "Sales.Region"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Geo"}}, "Property": "City"},
+             "queryRef": "Sales.City"}],
+            "objects": {"values": [{"selector": {"metadata": "Sales.City"}}]}}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+        Path(mdef, "tables", "Geo.tmdl").write_text(
+            "table Geo\n\tcolumn City\n\t\tdataType: string\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_queryref_collision_via_native_ref_refused(self):
+        # A nativeQueryRef text must not confer queryRef ownership: the
+        # arithmetic projection's unowned queryRef already reads "A.Y", so
+        # rewriting A[X]'s queryRef onto it would strand the selector.
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "A"}}, "Property": "X"},
+             "queryRef": "A.X", "nativeQueryRef": "A.Y"},
+            {"Arithmetic": {"Left": {"Column": {"Expression": {"SourceRef": {"Entity": "B"}},
+                                            "Property": "Y"}},
+                            "Right": {"Literal": {"Value": "1L"}}, "Operator": 0},
+             "queryRef": "A.Y"}],
+            "selector": {"metadata": "A.Y"}}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "B.tmdl").write_text(
+            "table B\n\tcolumn Y\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "Y", table="A")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_same_field_queryref_merge_refused(self):
+        # The same field projected twice under distinct queryRefs: rewriting
+        # the canonical one onto the custom one would merge the identifiers
+        # a formatting selector uses to tell the projections apart.
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "A"}}, "Property": "X"},
+             "queryRef": "A.X"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "A"}}, "Property": "X"},
+             "queryRef": "A.Y"}],
+            "objects": {"values": [{"selector": {"metadata": "A.Y"}}]}}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "Y", table="A")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_dotted_name_path_collision_refused(self):
+        # Renaming A[X] to "B.C" would give it the qualified path A.B.C,
+        # already owned by column C of table "A.B": the destination path
+        # ownership check refuses before any write, with or without an
+        # additional dotted column present.
+        for extra in ("", "\n\tcolumn 'B.C'\n\t\tdataType: int64\n"):
+            ws, project, mdef, _path = self._report_project({"queryRef": "A.B.C"})
+            Path(mdef, "tables", "A.tmdl").write_text(
+                "table A\n\tcolumn X\n\t\tdataType: int64\n")
+            Path(mdef, "tables", "A.B.tmdl").write_text(
+                "table 'A.B'\n\tcolumn C\n\t\tdataType: int64\n" + extra)
+            before = _bytes(ws.mirror)
+            with patch("pbz.rename.commit_bytes") as commit:
+                with self.assertRaises(PbzError) as caught:
+                    rename.rename(ws, project, "column", "X", "B.C", table="A")
+            self.assertEqual(caught.exception.code, "NAME_TAKEN")
+            commit.assert_not_called()
+            self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_wrapped_selector_destination_path_refused(self):
+        # The wrapped selector Sum(A.X) would be rewritten to Sum(A.Y),
+        # which is also the literal qualified path of column 'Y)' in the
+        # table named 'Sum(A': the string rename refuses before any write.
+        ws, project, mdef, _path = self._report_project({"selector": {"metadata": "Sum(A.X)"}})
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "Sum(A.tmdl").write_text(
+            "table 'Sum(A'\n\tcolumn Y\n\t\tdataType: int64\n\tcolumn 'Y)'\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "Y", table="A")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_orphan_variation_selector_follows(self):
+        # A variation selector in a file with no proven projection for it
+        # (here a bookmark file) is a pure path extension of the target:
+        # the target is its only possible owner, so it follows the rename
+        # instead of being left pointing at the old path.
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        new = "Sales.Order Date.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}],
+            "objects": {"dataPoint": [{"selector": {"metadata": old}}]}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "Bm1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"objects": {"labels": [{"selector": {"metadata": old}}]}}))
+        rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["objects"]["dataPoint"][0]["selector"]["metadata"], new)
+        self.assertEqual(json.loads(bookmark.read_text())["objects"]["labels"][0]["selector"]["metadata"], new)
+
+    def test_column_rename_orphan_selector_claimed_by_other_projection_stays(self):
+        # The bookmark selector's text is the queryRef of a projection
+        # owned by Sales[ShipDate], even though it spells a path extension
+        # of the renamed column: the claim leaves the selector with its
+        # projection instead of following the rename away from it.
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                          "Property": "ShipDate"}, "queryRef": old}]}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n"
+            "\tcolumn ShipDate\n\t\tdataType: dateTime\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "Bm1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"selector": {"metadata": old}}))
+        rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], old)
+        self.assertEqual(json.loads(bookmark.read_text())["selector"]["metadata"], old)
+
+    def test_column_rename_cross_file_queryref_landing_refused(self):
+        # A rewritten queryRef must not land on a queryRef another file's
+        # projection answers to: here Sales[ShipDate]'s projection in a
+        # second visual already reads "Sales.BookedDate", so renaming
+        # OrderDate to BookedDate would leave two projections of different
+        # fields sharing one identifier across the report.
+        def proj(prop, qr):
+            return {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                "Property": prop}, "queryRef": qr}]}
+        ws, project, mdef, _path = self._report_project(proj("OrderDate", "Sales.OrderDate"))
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n"
+            "\tcolumn ShipDate\n\t\tdataType: dateTime\n")
+        report = Path(project.mirror_report, "definition")
+        (report / "visual2.json").write_text(json.dumps(proj("ShipDate", "Sales.BookedDate")))
+        bookmarks = report / "bookmarks"
+        bookmarks.mkdir(parents=True, exist_ok=True)
+        (bookmarks / "Bm1.bookmark.json").write_text(
+            json.dumps({"selector": {"metadata": "Sales.OrderDate"}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_selector_claimed_by_other_projection_stays(self):
+        # The selector's text spells the renamed column's path, but the
+        # only projection carrying that text as its queryRef is owned by
+        # T[B] and does not move: the claim keeps the selector with its
+        # projection instead of rewriting it away.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "B"}, "queryRef": "T.A"}]}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n\tcolumn B\n\t\tdataType: int64\n")
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"selector": {"metadata": "T.A"}}))
+        rename.rename(ws, project, "column", "A", "C", table="T")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "T.A")
+        self.assertEqual(json.loads(other.read_text())["selector"]["metadata"], "T.A")
+
+    def test_column_rename_cross_file_same_field_queryref_merge_refused(self):
+        # The same field projected in two files under distinct queryRefs:
+        # rewriting the canonical one onto the custom one would merge the
+        # identifiers across the report, just as in the one-file case.
+        def proj(qr):
+            return {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                                "Property": "A"}, "queryRef": qr}]}
+        ws, project, mdef, _path = self._report_project(proj("T.A"))
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        (Path(project.mirror_report, "definition", "visual2.json")).write_text(
+            json.dumps(proj("T.C")))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "C", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_selector_landing_on_other_queryref_refused(self):
+        # The selector follows the rename onto "T.New", which is already
+        # the unchanged queryRef of T[Keep]'s projection in the same
+        # report: the selector would end up naming that projection.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "Keep"}, "queryRef": "T.New"}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn Old\n\t\tdataType: int64\n\tcolumn Keep\n\t\tdataType: int64\n")
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"selector": {"metadata": "T.Old"}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Old", "New", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_selector_claim_beats_local_candidate(self):
+        # The selector's text "Old" is the queryRef of T[Keep]'s
+        # projection in another file, so the claim keeps it there; the
+        # target projection's own bound nativeQueryRef "Old" in the
+        # selector's file must not supply a candidate that overrides it.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "Old"},
+                                "queryRef": "T.Old", "nativeQueryRef": "Old"}],
+               "objects": {"values": [{"selector": {"metadata": "Old"}}]}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn Old\n\t\tdataType: int64\n\tcolumn Keep\n\t\tdataType: int64\n")
+        visual_a = Path(project.mirror_report, "definition", "visualA.json")
+        visual_a.write_text(json.dumps({"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "T"}}, "Property": "Keep"},
+             "queryRef": "Old"}]}))
+        rename.rename(ws, project, "column", "Old", "New", table="T")
+        after = json.loads(path.read_text())
+        self.assertEqual(after["objects"]["values"][0]["selector"]["metadata"], "Old")
+        self.assertEqual(json.loads(visual_a.read_text())["projections"][0]["queryRef"], "Old")
+
+    def test_column_rename_selector_must_land_with_claiming_projection(self):
+        # The claiming projection's queryRef is a path-like identifier the
+        # plain column rename does not rewrite, so a selector that
+        # followed the path shape away from it would match nothing: the
+        # verifier refuses before any write.
+        old = "T.A.Date Hierarchy.Year"
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "A"}, "queryRef": old}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"selector": {"metadata": old}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "B", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_case_only_orphan_variation_selector_follows(self):
+        old = "Sales.orderdate.Variation.Date Hierarchy.Year"
+        new = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "orderdate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}]}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn orderdate\n\t\tdataType: dateTime\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "b1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"selector": {"metadata": old}}))
+        rename.rename(ws, project, "column", "orderdate", "OrderDate", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], new)
+        self.assertEqual(json.loads(bookmark.read_text())["selector"]["metadata"], new)
+
+    def test_column_rename_both_claims_unaffected_selector_succeeds(self):
+        # The selector's text is claimed by a stale target queryRef in one
+        # file and by its own other-field projection in its file, but
+        # nothing in the rename would move the selector or either
+        # claiming queryRef, so the contested claim alone does not refuse.
+        def proj(prop, qr, sel=False):
+            obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                               "Property": prop}, "queryRef": qr}]}
+            if sel:
+                obj["objects"] = {"values": [{"selector": {"metadata": qr}}]}
+            return obj
+        ws, project, mdef, _path = self._report_project(proj("Region", "Sales.Area"))
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n\tcolumn Area\n\t\tdataType: string\n")
+        visual_b = Path(project.mirror_report, "definition", "visualB.json")
+        visual_b.write_text(json.dumps(proj("Area", "Sales.Area", sel=True)))
+        rename.rename(ws, project, "column", "Region", "Territory", table="Sales")
+        after = json.loads(visual_b.read_text())
+        self.assertEqual(after["objects"]["values"][0]["selector"]["metadata"], "Sales.Area")
+
+    def test_column_rename_selector_left_behind_by_carrier_refused(self):
+        # The selector's text is the wrapped queryRef of an aggregation
+        # projection; the projection follows the rename while the
+        # selector, whose string is also the literal path of an unrelated
+        # column, would stay behind matching nothing.
+        obj = {"projections": [{"Aggregation": {"Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "T"}}, "Property": "A"}}, "Function": 0},
+            "queryRef": "Sum(T.A)"}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "Sum(T.tmdl").write_text(
+            "table 'Sum(T'\n\tcolumn 'A)'\n\t\tdataType: int64\n")
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"selector": {"metadata": "Sum(T.A)"}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "B", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_unowned_variation_queryref_follows(self):
+        # An unowned queryRef carrying the variation path (a standalone
+        # reference in a bookmark file) is a pure path extension of the
+        # target: it follows the rename alongside the projections and
+        # selectors naming the same text, in every combination.
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        new = "Sales.Order Date.Variation.Date Hierarchy.Year"
+        visual = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}],
+            "objects": {"dataPoint": [{"selector": {"metadata": old}}]}}
+        for bookmark_obj in ({"selector": {"metadata": old}, "queryRef": old},
+                             {"queryRef": old}):
+            ws, project, mdef, path = self._report_project(visual)
+            Path(mdef, "tables", "Sales.tmdl").write_text(
+                "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+            bookmark = Path(project.mirror_report, "definition", "bookmarks", "B1.bookmark.json")
+            bookmark.parent.mkdir(parents=True, exist_ok=True)
+            bookmark.write_text(json.dumps(bookmark_obj))
+            rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+            after = json.loads(bookmark.read_text())
+            self.assertEqual(after["queryRef"], new)
+            if "selector" in bookmark_obj:
+                self.assertEqual(after["selector"]["metadata"], new)
+            self.assertEqual(json.loads(path.read_text())["objects"]["dataPoint"][0]["selector"]["metadata"], new)
+
+    def test_column_rename_mixed_casing_sibling_selector_follows(self):
+        # Two projections of the same field, one queryRef already at the
+        # destination casing: the selector adopting the new casing lands
+        # on the same field's text, not on a foreign projection.
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "orderdate"},
+             "queryRef": "Sales.orderdate"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "orderdate"},
+             "queryRef": "Sales.OrderDate"}],
+            "selector": {"metadata": "Sales.orderdate"}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn orderdate\n\t\tdataType: decimal\n")
+        rename.rename(ws, project, "column", "orderdate", "OrderDate", table="Sales")
+        after = json.loads(path.read_text())
+        self.assertEqual(after["selector"]["metadata"], "Sales.OrderDate")
+        self.assertEqual([p["queryRef"] for p in after["projections"]],
+                         ["Sales.OrderDate", "Sales.OrderDate"])
+
+    def test_column_rename_bookmark_queryref_link_split_refused(self):
+        # A fieldless queryRef in a bookmark's explorationState names the
+        # visual's only projection by its text "T.A"; that projection is
+        # owned by U[X] and keeps the text, so the bookmark reference
+        # must not follow the T[A] rename away from it.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "U"}},
+                                          "Property": "X"}, "queryRef": "T.A"}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "U.tmdl").write_text(
+            "table U\n\tcolumn X\n\t\tdataType: int64\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "Bm1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"sections": {"p": {"visualContainers": {"v": {
+            "singleVisual": {"projections": {"Values": [{"queryRef": "T.A"}]}}}}}}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "B", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_table_rename_selector_link_split_refused(self):
+        # On a table rename, a bookmark selector naming another table's
+        # projection by its custom queryRef text must not be carried to
+        # the new table prefix while its projection stays behind.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "U"}},
+                                          "Property": "B"},
+                                "queryRef": "S.A", "nativeQueryRef": "B"}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "S.tmdl").write_text(
+            "table S\n\tcolumn A\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "U.tmdl").write_text(
+            "table U\n\tcolumn B\n\t\tdataType: int64\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "Bm1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"selector": {"metadata": "S.A"}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "table", "S", "T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_native_label_does_not_drag_selector(self):
+        # The selector's text coincides with the target projection's
+        # nativeQueryRef label and with the qualified path of the
+        # untouched column U[C]; a native label is not a projection
+        # identifier, so it must not supply the selector's candidate.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "U.C"},
+                                "queryRef": "T.U.C", "nativeQueryRef": "U.C"}],
+               "objects": {"dataPoint": [{"selector": {"metadata": "U.C"}, "properties": {}}]}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn 'U.C'\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "U.tmdl").write_text(
+            "table U\n\tcolumn C\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "U.C", "Fresh", table="T")
+        after = json.loads(path.read_text())
+        self.assertEqual(after["projections"][0]["queryRef"], "T.Fresh")
+        self.assertEqual(after["projections"][0]["nativeQueryRef"], "Fresh")
+        self.assertEqual(after["objects"]["dataPoint"][0]["selector"]["metadata"], "U.C")
+
+    def test_column_rename_extension_shaped_literal_path_preserved(self):
+        # The string is a pure path extension of T[A] and simultaneously
+        # the literal qualified path of the sibling column named
+        # "A.Variation.Date Hierarchy.Year": the literal owner wins, so a
+        # selector and an unowned queryRef carrying it stay unchanged.
+        text = "T.A.Variation.Date Hierarchy.Year"
+        for obj in ({"selector": {"metadata": text}}, {"queryRef": text}):
+            ws, project, mdef, path = self._report_project(obj)
+            Path(mdef, "tables", "T.tmdl").write_text(
+                "table T\n\tcolumn A\n\t\tdataType: int64\n"
+                "\tcolumn 'A.Variation.Date Hierarchy.Year'\n\t\tdataType: int64\n")
+            rename.rename(ws, project, "column", "A", "B", table="T")
+            after = json.loads(path.read_text())
+            got = after["selector"]["metadata"] if "selector" in obj else after["queryRef"]
+            self.assertEqual(got, text)
+
+    def test_column_rename_dotted_sibling_path_not_followed(self):
+        # The bookmark string extends the path of the dotted sibling
+        # column 'Order.Date' more specifically than the target's own
+        # path, so it belongs to the sibling's variation and must not
+        # follow the rename of Sales[Order], with or without the
+        # sibling's projection present.
+        text = "Sales.Order.Date.Variation.Date Hierarchy.Year"
+        visual = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "Order.Date"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": text}]}
+        for obj in (visual, {"projections": []}):
+            ws, project, mdef, _path = self._report_project(obj)
+            Path(mdef, "tables", "Sales.tmdl").write_text(
+                "table Sales\n\tcolumn Order\n\t\tdataType: int64\n"
+                "\tcolumn 'Order.Date'\n\t\tdataType: dateTime\n")
+            bookmark = Path(project.mirror_report, "definition", "bookmarks", "B1.bookmark.json")
+            bookmark.parent.mkdir(parents=True, exist_ok=True)
+            bookmark.write_text(json.dumps({"queryRef": text}))
+            rename.rename(ws, project, "column", "Order", "Ord", table="Sales")
+            self.assertEqual(json.loads(bookmark.read_text())["queryRef"], text)
+
+    def test_column_rename_selector_aggregation_landing_refused(self):
+        # The selector naming the plain column would follow the rename
+        # onto "T.B", already the unchanged queryRef of the Sum
+        # aggregation of the same column: an aggregation is a different
+        # projection identity, so the landing refuses before writing.
+        obj = {"projections": [{"Aggregation": {"Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "T"}}, "Property": "A"}}, "Function": 0},
+            "queryRef": "T.B"}],
+            "objects": {"values": [{"selector": {"metadata": "T.A"}, "properties": {}}]}}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "B", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_bare_string_captured_by_new_qualified_path_refused(self):
+        # The fieldless nativeQueryRef "A.Y" uniquely names the bare
+        # column name of B's column 'A.Y'; renaming A[X] to Y would make
+        # the same spelling the target's qualified path, giving the
+        # unchanged string a second owner.
+        ws, project, mdef, _path = self._report_project(
+            {"explorationState": {"nativeQueryRef": "A.Y"}})
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "B.tmdl").write_text(
+            "table B\n\tcolumn Y\n\t\tdataType: int64\n\tcolumn 'A.Y'\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "Y", table="A")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_dotted_new_name_capturing_qualified_ref_refused(self):
+        # Renaming B[X] to the dotted name "A.Y" would give the unchanged
+        # fieldless nativeQueryRef "A.Y" a second reading (the bare name
+        # of the new column, beside the qualified path of A[Y] it already
+        # names): the destination ownership check refuses before writing.
+        ws, project, mdef, _path = self._report_project({"nativeQueryRef": "A.Y"})
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn Y\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "B.tmdl").write_text(
+            "table B\n\tcolumn X\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "A.Y", table="B")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_near_name_neighbor_untouched(self):
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Net"},
+             "queryRef": "Sales.Net"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Net Margin"},
+             "queryRef": "Sales.Net Margin"}]}
+        ws, project, mdef, path = self._report_project(obj)
+        sales = Path(mdef, "tables", "Sales.tmdl")
+        sales.write_text("table Sales\n\tcolumn Net\n\t\tdataType: decimal\n"
+                         "\tcolumn 'Net Margin'\n\t\tdataType: decimal\n")
+        rename.rename(ws, project, "column", "Net", "Gross", table="Sales")
+        projections = json.loads(path.read_text())["projections"]
+        self.assertEqual([(p["Column"]["Property"], p["queryRef"]) for p in projections],
+                         [("Gross", "Sales.Gross"), ("Net Margin", "Sales.Net Margin")])
+        self.assertEqual(sales.read_text(),
+                         "table Sales\n\tcolumn Gross\n\t\tdataType: decimal\n"
+                         "\tcolumn 'Net Margin'\n\t\tdataType: decimal\n")
+
+    def test_column_rename_wrong_owner_bare_ref_unchanged(self):
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Net"},
+             "queryRef": "Sales.Net", "nativeQueryRef": "Net"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Net"},
+             "queryRef": "Other.Net", "nativeQueryRef": "Net"}]}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Net\n\t\tdataType: decimal\n")
+        Path(mdef, "tables", "Other.tmdl").write_text(
+            "table Other\n\tcolumn Net\n\t\tdataType: decimal\n")
+        rename.rename(ws, project, "column", "Net", "Gross", table="Sales")
+        projections = json.loads(path.read_text())["projections"]
+        self.assertEqual(projections[0]["Column"]["Property"], "Gross")
+        self.assertEqual(projections[0]["nativeQueryRef"], "Gross")
+        self.assertEqual(projections[1], obj["projections"][1])
+
+    def test_verifier_rejects_stale_selector_and_unrelated_change(self):
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"},
+             "queryRef": "Other.Amount"}],
+            "objects": {"dataPoint": [{"selector": {"metadata": old}}]}}
+        ws1, project1, mdef1, _path1 = self._report_project(obj)
+        Path(mdef1, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        captured = []
+        with patch("pbz.rename.commit_bytes", side_effect=lambda ops, **kw: captured.extend(ops)):
+            rename.rename(ws1, project1, "column", "OrderDate", "Order Date", table="Sales")
+        self.assertTrue(captured)
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(Path(mdef1, "tables", "Sales.tmdl").read_text())
+        model = tmdl.load_model(mdef)
+        ops = [(op[0], str(Path(ws.mirror, Path(op[1]).relative_to(ws1.mirror))), *op[2:])
+               for op in captured]
+        before = _bytes(ws.mirror)
+        for tamper in ("stale-selector", "unrelated", "missing-write", "good"):
+            with self.subTest(tamper=tamper):
+                candidate = []
+                for op in ops:
+                    if op[1] != str(path):
+                        candidate.append(op)
+                        continue
+                    if tamper == "missing-write":
+                        continue
+                    report = json.loads(op[2])
+                    if tamper == "stale-selector":
+                        report["objects"]["dataPoint"][0]["selector"]["metadata"] = old
+                    elif tamper == "unrelated":
+                        report["projections"][1]["queryRef"] = "Other.Changed"
+                    candidate.append((op[0], op[1], json.dumps(report), op[3]))
+                with patch("pbz.rename._report_string_rename", side_effect=AssertionError("editor is not an oracle")), \
+                        patch("pbz.rename._report_string_rename_inner", side_effect=AssertionError("editor is not an oracle")):
+                    if tamper == "good":
+                        rename._verify_plan(ws, project, model, mdef, candidate,
+                                            "column", "Sales", "OrderDate", "Order Date")
+                    else:
+                        with self.assertRaises(PbzError) as caught:
+                            rename._verify_plan(ws, project, model, mdef, candidate,
+                                                "column", "Sales", "OrderDate", "Order Date")
+                        self.assertEqual(caught.exception.code, "REFUSED")
+                        self.assertIn("report string", str(caught.exception))
+                self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_variation_selector_competition_and_document_scope(self):
+        old, new = "Sales.OrderDate.Variation.Date Hierarchy.Year", "Sales.Order Date.Variation.Date Hierarchy.Year"
+        for competitor in ("source", "destination", "ambiguous", "same-target", "separate-document"):
+            with self.subTest(competitor=competitor):
+                obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+                    "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                               "Property": "OrderDate"}},
+                    "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old,
+                    "queryName": old}], "objects": {"dataPoint": [{"selector": {"metadata": old}}]},
+                    "unrelated": {"metadata": old}}
+                other_field = {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"}}
+                if competitor in ("source", "destination"):
+                    obj["projections"].append(dict(other_field, queryRef=old if competitor == "source" else new))
+                elif competitor == "ambiguous":
+                    obj["mixed"] = {"left": other_field, "right": other_field, "queryRef": old}
+                elif competitor == "same-target":
+                    obj["projections"].append(dict(obj["projections"][0], queryRef=old.lower()))
+                    obj["unbound"] = {"queryRef": "Sales.OrderDate"}
+                ws, project, mdef, path = self._report_project(obj)
+                Path(mdef, "tables", "Sales.tmdl").write_text(
+                    "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+                if competitor == "ambiguous":
+                    sites = rename._report_string_sites(pbir.parse_json(path.read_text()), tmdl.load_model(mdef))
+                    self.assertIs(sites[("mixed", "queryRef")][1], rename._AMBIGUOUS)
+                separate = path.with_name("other.json")
+                separate.write_text(json.dumps({"selector": {"metadata": old}}))
+                before, separate_before = _bytes(ws.mirror), separate.read_bytes()
+                if competitor in ("same-target", "separate-document"):
+                    rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+                    after = json.loads(path.read_text())
+                    self.assertEqual(after["objects"]["dataPoint"][0]["selector"]["metadata"], new)
+                    self.assertEqual(after["unrelated"]["metadata"], old)
+                    self.assertEqual(after["projections"][0]["queryName"], old)
+                    self.assertEqual(json.loads(separate.read_text())["selector"]["metadata"], new)
+                else:
+                    with patch("pbz.rename.commit_bytes") as commit:
+                        with self.assertRaises(PbzError) as caught:
+                            rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+                    self.assertEqual(caught.exception.code, "REFUSED")
+                    commit.assert_not_called()
+                    self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_cross_table_bare_capture_refused_qualified_allowed(self):
+        for expression in ("SUM([Region])", "SUM([City])", "SUM(Sales[Region])"):
+            with self.subTest(expression=expression):
+                ws, project, mdef, _path = self._report_project({"refs": []})
+                Path(mdef, "tables", "Sales.tmdl").write_text(
+                    "table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+                Path(mdef, "tables", "Other.tmdl").write_text(
+                    "table Other\n\tcolumn City\n\t\tdataType: string\n")
+                ext = Path(project.mirror_report, "definition", "reportExtensions.json")
+                ext.write_text(json.dumps({"entities": [{"name": "Other", "measures": [
+                    {"name": "M", "expression": expression}]}]}))
+                before = _bytes(ws.mirror)
+                if expression == "SUM(Sales[Region])":
+                    rename.rename(ws, project, "column", "Region", "City", table="Sales")
+                    self.assertEqual(json.loads(ext.read_text())["entities"][0]["measures"][0]["expression"],
+                                     "SUM(Sales[City])")
+                else:
+                    with patch("pbz.rename.commit_bytes") as commit:
+                        with self.assertRaises(PbzError) as caught:
+                            rename.rename(ws, project, "column", "Region", "City", table="Sales")
+                    self.assertEqual(caught.exception.code, "NAME_TAKEN")
+                    commit.assert_not_called()
+                    self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_cross_table_unowned_bare_capture_in_unwritten_report_refused(self):
+        for value in ("Region", "City"):
+            with self.subTest(value=value):
+                ws, project, mdef, path = self._report_project({"refs": []})
+                Path(mdef, "tables", "Sales.tmdl").write_text(
+                    "table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+                Path(mdef, "tables", "Other.tmdl").write_text(
+                    "table Other\n\tcolumn City\n\t\tdataType: string\n")
+                path.with_name("bare.json").write_text(json.dumps({"nativeQueryRef": value}))
+                before = _bytes(ws.mirror)
+                with patch("pbz.rename.commit_bytes") as commit:
+                    with self.assertRaises(PbzError) as caught:
+                        rename.rename(ws, project, "column", "Region", "City", table="Sales")
+                self.assertEqual(caught.exception.code, "NAME_TAKEN")
+                commit.assert_not_called()
+                self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_exact_selector_competitor_refused_before_existing_rule_wins(self):
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": table}}, "Property": "Amount"},
+             "queryRef": "Sales.Amount"} for table in ("Sales", "Other")],
+            "objects": {"dataPoint": [{"selector": {"metadata": "Sales.Amount"}}]}}
+        ws, project, _mdef, _path = self._report_project(obj)
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_cross_table_tmdl_bare_destination_capture_refused(self):
+        ws, project, mdef, _path = self._report_project({"refs": []})
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n\tmeasure M = SUM([City])\n")
+        Path(mdef, "tables", "Other.tmdl").write_text(
+            "table Other\n\tcolumn City\n\t\tdataType: string\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_selector_destination_with_different_variation_level_refused(self):
+        old, new = "Sales.OrderDate.Variation.Date Hierarchy.Year", "Sales.Order Date.Variation.Date Hierarchy.Year"
+        projection = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}
+        for identifier in (old, new):
+            with self.subTest(identifier=identifier):
+                other = json.loads(json.dumps(projection))
+                other["HierarchyLevel"]["Level"] = "Month"
+                other["queryRef"] = identifier
+                ws, project, mdef, path = self._report_project({"projections": [projection, other],
+                    "objects": {"dataPoint": [{"selector": {"metadata": old}}]}})
+                Path(mdef, "tables", "Sales.tmdl").write_text(
+                    "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+                before = _bytes(ws.mirror)
+                with patch("pbz.rename.commit_bytes") as commit:
+                    with self.assertRaises(PbzError) as caught:
+                        rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+                self.assertEqual(caught.exception.code, "REFUSED")
+                commit.assert_not_called()
+                self.assertEqual(_bytes(ws.mirror), before)
+                report = json.loads(path.read_text())
+                for proj in report["projections"]:
+                    pvs = proj["HierarchyLevel"]["Expression"]["Hierarchy"]["Expression"]["PropertyVariationSource"]
+                    pvs["Property"] = "Order Date"
+                    proj["queryRef"] = new
+                report["objects"]["dataPoint"][0]["selector"]["metadata"] = new
+                sales = Path(mdef, "tables", "Sales.tmdl")
+                candidate = [("write", str(sales), sales.read_text().replace("column OrderDate", "column 'Order Date'"), b""),
+                             ("write", str(path), json.dumps(report), b"")]
+                with self.assertRaises(PbzError) as caught:
+                    rename._verify_plan(ws, project, tmdl.load_model(mdef), mdef, candidate,
+                                        "column", "Sales", "OrderDate", "Order Date")
+                self.assertEqual(caught.exception.code, "REFUSED")
+                self.assertIn("report string", str(caught.exception))
+                self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_selector_same_target_standalone_case_variant_follows(self):
+        ws, project, _mdef, path = self._report_project({"projections": [{
+            "Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"},
+            "queryRef": "Sales.Amount"}], "reference": {"queryRef": "sales.amount"},
+            "selector": {"metadata": "Sales.Amount"}})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        after = json.loads(path.read_text())
+        self.assertEqual(after["projections"][0]["queryRef"], "Sales.Value")
+        self.assertEqual(after["reference"]["queryRef"], "Sales.Value")
+        self.assertEqual(after["selector"]["metadata"], "Sales.Value")
+
+    def test_verifier_rejects_forward_bare_capture_candidate(self):
+        ws, project, mdef, path = self._report_project({"nativeQueryRef": "Region"})
+        sales = Path(mdef, "tables", "Sales.tmdl")
+        sales.write_text("table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+        Path(mdef, "tables", "Other.tmdl").write_text(
+            "table Other\n\tcolumn City\n\t\tdataType: string\n")
+        model, before = tmdl.load_model(mdef), _bytes(ws.mirror)
+        ops = [("write", str(sales), sales.read_text().replace("column Region", "column City"), b""),
+               ("write", str(path), json.dumps({"nativeQueryRef": "City"}), b"")]
+        with self.assertRaises(PbzError) as caught:
+            rename._verify_plan(ws, project, model, mdef, ops, "column", "Sales", "Region", "City")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertIn("report string", str(caught.exception))
+        self.assertEqual(_bytes(ws.mirror), before)
 
     def test_missed_metadata_bindings_refuse_without_writes(self):
         for seam in ("columnPermission", "baseColumn", "ref table"):
@@ -68,7 +933,7 @@ class RenameBindingsTests(unittest.TestCase):
         self.assertEqual(paths, [("projections", 0), ("projections", 1)])
         before = _bytes(ws.mirror)
         original = rename.pbir_ref_edits
-        with patch("pbz.rename.pbir_ref_edits", side_effect=lambda *a: original(*a)[1:]):
+        with patch("pbz.rename.pbir_ref_edits", side_effect=lambda *a, **k: original(*a, **k)[1:]):
             with self.assertRaises(PbzError) as caught:
                 rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
         self.assertEqual(caught.exception.code, "REFUSED")
@@ -95,6 +960,82 @@ class RenameBindingsTests(unittest.TestCase):
                                 "column", "Sales", "Absent", "New")
         self.assertEqual(caught.exception.code, "REFUSED")
         self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_standalone_report_string_substrings_unchanged(self):
+        for value in ("Sales.Amount Margin", "Other Sales.Amount", "Sales.Amount-1"):
+            with self.subTest(value=value):
+                ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": value}]})
+                before = path.read_bytes()
+                rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_other_projection_native_query_ref_unchanged(self):
+        obj = {"projections": [{
+            "Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"},
+            "nativeQueryRef": "Amount",
+        }]}
+        ws, project, mdef, path = self._report_project(obj)
+        model = tmdl.load_model(mdef)
+        self.assertIsNotNone(model.column("Other", "Amount"))
+        fields = pbir.walk_fields_with_path(pbir.parse_json(path.read_text()), model)
+        self.assertEqual([(ref.kind, ref.table, ref.name, site) for ref, site in fields],
+                         [("column", "Other", "Amount", ("projections", 0))])
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        projection = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(projection["Column"]["Property"], "Amount")
+        self.assertEqual(projection["nativeQueryRef"], "Amount")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_report_scope_violation_planned_write_refuses(self):
+        for case, obj in (
+            ("substring", {"refs": [{"queryRef": "Sales.Amount Margin"}]}),
+            ("other_projection", {"projections": [{
+                "Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"},
+                "nativeQueryRef": "Amount",
+            }]}),
+        ):
+            with self.subTest(case=case):
+                ws, project, mdef, path = self._report_project({})
+                model = tmdl.load_model(mdef)
+                model_ops = []
+                for rel, old, new in (("tables/Sales.tmdl", "Amount", "Value"),
+                                      ("tables/Other.tmdl", "Sales.Amount", "Sales.Value"),
+                                      ("roles/Reader.tmdl", "columnPermission Amount", "columnPermission Value")):
+                    model_path = Path(mdef, rel)
+                    text = model_path.read_text()
+                    changed = text.replace(old, new, 1) if rel.startswith("roles/") else text.replace(old, new)
+                    model_ops.append(("write", str(model_path), changed, b""))
+                # Prove the model plan is valid before adding a report scope violation.
+                rename._verify_plan(ws, project, model, mdef, model_ops,
+                                    "column", "Sales", "Amount", "Value")
+                original = json.dumps(obj)
+                path.write_text(original)
+                if case == "other_projection":
+                    self.assertIsNotNone(model.column("Other", "Amount"))
+                    fields = pbir.walk_fields_with_path(pbir.parse_json(original), model)
+                    self.assertEqual([(ref.kind, ref.table, ref.name, site) for ref, site in fields],
+                                     [("column", "Other", "Amount", ("projections", 0))])
+                    changed = original.replace('"nativeQueryRef": "Amount"', '"nativeQueryRef": "Value"')
+                else:
+                    changed = original.replace("Sales.Amount Margin", "Sales.Value Margin")
+                before = _bytes(ws.mirror)
+                with self.assertRaises(PbzError) as caught:
+                    rename._verify_plan(ws, project, model, mdef,
+                                        model_ops + [("write", str(path), changed, b"")],
+                                        "column", "Sales", "Amount", "Value")
+                self.assertEqual(caught.exception.code, "REFUSED")
+                self.assertIn("report string", str(caught.exception))
+                self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_exact_standalone_report_strings_follow_column_rename(self):
+        ws, project, _mdef, path = self._report_project({"refs": [
+            {"queryRef": "Sales.Amount"}, {"nativeQueryRef": "Amount"}, {"queryRef": "Other.Amount"},
+        ]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text()), {"refs": [
+            {"queryRef": "Sales.Value"}, {"nativeQueryRef": "Value"}, {"queryRef": "Other.Amount"},
+        ]})
 
     def test_malformed_planned_report_refuses(self):
         ws, project, mdef, path = self._report_project({})
@@ -150,6 +1091,26 @@ class RenameBindingsTests(unittest.TestCase):
         rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
         self.assertEqual(json.loads(path.read_text())["queryName"], "Sales.Amount")
 
+    def test_council_round_shapes(self):
+        # Sibling string of a wrapper field for Other stays unchanged.
+        obj = {"projections": [{"field": {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"}}, "nativeQueryRef": "Amount"}]}
+        ws, project, _mdef, path = self._report_project(obj)
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["nativeQueryRef"], "Amount")
+        # Standalone wrapped aggregation string follows a column rename.
+        ws, project, _mdef, path = self._report_project({"objects": {"metadata": "Sum(Sales.Amount)"}})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["objects"]["metadata"], "Sum(Sales.Value)")
+        # Descriptive metadata containing two wrapped terms is not one reference.
+        ws, project, _mdef, path = self._report_project({"objects": {"metadata": "Sum(Sales.Amount) vs Sum(Other.Amount)"}})
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["objects"]["metadata"],
+                         "Sum(Sales.Amount) vs Sum(Other.Amount)")
+        # Case-variant standalone string follows.
+        ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "sales.amount"}]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Sales.Value")
+
     def test_standalone_report_strings_verified(self):
         for kind, old, new, strings in (
             ("column", "Amount", "Value", ["Sales.Amount", "Other.Amount", "Amount"]),
@@ -172,6 +1133,1803 @@ class RenameBindingsTests(unittest.TestCase):
                         self.assertEqual(after[0]["queryRef"], "Revenue.Amount" if kind == "table" else "Sales.Value")
                         self.assertEqual(after[1], obj["refs"][1])
                         self.assertEqual(after[2]["nativeQueryRef"], "Sales" if kind == "table" else "Value")
+
+    def test_table_rename_expression_metadata_unchanged(self):
+        for value in ("Sales.Amount.Share IN { 2025 }", "Sales.Amount.Share % Sales.Total",
+                      "Sales.Amount.Share || Sales.Amount", "Sales.Amount.Share AND Sales.Total",
+                      "Sales.Amount.Share IN AllowedYears", "Sales.Amount.Share vs Other.Amount"):
+            with self.subTest(value=value):
+                ws, project, _mdef, path = self._report_project({"refs": [{"metadata": value}]})
+                before = path.read_bytes()
+                rename.rename(ws, project, "table", "Sales", "Revenue")
+                self.assertEqual(path.read_bytes(), before)
+        # A pure dotted extension of a qualified path still follows, including
+        # a segment that merely ends in the table's name.
+        for value, expected in (("Sales.Amount.Share", "Revenue.Amount.Share"),
+                                ("Sales.Amount.Net Sales", "Revenue.Amount.Net Sales")):
+            with self.subTest(value=value):
+                ws, project, _mdef, path = self._report_project({"refs": [{"metadata": value}]})
+                rename.rename(ws, project, "table", "Sales", "Revenue")
+                self.assertEqual(json.loads(path.read_text())["refs"][0]["metadata"], expected)
+
+    def test_nested_string_follows_owning_projection(self):
+        def proj(entity):
+            return {"field": {"Column": {"Expression": {"SourceRef": {"Entity": entity}},
+                                         "Property": "Amount"}},
+                    "details": {"nativeQueryRef": "Amount"}}
+        ws, project, _mdef, path = self._report_project({"projections": [proj("Other"), proj("Sales")]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        after = json.loads(path.read_text())["projections"]
+        self.assertEqual(after[0]["details"]["nativeQueryRef"], "Amount")
+        self.assertEqual(after[1]["details"]["nativeQueryRef"], "Value")
+
+    def test_string_ownership_scoped_to_containing_element(self):
+        col = lambda e: {"Column": {"Expression": {"SourceRef": {"Entity": e}}, "Property": "Amount"}}
+        # A standalone string in a sibling element does not inherit its field.
+        ws, project, _mdef, path = self._report_project(
+            {"projections": [col("Other"), {"queryRef": "Sales.Amount"}]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][1]["queryRef"], "Sales.Value")
+        # A nearer unique field is not poisoned by the array's other elements.
+        ws, project, _mdef, path = self._report_project({"projections": [
+            col("Other"), col("Sales"),
+            {"field": col("Sales"), "queryRef": "Sales.Amount",
+             "details": {"nativeQueryRef": "Amount"}}]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        after = json.loads(path.read_text())["projections"]
+        self.assertEqual(after[2]["queryRef"], "Sales.Value")
+        self.assertEqual(after[2]["details"]["nativeQueryRef"], "Value")
+        self.assertEqual(after[0]["Column"]["Property"], "Amount")
+
+    def _colliding_project(self, obj):
+        """A project where Sales has a column named 'Region.Amount' and a
+        second table is named 'Sales.Region', plus a report holding obj."""
+        ws, project, mdef = self._project()
+        _write(os.path.join(mdef, "model.tmdl"),
+               "model Model\n\tculture: en-US\n\nref table Sales\n\nref table 'Sales.Region'\n")
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Amount'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        path = Path(project.mirror_report, "definition", "report.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(obj))
+        return ws, project, mdef, path
+
+    def _bound_colliding(self, query_ref):
+        return {"projections": [{
+            "field": {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                 "Property": "Region.Amount"}},
+            "queryRef": query_ref}]}
+
+    def test_table_rename_field_binding_beats_longer_table_prefix(self):
+        ws, project, mdef, path = self._colliding_project(self._bound_colliding("Sales.Region.Amount"))
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        after = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(after["queryRef"], "Revenue.Region.Amount")
+        self.assertEqual(after["field"]["Column"]["Expression"]["SourceRef"]["Entity"], "Revenue")
+        # The same string with no binding stays untouched: the longer table owns it.
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount"}]})
+        model = tmdl.load_model(mdef)
+        self.assertIsNotNone(model.column("Sales", "Region.Amount"))
+        self.assertIsNotNone(model.table("Sales.Region"))
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_other_table_keeps_bound_string(self):
+        ws, project, mdef, path = self._colliding_project(self._bound_colliding("Sales.Region.Amount"))
+        rename.rename(ws, project, "table", "Sales.Region", "Territory")
+        after = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(after["queryRef"], "Sales.Region.Amount")
+        self.assertEqual(after["field"]["Column"]["Expression"]["SourceRef"]["Entity"], "Sales")
+
+    def test_table_rename_bound_wrapped_extension_follows(self):
+        ws, project, mdef, path = self._colliding_project(
+            self._bound_colliding("Sum(Sales.Region.Amount.Share)"))
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        after = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(after["queryRef"], "Sum(Revenue.Region.Amount.Share)")
+
+    def test_column_rename_ambiguous_unbound_string_unchanged(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount"}]})
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Region.Amount", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_casefold_length_mismatch(self):
+        from types import SimpleNamespace as NS
+        field = NS(table="İ", name="Amount", kind="column")
+        out = rename._report_string_rename("queryRef", "i̇.Amount", "table", "", "İ", "Revenue",
+                                           field=field, model=None)
+        self.assertEqual(out, "Revenue.Amount")
+
+    def test_table_rewrite_unicode_qualified_prefix_offsets(self):
+        from types import SimpleNamespace as NS
+        model = NS(tables={"İ": NS(name="İ")})
+        qualified = {"İ.Amount".lower()}
+        out = rename._table_rewrite("İ.Amount.X", "İ", "Revenue", qualified, NS(name="İ"), model)
+        self.assertEqual(out, "Revenue.Amount.X")
+        out = rename._table_rewrite("İ.Amount.% Share", "İ", "Revenue", qualified, NS(name="İ"), model)
+        self.assertEqual(out, "İ.Amount.% Share")
+
+    def test_column_rename_extension_owned_string_unchanged(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Ext"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Ext'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales.Region", "measures": [{"name": "Ext", "expression": "1"}]}]}))
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Region.Ext", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_hierarchy_owned_string_unchanged(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Calendar.Year"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Calendar.Year'\n\t\tdataType: string\n")
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n\n\thierarchy Calendar\n\n\t\tlevel Year\n\t\t\tcolumn: Amount\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Region.Calendar.Year", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rewrite_unicode_equal_length_guard(self):
+        from types import SimpleNamespace as NS
+        t1, other = "i̇i̇", "İİ.X"
+        tables = {t1: NS(name=t1, columns={"X.Amount": NS(name="X.Amount")}, measures={}, hierarchies={}),
+                  other: NS(name=other, columns={"Amount": NS(name="Amount")}, measures={}, hierarchies={})}
+        model = NS(tables=tables, table=lambda name: tables.get(name))
+        qualified = {f"{t1}.X.Amount".lower(), f"{other}.Amount".lower()}
+        out = rename._table_rewrite("İİ.X.Amount", t1, "Revenue", qualified, tables[t1], model)
+        self.assertEqual(out, "İİ.X.Amount")
+
+    def test_table_rename_longer_table_not_blocked_by_prefix_table(self):
+        ws, project, mdef, path = self._colliding_project(
+            {"refs": [{"queryRef": "Sales.Region.Amount"}, {"queryRef": "Sum(Sales.Region.Amount)"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Total\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales.Region", "Territory")
+        refs = [r["queryRef"] for r in json.loads(path.read_text())["refs"]]
+        self.assertEqual(refs, ["Territory.Amount", "Sum(Territory.Amount)"])
+
+    def test_table_rename_exact_string_owned_by_shorter_table_stays(self):
+        ws, project, mdef, path = self._colliding_project(
+            {"refs": [{"queryRef": "Sales.Region.Amount"}, {"queryRef": "Sum(Sales.Region.Amount)"}]})
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales.Region", "Territory")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_bound_string_of_other_table_unchanged(self):
+        field = {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"},
+                 "queryRef": "Sales.Amount"}
+        ws, project, mdef, path = self._report_project({"projections": [field]})
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_bare_native_query_ref_extension_measure_of_other(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"nativeQueryRef": "Other.Ext.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Other.Ext.Share'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Other", "measures": [{"name": "Ext", "expression": "1"}]}]}))
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Other.Ext.Share", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_own_column_under_longer_prefix(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Budget"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Budget'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Revenue.Region.Budget")
+
+    def test_column_rename_bare_native_query_ref_owned_by_other_table(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"nativeQueryRef": "Sales.Region.Amount"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Sales.Region.Amount'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Sales.Region.Amount", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_extension_measure_on_longer_table_stays(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Ext"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Ext'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales.Region", "measures": [{"name": "Ext", "expression": "1"}]}]}))
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_bare_native_query_ref_owned_by_unrelated_table(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"nativeQueryRef": "Other.Amount"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Other.Amount'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Other.Amount", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_owned_extension_string_unchanged(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Amount.Share'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Region.Amount.Share", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_bare_native_query_ref_extension_of_unrelated_table(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"nativeQueryRef": "Other.Amount.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Other.Amount.Share'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Other.Amount.Share", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_column_rename_prefix_table_extension_measure_does_not_block(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn 'Amount.Share'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales", "measures": [{"name": "Region.Amount", "expression": "1"}]}]}))
+        rename.rename(ws, project, "column", "Amount.Share", "Value", table="Sales.Region")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Sales.Region.Value")
+
+    def test_table_rename_extension_of_shorter_table_does_not_block(self):
+        ws, project, mdef, path = self._colliding_project({"refs": [{"queryRef": "Sales.Region.Amount.Share"}]})
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn 'Amount.Share'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales.Region", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Revenue.Amount.Share")
+
+    def test_table_rewrite_wrapper_does_not_bypass_exact_block(self):
+        from types import SimpleNamespace as NS
+        sales = NS(name="Sales", columns={"Amount": NS(name="Amount")}, measures={}, hierarchies={})
+        weird = NS(name="Sum(Sales", columns={"Amount)": NS(name="Amount)")}, measures={}, hierarchies={})
+        tables = {"Sales": sales, "Sum(Sales": weird}
+        model = NS(tables=tables, table=lambda name: tables.get(name))
+        out = rename._table_rewrite("Sum(Sales.Amount)", "Sales", "Revenue", {"sales.amount"}, sales, model)
+        self.assertEqual(out, "Sum(Sales.Amount)")
+
+    def test_table_rename_hierarchy_bound_query_ref_follows(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                              "Hierarchy": "Calendar"}}, "Level": "Year"},
+              "queryRef": "Sales.Calendar.Year"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n\n\thierarchy Calendar\n\n\t\tlevel Year\n\t\t\tcolumn: OrderDate\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Revenue.Calendar.Year")
+
+    def test_column_rename_wrapped_whole_string_owned_by_other_table(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sum(Sales.Amount)"}]})
+        _write(os.path.join(mdef, "tables", "Sum(Sales.tmdl"),
+               "table 'Sum(Sales'\n\tcolumn 'Amount)'\n\t\tdataType: int64\n")
+        before = path.read_bytes()
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_bound_literal_path_that_looks_wrapped(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sum(Sales"}}, "Property": "Amount)"},
+               "queryRef": "Sum(Sales.Amount)"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        _write(os.path.join(mdef, "tables", "Sum(Sales.tmdl"),
+               "table 'Sum(Sales'\n\tcolumn 'Amount)'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sum(Sales", "Totals")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Totals.Amount)")
+
+    def test_table_rename_ambiguous_site_unchanged(self):
+        out = rename._report_string_rename("queryRef", "Sales.Amount", "table", "", "Sales", "Revenue",
+                                           field=rename._AMBIGUOUS, model=None)
+        self.assertEqual(out, "Sales.Amount")
+
+    def test_table_rename_final_sigma_casefold(self):
+        from types import SimpleNamespace as NS
+        field = NS(table="İΟΣ", name="Amount", kind="column")
+        out = rename._report_string_rename("queryRef", "i̇οσ.Amount", "table", "", "İΟΣ", "Revenue",
+                                           field=field, model=None)
+        self.assertEqual(out, "Revenue.Amount")
+        self.assertEqual(rename._head_swap("i̇οσ.Amount", "İΟΣ", "Revenue"), "Revenue.Amount")
+
+    def test_column_rename_bound_wrapped_query_ref_follows(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"},
+               "queryRef": "Sum(Sales.Amount)"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Sum(Sales.Value)")
+
+    def test_table_rename_medial_sigma_entity_and_string_follow(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "οσ"}}, "Property": "Amount"},
+               "queryRef": "οσ.Amount"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        _write(os.path.join(mdef, "tables", "ΟΣ.tmdl"),
+               "table 'ΟΣ'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "ΟΣ", "Revenue")
+        proj = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(proj["Column"]["Expression"]["SourceRef"]["Entity"], "Revenue")
+        self.assertEqual(proj["queryRef"], "Revenue.Amount")
+
+    def test_column_rename_sharp_s_names_stay_distinct(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Masse"},
+               "queryRef": "Sales.Masse"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        sales_path = os.path.join(mdef, "tables", "Sales.tmdl")
+        _write(sales_path,
+               "table Sales\n\tcolumn 'Maße'\n\t\tdataType: int64\n\tcolumn Masse\n\t\tdataType: int64\n\tmeasure Use = SUM(Sales[Masse])\n")
+        rename.rename(ws, project, "column", "Maße", "Value", table="Sales")
+        proj = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(proj["queryRef"], "Sales.Masse")
+        sales = open(sales_path).read()
+        self.assertIn("SUM(Sales[Masse])", sales)
+        self.assertIn("column Value", sales)
+
+    def test_column_rename_to_fold_collision_refused(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn 'ΟΣ'\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "οσ", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_table_rename_fresh_reference_to_extension_entity_stays(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"metadata": "Sales.Amount.Share vs Local.Total"}]})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Local", "measures": [{"name": "Total", "expression": "1"}]}]}))
+        before = path.read_bytes()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_table_rename_translated_sigma_name_refused(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "ΟΣ.tmdl"),
+               "table 'ΟΣ'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        with patch("pbz.rename.translated_names", return_value={"ος"}):
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "table", "ΟΣ", "Revenue")
+        self.assertEqual(caught.exception.code, "UNSUPPORTED")
+
+    def test_table_rename_into_extension_entity_name_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales", "measures": [{"name": "A", "expression": "1"}]},
+            {"name": "Revenue", "measures": [{"name": "B", "expression": "2"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_source_lookup_folds_sigma(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "ΟΣ.tmdl"),
+               "table 'ΟΣ'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "οσ", "Revenue")
+        self.assertTrue(os.path.isfile(os.path.join(mdef, "tables", "Revenue.tmdl")))
+
+    def test_table_rename_query_order_folds_sigma(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "ΟΣ.tmdl"),
+               "table 'ΟΣ'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        model_path = Path(mdef, "model.tmdl")
+        model_path.write_text(model_path.read_text(encoding="utf-8") + '\nannotation PBI_QueryOrder = ["οσ"]\n',
+                              encoding="utf-8")
+        rename.rename(ws, project, "table", "ΟΣ", "Revenue")
+        self.assertIn('"Revenue"', model_path.read_text(encoding="utf-8"))
+
+    def test_column_rename_variation_hierarchy_follows(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+                "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                           "Property": "OrderDate"}},
+                "Hierarchy": "Date Hierarchy"}}, "Level": "Year"},
+              "queryRef": "Sales.OrderDate.Date Hierarchy.Year"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+        proj = json.loads(path.read_text())["projections"][0]
+        self.assertEqual(proj["queryRef"], "Sales.BookedDate.Date Hierarchy.Year")
+        pvs = proj["HierarchyLevel"]["Expression"]["Hierarchy"]["Expression"]["PropertyVariationSource"]
+        self.assertEqual(pvs["Property"], "BookedDate")
+
+    def test_column_rename_variation_wrapped_and_bare_follow(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+                "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                           "Property": "OrderDate"}},
+                "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}}
+        for key, given, expected in (("queryRef", "Min(Sales.OrderDate)", "Min(Sales.BookedDate)"),
+                                     ("nativeQueryRef", "OrderDate", "BookedDate"),
+                                     ("queryRef", "Sales.OrderDate.OrderDate.Year",
+                                      "Sales.BookedDate.OrderDate.Year")):
+            with self.subTest(given=given):
+                ws, project, mdef, path = self._report_project({"projections": [dict(hl, **{key: given})]})
+                _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+                       "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+                rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+                self.assertEqual(json.loads(path.read_text())["projections"][0][key], expected)
+
+    def test_measure_rename_fold_spelling_keeps_culture(self):
+        ws, project, mdef = self._column_project()
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tmeasure 'ΟΣ' = 1\n")
+        cult = Path(mdef, "cultures", "en-US.tmdl")
+        cult.parent.mkdir(parents=True, exist_ok=True)
+        cult.write_text("cultureInfo en-US\n\ttranslations\n\t\ttable Sales\n\t\t\tmeasure 'ΟΣ'\n\t\t\t\tcaption: Sigma\n",
+                        encoding="utf-8")
+        rename.rename(ws, project, "measure", "οσ", "Total")
+        self.assertNotIn("ΟΣ", cult.read_text(encoding="utf-8"))
+        self.assertIn("Total", cult.read_text(encoding="utf-8"))
+
+    def test_measure_rename_into_extension_measure_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Net"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tmeasure Net = 1\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales", "measures": [{"name": "Total", "expression": "2"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "measure", "Net", "Total")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_report_extension_measure_follows(self):
+        ws, project, _mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Ext"}]})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales", "measures": [{"name": "Ext", "expression": "SUM(Sales[Amount])"}]}]}))
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Revenue.Ext")
+        self.assertEqual(json.loads(ext_path.read_text())["entities"][0]["name"], "Revenue")
+        self.assertEqual(json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"],
+                         "SUM(Revenue[Amount])")
+
+    def test_table_rename_qualified_native_query_ref_follows(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"},
+               "nativeQueryRef": "Sales.Amount"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["nativeQueryRef"], "Revenue.Amount")
+
+    def test_table_rename_case_variant_hierarchy_entity_not_refused(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {"Expression": {"SourceRef": {"Entity": "sales"}},
+                                                              "Hierarchy": "Geo"}}, "Level": "City"},
+              "queryRef": "Sales.Geo.City"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn CityName\n\t\tdataType: string\n\n\thierarchy Geo\n\n\t\tlevel City\n\t\t\tcolumn: CityName\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Revenue.Geo.City")
+
+    def test_column_rename_extension_measure_bare_ref_not_retargeted(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"},
+                                            {"name": "Twice", "expression": "2 * [Amount]"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        twice = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(twice, "2 * [Amount]")
+
+    def test_table_rename_extension_qualified_ref_follows_qualifier(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"},
+                                            {"name": "Twice", "expression": "2 * 'Budget'[Amount]"}]}]}))
+        rename.rename(ws, project, "table", "Budget", "Plan")
+        twice = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(twice, "2 * 'Plan'[Amount]")
+
+    def test_table_rename_extension_table_ref_not_shadowed_by_measure_name(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Sales", "expression": "1"},
+                                            {"name": "Rows", "expression": "COUNTROWS('Sales')"}]}]}))
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        rows = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(rows, "COUNTROWS('Revenue')")
+
+    def test_column_rename_extension_row_context_ref_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"},
+                                            {"name": "Total", "expression": "SUMX('Sales', [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        tot = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(tot, "SUMX('Sales', [Net])")
+
+    def test_column_rename_variation_under_group_ref_follows(self):
+        grp = {"GroupRef": {"Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                                      "Name": "Variation",
+                                                                      "Property": "OrderDate"}},
+                            "Property": "Year"},
+               "queryRef": "Sales.OrderDate.Variation.Year"}
+        ws, project, mdef, path = self._report_project({"refs": [grp]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+        pvs = json.loads(path.read_text())["refs"][0]["GroupRef"]["Expression"]["PropertyVariationSource"]
+        self.assertEqual(pvs["Property"], "BookedDate")
+
+    def test_column_rename_unrelated_expression_object_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"name": "example", "expression": "'Sales'[Amount]"}))
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(json.loads(other.read_text())["expression"], "'Sales'[Amount]")
+
+    def test_column_rename_into_extension_measure_name_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Net", "expression": "7"},
+                                            {"name": "Total", "expression": "SUMX('Sales', [Net])"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_measure_rename_into_column_on_other_table_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tmeasure Margin = 1\n")
+        _write(os.path.join(mdef, "tables", "Other.tmdl"),
+               "table Other\n\tcolumn Net\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Total", "expression": "SUMX('Other', [Margin])"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "measure", "Margin", "Net")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_column_rename_destination_string_owned_by_longer_table_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Amount"}]})
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Value\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "Region.Value", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_destination_string_owned_by_longer_table_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Region.Amount"}]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Region.Amount'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Revenue.Region.tmdl"),
+               "table 'Revenue.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_column_rename_destination_extending_extension_path_allowed(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales", "measures": [{"name": "Region.Fee", "expression": "1"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Fee.Share", table="Sales.Region")
+
+    def test_column_rename_bare_destination_owned_by_other_table_refused(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"},
+               "nativeQueryRef": "Amount"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        _write(os.path.join(mdef, "tables", "Other.tmdl"),
+               "table Other\n\tcolumn Amount\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "Other.Amount", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_column_rename_bare_destination_extending_other_path_refused(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"},
+               "nativeQueryRef": "Amount"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        _write(os.path.join(mdef, "tables", "Other.tmdl"),
+               "table Other\n\tcolumn Metric\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "Other.Metric.Level", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_destination_extending_new_namespace_path_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Orders.Region.Amount.Level"}]})
+        _write(os.path.join(mdef, "tables", "Orders.tmdl"),
+               "table Orders\n\tcolumn 'Region.Amount.Level'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Orders", "Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_retained_suffix_destination_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "A.X.Level"}]})
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "B.X.tmdl"),
+               "table 'B.X'\n\tcolumn Level\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "A", "B")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_column_rename_wrapped_destination_owned_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sum(Sales.Amount)"}]})
+        _write(os.path.join(mdef, "tables", "Odd.tmdl"),
+               "table 'Sum(Sales'\n\tcolumn 'Revenue)'\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "Revenue", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_destination_extending_new_entity_extension_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "A.X.Y.Level"}]})
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn 'X.Y.Level'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "B.X", "measures": [{"name": "Y", "expression": "1"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "A", "B")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_wrapped_destination_inner_path_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sum(A.X.Level)"}]})
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "B.X.tmdl"),
+               "table 'B.X'\n\tcolumn Level\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "A", "B")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_to_shorter_name_own_extension_path_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Region.Total.Level"}]})
+        os.remove(os.path.join(mdef, "tables", "Sales.tmdl"))
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales.Region", "measures": [{"name": "Total", "expression": "1"}]}]}))
+        rename.rename(ws, project, "table", "Sales.Region", "Sales")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "Sales.Total.Level")
+
+    def test_table_rename_to_shorter_name_no_self_preflight_block(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        os.remove(os.path.join(mdef, "tables", "Sales.tmdl"))
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn 'Region.Total'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Sales.Region", "measures": [{"name": "Total", "expression": "1"}]}]}))
+        rename.rename(ws, project, "table", "Sales.Region", "Sales")
+
+    def test_table_rename_shorter_source_not_blocked_by_destination_set(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "A.B.C.X"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "ABC.tmdl"),
+               "table 'A.B.C'\n\tcolumn X\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "A.B", "measures": [{"name": "C", "expression": "1"}]}]}))
+        rename.rename(ws, project, "table", "A.B.C", "A")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "A.X")
+
+    def test_table_rename_longer_destination_extending_shorter_entity_allowed(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "A.X"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "A.B", "measures": [{"name": "C", "expression": "1"}]}]}))
+        rename.rename(ws, project, "table", "A", "A.B.C")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "A.B.C.X")
+
+    def test_table_rename_destination_suffix_classified_post_rename(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Old.Sub.X.Old.Level"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Old.tmdl"),
+               "table Old\n\tcolumn 'Sub.X.Old.Level'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Dest.Sub.tmdl"),
+               "table 'Dest.Sub'\n\tcolumn X\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Old", "measures": [{"name": "M", "expression": "1"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Old", "Dest")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_emitting_unrecognizable_variation_path_refused(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+                "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                           "Property": "OrderDate"}},
+                "Hierarchy": "Calendar"}}, "Level": "Year"},
+              "queryRef": "Sales.OrderDate.Calendar.Year"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "Calendar")
+        self.assertEqual(caught.exception.code, "AMBIGUOUS")
+
+    def test_table_rename_unrecognizable_path_not_masked_by_longer_column(self):
+        hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+                "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                           "Property": "OrderDate"}},
+                "Hierarchy": "Calendar"}}, "Level": "Year"},
+              "queryRef": "Sales.OrderDate.Calendar.Year"}
+        ws, project, mdef, path = self._report_project({"projections": [hl]})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n\tcolumn 'OrderDate.Calendar'\n\t\tdataType: string\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "Calendar")
+        self.assertEqual(caught.exception.code, "AMBIGUOUS")
+
+    def test_table_rename_unrecognizable_extension_path_unicode_name_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "İ.M.Calendar.Year"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "I.tmdl"),
+               "table 'İ'\n\tcolumn X\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "İ", "measures": [{"name": "M", "expression": "1"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "İ", "Calendar")
+        self.assertEqual(caught.exception.code, "AMBIGUOUS")
+
+    def test_table_rename_literal_destination_not_reparsed_as_wrapper(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Totals"}}, "Property": "Amount)"},
+               "queryRef": "Totals.Amount)"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Totals.tmdl"),
+               "table Totals\n\tcolumn 'Amount)'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Totals", "Sum(Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Sum(Sales.Amount)")
+
+    def test_table_rename_literal_paths_looking_like_wrappers_follow(self):
+        fld = {"Column": {"Expression": {"SourceRef": {"Entity": "Sum(Old"}}, "Property": "Amount)"},
+               "queryRef": "Sum(Old.Amount)"}
+        ws, project, mdef, path = self._report_project({"projections": [fld]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "SumOld.tmdl"),
+               "table 'Sum(Old'\n\tcolumn 'Amount)'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "New.tmdl"),
+               "table New\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sum(Old", "Sum(New")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "Sum(New.Amount)")
+
+    def test_table_rename_wrapped_emission_recognizability_on_inner_path(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"metadata": "Sum(Sales.Amount.Level)"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "SumRevenue.tmdl"),
+               "table 'Sum(Revenue'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        self.assertEqual(json.loads(path.read_text())["refs"][0]["metadata"], "Sum(Revenue.Amount.Level)")
+
+    def test_table_rename_recognizability_picks_most_consuming_base(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.İİİ.X.Y"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        col1 = "i\u0307" * 3
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn '" + col1 + "'\n\t\tdataType: string\n\tcolumn 'İİİ.X'\n\t\tdataType: string\n")
+        rename.rename(ws, project, "table", "Sales", "X")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["refs"][0]["queryRef"], "X.İİİ.X.Y")
+
+    def test_column_rename_destination_extension_spelling_invariant(self):
+        for new_name in ("Region.Amount.\u0130", "Region.Amount.i\u0307"):
+            ws, project, mdef, path = self._report_project({"refs": []})
+            _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+                   "table Sales\n\tcolumn Cost\n\t\tdataType: int64\n")
+            _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+                   "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Cost", new_name, table="Sales")
+            self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_column_rename_destination_extension_with_mark_inside_name_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Cost\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Sales.Region.tmdl"),
+               "table 'Sales.Region'\n\tcolumn Amount\n\t\tdataType: int64\n")
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Cost", "Region.Amount.İSales.Year", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_column_rename_extension_bare_and_spaced_refs_stay_row_context_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"},
+                                            {"name": "Twice", "expression": "2 * [Amount]"},
+                                            {"name": "Total", "expression": "SUMX('Sales', Budget [Amount])"},
+                                            {"name": "Ctx", "expression": "SUMX('Sales', [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        ms = {m["name"]: m["expression"]
+              for m in json.loads(ext_path.read_text())["entities"][0]["measures"]}
+        self.assertEqual(ms["Twice"], "2 * [Amount]")
+        self.assertEqual(ms["Total"], "SUMX('Sales', Budget [Amount])")
+        self.assertEqual(ms["Ctx"], "SUMX('Sales', [Net])")
+
+    def test_column_rename_into_column_on_other_table_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn Total\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "M", "expression": "SUM([Amount])"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "column", "Amount", "Total", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+
+    def test_table_rename_capturing_extension_var_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "VAR Batch = 1 RETURN COUNTROWS(Sales)"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "table", "Sales", "Batch")
+        self.assertEqual(caught.exception.code, "AMBIGUOUS")
+
+    def test_column_rename_return_keyword_not_a_spaced_qualifier(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Return", "measures": [{"name": "Amount", "expression": "7"}]},
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "SUMX(Sales, VAR x = 1 RETURN [Amount] + x)"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        ms = json.loads(ext_path.read_text())["entities"][1]["measures"]
+        self.assertEqual(ms[0]["expression"], "SUMX(Sales, VAR x = 1 RETURN [Net] + x)")
+
+    def test_table_rename_keyword_qualifier_untouched_quoted_follows(self):
+        def fresh(expr):
+            ws, project, mdef, path = self._report_project({"refs": []})
+            for f in os.listdir(os.path.join(mdef, "tables")):
+                os.remove(os.path.join(mdef, "tables", f))
+            _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+                   "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+            _write(os.path.join(mdef, "tables", "Return.tmdl"),
+                   "table Return\n\tcolumn Code\n\t\tdataType: string\n")
+            ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+            ext_path.write_text(json.dumps({"name": "extension", "entities": [
+                {"name": "Return", "measures": [{"name": "Amount", "expression": "7"}]},
+                {"name": "Budget", "measures": [{"name": "M", "expression": expr}]}]}))
+            return ws, project, ext_path
+
+        ws, project, ext_path = fresh("SUMX(Sales, VAR x = 1 RETURN [Amount] + x)")
+        rename.rename(ws, project, "table", "Return", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][1]["measures"][0]["expression"]
+        self.assertEqual(m, "SUMX(Sales, VAR x = 1 RETURN [Amount] + x)")
+
+        ws, project, ext_path = fresh("SUM('Return' [Amount])")
+        rename.rename(ws, project, "table", "Return", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][1]["measures"][0]["expression"]
+        self.assertEqual(m, "SUM('Archive' [Amount])")
+
+    def test_column_rename_keyword_qualifier_row_context_still_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Return.tmdl"),
+               "table Return\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Return", "measures": [{"name": "Amount", "expression": "7"}]},
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "SUMX(Sales, VAR x = 1 RETURN [Amount] + x)"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        ms = json.loads(ext_path.read_text())["entities"][1]["measures"]
+        self.assertEqual(ms[0]["expression"], "SUMX(Sales, VAR x = 1 RETURN [Net] + x)")
+
+    def test_unanchored_bare_native_query_ref_with_two_owners_stays(self):
+        ws, project, mdef, path = self._report_project({"projections": [{"nativeQueryRef": "Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "NetAmount", table="Sales")
+        self.assertEqual(json.loads(path.read_text()),
+                         {"projections": [{"nativeQueryRef": "Amount"}]})
+
+    def test_table_rename_return_keyword_standalone_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Return.tmdl"),
+               "table Return\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "M", "expression": "VAR x = 1 RETURN x"}]}]}))
+        rename.rename(ws, project, "table", "Return", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "VAR x = 1 RETURN x")
+
+    def test_unanchored_bare_native_query_ref_vs_extension_measure_stays(self):
+        ws, project, mdef, path = self._report_project({"projections": [{"nativeQueryRef": "Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "NetTotal", table="Sales")
+        self.assertEqual(json.loads(path.read_text()),
+                         {"projections": [{"nativeQueryRef": "Amount"}]})
+
+    def test_unanchored_bare_native_query_ref_dotted_name_two_owners_stays(self):
+        ws, project, mdef, path = self._report_project({"projections": [{"nativeQueryRef": "Net.Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Net.Amount'\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn 'Net.Amount'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Net.Amount", "NetTotal", table="Sales")
+        self.assertEqual(json.loads(path.read_text()),
+                         {"projections": [{"nativeQueryRef": "Net.Amount"}]})
+
+    def test_unanchored_bare_ref_dotted_extension_measure_blocks_plain_does_not(self):
+        ws, project, mdef, path = self._report_project({"projections": [{"nativeQueryRef": "Net.Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn 'Net.Amount'\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Net.Amount", "expression": "7"}]}]}))
+        rename.rename(ws, project, "column", "Net.Amount", "Revised", table="Sales")
+        self.assertEqual(json.loads(path.read_text()),
+                         {"projections": [{"nativeQueryRef": "Net.Amount"}]})
+
+        ws, project, mdef, path = self._report_project({"projections": [{"nativeQueryRef": "Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Net.Amount", "expression": "7"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Revised", table="Sales")
+        self.assertEqual(json.loads(path.read_text()),
+                         {"projections": [{"nativeQueryRef": "Revised"}]})
+
+    def test_wrapped_query_ref_emission_ignores_bare_name_collision(self):
+        ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sum(Sales.Amount)"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn 'Sum(Sales.Total)'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "Total", table="Sales")
+        self.assertEqual(json.loads(path.read_text()), {"refs": [{"queryRef": "Sum(Sales.Total)"}]})
+
+    def test_table_rename_to_keyword_name_quotes_and_renames_on(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "M", "expression": "COUNTROWS(Sales)"}]}]}))
+        rename.rename(ws, project, "table", "Sales", "Return")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS('Return')")
+        rename.rename(ws, project, "table", "Return", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS('Archive')")
+
+    def test_bare_ref_ambiguous_between_model_and_extension_measure_stays(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tmeasure M = 1\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "M", "expression": "7"}]},
+            {"name": "Forecast", "measures": [{"name": "F", "expression": "[M]"}]}]}))
+        rename.rename(ws, project, "measure", "M", "Net", table="Sales")
+        f = json.loads(ext_path.read_text())["entities"][1]["measures"][0]["expression"]
+        self.assertEqual(f, "[M]")
+
+    def test_column_rename_keyword_mask_keeps_row_context(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Return.tmdl"),
+               "table Return\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "SUMX(Sales, VAR x = Budget RETURN [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "SUMX(Sales, VAR x = Budget RETURN [Net])")
+
+    def test_table_rename_sort_keyword_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Asc.tmdl"),
+               "table Asc\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "RANKX(Sales, Sales[Amount], , ASC)"},
+                {"name": "N", "expression": "COUNTROWS('Asc')"}]}]}))
+        rename.rename(ws, project, "table", "Asc", "Archive")
+        ms = {m["name"]: m["expression"]
+              for m in json.loads(ext_path.read_text())["entities"][0]["measures"]}
+        self.assertEqual(ms["M"], "RANKX(Sales, Sales[Amount], , ASC)")
+        self.assertEqual(ms["N"], "COUNTROWS('Archive')")
+
+    def test_table_rename_dense_ties_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Dense.tmdl"),
+               "table Dense\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "RANKX(Sales, Sales[Amount], , DESC, DENSE)"},
+                {"name": "N", "expression": "COUNTROWS('Dense')"}]}]}))
+        rename.rename(ws, project, "table", "Dense", "Archive")
+        ms = {m["name"]: m["expression"]
+              for m in json.loads(ext_path.read_text())["entities"][0]["measures"]}
+        self.assertEqual(ms["M"], "RANKX(Sales, Sales[Amount], , DESC, DENSE)")
+        self.assertEqual(ms["N"], "COUNTROWS('Archive')")
+
+    def test_table_rename_to_reserved_keyword_destination_quoted(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "M", "expression": "COUNTROWS(Sales)"}]}]}))
+        rename.rename(ws, project, "table", "Sales", "Evaluate")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS('Evaluate')")
+
+    def test_table_rename_interval_argument_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Calendar.tmdl"),
+               "table Calendar\n\tcolumn Date\n\t\tdataType: dateTime\n")
+        _write(os.path.join(mdef, "tables", "Year.tmdl"),
+               "table Year\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATEADD('Calendar'[Date], -1, YEAR)) + COUNTROWS('Year')"}]}]}))
+        rename.rename(ws, project, "table", "Year", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATEADD('Calendar'[Date], -1, YEAR)) + COUNTROWS('Archive')")
+
+    def test_table_rename_datediff_interval_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Hour.tmdl"),
+               "table Hour\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "DATEDIFF(DATE(2024,1,1), DATE(2024,1,2), HOUR) + COUNTROWS('Hour')"}]}]}))
+        rename.rename(ws, project, "table", "Hour", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "DATEDIFF(DATE(2024,1,1), DATE(2024,1,2), HOUR) + COUNTROWS('Archive')")
+
+    def test_column_rename_keyword_row_context_poison_masked(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Return.tmdl"),
+               "table Return\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "SUMX(VAR x = 1 RETURN Sales, [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "SUMX(VAR x = 1 RETURN Sales, [Net])")
+
+    def test_table_rename_crossfilter_direction_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn ProductKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Product.tmdl"),
+               "table Product\n\tcolumn ProductKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Both.tmdl"),
+               "table Both\n\tcolumn Code\n\t\tdataType: string\n")
+        _write(os.path.join(mdef, "tables", "relationships.tmdl"),
+               "relationship rel1\n\tfromColumn: Sales.ProductKey\n\ttoColumn: Product.ProductKey\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "CALCULATE(COUNTROWS('Both'), CROSSFILTER(Sales[ProductKey], Product[ProductKey], BOTH))"}]}]}))
+        rename.rename(ws, project, "table", "Both", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "CALCULATE(COUNTROWS('Archive'), CROSSFILTER(Sales[ProductKey], Product[ProductKey], BOTH))")
+
+    def test_table_rename_crossfilter_directional_spelling_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "A.tmdl"),
+               "table A\n\tcolumn K\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "B.tmdl"),
+               "table B\n\tcolumn K\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "OneWay_LeftFiltersRight.tmdl"),
+               "table OneWay_LeftFiltersRight\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "CALCULATE(COUNTROWS('OneWay_LeftFiltersRight'), CROSSFILTER(A[K], B[K], OneWay_LeftFiltersRight))"}]}]}))
+        rename.rename(ws, project, "table", "OneWay_LeftFiltersRight", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "CALCULATE(COUNTROWS('Archive'), CROSSFILTER(A[K], B[K], OneWay_LeftFiltersRight))")
+
+    def test_column_rename_keyword_touching_bracket_still_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "7"},
+                                            {"name": "M", "expression": "SUMX(Sales, VAR x = 1 RETURN[Amount] + x)"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, "SUMX(Sales, VAR x = 1 RETURN[Net] + x)")
+
+    def test_table_rename_window_boundary_modes_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Abs.tmdl"),
+               "table Abs\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(WINDOW(1, ABS, 0, REL, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC)))"},
+                {"name": "N", "expression": "SUM('Abs'[Amount])"}]}]}))
+        rename.rename(ws, project, "table", "Abs", "Archive")
+        ms = {m["name"]: m["expression"]
+              for m in json.loads(ext_path.read_text())["entities"][0]["measures"]}
+        self.assertEqual(ms["M"], "COUNTROWS(WINDOW(1, ABS, 0, REL, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC)))")
+        self.assertEqual(ms["N"], "SUM('Archive'[Amount])")
+
+    def test_table_rename_rank_blank_option_untouched_quoted_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Last.tmdl"),
+               "table Last\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "RANK(DENSE, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC), LAST) + COUNTROWS('Last')"}]}]}))
+        rename.rename(ws, project, "table", "Last", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "RANK(DENSE, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC), LAST) + COUNTROWS('Archive')")
+
+    def test_table_rename_blanks_and_convert_type_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Blanks.tmdl"),
+               "table Blanks\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "RANK(DENSE, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC BLANKS LAST))"}]}]}))
+        rename.rename(ws, project, "table", "Blanks", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "RANK(DENSE, ALL(Sales[Amount]), ORDERBY(Sales[Amount], ASC BLANKS LAST))")
+
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Integer.tmdl"),
+               "table Integer\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "CONVERT(1, INTEGER) + COUNTROWS('Integer')"}]}]}))
+        rename.rename(ws, project, "table", "Integer", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "CONVERT(1, INTEGER) + COUNTROWS('Archive')")
+
+    def test_table_rename_datatable_type_and_precise_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Int64.tmdl"),
+               "table Int64\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATATABLE(\"K\", INT64, {{1}})) + COUNTROWS('Int64')"}]}]}))
+        rename.rename(ws, project, "table", "Int64", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATATABLE(\"K\", INT64, {{1}})) + COUNTROWS('Archive')")
+
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "FiscalCalendar.tmdl"),
+               "table FiscalCalendar\n\tcolumn Date\n\t\tdataType: dateTime\n")
+        _write(os.path.join(mdef, "tables", "Precise.tmdl"),
+               "table Precise\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATEADD(FiscalCalendar, 1, MONTH, PRECISE)) + COUNTROWS('Precise')"}]}]}))
+        rename.rename(ws, project, "table", "Precise", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATEADD(FiscalCalendar, 1, MONTH, PRECISE)) + COUNTROWS('Archive')")
+
+    def test_table_rename_dateadd_extending_option_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "FiscalCalendar.tmdl"),
+               "table FiscalCalendar\n\tcolumn Date\n\t\tdataType: dateTime\n")
+        _write(os.path.join(mdef, "tables", "Extending.tmdl"),
+               "table Extending\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATEADD(FiscalCalendar, 1, MONTH, EXTENDING)) + COUNTROWS('Extending')"}]}]}))
+        rename.rename(ws, project, "table", "Extending", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATEADD(FiscalCalendar, 1, MONTH, EXTENDING)) + COUNTROWS('Archive')")
+
+    def test_table_rename_dateadd_anchored_option_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "FiscalCalendar.tmdl"),
+               "table FiscalCalendar\n\tcolumn Date\n\t\tdataType: dateTime\n")
+        _write(os.path.join(mdef, "tables", "Anchored.tmdl"),
+               "table Anchored\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATEADD(FiscalCalendar, -1, MONTH, PRECISE, ANCHORED)) + COUNTROWS('Anchored')"}]}]}))
+        rename.rename(ws, project, "table", "Anchored", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATEADD(FiscalCalendar, -1, MONTH, PRECISE, ANCHORED)) + COUNTROWS('Archive')")
+
+    def test_table_rename_endaligned_and_text_type_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "FiscalCalendar.tmdl"),
+               "table FiscalCalendar\n\tcolumn Date\n\t\tdataType: dateTime\n")
+        _write(os.path.join(mdef, "tables", "EndAligned.tmdl"),
+               "table EndAligned\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATEADD(FiscalCalendar, 1, MONTH, ENDALIGNED)) + COUNTROWS('EndAligned')"}]}]}))
+        rename.rename(ws, project, "table", "EndAligned", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATEADD(FiscalCalendar, 1, MONTH, ENDALIGNED)) + COUNTROWS('Archive')")
+
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Text.tmdl"),
+               "table Text\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATATABLE(\"K\", TEXT, {{\"x\"}})) + COUNTROWS('Text')"}]}]}))
+        rename.rename(ws, project, "table", "Text", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATATABLE(\"K\", TEXT, {{\"x\"}})) + COUNTROWS('Archive')")
+
+    def test_table_rename_datatable_decimal_alias_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Decimal.tmdl"),
+               "table Decimal\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATATABLE(\"K\", DECIMAL, {{1}})) + COUNTROWS('Decimal')"}]}]}))
+        rename.rename(ws, project, "table", "Decimal", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATATABLE(\"K\", DECIMAL, {{1}})) + COUNTROWS('Archive')")
+
+    def test_column_rename_extension_ref_does_not_poison_row_inference(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn SortKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Decoy.tmdl"),
+               "table Decoy\n\tcolumn Limit\n\t\tdataType: int64\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Limit", "expression": "3"}]},
+            {"name": "Decoy", "measures": [
+                {"name": "M", "expression": "SUMX(TOPN(Budget [Limit], Sales, Sales[SortKey]), [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][1]["measures"][0]["expression"]
+        self.assertEqual(m, "SUMX(TOPN(Budget [Limit], Sales, Sales[SortKey]), [Net])")
+
+    def test_bare_extension_measure_does_not_poison_row_inference(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn SortKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Decoy.tmdl"),
+               "table Decoy\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn Limit\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Limit", "expression": "3"},
+                                            {"name": "M", "expression": "SUMX(TOPN([Limit], Sales, Sales[SortKey]), [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Decoy")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, "SUMX(TOPN([Limit], Sales, Sales[SortKey]), [Amount])")
+
+    def test_anchor_in_select_name_counts_for_bare_native_query_ref(self):
+        ws, project, mdef, path = self._report_project({
+            "Select": [{"Name": "Sales.Amount", "Expression": "Sales[Amount]"}],
+            "projections": [{"nativeQueryRef": "Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["nativeQueryRef"], "Net")
+
+    def test_table_rename_datatable_logical_alias_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Logical.tmdl"),
+               "table Logical\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATATABLE(\"Flag\", LOGICAL, {{TRUE()}})) + COUNTROWS('Logical')"}]}]}))
+        rename.rename(ws, project, "table", "Logical", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATATABLE(\"Flag\", LOGICAL, {{TRUE()}})) + COUNTROWS('Archive')")
+
+    def test_column_rename_model_table_extension_ref_does_not_poison_row_inference(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn SortKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Decoy.tmdl"),
+               "table Decoy\n\tcolumn Limit\n\t\tdataType: int64\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Decoy", "measures": [{"name": "Limit", "expression": "3"},
+                                           {"name": "M", "expression": "SUMX(TOPN(Decoy [Limit], Sales, Sales[SortKey]), [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, "SUMX(TOPN(Decoy [Limit], Sales, Sales[SortKey]), [Net])")
+
+    def test_table_rename_extension_ref_qualifier_still_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Decoy.tmdl"),
+               "table Decoy\n\tcolumn Limit\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Decoy", "measures": [{"name": "Limit", "expression": "3"},
+                                           {"name": "M", "expression": "Decoy [Limit] + COUNTROWS(Decoy)"}]}]}))
+        rename.rename(ws, project, "table", "Decoy", "Plan")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, "Plan [Limit] + COUNTROWS(Plan)")
+
+    def test_table_rename_mask_glue_phantom_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "RETURN111111.tmdl"),
+               "table RETURN111111\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "B", "measures": [{"name": "M", "expression": "3"},
+                                       {"name": "N", "expression": "VAR x = 1 RETURN'B'[M]"}]}]}))
+        rename.rename(ws, project, "table", "RETURN111111", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, "VAR x = 1 RETURN'B'[M]")
+
+    def test_column_rename_mask_glue_does_not_steer_row_inference(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn SortKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "RETURN111111.tmdl"),
+               "table RETURN111111\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        expr = "SUMX(TOPN(VAR x = 1 RETURN'B'[M], Sales, Sales[SortKey]), [Amount])"
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "B", "measures": [{"name": "M", "expression": "3"},
+                                       {"name": "N", "expression": expr}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="RETURN111111")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, expr)
+
+    def test_table_rename_nested_entities_array_untouched(self):
+        doc = {"payload": {"entities": [{"name": "Sales", "measures": [
+            {"name": "Local", "expression": "1"},
+            {"name": "UseLocal", "expression": "Sales[Local]"}]}]}}
+        ws, project, mdef, path = self._report_project(doc)
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        got = json.loads(path.read_text())
+        ent = got["payload"]["entities"][0]
+        self.assertEqual(ent["name"], "Sales")
+        self.assertEqual(ent["measures"][1]["expression"], "Sales[Local]")
+
+    def test_table_rename_empty_key_entities_array_untouched(self):
+        doc = {"": {"entities": [{"name": "Sales", "measures": [
+            {"name": "Local", "expression": "1"},
+            {"name": "UseLocal", "expression": "Sales[Local]"}]}]}}
+        ws, project, mdef, path = self._report_project(doc)
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        got = json.loads(path.read_text())
+        ent = got[""]["entities"][0]
+        self.assertEqual(ent["name"], "Sales")
+        self.assertEqual(ent["measures"][1]["expression"], "Sales[Local]")
+
+    def test_column_rename_duplicate_entity_entries_union(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "1"}]},
+            {"name": "Budget", "measures": [{"name": "Forecast", "expression": "2"}]},
+            {"name": "Sales", "measures": [{"name": "UseIt", "expression": "Budget [Amount]"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][2]["measures"][0]["expression"]
+        self.assertEqual(m, "Budget [Amount]")
+
+    def test_column_case_only_rename_allowed_with_same_named_column_elsewhere(self):
+        # A case-only rename changes nothing in folded space, so the
+        # cross-table destination check does not fire: the base suite
+        # pins this in test_modeling_atomic.test_case_only_column_rename
+        # (Other.Amount present). The qualified reference follows and
+        # the other table's column is untouched.
+        ws, project, mdef, path = self._report_project(
+            {"refs": [{"queryRef": "Sales.Amount"}]})
+        rename.rename(ws, project, "column", "Amount", "AMOUNT", table="Sales")
+        got = json.loads(path.read_text())["refs"][0]["queryRef"]
+        self.assertEqual(got, "Sales.AMOUNT")
+        other = Path(mdef, "tables", "Other.tmdl").read_text()
+        self.assertIn("column Amount", other)
+
+    def test_column_rename_wrapper_spelling_fold_consistent(self):
+        for wrap in ("A\u0130", "Ai\u0307"):
+            ws, project, mdef, path = self._report_project(
+                {"refs": [{"queryRef": f"{wrap}(Sales.Amount)"}]})
+            rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+            got = json.loads(path.read_text(encoding="utf-8"))["refs"][0]["queryRef"]
+            self.assertEqual(got, f"{wrap}(Sales.Net)")
+
+    def test_nearer_ambiguous_container_stops_field_inheritance(self):
+        def fld(entity):
+            return {"Column": {"Expression": {"SourceRef": {"Entity": entity}}, "Property": "Amount"}}
+        doc = {"projections": [{
+            **fld("Sales"),
+            "details": {"left": fld("Budget"), "right": fld("Forecast"),
+                        "nativeQueryRef": "Amount"}}]}
+        ws, project, mdef, path = self._report_project(doc)
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        for name in ("Sales", "Budget", "Forecast"):
+            _write(os.path.join(mdef, "tables", f"{name}.tmdl"),
+                   f"table {name}\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        got = json.loads(path.read_text())["projections"][0]["details"]["nativeQueryRef"]
+        self.assertEqual(got, "Amount")
+
+    def test_nearer_ambiguous_container_stops_inheritance_through_nested_array(self):
+        def fld(entity):
+            return {"Column": {"Expression": {"SourceRef": {"Entity": entity}}, "Property": "Amount"}}
+        doc = {"projections": [{
+            **fld("Sales"),
+            "details": {"left": fld("Budget"), "right": fld("Forecast"),
+                        "refs": [{"nativeQueryRef": "Amount"}]}}]}
+        ws, project, mdef, path = self._report_project(doc)
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        for name in ("Sales", "Budget", "Forecast"):
+            _write(os.path.join(mdef, "tables", f"{name}.tmdl"),
+                   f"table {name}\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        got = json.loads(path.read_text())["projections"][0]["details"]["refs"][0]["nativeQueryRef"]
+        self.assertEqual(got, "Amount")
+
+    def test_two_calls_are_not_one_wrapper(self):
+        ws, project, mdef, path = self._report_project(
+            {"refs": [{"metadata": "SUM(Sales.A) + SUM(Sales.B)"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn A\n\t\tdataType: int64\n\tcolumn B\n\t\tdataType: int64\n"
+               "\tcolumn 'A) + SUM(Sales.B'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "A) + SUM(Sales.B", "Net", table="Sales")
+        got = json.loads(path.read_text())["refs"][0]["metadata"]
+        self.assertEqual(got, "SUM(Sales.A) + SUM(Sales.B)")
+
+    def test_table_rename_breaking_wrapper_refused(self):
+        ws, project, mdef, path = self._report_project(
+            {"refs": [{"queryRef": "Sum(Sales.Amount)"}]})
+        with self.assertRaises(PbzError) as ctx:
+            rename.rename(ws, project, "table", "Sales", "Sales(")
+        self.assertEqual(ctx.exception.code, "NAME_TAKEN")
+        got = json.loads(path.read_text())["refs"][0]["queryRef"]
+        self.assertEqual(got, "Sum(Sales.Amount)")
+
+    def _references_project(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tmeasure Net = 1\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "UseNet", "expression": "Sales[Net]",
+                 "references": {"measures": [{"entity": "Sales", "name": "Net"},
+                                             {"entity": "Sales", "name": "Net", "schema": "extension"}]}}]}]}))
+        return ws, project, ext_path
+
+    def test_measure_rename_references_record_follows(self):
+        ws, project, ext_path = self._references_project()
+        rename.rename(ws, project, "measure", "Net", "Margin")
+        ent = json.loads(ext_path.read_text())["entities"][0]["measures"][0]
+        self.assertEqual(ent["expression"], "Sales[Margin]")
+        recs = ent["references"]["measures"]
+        self.assertEqual(recs[0]["name"], "Margin")
+        self.assertEqual(recs[1]["name"], "Net")
+
+    def test_table_rename_references_record_entity_follows(self):
+        ws, project, ext_path = self._references_project()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        recs = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["references"]["measures"]
+        self.assertEqual(recs[0]["entity"], "Revenue")
+        self.assertEqual(recs[1]["entity"], "Sales")
+
+    def test_extension_inventory_symlink_escape_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        outside = Path(tempfile.mkdtemp()) / "outside-ext.json"
+        outside.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Margin", "expression": "1"}]}]}))
+        try:
+            ext_path.symlink_to(outside)
+        except OSError:
+            outside.unlink(missing_ok=True)
+            return  # Windows may not grant symlink creation.
+        try:
+            with self.assertRaises(PbzError) as ctx:
+                rename.rename(ws, project, "measure", "Keep", "Margin")
+            self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_extension_inventory_broken_path_refuses(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        d = Path(project.mirror_report, "definition")
+        shutil.rmtree(d)
+        d.write_text("not a directory")
+        with self.assertRaises(PbzError):
+            rename._extension_entities(project.mirror_report)
+
+    def test_extension_inventory_unparseable_refuses(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text("{")
+        with self.assertRaises(PbzError):
+            rename._extension_entities(project.mirror_report)
+
+    def test_extension_inventory_definition_link_refused(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        d = Path(project.mirror_report, "definition")
+        shutil.rmtree(d)
+        try:
+            d.symlink_to(Path(tempfile.mkdtemp()), target_is_directory=True)
+        except OSError:
+            return  # Windows may not grant symlink creation.
+        with self.assertRaises(PbzError) as ctx:
+            rename._extension_entities(project.mirror_report)
+        self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+
+    def test_extension_inventory_dangling_report_link_refused(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        rd = Path(project.mirror_report)
+        shutil.rmtree(rd)
+        try:
+            rd.symlink_to(Path(tempfile.mkdtemp()) / "missing-target", target_is_directory=True)
+        except OSError:
+            return  # Windows may not grant symlink creation.
+        with self.assertRaises(PbzError) as ctx:
+            rename._extension_entities(str(rd))
+        self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+
+    def test_extension_inventory_report_dir_file_refused(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        rd = Path(project.mirror_report)
+        shutil.rmtree(rd)
+        rd.write_text("not a directory")
+        with self.assertRaises(PbzError):
+            rename._extension_entities(str(rd))
+
+    def test_extension_inventory_missing_definition_is_empty(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        shutil.rmtree(Path(project.mirror_report, "definition"))
+        self.assertEqual(rename._extension_entities(project.mirror_report), [])
+
+    def test_bare_native_query_ref_wrapper_shaped_field_name_blocks_retry(self):
+        ws, project, mdef, path = self._report_project(
+            {"projections": [{"nativeQueryRef": "Sum(Sales.Amount)"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn 'Sum(Sales.Amount)'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        got = json.loads(path.read_text())["projections"][0]["nativeQueryRef"]
+        self.assertEqual(got, "Sum(Sales.Amount)")
+
+    def test_extension_inventory_entities_not_array_refuses(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"entities": {"name": "Budget", "measures": [{"name": "Net"}]}}))
+        with self.assertRaises(PbzError):
+            rename._extension_entities(project.mirror_report)
+
+    def test_table_rename_bare_native_query_ref_wrapper_shaped_field_stays(self):
+        ws, project, mdef, path = self._report_project(
+            {"projections": [{"nativeQueryRef": "Sum(Sales.Amount)"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn 'Sum(Sales.Amount)'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        got = json.loads(path.read_text())["projections"][0]["nativeQueryRef"]
+        self.assertEqual(got, "Sum(Sales.Amount)")
+
+    def test_extension_inventory_measures_not_array_refuses(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"entities": [{"name": "Budget", "measures": {"name": "Total", "expression": "2"}}]}))
+        with self.assertRaises(PbzError):
+            rename._extension_entities(project.mirror_report)
+
+    def test_extension_inventory_unnamed_entity_measures_not_array_refuses(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"entities": [{"measures": {"name": "Total", "expression": "2"}}]}))
+        with self.assertRaises(PbzError):
+            rename._extension_entities(project.mirror_report)
+
+    def test_table_rename_extension_measure_named_like_wrapper_string_stays(self):
+        ws, project, mdef, path = self._report_project(
+            {"projections": [{"nativeQueryRef": "Sum(Sales.Amount)"}]})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Sum(Sales.Amount)", "expression": "1"}]}]}))
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        got = json.loads(path.read_text())["projections"][0]["nativeQueryRef"]
+        self.assertEqual(got, "Sum(Sales.Amount)")
+
+    def test_table_rename_bare_native_query_ref_dotted_field_name_stays(self):
+        ws, project, mdef, path = self._report_project(
+            {"projections": [{"nativeQueryRef": "Sales.Amount.Year"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn 'Sales.Amount.Year'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        got = json.loads(path.read_text())["projections"][0]["nativeQueryRef"]
+        self.assertEqual(got, "Sales.Amount.Year")
+
+    def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tmeasure Net = 1\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Total", "expression": "2"}]}]}))
+        with self.assertRaises(PbzError) as caught:
+            rename.rename(ws, project, "measure", "Net", "Total")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
 
     def test_verify_report_parse_failure_refuses_and_pbzerror_passes_through(self):
         ws, project, mdef, _path = self._report_project({})
@@ -533,7 +3291,7 @@ class RenameBindingsTests(unittest.TestCase):
                              'tables/Sales.tmdl': 'table Sales\n\tcolumn Qty\n\tmeasure Dup = 1\n',
                              'tables/Other.tmdl': 'table Other\n\tcolumn Qty\n',
                          })))
-        self.assertEqual(retargeted, ('[Target] + [Qty]', 1))
+        self.assertEqual(retargeted, ('[Target] + [Qty]', 1, True))
         self.assertEqual([b.ref for b in bound], [deps.Ref('column', 'Sales', 'Qty')])
 
 
