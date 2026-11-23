@@ -11,7 +11,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     __package__ = "pbz"
 
-from pbz import checks, describe, desktop, dpapi, handoff, memscrub, mirror, policy, rename, scan, smoke, validate  # noqa: E402
+from pbz import checks, describe, desktop, dpapi, handoff, memscrub, mirror, policy, rename, scan, smoke, tokens, validate  # noqa: E402
 from pbz.common import (  # noqa: E402
     PbzError, _contained, _reparse_link, emit, engine_call, file_sha, find_workspace, pbz_state_path)
 
@@ -184,8 +184,9 @@ def _vendor_host(host: str) -> bool:
 def cmd_init(ws, project, a):
     pbz_state_path(ws)
     os.makedirs(ws.pbz_dir, exist_ok=True)
-    if not os.path.exists(ws.policy_path):
-        policy.save(ws, policy.load(ws))
+    with tokens.WorkspaceLock(ws.private):
+        if not os.path.exists(ws.policy_path):
+            policy.save(ws, policy.load(ws))
     dpapi.load_key(ws.private)
     sc = scan.scan(ws, apply=True)
     hosts = set()
