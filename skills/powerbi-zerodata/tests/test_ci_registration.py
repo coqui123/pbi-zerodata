@@ -470,16 +470,16 @@ class EquivalenceTests(unittest.TestCase):
                 row = dict(id=control['id'], argv=control['argv'], exit_code=91, error=None,
                            skip_reasons=[], failure_reason=control['reason'])
                 ref['executed'].append(row)
-                inventory, _ = controls(json.loads(MANIFEST.read_text()), [control], check_scripts=False)
-                rows = {e['id']: e for e in ref['executed']}
-                for shard, group in zip(shards, allocate(inventory, 2)):
-                    shard['executed'] = copy.deepcopy([rows[e['id']] for e in group])
             else:
                 for r in [ref, *shards]:
                     for row in r['executed']:
                         if row['id'] == control['id']:
                             row.update(exit_code=91, failure_reason=control['reason'],
                                        source=dict(revision=control['revision'], path=control['script'], sha256=control['sha256']))
+            allocation, _ = controls(json.loads(MANIFEST.read_text()), [control], check_scripts=False)
+            rows = {e['id']: e for e in ref['executed']}
+            for shard, group in zip(shards, allocate(allocation, 2)):
+                shard['executed'] = copy.deepcopy([rows[e['id']] for e in group])
             for r in [ref, *shards]:
                 r['ok'] = all(e['exit_code'] == 0 for e in r['executed'])
             result[key] = dict(run_id='control-' + purpose, controls=[control], reference=ref, shards=shards,

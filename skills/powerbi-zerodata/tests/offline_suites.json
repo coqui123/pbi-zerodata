@@ -6,7 +6,8 @@
       "--provenance"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 20.7
   },
   {
     "id": "guard",
@@ -14,7 +15,8 @@
       "tests/test_guard.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 28.0
   },
   {
     "id": "checks",
@@ -22,7 +24,8 @@
       "tests/test_checks.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.2
   },
   {
     "id": "mirror",
@@ -30,7 +33,8 @@
       "tests/test_mirror.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 2.4
   },
   {
     "id": "parity",
@@ -38,7 +42,8 @@
       "tests/test_parity.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 12.7
   },
   {
     "id": "bpa",
@@ -46,7 +51,8 @@
       "tests/test_bpa.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 4.1
   },
   {
     "id": "tools",
@@ -54,7 +60,8 @@
       "tests/test_tools.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 2.0
   },
   {
     "id": "refactor",
@@ -62,7 +69,8 @@
       "tests/test_refactor.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 9.1
   },
   {
     "id": "rename_bindings",
@@ -70,7 +78,8 @@
       "tests/test_rename_bindings.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 10.2
   },
   {
     "id": "authoring",
@@ -78,7 +87,8 @@
       "tests/test_authoring.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 15.8
   },
   {
     "id": "selfcontained",
@@ -86,7 +96,8 @@
       "tests/test_selfcontained.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.7
   },
   {
     "id": "governance",
@@ -94,7 +105,8 @@
       "tests/test_governance.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 25.2
   },
   {
     "id": "mcp",
@@ -102,7 +114,8 @@
       "tests/test_mcp.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 19.9
   },
   {
     "id": "synth",
@@ -110,7 +123,8 @@
       "tests/test_synth.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 4.5
   },
   {
     "id": "consumers",
@@ -118,7 +132,8 @@
       "tests/test_consumers.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 3.8
   },
   {
     "id": "visuals",
@@ -126,7 +141,8 @@
       "tests/test_visuals.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 9.8
   },
   {
     "id": "style",
@@ -134,7 +150,8 @@
       "tests/test_style.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 5.8
   },
   {
     "id": "reportedit",
@@ -142,7 +159,8 @@
       "tests/test_reportedit.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 9.0
   },
   {
     "id": "synthtest",
@@ -150,7 +168,8 @@
       "tests/test_synthtest.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 1.7
   },
   {
     "id": "props",
@@ -158,7 +177,8 @@
       "tests/test_props.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 3.7
   },
   {
     "id": "modeling",
@@ -166,7 +186,8 @@
       "tests/test_modeling.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 15.0
   },
   {
     "id": "workflow",
@@ -174,7 +195,8 @@
       "tests/test_workflow.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 12.9
   },
   {
     "id": "components",
@@ -182,7 +204,8 @@
       "tests/test_components.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 26.8
   },
   {
     "id": "a11y",
@@ -190,7 +213,8 @@
       "tests/test_a11y.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 5.6
   },
   {
     "id": "synthedge",
@@ -198,7 +222,8 @@
       "tests/test_synthedge.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 4.2
   },
   {
     "id": "audit",
@@ -206,7 +231,8 @@
       "tests/test_audit.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 4.7
   },
   {
     "id": "consolidate",
@@ -214,7 +240,8 @@
       "tests/test_consolidate.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 26.8
   },
   {
     "id": "consolidate_atomic",
@@ -222,7 +249,8 @@
       "tests/test_consolidate_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.6
   },
   {
     "id": "memory",
@@ -230,7 +258,8 @@
       "tests/test_memory.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 6.3
   },
   {
     "id": "images",
@@ -238,7 +267,8 @@
       "tests/test_images.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 9.6
   },
   {
     "id": "improvement_core",
@@ -246,7 +276,8 @@
       "tests/test_improvement_core.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 1.3
   },
   {
     "id": "desktop_evidence",
@@ -254,7 +285,8 @@
       "tests/test_desktop_evidence.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.5
   },
   {
     "id": "preview",
@@ -262,7 +294,8 @@
       "tests/test_preview.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.7
   },
   {
     "id": "session_features",
@@ -270,7 +303,8 @@
       "tests/test_session_features.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.7
   },
   {
     "id": "consent",
@@ -278,7 +312,8 @@
       "tests/test_consent.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 1.0
   },
   {
     "id": "smoke_honesty",
@@ -286,7 +321,8 @@
       "tests/test_smoke_honesty.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.4
   },
   {
     "id": "disclosure_gate",
@@ -294,7 +330,8 @@
       "tests/test_disclosure_gate.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 1.1
   },
   {
     "id": "atomic_refactor",
@@ -302,7 +339,8 @@
       "tests/test_atomic_refactor.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.6
   },
   {
     "id": "usage",
@@ -310,7 +348,8 @@
       "tests/test_usage.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.2
   },
   {
     "id": "unused_atomic",
@@ -318,7 +357,8 @@
       "tests/test_unused_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.9
   },
   {
     "id": "governance_atomic",
@@ -326,7 +366,8 @@
       "tests/test_governance_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "edit_refusals",
@@ -334,7 +375,8 @@
       "tests/test_edit_refusals.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 1.9
   },
   {
     "id": "repair_props_atomic",
@@ -342,7 +384,8 @@
       "tests/test_repair_props_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.4
   },
   {
     "id": "bookmarks_atomic",
@@ -350,7 +393,8 @@
       "tests/test_bookmarks_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "a11y_atomic",
@@ -358,7 +402,8 @@
       "tests/test_a11y_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "style_atomic",
@@ -366,7 +411,8 @@
       "tests/test_style_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "author_atomic",
@@ -374,7 +420,8 @@
       "tests/test_author_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "components_atomic",
@@ -382,7 +429,8 @@
       "tests/test_components_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.4
   },
   {
     "id": "consumers_refusals",
@@ -390,7 +438,8 @@
       "tests/test_consumers_refusals.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.6
   },
   {
     "id": "images_atomic",
@@ -398,7 +447,8 @@
       "tests/test_images_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.4
   },
   {
     "id": "edit_dryrun",
@@ -406,7 +456,8 @@
       "tests/test_edit_dryrun.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.9
   },
   {
     "id": "scaffold_atomic",
@@ -414,7 +465,8 @@
       "tests/test_scaffold_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "modeling_atomic",
@@ -422,7 +474,8 @@
       "tests/test_modeling_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.7
   },
   {
     "id": "recipe_rollback",
@@ -430,7 +483,8 @@
       "tests/test_recipe_rollback.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.9
   },
   {
     "id": "writers_atomic",
@@ -438,7 +492,8 @@
       "tests/test_writers_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.2
   },
   {
     "id": "capabilities",
@@ -446,7 +501,8 @@
       "tests/test_capabilities.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.2
   },
   {
     "id": "daxfmt",
@@ -454,7 +510,8 @@
       "tests/test_daxfmt.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.2
   },
   {
     "id": "cli_mcp_parity",
@@ -462,7 +519,8 @@
       "tests/test_cli_mcp_parity.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.2
   },
   {
     "id": "freshness_offline",
@@ -470,7 +528,8 @@
       "tests/test_freshness_offline.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.1
   },
   {
     "id": "writers_tmp_cleanup",
@@ -478,7 +537,8 @@
       "tests/test_writers_tmp_cleanup.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "consumers_atomic",
@@ -486,7 +546,8 @@
       "tests/test_consumers_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 3.2
   },
   {
     "id": "synth_atomic",
@@ -494,7 +555,8 @@
       "tests/test_synth_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 26.0
   },
   {
     "id": "handoff_atomic",
@@ -502,7 +564,8 @@
       "tests/test_handoff_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 3.4
   },
   {
     "id": "preview_atomic",
@@ -510,7 +573,8 @@
       "tests/test_preview_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.5
   },
   {
     "id": "memscrub_atomic",
@@ -518,7 +582,8 @@
       "tests/test_memscrub_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.4
   },
   {
     "id": "synthtest_honesty",
@@ -526,7 +591,8 @@
       "tests/test_synthtest_honesty.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 3.2
   },
   {
     "id": "outcomes_mapping",
@@ -534,7 +600,8 @@
       "tests/test_outcomes_mapping.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 5.7
   },
   {
     "id": "revert_atomic",
@@ -542,7 +609,8 @@
       "tests/test_revert_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 3.1
   },
   {
     "id": "bpafix_atomic",
@@ -550,7 +618,8 @@
       "tests/test_bpafix_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 1.9
   },
   {
     "id": "pull_refusal",
@@ -558,7 +627,8 @@
       "tests/test_pull_refusal.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 14.0
   },
   {
     "id": "mirror_recovery_honesty",
@@ -566,7 +636,8 @@
       "tests/test_mirror_recovery_honesty.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 20.6
   },
   {
     "id": "push_boundary_honesty",
@@ -574,7 +645,8 @@
       "tests/test_push_boundary_honesty.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 20.2
   },
   {
     "id": "history_honesty",
@@ -582,7 +654,8 @@
       "tests/test_history_honesty.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 3.7
   },
   {
     "id": "synthtest_atomic",
@@ -590,7 +663,8 @@
       "tests/test_synthtest_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 2.3
   },
   {
     "id": "memory_disclosure",
@@ -598,7 +672,8 @@
       "tests/test_memory_disclosure.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 10.4
   },
   {
     "id": "docs_changelog",
@@ -606,7 +681,8 @@
       "tests/test_docs_changelog.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 1.0
   },
   {
     "id": "ci_registration",
@@ -614,7 +690,8 @@
       "tests/test_ci_registration.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 12.3
   },
   {
     "id": "policy_atomic",
@@ -622,7 +699,8 @@
       "tests/test_policy_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.2
   },
   {
     "id": "pbz_state_atomic",
@@ -630,7 +708,8 @@
       "tests/test_pbz_state_atomic.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 3.8
   },
   {
     "id": "mirror_writers_root",
@@ -638,7 +717,8 @@
       "tests/test_mirror_writers_root.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.7
   },
   {
     "id": "spec_input_gate",
@@ -646,7 +726,8 @@
       "tests/test_spec_input_gate.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 2.8
   },
   {
     "id": "requirements_honesty",
@@ -654,7 +735,8 @@
       "tests/test_requirements_honesty.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.9
   },
   {
     "id": "evidence",
@@ -662,7 +744,8 @@
       "tests/test_evidence.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 4.1
   },
   {
     "id": "evidence_honesty",
@@ -670,7 +753,8 @@
       "tests/test_evidence_honesty.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 1.3
   },
   {
     "id": "synthtest_state_paths",
@@ -678,7 +762,8 @@
       "tests/test_synthtest_state_paths.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "policy_failclosed",
@@ -686,7 +771,8 @@
       "tests/test_policy_failclosed.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 1.2
   },
   {
     "id": "mirror_alias_disclosure",
@@ -694,7 +780,8 @@
       "tests/test_mirror_alias_disclosure.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.6
   },
   {
     "id": "recipe_paths",
@@ -702,7 +789,8 @@
       "tests/test_recipe_paths.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "mirror_reader_links",
@@ -710,7 +798,8 @@
       "tests/test_mirror_reader_links.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 21.9
   },
   {
     "id": "interactions_static",
@@ -718,7 +807,8 @@
       "tests/test_interactions_static.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 9.6
   },
   {
     "id": "interactions_boundary",
@@ -726,7 +816,8 @@
       "tests/test_interactions_boundary.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 2.1
   },
   {
     "id": "guard_protected_mutations",
@@ -734,7 +825,8 @@
       "tests/test_guard_protected_mutations.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.2
   },
   {
     "id": "guard_tree_operations",
@@ -742,7 +834,8 @@
       "tests/test_guard_tree_operations.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.6
   },
   {
     "id": "guard_false_positives",
@@ -750,7 +843,8 @@
       "tests/test_guard_false_positives.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.2
   },
   {
     "id": "evidence_rotation",
@@ -758,7 +852,8 @@
       "tests/test_evidence_rotation.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 2.2
   },
   {
     "id": "contract_verbs",
@@ -766,7 +861,8 @@
       "tests/test_contract_verbs.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.1
   },
   {
     "id": "plan_pure",
@@ -774,7 +870,8 @@
       "tests/test_plan_pure.py"
     ],
     "windows": true,
-    "engine": false
+    "engine": false,
+    "weight": 9.1
   },
   {
     "id": "plan_cli",
@@ -782,7 +879,8 @@
       "tests/test_plan_cli.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 9.9
   },
   {
     "id": "followup_graph",
@@ -790,7 +888,8 @@
       "tests/test_followup_graph.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.5
   },
   {
     "id": "followup_state",
@@ -798,7 +897,8 @@
       "tests/test_followup_state.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "followup_engine",
@@ -806,7 +906,8 @@
       "tests/test_followup_engine.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "followup_author",
@@ -814,7 +915,8 @@
       "tests/test_followup_author.py"
     ],
     "windows": true,
-    "engine": true
+    "engine": true,
+    "weight": 0.3
   },
   {
     "id": "engine-offline",
@@ -824,7 +926,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 37.6
+    "weight": 69.9
   },
   {
     "id": "skip_capture",
@@ -832,7 +934,8 @@
       "tests/test_skip_capture.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 0.8
   },
   {
     "id": "rewrite_qualify",
@@ -840,7 +943,8 @@
       "tests/test_rewrite_qualify.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 2.6
   },
   {
     "id": "rewrite_scopes",
@@ -848,7 +952,8 @@
       "tests/test_rewrite_scopes.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 0.1
   },
   {
     "id": "dpapi_seam",
@@ -856,7 +961,8 @@
       "tests/test_dpapi_seam.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 0.7
   },
   {
     "id": "formatstring_roundtrip",
@@ -864,7 +970,8 @@
       "tests/test_formatstring_roundtrip.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 0.3
   },
   {
     "id": "similar_scope",
@@ -872,7 +979,8 @@
       "tests/test_similar_scope.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 10.3
   },
   {
     "id": "dax_binding_alignment",
@@ -880,7 +988,8 @@
       "tests/test_dax_binding_alignment.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 0.4
   },
   {
     "id": "ci_weights",

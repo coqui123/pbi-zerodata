@@ -23,6 +23,12 @@ class CiWeightsTests(unittest.TestCase):
         reports = [report(a=1.21, even=2, tiny=0.01, single=7.36),
                    report(a=9, even=5, tiny=0.02), report(a=1.26, tiny=0.03)]
         reports[0]['executed'].append(dict(id='not_launched', seconds=99, launched=False))
+        reports[0]['executed'].append(dict(id='a', seconds=500, exit_code=1))
+        reports[0]['executed'].append(dict(id='a', seconds=500,
+                                           source=dict(revision='r', path='p', sha256='s')))
+        reports[0]['executed'].append(dict(id='failed_only', seconds=5, exit_code=1))
+        reports[0]['executed'].append(dict(id='control_only', seconds=5,
+                                           source=dict(revision='r', path='p', sha256='s')))
         with tempfile.TemporaryDirectory() as directory:
             paths = []
             for index, data in enumerate(reports):
@@ -40,7 +46,8 @@ class CiWeightsTests(unittest.TestCase):
         self.assertEqual(unit_sums, [90, 70])
         self.assertGreater(max(unit_sums), min(unit_sums) * 1.05)
         weights = compute_weights([report(**seconds)])
-        weighted = [dict(e, weight=weights[e['id']]) for e in suites]
+        from ci_weights import apply_weights
+        weighted = apply_weights(suites, weights)
         sums = [sum(seconds[e['id']] for e in group) for group in allocate(weighted, 2)]
         self.assertLessEqual(max(sums), min(sums) * 1.05)
         self.assertEqual(sums, [80, 80])
@@ -52,21 +59,20 @@ class CiWeightsTests(unittest.TestCase):
                               [e['id'] for e in suites])
 
     def test_entries_without_data_keep_no_weight(self):
-        from ci_weights import compute_weights
+        from ci_weights import apply_weights, compute_weights
         suites = entries() + [dict(id='future', argv=['tests/test_future.py'],
                                   windows=False, engine=False)]
         original = copy.deepcopy(suites)
         untouched = json.dumps(suites[-1]).encode('utf-8')
         weights = compute_weights([report(a=3.24)])
-        for entry in suites:
-            if entry['id'] in weights:
-                entry['weight'] = weights[entry['id']]
+        applied = apply_weights(suites, weights)
         self.assertEqual(weights, {'a': 3.2})
-        self.assertEqual(suites[0]['weight'], 3.2)
-        self.assertEqual(json.dumps(suites[-1]).encode('utf-8'), untouched)
-        self.assertNotIn('weight', suites[-1])
-        self.assertEqual([{k: v for k, v in e.items() if k != 'weight'} for e in suites],
+        self.assertEqual(applied[0]['weight'], 3.2)
+        self.assertEqual(json.dumps(applied[-1]).encode('utf-8'), untouched)
+        self.assertNotIn('weight', applied[-1])
+        self.assertEqual([{k: v for k, v in e.items() if k != 'weight'} for e in applied],
                          original)
+        self.assertEqual(suites, original)
 
 
 if __name__ == '__main__':

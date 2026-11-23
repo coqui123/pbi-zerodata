@@ -6,6 +6,10 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- Offline shard weights in `offline_suites.json` use median suite seconds from five hosted
+  Windows serial reports, rounded to tenths with a 0.1-second floor. `tests/ci_weights.py`
+  recomputes weights from report JSON.
+
 - Multiline dynamic format expressions (`formatStringDefinition`) written by `pbz format-expr`
   now reload as one complete DAX region on the measure, so deps, rename, usage and tokenization
   see every reference. Renaming a referenced measure updates its reference inside the format
