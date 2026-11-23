@@ -6,6 +6,8 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- `pbz pull --rebase` preserves mirror deletions and reports upstream changes as conflicts without advancing their manifest or base.
+
 - Recovery preserves external saves made between its two rollback passes and keeps the transaction pending as a recovery conflict.
 
 - Push, status and pull no longer treat a withheld file's designed absence as a deletion,
