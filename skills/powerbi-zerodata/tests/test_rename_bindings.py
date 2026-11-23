@@ -24,6 +24,870 @@ class RenameBindingsTests(unittest.TestCase):
     _project = fixtures.ModelingAtomicTests._project
     _column_project = fixtures.ModelingAtomicTests._column_project
 
+    def test_column_rename_to_other_tables_column_name_succeeds(self):
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": table}}, "Property": name},
+             "queryRef": f"{table}.{name}", "nativeQueryRef": name}
+            for table, name in (("Sales", "Region"), ("Other", "City"))]}
+        ws, project, mdef, path = self._report_project(obj)
+        sales, other = Path(mdef, "tables", "Sales.tmdl"), Path(mdef, "tables", "Other.tmdl")
+        sales.write_text("table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+        other.write_text("table Other\n\tcolumn City\n\t\tdataType: string\n")
+        before_other = other.read_bytes()
+        result = rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(result["to"], "City")
+        projections = json.loads(path.read_text())["projections"]
+        self.assertEqual(projections[0]["queryRef"], "Sales.City")
+        self.assertEqual(projections[0]["nativeQueryRef"], "City")
+        self.assertEqual(projections[0]["Column"]["Property"], "City")
+        self.assertEqual(projections[1], obj["projections"][1])
+        self.assertEqual(other.read_bytes(), before_other)
+        self.assertEqual(sales.read_text(), "table Sales\n\tcolumn City\n\t\tdataType: string\n")
+
+    def test_column_rename_same_table_collision_refused(self):
+        ws, project, mdef, _path = self._report_project({"refs": []})
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n\tcolumn City\n\t\tdataType: string\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_measure_name_conflict_refused(self):
+        ws, project, mdef, _path = self._report_project({"refs": []})
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+        other = Path(mdef, "tables", "Other.tmdl")
+        other.write_text(other.read_text() + "\tmeasure City = 1\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_variation_selector_metadata_follows(self):
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}],
+            "objects": {"dataPoint": [{"selector": {"metadata": old}}]}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+        after = json.loads(path.read_text())
+        expected = "Sales.Order Date.Variation.Date Hierarchy.Year"
+        self.assertEqual(after["projections"][0]["queryRef"], expected)
+        self.assertEqual(after["objects"]["dataPoint"][0]["selector"]["metadata"], expected)
+        pvs = after["projections"][0]["HierarchyLevel"]["Expression"]["Hierarchy"]["Expression"]["PropertyVariationSource"]
+        self.assertEqual(pvs["Property"], "Order Date")
+        self.assertEqual(Path(mdef, "tables", "Sales.tmdl").read_text(),
+                         "table Sales\n\tcolumn 'Order Date'\n\t\tdataType: dateTime\n")
+
+    def test_column_rename_destination_queryref_collision_refused(self):
+        # Another table's projection already answers to the destination
+        # queryRef text: rewriting the target's queryRef onto it would
+        # leave the selector naming that string pointing at either one.
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Region"},
+             "queryRef": "Sales.Region"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Geo"}}, "Property": "City"},
+             "queryRef": "Sales.City"}],
+            "objects": {"values": [{"selector": {"metadata": "Sales.City"}}]}}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+        Path(mdef, "tables", "Geo.tmdl").write_text(
+            "table Geo\n\tcolumn City\n\t\tdataType: string\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_queryref_collision_via_native_ref_refused(self):
+        # A nativeQueryRef text must not confer queryRef ownership: the
+        # arithmetic projection's unowned queryRef already reads "A.Y", so
+        # rewriting A[X]'s queryRef onto it would strand the selector.
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "A"}}, "Property": "X"},
+             "queryRef": "A.X", "nativeQueryRef": "A.Y"},
+            {"Arithmetic": {"Left": {"Column": {"Expression": {"SourceRef": {"Entity": "B"}},
+                                            "Property": "Y"}},
+                            "Right": {"Literal": {"Value": "1L"}}, "Operator": 0},
+             "queryRef": "A.Y"}],
+            "selector": {"metadata": "A.Y"}}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "B.tmdl").write_text(
+            "table B\n\tcolumn Y\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "Y", table="A")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_same_field_queryref_merge_refused(self):
+        # The same field projected twice under distinct queryRefs: rewriting
+        # the canonical one onto the custom one would merge the identifiers
+        # a formatting selector uses to tell the projections apart.
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "A"}}, "Property": "X"},
+             "queryRef": "A.X"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "A"}}, "Property": "X"},
+             "queryRef": "A.Y"}],
+            "objects": {"values": [{"selector": {"metadata": "A.Y"}}]}}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "Y", table="A")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_dotted_name_path_collision_refused(self):
+        # Renaming A[X] to "B.C" would give it the qualified path A.B.C,
+        # already owned by column C of table "A.B": the destination path
+        # ownership check refuses before any write, with or without an
+        # additional dotted column present.
+        for extra in ("", "\n\tcolumn 'B.C'\n\t\tdataType: int64\n"):
+            ws, project, mdef, _path = self._report_project({"queryRef": "A.B.C"})
+            Path(mdef, "tables", "A.tmdl").write_text(
+                "table A\n\tcolumn X\n\t\tdataType: int64\n")
+            Path(mdef, "tables", "A.B.tmdl").write_text(
+                "table 'A.B'\n\tcolumn C\n\t\tdataType: int64\n" + extra)
+            before = _bytes(ws.mirror)
+            with patch("pbz.rename.commit_bytes") as commit:
+                with self.assertRaises(PbzError) as caught:
+                    rename.rename(ws, project, "column", "X", "B.C", table="A")
+            self.assertEqual(caught.exception.code, "NAME_TAKEN")
+            commit.assert_not_called()
+            self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_wrapped_selector_destination_path_refused(self):
+        # The wrapped selector Sum(A.X) would be rewritten to Sum(A.Y),
+        # which is also the literal qualified path of column 'Y)' in the
+        # table named 'Sum(A': the string rename refuses before any write.
+        ws, project, mdef, _path = self._report_project({"selector": {"metadata": "Sum(A.X)"}})
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "Sum(A.tmdl").write_text(
+            "table 'Sum(A'\n\tcolumn Y\n\t\tdataType: int64\n\tcolumn 'Y)'\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "Y", table="A")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_orphan_variation_selector_follows(self):
+        # A variation selector in a file with no proven projection for it
+        # (here a bookmark file) is a pure path extension of the target:
+        # the target is its only possible owner, so it follows the rename
+        # instead of being left pointing at the old path.
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        new = "Sales.Order Date.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}],
+            "objects": {"dataPoint": [{"selector": {"metadata": old}}]}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "Bm1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"objects": {"labels": [{"selector": {"metadata": old}}]}}))
+        rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["objects"]["dataPoint"][0]["selector"]["metadata"], new)
+        self.assertEqual(json.loads(bookmark.read_text())["objects"]["labels"][0]["selector"]["metadata"], new)
+
+    def test_column_rename_orphan_selector_claimed_by_other_projection_stays(self):
+        # The bookmark selector's text is the queryRef of a projection
+        # owned by Sales[ShipDate], even though it spells a path extension
+        # of the renamed column: the claim leaves the selector with its
+        # projection instead of following the rename away from it.
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                          "Property": "ShipDate"}, "queryRef": old}]}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n"
+            "\tcolumn ShipDate\n\t\tdataType: dateTime\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "Bm1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"selector": {"metadata": old}}))
+        rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], old)
+        self.assertEqual(json.loads(bookmark.read_text())["selector"]["metadata"], old)
+
+    def test_column_rename_cross_file_queryref_landing_refused(self):
+        # A rewritten queryRef must not land on a queryRef another file's
+        # projection answers to: here Sales[ShipDate]'s projection in a
+        # second visual already reads "Sales.BookedDate", so renaming
+        # OrderDate to BookedDate would leave two projections of different
+        # fields sharing one identifier across the report.
+        def proj(prop, qr):
+            return {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                "Property": prop}, "queryRef": qr}]}
+        ws, project, mdef, _path = self._report_project(proj("OrderDate", "Sales.OrderDate"))
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n"
+            "\tcolumn ShipDate\n\t\tdataType: dateTime\n")
+        report = Path(project.mirror_report, "definition")
+        (report / "visual2.json").write_text(json.dumps(proj("ShipDate", "Sales.BookedDate")))
+        bookmarks = report / "bookmarks"
+        bookmarks.mkdir(parents=True, exist_ok=True)
+        (bookmarks / "Bm1.bookmark.json").write_text(
+            json.dumps({"selector": {"metadata": "Sales.OrderDate"}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "OrderDate", "BookedDate", table="Sales")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_selector_claimed_by_other_projection_stays(self):
+        # The selector's text spells the renamed column's path, but the
+        # only projection carrying that text as its queryRef is owned by
+        # T[B] and does not move: the claim keeps the selector with its
+        # projection instead of rewriting it away.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "B"}, "queryRef": "T.A"}]}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n\tcolumn B\n\t\tdataType: int64\n")
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"selector": {"metadata": "T.A"}}))
+        rename.rename(ws, project, "column", "A", "C", table="T")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], "T.A")
+        self.assertEqual(json.loads(other.read_text())["selector"]["metadata"], "T.A")
+
+    def test_column_rename_cross_file_same_field_queryref_merge_refused(self):
+        # The same field projected in two files under distinct queryRefs:
+        # rewriting the canonical one onto the custom one would merge the
+        # identifiers across the report, just as in the one-file case.
+        def proj(qr):
+            return {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                                "Property": "A"}, "queryRef": qr}]}
+        ws, project, mdef, _path = self._report_project(proj("T.A"))
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        (Path(project.mirror_report, "definition", "visual2.json")).write_text(
+            json.dumps(proj("T.C")))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "C", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_selector_landing_on_other_queryref_refused(self):
+        # The selector follows the rename onto "T.New", which is already
+        # the unchanged queryRef of T[Keep]'s projection in the same
+        # report: the selector would end up naming that projection.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "Keep"}, "queryRef": "T.New"}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn Old\n\t\tdataType: int64\n\tcolumn Keep\n\t\tdataType: int64\n")
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"selector": {"metadata": "T.Old"}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Old", "New", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_selector_claim_beats_local_candidate(self):
+        # The selector's text "Old" is the queryRef of T[Keep]'s
+        # projection in another file, so the claim keeps it there; the
+        # target projection's own bound nativeQueryRef "Old" in the
+        # selector's file must not supply a candidate that overrides it.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "Old"},
+                                "queryRef": "T.Old", "nativeQueryRef": "Old"}],
+               "objects": {"values": [{"selector": {"metadata": "Old"}}]}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn Old\n\t\tdataType: int64\n\tcolumn Keep\n\t\tdataType: int64\n")
+        visual_a = Path(project.mirror_report, "definition", "visualA.json")
+        visual_a.write_text(json.dumps({"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "T"}}, "Property": "Keep"},
+             "queryRef": "Old"}]}))
+        rename.rename(ws, project, "column", "Old", "New", table="T")
+        after = json.loads(path.read_text())
+        self.assertEqual(after["objects"]["values"][0]["selector"]["metadata"], "Old")
+        self.assertEqual(json.loads(visual_a.read_text())["projections"][0]["queryRef"], "Old")
+
+    def test_column_rename_selector_must_land_with_claiming_projection(self):
+        # The claiming projection's queryRef is a path-like identifier the
+        # plain column rename does not rewrite, so a selector that
+        # followed the path shape away from it would match nothing: the
+        # verifier refuses before any write.
+        old = "T.A.Date Hierarchy.Year"
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "A"}, "queryRef": old}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"selector": {"metadata": old}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "B", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_case_only_orphan_variation_selector_follows(self):
+        old = "Sales.orderdate.Variation.Date Hierarchy.Year"
+        new = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "orderdate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}]}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn orderdate\n\t\tdataType: dateTime\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "b1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"selector": {"metadata": old}}))
+        rename.rename(ws, project, "column", "orderdate", "OrderDate", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["queryRef"], new)
+        self.assertEqual(json.loads(bookmark.read_text())["selector"]["metadata"], new)
+
+    def test_column_rename_both_claims_unaffected_selector_succeeds(self):
+        # The selector's text is claimed by a stale target queryRef in one
+        # file and by its own other-field projection in its file, but
+        # nothing in the rename would move the selector or either
+        # claiming queryRef, so the contested claim alone does not refuse.
+        def proj(prop, qr, sel=False):
+            obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                               "Property": prop}, "queryRef": qr}]}
+            if sel:
+                obj["objects"] = {"values": [{"selector": {"metadata": qr}}]}
+            return obj
+        ws, project, mdef, _path = self._report_project(proj("Region", "Sales.Area"))
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n\tcolumn Area\n\t\tdataType: string\n")
+        visual_b = Path(project.mirror_report, "definition", "visualB.json")
+        visual_b.write_text(json.dumps(proj("Area", "Sales.Area", sel=True)))
+        rename.rename(ws, project, "column", "Region", "Territory", table="Sales")
+        after = json.loads(visual_b.read_text())
+        self.assertEqual(after["objects"]["values"][0]["selector"]["metadata"], "Sales.Area")
+
+    def test_column_rename_selector_left_behind_by_carrier_refused(self):
+        # The selector's text is the wrapped queryRef of an aggregation
+        # projection; the projection follows the rename while the
+        # selector, whose string is also the literal path of an unrelated
+        # column, would stay behind matching nothing.
+        obj = {"projections": [{"Aggregation": {"Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "T"}}, "Property": "A"}}, "Function": 0},
+            "queryRef": "Sum(T.A)"}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "Sum(T.tmdl").write_text(
+            "table 'Sum(T'\n\tcolumn 'A)'\n\t\tdataType: int64\n")
+        other = Path(project.mirror_report, "definition", "other.json")
+        other.write_text(json.dumps({"selector": {"metadata": "Sum(T.A)"}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "B", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_unowned_variation_queryref_follows(self):
+        # An unowned queryRef carrying the variation path (a standalone
+        # reference in a bookmark file) is a pure path extension of the
+        # target: it follows the rename alongside the projections and
+        # selectors naming the same text, in every combination.
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        new = "Sales.Order Date.Variation.Date Hierarchy.Year"
+        visual = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}],
+            "objects": {"dataPoint": [{"selector": {"metadata": old}}]}}
+        for bookmark_obj in ({"selector": {"metadata": old}, "queryRef": old},
+                             {"queryRef": old}):
+            ws, project, mdef, path = self._report_project(visual)
+            Path(mdef, "tables", "Sales.tmdl").write_text(
+                "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+            bookmark = Path(project.mirror_report, "definition", "bookmarks", "B1.bookmark.json")
+            bookmark.parent.mkdir(parents=True, exist_ok=True)
+            bookmark.write_text(json.dumps(bookmark_obj))
+            rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+            after = json.loads(bookmark.read_text())
+            self.assertEqual(after["queryRef"], new)
+            if "selector" in bookmark_obj:
+                self.assertEqual(after["selector"]["metadata"], new)
+            self.assertEqual(json.loads(path.read_text())["objects"]["dataPoint"][0]["selector"]["metadata"], new)
+
+    def test_column_rename_mixed_casing_sibling_selector_follows(self):
+        # Two projections of the same field, one queryRef already at the
+        # destination casing: the selector adopting the new casing lands
+        # on the same field's text, not on a foreign projection.
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "orderdate"},
+             "queryRef": "Sales.orderdate"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "orderdate"},
+             "queryRef": "Sales.OrderDate"}],
+            "selector": {"metadata": "Sales.orderdate"}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn orderdate\n\t\tdataType: decimal\n")
+        rename.rename(ws, project, "column", "orderdate", "OrderDate", table="Sales")
+        after = json.loads(path.read_text())
+        self.assertEqual(after["selector"]["metadata"], "Sales.OrderDate")
+        self.assertEqual([p["queryRef"] for p in after["projections"]],
+                         ["Sales.OrderDate", "Sales.OrderDate"])
+
+    def test_column_rename_bookmark_queryref_link_split_refused(self):
+        # A fieldless queryRef in a bookmark's explorationState names the
+        # visual's only projection by its text "T.A"; that projection is
+        # owned by U[X] and keeps the text, so the bookmark reference
+        # must not follow the T[A] rename away from it.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "U"}},
+                                          "Property": "X"}, "queryRef": "T.A"}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "U.tmdl").write_text(
+            "table U\n\tcolumn X\n\t\tdataType: int64\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "Bm1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"sections": {"p": {"visualContainers": {"v": {
+            "singleVisual": {"projections": {"Values": [{"queryRef": "T.A"}]}}}}}}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "B", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_table_rename_selector_link_split_refused(self):
+        # On a table rename, a bookmark selector naming another table's
+        # projection by its custom queryRef text must not be carried to
+        # the new table prefix while its projection stays behind.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "U"}},
+                                          "Property": "B"},
+                                "queryRef": "S.A", "nativeQueryRef": "B"}]}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "S.tmdl").write_text(
+            "table S\n\tcolumn A\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "U.tmdl").write_text(
+            "table U\n\tcolumn B\n\t\tdataType: int64\n")
+        bookmark = Path(project.mirror_report, "definition", "bookmarks", "Bm1.bookmark.json")
+        bookmark.parent.mkdir(parents=True, exist_ok=True)
+        bookmark.write_text(json.dumps({"selector": {"metadata": "S.A"}}))
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "table", "S", "T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_native_label_does_not_drag_selector(self):
+        # The selector's text coincides with the target projection's
+        # nativeQueryRef label and with the qualified path of the
+        # untouched column U[C]; a native label is not a projection
+        # identifier, so it must not supply the selector's candidate.
+        obj = {"projections": [{"Column": {"Expression": {"SourceRef": {"Entity": "T"}},
+                                          "Property": "U.C"},
+                                "queryRef": "T.U.C", "nativeQueryRef": "U.C"}],
+               "objects": {"dataPoint": [{"selector": {"metadata": "U.C"}, "properties": {}}]}}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn 'U.C'\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "U.tmdl").write_text(
+            "table U\n\tcolumn C\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "U.C", "Fresh", table="T")
+        after = json.loads(path.read_text())
+        self.assertEqual(after["projections"][0]["queryRef"], "T.Fresh")
+        self.assertEqual(after["projections"][0]["nativeQueryRef"], "Fresh")
+        self.assertEqual(after["objects"]["dataPoint"][0]["selector"]["metadata"], "U.C")
+
+    def test_column_rename_extension_shaped_literal_path_preserved(self):
+        # The string is a pure path extension of T[A] and simultaneously
+        # the literal qualified path of the sibling column named
+        # "A.Variation.Date Hierarchy.Year": the literal owner wins, so a
+        # selector and an unowned queryRef carrying it stay unchanged.
+        text = "T.A.Variation.Date Hierarchy.Year"
+        for obj in ({"selector": {"metadata": text}}, {"queryRef": text}):
+            ws, project, mdef, path = self._report_project(obj)
+            Path(mdef, "tables", "T.tmdl").write_text(
+                "table T\n\tcolumn A\n\t\tdataType: int64\n"
+                "\tcolumn 'A.Variation.Date Hierarchy.Year'\n\t\tdataType: int64\n")
+            rename.rename(ws, project, "column", "A", "B", table="T")
+            after = json.loads(path.read_text())
+            got = after["selector"]["metadata"] if "selector" in obj else after["queryRef"]
+            self.assertEqual(got, text)
+
+    def test_column_rename_dotted_sibling_path_not_followed(self):
+        # The bookmark string extends the path of the dotted sibling
+        # column 'Order.Date' more specifically than the target's own
+        # path, so it belongs to the sibling's variation and must not
+        # follow the rename of Sales[Order], with or without the
+        # sibling's projection present.
+        text = "Sales.Order.Date.Variation.Date Hierarchy.Year"
+        visual = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "Order.Date"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": text}]}
+        for obj in (visual, {"projections": []}):
+            ws, project, mdef, _path = self._report_project(obj)
+            Path(mdef, "tables", "Sales.tmdl").write_text(
+                "table Sales\n\tcolumn Order\n\t\tdataType: int64\n"
+                "\tcolumn 'Order.Date'\n\t\tdataType: dateTime\n")
+            bookmark = Path(project.mirror_report, "definition", "bookmarks", "B1.bookmark.json")
+            bookmark.parent.mkdir(parents=True, exist_ok=True)
+            bookmark.write_text(json.dumps({"queryRef": text}))
+            rename.rename(ws, project, "column", "Order", "Ord", table="Sales")
+            self.assertEqual(json.loads(bookmark.read_text())["queryRef"], text)
+
+    def test_column_rename_selector_aggregation_landing_refused(self):
+        # The selector naming the plain column would follow the rename
+        # onto "T.B", already the unchanged queryRef of the Sum
+        # aggregation of the same column: an aggregation is a different
+        # projection identity, so the landing refuses before writing.
+        obj = {"projections": [{"Aggregation": {"Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "T"}}, "Property": "A"}}, "Function": 0},
+            "queryRef": "T.B"}],
+            "objects": {"values": [{"selector": {"metadata": "T.A"}, "properties": {}}]}}
+        ws, project, mdef, _path = self._report_project(obj)
+        Path(mdef, "tables", "T.tmdl").write_text(
+            "table T\n\tcolumn A\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "A", "B", table="T")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_bare_string_captured_by_new_qualified_path_refused(self):
+        # The fieldless nativeQueryRef "A.Y" uniquely names the bare
+        # column name of B's column 'A.Y'; renaming A[X] to Y would make
+        # the same spelling the target's qualified path, giving the
+        # unchanged string a second owner.
+        ws, project, mdef, _path = self._report_project(
+            {"explorationState": {"nativeQueryRef": "A.Y"}})
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn X\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "B.tmdl").write_text(
+            "table B\n\tcolumn Y\n\t\tdataType: int64\n\tcolumn 'A.Y'\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "Y", table="A")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_dotted_new_name_capturing_qualified_ref_refused(self):
+        # Renaming B[X] to the dotted name "A.Y" would give the unchanged
+        # fieldless nativeQueryRef "A.Y" a second reading (the bare name
+        # of the new column, beside the qualified path of A[Y] it already
+        # names): the destination ownership check refuses before writing.
+        ws, project, mdef, _path = self._report_project({"nativeQueryRef": "A.Y"})
+        Path(mdef, "tables", "A.tmdl").write_text(
+            "table A\n\tcolumn Y\n\t\tdataType: int64\n")
+        Path(mdef, "tables", "B.tmdl").write_text(
+            "table B\n\tcolumn X\n\t\tdataType: int64\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "X", "A.Y", table="B")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_column_rename_near_name_neighbor_untouched(self):
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Net"},
+             "queryRef": "Sales.Net"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Net Margin"},
+             "queryRef": "Sales.Net Margin"}]}
+        ws, project, mdef, path = self._report_project(obj)
+        sales = Path(mdef, "tables", "Sales.tmdl")
+        sales.write_text("table Sales\n\tcolumn Net\n\t\tdataType: decimal\n"
+                         "\tcolumn 'Net Margin'\n\t\tdataType: decimal\n")
+        rename.rename(ws, project, "column", "Net", "Gross", table="Sales")
+        projections = json.loads(path.read_text())["projections"]
+        self.assertEqual([(p["Column"]["Property"], p["queryRef"]) for p in projections],
+                         [("Gross", "Sales.Gross"), ("Net Margin", "Sales.Net Margin")])
+        self.assertEqual(sales.read_text(),
+                         "table Sales\n\tcolumn Gross\n\t\tdataType: decimal\n"
+                         "\tcolumn 'Net Margin'\n\t\tdataType: decimal\n")
+
+    def test_column_rename_wrong_owner_bare_ref_unchanged(self):
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Net"},
+             "queryRef": "Sales.Net", "nativeQueryRef": "Net"},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Net"},
+             "queryRef": "Other.Net", "nativeQueryRef": "Net"}]}
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Net\n\t\tdataType: decimal\n")
+        Path(mdef, "tables", "Other.tmdl").write_text(
+            "table Other\n\tcolumn Net\n\t\tdataType: decimal\n")
+        rename.rename(ws, project, "column", "Net", "Gross", table="Sales")
+        projections = json.loads(path.read_text())["projections"]
+        self.assertEqual(projections[0]["Column"]["Property"], "Gross")
+        self.assertEqual(projections[0]["nativeQueryRef"], "Gross")
+        self.assertEqual(projections[1], obj["projections"][1])
+
+    def test_verifier_rejects_stale_selector_and_unrelated_change(self):
+        old = "Sales.OrderDate.Variation.Date Hierarchy.Year"
+        obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old},
+            {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"},
+             "queryRef": "Other.Amount"}],
+            "objects": {"dataPoint": [{"selector": {"metadata": old}}]}}
+        ws1, project1, mdef1, _path1 = self._report_project(obj)
+        Path(mdef1, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+        captured = []
+        with patch("pbz.rename.commit_bytes", side_effect=lambda ops, **kw: captured.extend(ops)):
+            rename.rename(ws1, project1, "column", "OrderDate", "Order Date", table="Sales")
+        self.assertTrue(captured)
+        ws, project, mdef, path = self._report_project(obj)
+        Path(mdef, "tables", "Sales.tmdl").write_text(Path(mdef1, "tables", "Sales.tmdl").read_text())
+        model = tmdl.load_model(mdef)
+        ops = [(op[0], str(Path(ws.mirror, Path(op[1]).relative_to(ws1.mirror))), *op[2:])
+               for op in captured]
+        before = _bytes(ws.mirror)
+        for tamper in ("stale-selector", "unrelated", "missing-write", "good"):
+            with self.subTest(tamper=tamper):
+                candidate = []
+                for op in ops:
+                    if op[1] != str(path):
+                        candidate.append(op)
+                        continue
+                    if tamper == "missing-write":
+                        continue
+                    report = json.loads(op[2])
+                    if tamper == "stale-selector":
+                        report["objects"]["dataPoint"][0]["selector"]["metadata"] = old
+                    elif tamper == "unrelated":
+                        report["projections"][1]["queryRef"] = "Other.Changed"
+                    candidate.append((op[0], op[1], json.dumps(report), op[3]))
+                with patch("pbz.rename._report_string_rename", side_effect=AssertionError("editor is not an oracle")), \
+                        patch("pbz.rename._report_string_rename_inner", side_effect=AssertionError("editor is not an oracle")):
+                    if tamper == "good":
+                        rename._verify_plan(ws, project, model, mdef, candidate,
+                                            "column", "Sales", "OrderDate", "Order Date")
+                    else:
+                        with self.assertRaises(PbzError) as caught:
+                            rename._verify_plan(ws, project, model, mdef, candidate,
+                                                "column", "Sales", "OrderDate", "Order Date")
+                        self.assertEqual(caught.exception.code, "REFUSED")
+                        self.assertIn("report string", str(caught.exception))
+                self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_variation_selector_competition_and_document_scope(self):
+        old, new = "Sales.OrderDate.Variation.Date Hierarchy.Year", "Sales.Order Date.Variation.Date Hierarchy.Year"
+        for competitor in ("source", "destination", "ambiguous", "same-target", "separate-document"):
+            with self.subTest(competitor=competitor):
+                obj = {"projections": [{"HierarchyLevel": {"Expression": {"Hierarchy": {
+                    "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                               "Property": "OrderDate"}},
+                    "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old,
+                    "queryName": old}], "objects": {"dataPoint": [{"selector": {"metadata": old}}]},
+                    "unrelated": {"metadata": old}}
+                other_field = {"Column": {"Expression": {"SourceRef": {"Entity": "Other"}}, "Property": "Amount"}}
+                if competitor in ("source", "destination"):
+                    obj["projections"].append(dict(other_field, queryRef=old if competitor == "source" else new))
+                elif competitor == "ambiguous":
+                    obj["mixed"] = {"left": other_field, "right": other_field, "queryRef": old}
+                elif competitor == "same-target":
+                    obj["projections"].append(dict(obj["projections"][0], queryRef=old.lower()))
+                    obj["unbound"] = {"queryRef": "Sales.OrderDate"}
+                ws, project, mdef, path = self._report_project(obj)
+                Path(mdef, "tables", "Sales.tmdl").write_text(
+                    "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+                if competitor == "ambiguous":
+                    sites = rename._report_string_sites(pbir.parse_json(path.read_text()), tmdl.load_model(mdef))
+                    self.assertIs(sites[("mixed", "queryRef")][1], rename._AMBIGUOUS)
+                separate = path.with_name("other.json")
+                separate.write_text(json.dumps({"selector": {"metadata": old}}))
+                before, separate_before = _bytes(ws.mirror), separate.read_bytes()
+                if competitor in ("same-target", "separate-document"):
+                    rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+                    after = json.loads(path.read_text())
+                    self.assertEqual(after["objects"]["dataPoint"][0]["selector"]["metadata"], new)
+                    self.assertEqual(after["unrelated"]["metadata"], old)
+                    self.assertEqual(after["projections"][0]["queryName"], old)
+                    self.assertEqual(json.loads(separate.read_text())["selector"]["metadata"], new)
+                else:
+                    with patch("pbz.rename.commit_bytes") as commit:
+                        with self.assertRaises(PbzError) as caught:
+                            rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+                    self.assertEqual(caught.exception.code, "REFUSED")
+                    commit.assert_not_called()
+                    self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_cross_table_bare_capture_refused_qualified_allowed(self):
+        for expression in ("SUM([Region])", "SUM([City])", "SUM(Sales[Region])"):
+            with self.subTest(expression=expression):
+                ws, project, mdef, _path = self._report_project({"refs": []})
+                Path(mdef, "tables", "Sales.tmdl").write_text(
+                    "table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+                Path(mdef, "tables", "Other.tmdl").write_text(
+                    "table Other\n\tcolumn City\n\t\tdataType: string\n")
+                ext = Path(project.mirror_report, "definition", "reportExtensions.json")
+                ext.write_text(json.dumps({"entities": [{"name": "Other", "measures": [
+                    {"name": "M", "expression": expression}]}]}))
+                before = _bytes(ws.mirror)
+                if expression == "SUM(Sales[Region])":
+                    rename.rename(ws, project, "column", "Region", "City", table="Sales")
+                    self.assertEqual(json.loads(ext.read_text())["entities"][0]["measures"][0]["expression"],
+                                     "SUM(Sales[City])")
+                else:
+                    with patch("pbz.rename.commit_bytes") as commit:
+                        with self.assertRaises(PbzError) as caught:
+                            rename.rename(ws, project, "column", "Region", "City", table="Sales")
+                    self.assertEqual(caught.exception.code, "NAME_TAKEN")
+                    commit.assert_not_called()
+                    self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_cross_table_unowned_bare_capture_in_unwritten_report_refused(self):
+        for value in ("Region", "City"):
+            with self.subTest(value=value):
+                ws, project, mdef, path = self._report_project({"refs": []})
+                Path(mdef, "tables", "Sales.tmdl").write_text(
+                    "table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+                Path(mdef, "tables", "Other.tmdl").write_text(
+                    "table Other\n\tcolumn City\n\t\tdataType: string\n")
+                path.with_name("bare.json").write_text(json.dumps({"nativeQueryRef": value}))
+                before = _bytes(ws.mirror)
+                with patch("pbz.rename.commit_bytes") as commit:
+                    with self.assertRaises(PbzError) as caught:
+                        rename.rename(ws, project, "column", "Region", "City", table="Sales")
+                self.assertEqual(caught.exception.code, "NAME_TAKEN")
+                commit.assert_not_called()
+                self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_exact_selector_competitor_refused_before_existing_rule_wins(self):
+        obj = {"projections": [
+            {"Column": {"Expression": {"SourceRef": {"Entity": table}}, "Property": "Amount"},
+             "queryRef": "Sales.Amount"} for table in ("Sales", "Other")],
+            "objects": {"dataPoint": [{"selector": {"metadata": "Sales.Amount"}}]}}
+        ws, project, _mdef, _path = self._report_project(obj)
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_cross_table_tmdl_bare_destination_capture_refused(self):
+        ws, project, mdef, _path = self._report_project({"refs": []})
+        Path(mdef, "tables", "Sales.tmdl").write_text(
+            "table Sales\n\tcolumn Region\n\t\tdataType: string\n\tmeasure M = SUM([City])\n")
+        Path(mdef, "tables", "Other.tmdl").write_text(
+            "table Other\n\tcolumn City\n\t\tdataType: string\n")
+        before = _bytes(ws.mirror)
+        with patch("pbz.rename.commit_bytes") as commit:
+            with self.assertRaises(PbzError) as caught:
+                rename.rename(ws, project, "column", "Region", "City", table="Sales")
+        self.assertEqual(caught.exception.code, "NAME_TAKEN")
+        commit.assert_not_called()
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_selector_destination_with_different_variation_level_refused(self):
+        old, new = "Sales.OrderDate.Variation.Date Hierarchy.Year", "Sales.Order Date.Variation.Date Hierarchy.Year"
+        projection = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"PropertyVariationSource": {"Expression": {"SourceRef": {"Entity": "Sales"}},
+                                                       "Property": "OrderDate"}},
+            "Hierarchy": "Date Hierarchy"}}, "Level": "Year"}, "queryRef": old}
+        for identifier in (old, new):
+            with self.subTest(identifier=identifier):
+                other = json.loads(json.dumps(projection))
+                other["HierarchyLevel"]["Level"] = "Month"
+                other["queryRef"] = identifier
+                ws, project, mdef, path = self._report_project({"projections": [projection, other],
+                    "objects": {"dataPoint": [{"selector": {"metadata": old}}]}})
+                Path(mdef, "tables", "Sales.tmdl").write_text(
+                    "table Sales\n\tcolumn OrderDate\n\t\tdataType: dateTime\n")
+                before = _bytes(ws.mirror)
+                with patch("pbz.rename.commit_bytes") as commit:
+                    with self.assertRaises(PbzError) as caught:
+                        rename.rename(ws, project, "column", "OrderDate", "Order Date", table="Sales")
+                self.assertEqual(caught.exception.code, "REFUSED")
+                commit.assert_not_called()
+                self.assertEqual(_bytes(ws.mirror), before)
+                report = json.loads(path.read_text())
+                for proj in report["projections"]:
+                    pvs = proj["HierarchyLevel"]["Expression"]["Hierarchy"]["Expression"]["PropertyVariationSource"]
+                    pvs["Property"] = "Order Date"
+                    proj["queryRef"] = new
+                report["objects"]["dataPoint"][0]["selector"]["metadata"] = new
+                sales = Path(mdef, "tables", "Sales.tmdl")
+                candidate = [("write", str(sales), sales.read_text().replace("column OrderDate", "column 'Order Date'"), b""),
+                             ("write", str(path), json.dumps(report), b"")]
+                with self.assertRaises(PbzError) as caught:
+                    rename._verify_plan(ws, project, tmdl.load_model(mdef), mdef, candidate,
+                                        "column", "Sales", "OrderDate", "Order Date")
+                self.assertEqual(caught.exception.code, "REFUSED")
+                self.assertIn("report string", str(caught.exception))
+                self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_selector_same_target_standalone_case_variant_follows(self):
+        ws, project, _mdef, path = self._report_project({"projections": [{
+            "Column": {"Expression": {"SourceRef": {"Entity": "Sales"}}, "Property": "Amount"},
+            "queryRef": "Sales.Amount"}], "reference": {"queryRef": "sales.amount"},
+            "selector": {"metadata": "Sales.Amount"}})
+        rename.rename(ws, project, "column", "Amount", "Value", table="Sales")
+        after = json.loads(path.read_text())
+        self.assertEqual(after["projections"][0]["queryRef"], "Sales.Value")
+        self.assertEqual(after["reference"]["queryRef"], "Sales.Value")
+        self.assertEqual(after["selector"]["metadata"], "Sales.Value")
+
+    def test_verifier_rejects_forward_bare_capture_candidate(self):
+        ws, project, mdef, path = self._report_project({"nativeQueryRef": "Region"})
+        sales = Path(mdef, "tables", "Sales.tmdl")
+        sales.write_text("table Sales\n\tcolumn Region\n\t\tdataType: string\n")
+        Path(mdef, "tables", "Other.tmdl").write_text(
+            "table Other\n\tcolumn City\n\t\tdataType: string\n")
+        model, before = tmdl.load_model(mdef), _bytes(ws.mirror)
+        ops = [("write", str(sales), sales.read_text().replace("column Region", "column City"), b""),
+               ("write", str(path), json.dumps({"nativeQueryRef": "City"}), b"")]
+        with self.assertRaises(PbzError) as caught:
+            rename._verify_plan(ws, project, model, mdef, ops, "column", "Sales", "Region", "City")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertIn("report string", str(caught.exception))
+        self.assertEqual(_bytes(ws.mirror), before)
+
     def test_missed_metadata_bindings_refuse_without_writes(self):
         for seam in ("columnPermission", "baseColumn", "ref table"):
             with self.subTest(seam=seam):

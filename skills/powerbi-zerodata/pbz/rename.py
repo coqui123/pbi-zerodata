@@ -63,7 +63,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             raise PbzError("AMBIGUOUS" if hits else "NOT_FOUND", f"column {old}; pass --table")
         home = hits[0].table
         old = hits[0].name
-        if _fold(new) != _fold(old) and (any(_fold(c.name) == _fold(new)
+        if _fold(new) != _fold(old) and (any(_fold(c.table) == _fold(home) and _fold(c.name) == _fold(new)
                                               for c in model.all_columns())
                                          or any(_fold(mm.name) == _fold(new) for mm in model.all_measures())):
             raise PbzError("NAME_TAKEN", new)
@@ -114,7 +114,7 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
             if reg.kind != "dax":
                 continue
             bindings = deps.dax_region(text, reg, res).bindings
-            edits += _binding_edits(bindings, kind, home, old, new, text)
+            edits += _binding_edits(bindings, kind, home, old, new, text, model=model)
         if kind == "column":
             for m_ in re.finditer(r"(?m)^(\t*(?:sortByColumn|column)\s*:\s*)('(?:[^']|'')*'|\S+)\s*$", text):
                 if _fold(tmdl.unquote(m_.group(2))) == _fold(old) and rel == model.tables[home].file:
@@ -132,12 +132,14 @@ def rename(ws, project, kind: str, old: str, new: str, table: str | None = None)
     ext_owned = _extension_owned_others(project.mirror_report, home)
     ext_ext = _extension_owned(project.mirror_report, home)
     ext_tables = _extension_tables(project.mirror_report)
+    claims = _selector_claims(ws, project, model, kind, home, old)
     for path, text, bom, rel in plan_pbir(
             ws, project.mirror_report,
             lambda root, _text: (pbir_ref_edits(root, model, kind, home, old, new,
                                                 extra_owned=ext_owned,
                                                 extra_extending=ext_ext,
                                                 extra_tables=ext_tables,
+                                                selector_claims=claims,
                                                 ext_bare=_extension_bare_names(project.mirror_report)), False)):
         ops.append(("write", path, text, bom))
         changed.append(rel)
@@ -212,6 +214,40 @@ def _inventory(model):
     return out
 
 
+def _selector_claims(ws, project, model, kind, home, old):
+    """Cross-file ownership claims on queryRef texts: for each folded
+    queryRef string, whether the projections carrying it belong to the
+    rename target ("target"), to another field or an ambiguous binding
+    ("other"), or both. A formatting selector in any file links to a
+    projection by this text alone, so an orphan selector may follow the
+    rename only when no other field's projection claims its text."""
+    claims = {}
+    if kind not in ("column", "measure"):
+        return claims
+
+    def kind_of(r):
+        if r.kind == "aggregation" or (r.kind == "hierarchy" and r.variation):
+            return "column"
+        return r.kind
+
+    for path in pbir.report_files(project.mirror_report):
+        try:
+            text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
+            root = pbir.parse_json(text)
+        except Exception:
+            continue
+        fields = pbir.walk_fields_with_path(root, model)
+        for site, (node, field) in _report_string_sites(root, model, fields).items():
+            if site[-1] != "queryRef" or field is None:
+                continue
+            if field is not _AMBIGUOUS and kind_of(field) == kind \
+                    and _fold(field.table) == _fold(home) and _fold(field.name) == _fold(old):
+                claims.setdefault(_fold(node.value), set()).add("target")
+            else:
+                claims.setdefault(_fold(node.value), set()).add("other")
+    return claims
+
+
 def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     before = _inventory(model)
     texts = {rel: doc.text for rel, doc in model.docs.items()}
@@ -250,11 +286,83 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
     # Inventory report field sites before editing too, even when a missed rewrite
     # produced no write operation for the containing file.
     writes = {op[1]: op[2] for op in ops if op[0] == "write"}
-    ext_q = _extension_qualified(project.mirror_report, old) if kind == "table" else set()
-    ext_owned = _extension_owned_others(project.mirror_report, home) if kind != "table" \
-        else _extension_owned_others(project.mirror_report, old)
-    ext_ext = _extension_owned(project.mirror_report, home) if kind != "table" \
-        else _extension_owned(project.mirror_report, old)
+    home, old = _canonical_target(model, kind, home, old)
+    claims = _selector_claims(ws, project, model, kind, home, old)
+
+    def _kind_of(r):
+        if r.kind == "aggregation" or (r.kind == "hierarchy" and r.variation):
+            return "column"
+        return r.kind
+
+    # Independent ownership inventory: a dotted path may name several objects.
+    paths, bare_names = {}, {}
+
+    def add_owner(path, owner, bare=None):
+        paths.setdefault(_fold(path), set()).add(owner)
+        if bare is not None:
+            bare_names.setdefault(_fold(bare), set()).add(owner)
+
+    for table in model.tables.values():
+        for k, pool in (("column", table.columns), ("measure", table.measures)):
+            for obj in pool.values():
+                add_owner(f"{table.name}.{obj.name}", (k, _fold(table.name), _fold(obj.name)), obj.name)
+        for hierarchy, levels in table.hierarchies.items():
+            for level in levels:
+                add_owner(f"{table.name}.{hierarchy}.{level}",
+                          ("hierarchy", _fold(table.name), _fold(hierarchy), _fold(level)))
+    entities = _extension_entities(project.mirror_report)
+    for entity, measures in entities:
+        for measure in measures:
+            add_owner(f"{entity}.{measure}", ("extension", _fold(entity), _fold(measure)), measure)
+    table_names = [t.name for t in model.tables.values()] + [e for e, _ms in entities]
+    anchor = old if kind == "table" else home
+    base_old, base_new = f"{home}.{old}", f"{home}.{new}"
+
+    def target_owner(owner):
+        return owner[1] == _fold(old) if kind == "table" else owner == (kind, _fold(home), _fold(old))
+
+    def competing(text, *, bare=False, unanchored=False):
+        owners = set(paths.get(_fold(text), ()))
+        for path, tags in paths.items():
+            rest = _rest_after(text, path)
+            if rest is not None and _path_extension(rest, anchor, table_names):
+                owners.update(o for o in tags if o[1] != _fold(anchor)
+                              and (bare or o[1].startswith(_fold(anchor) + ".")))
+        if unanchored:
+            owners.update(bare_names.get(_fold(text), ()))
+        return any(not target_owner(o) for o in owners)
+
+    def head_after(text, table):
+        for i, ch in enumerate(text):
+            if ch == "." and _fold(text[:i]) == _fold(table):
+                return new + text[i:]
+        return text
+
+    def path_form(text, base, replacement, extensions=False):
+        if _fold(text) == _fold(base):
+            return replacement
+        rest = _rest_after(text, _fold(base))
+        if extensions and rest is not None and _path_extension(rest, anchor, table_names):
+            return replacement + "." + rest
+        return None
+
+    global_owned_by_text = {}
+    for path in pbir.report_files(project.mirror_report):
+        try:
+            scan_text, _sbom = mirror.read_mirror_text(path, root=ws.mirror)
+            scan_root = pbir.parse_json(scan_text)
+        except Exception:
+            continue
+        scan_fields = pbir.walk_fields_with_path(scan_root, model)
+        for site, (node, field) in _report_string_sites(scan_root, model, scan_fields).items():
+            if site[-1] == "queryRef" and field is not None and field is not _AMBIGUOUS:
+                global_owned_by_text.setdefault(_fold(node.value), set()).add(
+                    (field.kind, _fold(field.table), _fold(field.name), _fold(field.hierarchy),
+                     _fold(field.level), field.function, field.variation, _fold(node.value)))
+    global_finals = {}
+    global_originals = {}
+    global_selector_finals = []
+    global_link_finals = []
     for path in pbir.report_files(project.mirror_report):
         text, _bom = mirror.read_mirror_text(path, root=ws.mirror)
         try:
@@ -267,23 +375,187 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
         original = pbir.walk_fields_with_path(original_root, model)
         following = dict((site, ref) for ref, site in pbir.walk_fields_with_path(following_root, planned))
         after_strings = dict(_report_strings(following_root))
-        home, old = _canonical_target(model, kind, home, old)
-        for site, (node, field) in _report_string_sites(original_root, model, original).items():
-            expected = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
-                                             extra_qualified=ext_q, extra_owned=ext_owned,
-                                             extra_extending=ext_ext,
-                                             extra_tables=_extension_tables(project.mirror_report),
-                                             dest_owned=(ext_owned if kind == "table" else None),
-                                             dest_extending=(_extension_owned_dest(project.mirror_report, old, new)
-                                                             if kind == "table" else None),
-                                             anchored=_doc_anchored(original_root, kind, home, old),
-                                             ext_bare=_extension_bare_names(project.mirror_report))
+        orig_sites = _report_string_sites(original_root, model, original)
+        anchored = _doc_anchored(original_root, kind, home, old)
+
+        def expectation(key, value, field):
+            if (key == "queryName" and kind != "table") or field is _AMBIGUOUS:
+                return value
+            if field is not None:
+                target = (_fold(field.table) == _fold(old)) if kind == "table" else (
+                    _kind_of(field) == kind and _fold(field.table) == _fold(home)
+                    and _fold(field.name) == _fold(old))
+                if not target:
+                    return value
+                base = f"{field.table}.{field.name}"
+                if kind == "table":
+                    if field.kind == "hierarchy" and field.hierarchy and not field.variation:
+                        base = f"{field.table}.{field.hierarchy}.{field.level}"
+                    wrapped = _wrapped_inner(value)
+                    for text, wrapper in [(value, None)] + ([(wrapped[1], wrapped[0])] if wrapped else []):
+                        if path_form(text, base, base, True) is not None:
+                            out = head_after(text, field.table)
+                            return f"{wrapper}({out})" if wrapper else out
+                    return value
+                if key == "nativeQueryRef" and _fold(value) == _fold(field.name):
+                    return new
+                wrapped = _wrapped_call(value) if kind == "column" else None
+                for text, wrapper in [(value, None)] + ([(wrapped[1], wrapped[0])] if wrapped else []):
+                    out = path_form(text, base, base_new, bool(field.variation))
+                    if out is None and _fold(text) == _fold(base_old):
+                        out = base_new
+                    if out is not None:
+                        return f"{wrapper}({out})" if wrapper else out
+                return value
+
+            # Literal ownership takes precedence over a possible wrapped reading.
+            bare = key == "nativeQueryRef"
+            literal_bare = bare and (kind == "table" or _fold(value) == _fold(old))
+            if competing(value, bare=literal_bare,
+                         unanchored=bare and (kind == "table" or not anchored)):
+                return value
+            if kind == "table":
+                def table_form(text):
+                    if competing(text):
+                        return None
+                    if any(any(target_owner(o) for o in tags)
+                           and path_form(text, base, base, True) is not None
+                           for base, tags in paths.items()):
+                        return head_after(text, old)
+                    return None
+                out = table_form(value)
+                if out is not None:
+                    return out
+                wrapped = _wrapped_inner(value)
+                if wrapped:
+                    out = table_form(wrapped[1])
+                    if out is not None:
+                        return f"{wrapped[0]}({out})"
+            else:
+                if _fold(value) == _fold(base_old):
+                    return base_new
+                if bare and _fold(value) == _fold(old):
+                    return new
+                wrapped = _wrapped_call(value) if kind == "column" else None
+                if wrapped and _fold(wrapped[1]) == _fold(base_old) and not competing(wrapped[1]):
+                    return f"{wrapped[0]}({base_new})"
+                if key == "queryRef" and not _literal_other_owner(model, value, home, old):
+                    out = path_form(value, base_old, base_new, True)
+                    if out is not None:
+                        return out
+            return value
+
+        expected_strings, links, projection_owners = {}, {}, {}
+        for site, (node, field) in orig_sites.items():
+            expected = expectation(site[-1], node.value, field)
+            expected_strings[site] = expected
+            if site[-1] == "queryRef" and field is not None and field is not _AMBIGUOUS:
+                projection_owners.setdefault(_fold(node.value), set()).add((
+                    field.kind, _fold(field.table), _fold(field.name), _fold(field.hierarchy),
+                    _fold(field.level), field.function, field.variation))
+            if site[-1] == "queryRef":
+                links.setdefault(node.value, set()).add(expected)
+            if kind == "column" and _fold(new) != _fold(old) and field is None \
+                    and site[-1] == "nativeQueryRef" and _fold(node.value) == _fold(old) \
+                    and expected != node.value and competing(expected, bare=True, unanchored=True):
+                raise PbzError("REFUSED", "a report string would lose its owner; nothing renamed")
+            # An unchanged bare destination can lose its unique original owner.
+            if kind == "column" and _fold(new) != _fold(old) and field is None \
+                    and site[-1] == "nativeQueryRef" and _fold(node.value) == _fold(new) \
+                    and len(bare_names.get(_fold(new), ())) == 1 \
+                    and not target_owner(next(iter(bare_names[_fold(new)]))):
+                raise PbzError("NAME_TAKEN", "a bare report string would lose its owner; nothing renamed")
+            # An unchanged bare string can also be captured by the new
+            # qualified path: it uniquely named another field (here a
+            # column whose bare name contains a dot), and after the
+            # rename the same spelling is the target's qualified path.
+            if kind == "column" and _fold(new) != _fold(old) and field is None \
+                    and site[-1] == "nativeQueryRef" and _fold(node.value) == _fold(base_new) \
+                    and expected == node.value:
+                owners = bare_names.get(_fold(node.value), set()) | paths.get(_fold(node.value), set())
+                if len(owners) == 1 and not target_owner(next(iter(owners))):
+                    raise PbzError("NAME_TAKEN", "a bare report string would lose its owner; nothing renamed")
+        # A rewritten queryRef must not land on the expected text of a
+        # queryRef that answers to a different owner, or selectors naming
+        # that string would no longer identify one projection.
+        owned_by_text = {}
+        for site, (node, field) in orig_sites.items():
+            if site[-1] == "queryRef" and field is not None and field is not _AMBIGUOUS:
+                owned_by_text.setdefault(_fold(node.value), set()).add(
+                    (field.kind, _fold(field.table), _fold(field.name), _fold(field.hierarchy),
+                     _fold(field.level), field.function, field.variation, _fold(node.value)))
+        finals_by_text = {}
+        for site, (node, field) in orig_sites.items():
+            if site[-1] != "queryRef":
+                continue
+            if field is not None and field is not _AMBIGUOUS:
+                identity = (field.kind, _fold(field.table), _fold(field.name), _fold(field.hierarchy),
+                            _fold(field.level), field.function, field.variation, _fold(node.value))
+            elif field is _AMBIGUOUS:
+                identity = ("ambiguous", site)
+            else:
+                owners = owned_by_text.get(_fold(node.value), set())
+                identity = next(iter(owners)) if len(owners) == 1 else ("unowned", _fold(node.value))
+            finals_by_text.setdefault(_fold(expected_strings[site]), []).append(
+                (identity, expected_strings[site] != node.value))
+        for group in finals_by_text.values():
+            if any(changed for _identity, changed in group) and len({i for i, _c in group}) > 1:
+                raise PbzError("REFUSED", "a report string would become ambiguous; nothing renamed")
+        for site, (node, field) in orig_sites.items():
+            if site[-1] != "queryRef":
+                continue
+            if field is not None and field is not _AMBIGUOUS:
+                gidentity = (field.kind, _fold(field.table), _fold(field.name), _fold(field.hierarchy),
+                             _fold(field.level), field.function, field.variation, _fold(node.value))
+            elif field is _AMBIGUOUS:
+                gidentity = ("ambiguous", _fold(node.value))
+            else:
+                owners = global_owned_by_text.get(_fold(node.value), set())
+                gidentity = next(iter(owners)) if len(owners) == 1 else ("unowned", _fold(node.value))
+            global_finals.setdefault(_fold(expected_strings[site]), []).append(
+                (gidentity, expected_strings[site] != node.value))
+            global_originals.setdefault(_fold(node.value), set()).add(_fold(expected_strings[site]))
+        for site, (node, field) in orig_sites.items():
+            expected = expected_strings[site]
+            if kind != "table" and site[-2:] == ("selector", "metadata") and field is None:
+                claim = claims.get(_fold(node.value), set())
+                if "other" in claim:
+                    expected = node.value
+                candidates = set(links.get(node.value, ()))
+                if expected != node.value:
+                    candidates.add(expected)
+                if "other" not in claim and expected == node.value \
+                        and not any(v != node.value for v in candidates) \
+                        and not competing(node.value) \
+                        and not _literal_other_owner(model, node.value, home, old):
+                    followed = path_form(node.value, base_old, base_new, True)
+                    if followed is not None and followed != node.value:
+                        if competing(followed):
+                            raise PbzError("REFUSED", "a report string selector cannot be resolved uniquely; nothing renamed")
+                        expected = followed
+                        candidates.add(expected)
+                if "target" in claim and "other" in claim \
+                        and (expected != node.value or any(v != node.value for v in candidates)):
+                    raise PbzError("REFUSED", "a report string selector cannot be resolved uniquely; nothing renamed")
+                if "other" not in claim and any(v != node.value for v in candidates):
+                    if len(candidates) != 1 or len(projection_owners.get(_fold(node.value), ())) > 1:
+                        raise PbzError("REFUSED", "a report string selector cannot be resolved uniquely; nothing renamed")
+                    expected = next(iter(candidates))
+                    carrier_ids = {_raw_identity(f) for s2, (n2, f) in orig_sites.items()
+                                   if s2[-1] == "queryRef" and f is not None and f is not _AMBIGUOUS
+                                   and _fold(n2.value) == _fold(node.value)}
+                    if any(other.value != node.value and expected_strings[s] == expected
+                           and not (_fold(other.value) == _fold(node.value) and expected_strings[s] != other.value)
+                           and not (_owner is not None and _owner is not _AMBIGUOUS
+                                    and _raw_identity(_owner) in carrier_ids)
+                           for s, (other, _owner) in orig_sites.items() if s[-1] == "queryRef"):
+                        raise PbzError("REFUSED", "a report string selector cannot be resolved uniquely; nothing renamed")
+            if site[-2:] == ("selector", "metadata"):
+                global_selector_finals.append((_fold(node.value), _fold(expected), expected != node.value))
+            if site[-1] == "queryRef" and field is None:
+                global_link_finals.append((_fold(node.value), _fold(expected)))
             if after_strings.get(site) != expected:
                 raise PbzError("REFUSED", "a report string did not follow the rename; nothing renamed")
-        def _kind_of(r):
-            if r.kind == "aggregation" or (r.kind == "hierarchy" and r.variation):
-                return "column"
-            return r.kind
 
         for ref, site in original:
             k = _kind_of(ref)
@@ -306,6 +578,42 @@ def _verify_plan(ws, project, model, mdef, ops, kind, home, old, new):
             if (after_ref is None or _kind_of(after_ref) != k
                     or after_ref.table != table_name or after_ref.name != object_name):
                 raise PbzError("REFUSED", "a report binding did not follow the rename; nothing renamed")
+
+    # The per-file landing check cannot see across files: a rewritten
+    # queryRef must not land on the planned text of a queryRef answering
+    # to a different field in ANY report file, or a selector naming that
+    # string would no longer identify one projection in the report.
+    for group in global_finals.values():
+        if any(changed for _identity, changed in group) and len({i for i, _c in group}) > 1:
+            raise PbzError("REFUSED", "a report string would become ambiguous; nothing renamed")
+    # A selector rewritten by the rename must not land on the unchanged
+    # queryRef text of a projection owned by another field in any file:
+    # it would end up naming that projection instead of its own.
+    for _original_text, final_text, changed in global_selector_finals:
+        if not changed:
+            continue
+        carrier_ids = {i[:7] for i in global_owned_by_text.get(_original_text, ())}
+        for identity, qchanged in global_finals.get(final_text, []):
+            if qchanged:
+                continue
+            if not (len(identity) == 8 and identity[:7] in carrier_ids):
+                raise PbzError("REFUSED", "a report string would become ambiguous; nothing renamed")
+    # A reference string must end at the one planned text of the
+    # projections that carried its original text: if any of them kept the
+    # text (a path-like queryRef the field itself does not rewrite) or
+    # they landed on more than one text, the string cannot keep pointing
+    # at all of them. This covers selectors and fieldless references
+    # alike (for example a bookmark's explorationState queryRef); a
+    # projection's own queryRef and nativeQueryRef are identifiers and
+    # labels of their own field, not references, and are exempt.
+    for original_text, final_text in global_link_finals:
+        finals = global_originals.get(original_text, ())
+        if finals and finals != {final_text}:
+            raise PbzError("REFUSED", "a report string selector cannot be resolved uniquely; nothing renamed")
+    for original_text, final_text, _changed in global_selector_finals:
+        finals = global_originals.get(original_text, ())
+        if finals and finals != {final_text}:
+            raise PbzError("REFUSED", "a report string selector cannot be resolved uniquely; nothing renamed")
 
 
 def _report_strings(node, path=()):
@@ -853,6 +1161,31 @@ def _doc_anchored(root, kind, home, old):
     return walk(root)
 
 
+def _raw_identity(field):
+    """A projection's identity without its identifier text: kind, table,
+    name, hierarchy, level, function, and variation, folded where textual.
+    An aggregation of a column is a different identity from the column."""
+    return (field.kind, _fold(field.table), _fold(field.name), _fold(field.hierarchy),
+            _fold(field.level), field.function, field.variation)
+
+
+def _literal_other_owner(model, value, home, old):
+    """True when another field's qualified path owns the string at least
+    as specifically as the target's path: the string equals that path or
+    extends it with dotted segments, and the path is no shorter than the
+    target's own. Such a string denotes that field (or its extensions),
+    whatever reading as an extension of the target it also admits."""
+    folded = _fold(value)
+    base = _fold(f"{home}.{old}")
+    for c in list(model.all_columns()) + list(model.all_measures()):
+        if _fold(c.table) == _fold(home) and _fold(c.name) == _fold(old):
+            continue
+        path = _fold(f"{c.table}.{c.name}")
+        if len(path) >= len(base) and (folded == path or folded.startswith(path + ".")):
+            return True
+    return False
+
+
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
                           extra_qualified=(), extra_owned=(), extra_extending=(),
                           extra_tables=(), dest_owned=None, dest_extending=None,
@@ -1082,11 +1415,32 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
                                                extensions_any=True, extra_tables=extra_tables,
                                                bare_fields=not anchored, ext_bare=ext_bare)):
             return f"{wrapped[0]}({home}.{new})", True
+    if key == "queryRef" and kind in ("column", "measure"):
+        # An unowned queryRef that is a pure path extension of the target
+        # (for example a variation path in a bookmark file) has the target
+        # as its only possible owner, so it follows like the owned form,
+        # unless the full string is literally another field's own path.
+        rest = _rest_after(value, _fold(f"{home}.{old}"))
+        if rest is not None and _path_extension(
+                rest, home,
+                ([t.name for t in model.tables.values()] if model is not None else [])
+                + list(extra_tables)) \
+                and not (model is not None and _literal_other_owner(model, value, home, old)):
+            return _prefix_swap(value, f"{home}.{old}", f"{home}.{new}"), False
     return value, False
 
 
-def _binding_edits(bindings, kind, home, old, new, text):
+def _binding_edits(bindings, kind, home, old, new, text, *, model=None):
     edits = []
+    if model is not None and kind == "column" and _fold(new) != _fold(old) \
+            and any(_fold(c.table) != _fold(home) and _fold(c.name) == _fold(new)
+                    for c in model.all_columns()):
+        for binding in bindings:
+            ref = binding.ref
+            if binding.qualifier is None and ref.kind in ("column", "unresolved") \
+                    and (_fold(ref.name) == _fold(new)
+                         or (_fold(ref.name) == _fold(old) and _fold(ref.table) == _fold(home))):
+                raise PbzError("NAME_TAKEN", f"a bare reference could be captured by {new}; nothing renamed")
     for binding in bindings:
         ref = binding.ref
         if _fold(ref.name) != _fold(old):
@@ -1107,7 +1461,7 @@ def dax_ref_edits(text: str, start: int, end: int, kind: str, home: str, old: st
                   cur: str | None = None, *, res, row_home: bool = False) -> list[tuple[int, int, str]]:
     """Rename exactly the occurrences bound to the target by the shared resolver."""
     bindings = deps.dax_bindings(text[start:end], cur or "", res, row_home, base=start).bindings
-    return _binding_edits(bindings, kind, home, old, new, text)
+    return _binding_edits(bindings, kind, home, old, new, text, model=res.model)
 
 
 def _pvs_property_node(node):
@@ -1327,7 +1681,7 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
                 out.append((a, b, _dax_table(new, quoted)))
         return out
     kept = [b for b in bindings if not _ext_bound(b)]
-    return _binding_edits(kept, kind, home, old, new, text)
+    return _binding_edits(kept, kind, home, old, new, text, model=model)
 
 
 def _measure_expression_edits(root, model, kind, home, old, new):
@@ -1402,7 +1756,7 @@ def _measure_expression_edits(root, model, kind, home, old, new):
 
 def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
                    extra_owned=(), extra_extending=(), extra_tables=(),
-                   ext_bare=()) -> list[tuple[int, int, str]]:
+                   selector_claims=None, ext_bare=()) -> list[tuple[int, int, str]]:
     """Edits renaming measure / column `old` of table `home` in one parsed PBIR document: every field
     reference's Property, and queryRef / nativeQueryRef / metadata strings."""
     edits = []
@@ -1443,13 +1797,110 @@ def pbir_ref_edits(root, model, kind: str, home: str, old: str, new: str,
         visit(root, {})
     home, old = _canonical_target(model, kind, home, old)
     anchored = _doc_anchored(root, kind, home, old)
-    for site, (node, field) in _report_string_sites(root, model, fields).items():
+    sites = _report_string_sites(root, model, fields)
+    outputs = {}
+    proven, projection_owners = {}, {}
+    for site, (node, field) in sites.items():
         nv = _report_string_rename(site[-1], node.value, kind, home, old, new, field, model,
                                    extra_owned=extra_owned, extra_extending=extra_extending,
                                    extra_tables=extra_tables, anchored=anchored,
                                    ext_bare=ext_bare)
+        if kind == "column" and _fold(new) != _fold(old) and field is None \
+                and site[-1] == "nativeQueryRef" and _fold(node.value) == _fold(old) \
+                and nv != node.value and any(_fold(c.table) != _fold(home) and _fold(c.name) == _fold(new)
+                                            for c in model.all_columns()):
+            raise PbzError("NAME_TAKEN", f"a bare report reference could be captured by {new}; nothing renamed")
+        outputs[site] = nv
+        if site[-1] == "queryRef" and field is not None and field is not _AMBIGUOUS:
+            projection_owners.setdefault(_fold(node.value), set()).add((
+                field.kind, _fold(field.table), _fold(field.name), _fold(field.hierarchy),
+                _fold(field.level), field.function, field.variation))
+        if site[-1] == "queryRef":
+            # Only a queryRef is a projection identifier a selector can
+            # link to; a nativeQueryRef label or a metadata string with
+            # the same text must not supply the selector's candidate.
+            proven.setdefault(node.value, set()).add(nv)
+    finals = {}
+    for site, (node, field) in sites.items():
+        nv = outputs[site]
+        if kind in ("column", "measure") and site[-2:] == ("selector", "metadata") and field is None:
+            # A projection in any file carrying this text as its queryRef
+            # claims the selector for itself: another field's claim keeps
+            # the selector with that projection (its text does not move,
+            # whatever the string's shape), a claim by both sides is
+            # ambiguous, and only an unclaimed or target-claimed selector
+            # follows the shape-based rewrites below.
+            claim = (selector_claims or {}).get(_fold(node.value), set())
+            if "other" in claim:
+                nv = node.value
+            elif nv == node.value and not any(v != node.value for v in proven.get(node.value, ())):
+                # No proven projection in this file rewrites the selector,
+                # but the string itself is a pure path extension of the
+                # target (for example a variation path in a bookmark
+                # file): the target is its only possible owner, so it
+                # follows the rename instead of being left pointing at
+                # the old path.
+                rest = _rest_after(node.value, _fold(f"{home}.{old}"))
+                if rest is not None and _path_extension(
+                        rest, home,
+                        ([t.name for t in model.tables.values()] if model is not None else [])
+                        + list(extra_tables)) \
+                        and not (model is not None
+                                 and _literal_other_owner(model, node.value, home, old)):
+                    followed = _prefix_swap(node.value, f"{home}.{old}", f"{home}.{new}")
+                    if model is not None and _other_table_owns(
+                            model, home, followed, extra_owned, extra_extending,
+                            extra_tables=extra_tables):
+                        raise PbzError("REFUSED", "a formatting selector cannot be resolved uniquely; nothing renamed")
+                    nv = followed
+            candidates = set(proven.get(node.value, ()))
+            if nv != node.value:
+                candidates.add(nv)
+            if "target" in claim and "other" in claim \
+                    and (nv != node.value or any(value != node.value for value in candidates)):
+                raise PbzError("REFUSED", "a formatting selector cannot be resolved uniquely; nothing renamed")
+            if "other" not in claim and any(value != node.value for value in candidates):
+                if len(candidates) != 1 or len(projection_owners.get(_fold(node.value), ())) > 1:
+                    raise PbzError("REFUSED", "a formatting selector cannot be resolved uniquely; nothing renamed")
+                nv = next(iter(candidates))
+                carrier_ids = {_raw_identity(f) for s2, (n2, f) in sites.items()
+                               if s2[-1] == "queryRef" and f is not None and f is not _AMBIGUOUS
+                               and _fold(n2.value) == _fold(node.value)}
+                if any(other.value != node.value and outputs[s] == nv
+                       and not (_fold(other.value) == _fold(node.value) and outputs[s] != other.value)
+                       and not (_owner is not None and _owner is not _AMBIGUOUS
+                                and _raw_identity(_owner) in carrier_ids)
+                       for s, (other, _owner) in sites.items() if s[-1] == "queryRef"):
+                    raise PbzError("REFUSED", "a formatting selector cannot be resolved uniquely; nothing renamed")
+        finals[site] = nv
         if nv != node.value:
             edits.append((node.start, node.end, json.dumps(nv, ensure_ascii=False)))
+    # A rewritten queryRef must not land on the final text of a queryRef
+    # that answers to a different owner: two projections sharing one string
+    # would leave any selector naming it pointing at either of them.
+    owned_by_text = {}
+    for site, (node, field) in sites.items():
+        if site[-1] == "queryRef" and field is not None and field is not _AMBIGUOUS:
+            owned_by_text.setdefault(_fold(node.value), set()).add(
+                (field.kind, _fold(field.table), _fold(field.name), _fold(field.hierarchy),
+                 _fold(field.level), field.function, field.variation, _fold(node.value)))
+    finals_by_text = {}
+    for site, (node, field) in sites.items():
+        if site[-1] != "queryRef":
+            continue
+        if field is not None and field is not _AMBIGUOUS:
+            identity = (field.kind, _fold(field.table), _fold(field.name), _fold(field.hierarchy),
+                        _fold(field.level), field.function, field.variation, _fold(node.value))
+        elif field is _AMBIGUOUS:
+            identity = ("ambiguous", site)
+        else:
+            owners = owned_by_text.get(_fold(node.value), set())
+            identity = next(iter(owners)) if len(owners) == 1 else ("unowned", _fold(node.value))
+        finals_by_text.setdefault(_fold(finals[site]), []).append(
+            (identity, finals[site] != node.value))
+    for group in finals_by_text.values():
+        if any(changed for _identity, changed in group) and len({i for i, _c in group}) > 1:
+            raise PbzError("REFUSED", "the rename would make a report reference ambiguous; nothing renamed")
     edits.extend(_measure_expression_edits(root, model, kind, home, old, new))
     return edits
 
