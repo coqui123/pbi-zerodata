@@ -79,5 +79,54 @@ class ExactInt64EqualTests(unittest.TestCase):
         self.assertFalse(synthtest._same(100.0, 100.01, tol=0.00001))
 
 
+class NoBlankKeysKeepfiltersTests(unittest.TestCase):
+    def test_no_blank_keys_wraps_predicate_in_keepfilters(self):
+        ws = SimpleNamespace(private="private", root="root")
+        project = SimpleNamespace(name="Canary", mirror_model="mirror/Canary.SemanticModel")
+        col = SimpleNamespace(name="Region", data_type="string", table="Sales")
+        table = SimpleNamespace(name="Sales", column=lambda name: col if name == "Region" else None, partitions=[])
+        model = SimpleNamespace(tables={"Sales": table}, column=lambda t, c: col if t == "Sales" and c == "Region" else None)
+        calls = []
+        def fake_query(ws, project, dax, max_rows):
+            calls.append(dax)
+            return {"columns": ["n", "o"], "rows": [[100, 0]], "truncated": False}
+        with patch.object(synthtest.synth, "build_info", return_value={"profile": "standard"}), \
+                patch.object(synthtest.synth, "synth_project", return_value=SimpleNamespace(model_dir="dummy")), \
+                patch.object(synthtest.synth, "fake_dax_tokens", side_effect=lambda m, expr: expr), \
+                patch.object(synthtest.tmdl, "load_model", return_value=model), \
+                patch.object(synthtest, "QUERY", side_effect=fake_query):
+            chk = {"id": "nbk", "kind": "no_blank_keys", "column": "'Sales'[Region]", "where": ["'Sales'[Amount] > 0"]}
+            spec = {"checks": [chk]}
+            res = synthtest.check(ws, project, spec)
+            self.assertEqual(res["results"][0]["status"], "PASS")
+            self.assertTrue(any("KEEPFILTERS('Sales'[Region] = \"\")" in c for c in calls), f"Calls did not wrap in KEEPFILTERS: {calls}")
+
+    def test_no_blank_keys_counterexample_wraps_predicate_in_keepfilters(self):
+        ws = SimpleNamespace(private="private", root="root")
+        project = SimpleNamespace(name="Canary", mirror_model="mirror/Canary.SemanticModel")
+        col = SimpleNamespace(name="Region", data_type="string", table="Sales")
+        table = SimpleNamespace(name="Sales", column=lambda name: col if name == "Region" else None, partitions=[])
+        model = SimpleNamespace(tables={"Sales": table}, column=lambda t, c: col if t == "Sales" and c == "Region" else None)
+        calls = []
+        def fake_query(ws, project, dax, max_rows):
+            calls.append(dax)
+            if "ROW(" in dax:
+                return {"columns": ["n", "o"], "rows": [[100, 5]], "truncated": False}
+            return {"columns": ["Region"], "rows": [[""]], "truncated": False}
+        with patch.object(synthtest.synth, "build_info", return_value={"profile": "standard"}), \
+                patch.object(synthtest.synth, "synth_project", return_value=SimpleNamespace(model_dir="dummy")), \
+                patch.object(synthtest.synth, "fake_dax_tokens", side_effect=lambda m, expr: expr), \
+                patch.object(synthtest.tmdl, "load_model", return_value=model), \
+                patch.object(synthtest, "QUERY", side_effect=fake_query):
+            chk = {"id": "nbk", "kind": "no_blank_keys", "column": "'Sales'[Region]", "where": ["'Sales'[Amount] > 0"]}
+            spec = {"checks": [chk]}
+            res = synthtest.check(ws, project, spec)
+            self.assertEqual(res["results"][0]["status"], "FAIL")
+            self.assertEqual(res["results"][0]["offenders"], 5)
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(any("CALCULATETABLE('Sales', KEEPFILTERS('Sales'[Region] = \"\"))" in c for c in calls),
+                            f"Counterexample call did not wrap in KEEPFILTERS: {calls}")
+
+
 if __name__ == "__main__":
     unittest.main()

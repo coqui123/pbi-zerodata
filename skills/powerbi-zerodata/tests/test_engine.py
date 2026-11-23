@@ -429,6 +429,16 @@ Assert(!Checks.ValuesEqual(double.NaN, 0.0, 0.0), "NaN vs zero inequality");
 Assert(Checks.ValuesEqual(9007199254740993L, 9007199254740992L, 1e-9), "tol > 0 preserved for int64");
 Assert(Checks.ValuesEqual(100.0, 100.01, 0.01), "tol > 0 preserved for float");
 Assert(!Checks.ValuesEqual(100.0, 100.01, 0.00001), "tol > 0 tight tolerance");
+// PR 4b: Checks.NoBlankKeysDax wraps blank predicate in KEEPFILTERS
+string nbkDax = Checks.NoBlankKeysDax("'Hours'", "Hours[Person] = \"\"", new[] { "Hours[Hours] > 0" });
+Assert(nbkDax.Contains("KEEPFILTERS(Hours[Person] = \"\")"), "no_blank_keys wraps blank predicate in KEEPFILTERS with where");
+Assert(nbkDax == "EVALUATE ROW(\"n\", CALCULATE(COUNTROWS('Hours'), Hours[Hours] > 0), \"o\", CALCULATE(CALCULATE(COUNTROWS('Hours'), KEEPFILTERS(Hours[Person] = \"\")), Hours[Hours] > 0))", "no_blank_keys exact DAX with where");
+string nbkDaxNoWhere = Checks.NoBlankKeysDax("'Hours'", "Hours[Person] = \"\"", Array.Empty<string>());
+Assert(nbkDaxNoWhere == "EVALUATE ROW(\"n\", COUNTROWS('Hours'), \"o\", CALCULATE(COUNTROWS('Hours'), KEEPFILTERS(Hours[Person] = \"\")))", "no_blank_keys exact DAX without where");
+string nbkIsBlank = Checks.NoBlankKeysDax("'Hours'", "ISBLANK(Hours[ProjectID])", new[] { "Hours[Hours] > 0" });
+Assert(nbkIsBlank.Contains("KEEPFILTERS(ISBLANK(Hours[ProjectID]))"), "no_blank_keys wraps ISBLANK in KEEPFILTERS with where");
+string nbkSameCol = Checks.NoBlankKeysDax("'Hours'", "Hours[Person] = \"\"", new[] { "Hours[Person] <> \"\"" });
+Assert(nbkSameCol == "EVALUATE ROW(\"n\", CALCULATE(COUNTROWS('Hours'), Hours[Person] <> \"\"), \"o\", CALCULATE(CALCULATE(COUNTROWS('Hours'), KEEPFILTERS(Hours[Person] = \"\")), Hours[Person] <> \"\"))", "no_blank_keys exact DAX with same-column where");
 string directory = Path.Combine(Path.GetTempPath(), "pbz-grouped-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
 try {
@@ -1110,6 +1120,9 @@ def test_live(env: Env, key_holder: dict) -> None:
         {"id": "nbk-person", "kind": "no_blank_keys", "column": "Hours[Person]"},
         {"id": "nbk-pid", "kind": "no_blank_keys", "column": "Hours[ProjectID]"},
         {"id": "nbk-dim", "kind": "no_blank_keys", "column": "Project[ProjectID]"},
+        # nbk-where tests that an outer where filter on the key column (Hours[Person] <> "")
+        # is preserved by KEEPFILTERS and not clobbered by the blank predicate (Hours[Person] = "")
+        {"id": "nbk-where", "kind": "no_blank_keys", "column": "Hours[Person]", "where": ["Hours[Person] <> \"\""]},
         {"id": "sign-pos", "kind": "sign", "expr": "[Total Hours]"},
         {"id": "sign-neg", "kind": "sign", "expr": "CALCULATE(SUM(Hours[Hours]), Hours[Hours] < 0)", "expect": ["NEG"]},
         {"id": "sign-blank", "kind": "sign", "expr": "CALCULATE([Total Hours], Project[Status] = \"Nope\")"},
@@ -1158,8 +1171,8 @@ def test_live(env: Env, key_holder: dict) -> None:
            and c.get("uq-email", {}).get("offenders_bucket") == "1-9" and c.get("uq-pid", {}).get("offenders_bucket") == "0", r)
     expect("check no_orphans: planted orphans FAIL; blank FK ignored; dates PASS",
            (st.get("orph-proj"), st.get("orph-person"), st.get("orph-date")) == ("FAIL", "PASS", "PASS"), r)
-    expect("check no_blank_keys: planted blank FAIL; ids PASS; dimension blank row not counted",
-           (st.get("nbk-person"), st.get("nbk-pid"), st.get("nbk-dim")) == ("FAIL", "PASS", "PASS"), r)
+    expect("check no_blank_keys: planted blank FAIL; ids PASS; dimension blank row not counted; where PASS",
+           (st.get("nbk-person"), st.get("nbk-pid"), st.get("nbk-dim"), st.get("nbk-where")) == ("FAIL", "PASS", "PASS", "PASS"), r)
     expect("check sign: POS / NEG / BLANK / ZERO vs expect POS -> FAIL",
            (c.get("sign-pos", {}).get("sign"), c.get("sign-neg", {}).get("sign"), c.get("sign-blank", {}).get("sign"), c.get("sign-zero", {}).get("sign"))
            == ("POS", "NEG", "BLANK", "ZERO") and st.get("sign-neg") == "PASS" and st.get("sign-zero") == "FAIL", r)

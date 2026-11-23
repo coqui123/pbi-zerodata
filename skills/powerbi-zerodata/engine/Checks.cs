@@ -101,8 +101,7 @@ public static class Checks
                 {
                     var c = Col(chk, "column", conn);
                     string t = Dax.QTable(c.Table.Name);
-                    var row = conn.Row1("EVALUATE ROW(\"n\", " + Dax.Calc("COUNTROWS(" + t + ")", where) +
-                                        ", \"o\", " + Dax.Calc("CALCULATE(COUNTROWS(" + t + "), " + c.BlankPredicate + ")", where) + ")");
+                    var row = conn.Row1(NoBlankKeysDax(t, c.BlankPredicate, where));
                     Offenders(res, ColumnStats.L(row[0]), ColumnStats.L(row[1]), ctx);
                     break;
                 }
@@ -570,4 +569,8 @@ public static class Checks
     }
 
     static ColumnMeta Col(JsonObject chk, string field, Conn conn) => conn.Meta.ResolveColumn(J.ReqStr(chk, field));
+
+    public static string NoBlankKeysDax(string table, string blankPredicate, IReadOnlyList<string> where)
+        => "EVALUATE ROW(\"n\", " + Dax.Calc("COUNTROWS(" + table + ")", where) +
+           ", \"o\", " + Dax.Calc("CALCULATE(COUNTROWS(" + table + "), KEEPFILTERS(" + blankPredicate + "))", where) + ")";
 }
