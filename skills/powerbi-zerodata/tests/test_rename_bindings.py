@@ -1801,6 +1801,20 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][2]["measures"][0]["expression"]
         self.assertEqual(m, "Budget [Amount]")
 
+    def test_column_case_only_rename_allowed_with_same_named_column_elsewhere(self):
+        # A case-only rename changes nothing in folded space, so the
+        # cross-table destination check does not fire: the base suite
+        # pins this in test_modeling_atomic.test_case_only_column_rename
+        # (Other.Amount present). The qualified reference follows and
+        # the other table's column is untouched.
+        ws, project, mdef, path = self._report_project(
+            {"refs": [{"queryRef": "Sales.Amount"}]})
+        rename.rename(ws, project, "column", "Amount", "AMOUNT", table="Sales")
+        got = json.loads(path.read_text())["refs"][0]["queryRef"]
+        self.assertEqual(got, "Sales.AMOUNT")
+        other = Path(mdef, "tables", "Other.tmdl").read_text()
+        self.assertIn("column Amount", other)
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
