@@ -6,6 +6,14 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- Multiline dynamic format expressions (`formatStringDefinition`) written by `pbz format-expr`
+  now reload as one complete DAX region on the measure, so deps, rename, usage and tokenization
+  see every reference. Renaming a referenced measure updates its reference inside the format
+  body. Mirrors already written at the old indent are not repaired on load: the definition
+  still gets no region of its own, and individual body lines may parse as phantom declarations.
+  Rewrite the format expression with `pbz format-expr` before relying on rename to update all
+  references in it.
+
 - Private indexes publish through an `index-current.json` manifest pointing to a completed,
   hash-checked `index-<uuid>` generation directory. Publication pins the hardened artifacts
   and prunes older generations. New engine indexes include a model stamp over sorted model

@@ -214,7 +214,7 @@ def format_expression(ws, project, measure: str, dax: str | None, upgrade: bool 
             db_op = ("write", path, text, bom)
             note = f"compatibility level raised from {cur} to {need}"
         if "\n" in body:
-            text = f"{ind}formatStringDefinition ={eol}" + eol.join(ind + "\t" + ln.rstrip() for ln in body.splitlines() if ln.strip()) + eol
+            text = f"{ind}formatStringDefinition ={eol}" + eol.join(ind + "\t\t" + ln.rstrip() for ln in body.splitlines() if ln.strip()) + eol
         else:
             text = f"{ind}formatStringDefinition = {body}{eol}"
         if child is not None:
