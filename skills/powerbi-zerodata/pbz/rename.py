@@ -334,33 +334,44 @@ def _report_string_sites(root, model, fields=None):
     owners = {site: ref for ref, site in fields}
     siblings = {}
     for ref, site in fields:
-        parent = site[:-1]
-        siblings[parent] = ref if parent not in siblings else _AMBIGUOUS
+        siblings.setdefault(site[:-1], {})[id(ref)] = (ref, site)
+
+    def sibling_field(prefix, site):
+        # The fields held directly by an ancestor, counting only those
+        # in the string's own array elements: a field whose path
+        # diverges from the string's at an array index belongs to a
+        # sibling element and is never inherited. Several counting
+        # fields make the container ambiguous.
+        entries = siblings.get(prefix)
+        if not entries:
+            return None
+        refs = {}
+        for ref, fsite in entries.values():
+            if all(not isinstance(site[i], int) or fsite[i] == site[i]
+                   for i in range(min(len(fsite), len(site)))):
+                refs[id(ref)] = ref
+        if len(refs) == 1:
+            return next(iter(refs.values()))
+        return _AMBIGUOUS if refs else None
+
     sites = {}
     for site, node in _report_string_nodes(root):
         # Resolve ownership nearest-first across both maps: at each
         # ancestor, a field whose object contains the string (owners)
         # decides, else the fields held directly by that ancestor
-        # (siblings, _AMBIGUOUS for several) decide, and the search
+        # (siblings, ambiguous for several) decide, and the search
         # stops at whichever comes first, so a nearer ambiguous
         # container fails closed before a farther unique field can
         # claim the string, and a unique nearer field is not poisoned
-        # by a farther ambiguous container. The siblings lookup
-        # ascends only within the innermost array element on the path,
-        # so a sibling element's field is never inherited.
-        floor = 0
-        for i, part in enumerate(site):
-            if isinstance(part, int):
-                floor = i + 1
+        # by a farther ambiguous container.
         field = None
         for length in range(len(site) - 1, -1, -1):
             field = owners.get(site[:length])
             if field is not None:
                 break
-            if length >= floor:
-                field = siblings.get(site[:length])
-                if field is not None:
-                    break
+            field = sibling_field(site[:length], site)
+            if field is not None:
+                break
         sites[site] = (node, field)
     return sites
 
