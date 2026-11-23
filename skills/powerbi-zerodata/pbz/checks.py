@@ -1082,6 +1082,8 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
         if unknown:
             raise PbzError("BAD_REQUEST", "unknown token in query " + str(q.get("id")))
         queries.append({"id": q.get("id"), "dax": dax, "keys": q.get("keys", [])})
+    if not queries:
+        raise PbzError("BAD_REQUEST", "queries must not be empty")
     verb = "snapshot-save" if action == "save" else "snapshot-compare"
     if not spend(ws, "snapshot_queries", max(1, len(queries))):
         return {"verb": verb, "status": "BUDGET", "note": "daily snapshot query budget reached; the user can reset it"}

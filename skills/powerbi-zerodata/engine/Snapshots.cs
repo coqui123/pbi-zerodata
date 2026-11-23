@@ -37,6 +37,7 @@ public static class Snapshots
     static List<(string Id, string Dax, List<string> Keys)> Queries(Req req)
     {
         var arr = req.Arr("queries") ?? throw new BadRequestException("queries is required");
+        if (arr.Count == 0) throw new BadRequestException("queries must not be empty");
         var list = new List<(string, string, List<string>)>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var n in arr)

@@ -188,6 +188,7 @@ There is no calendar year field.
 ### `snapshot-save` / `snapshot-compare`
 Request `{"private_dir", "port", "name": "before-refactor", "queries": [{"id": "q1",
 "dax": "EVALUATE SUMMARIZECOLUMNS(DimDate[Year], \"m\", [Total Hours])", "keys": ["DimDate[Year]"]}]}`
+`queries` must be a non-empty array of query objects; an empty `queries` array produces `BAD_REQUEST`.
 - Save: run each query, store in `private_dir\snapshots\results\<name>.json` per query: map
   `hmac(key tuple)` -> list of per-column `hmac(cell)`; no keys -> multiset of row hmacs. Also
   store `refreshed`: max `RefreshedTime` over TMSCHEMA_PARTITIONS (stored only, never printed).

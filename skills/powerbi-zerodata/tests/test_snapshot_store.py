@@ -310,6 +310,36 @@ class SnapshotStoreTests(unittest.TestCase):
             self.assertTrue(res.get("ok"))
             self.assertTrue((self.snaps / "specs" / "fresh_snap.json").is_file())
 
+    def test_snapshot_refuses_empty_queries_in_checks(self):
+        # snapshot() must fail closed with BAD_REQUEST when queries list is empty
+        # and must not spend budget or invoke engine or write files
+        with patch("pbz.desktop.require_port", return_value=1234), \
+             patch("pbz.checks.spend") as mock_spend, \
+             patch("pbz.checks.engine_call") as mock_engine:
+            for action in ("save", "compare"):
+                for empty_spec in ({"queries": []}, {}, None):
+                    with self.subTest(action=action, empty_spec=empty_spec):
+                        with self.assertRaises(PbzError) as ctx:
+                            checks.snapshot(self.ws, None, action, "empty_snap", empty_spec)
+                        self.assertEqual(ctx.exception.code, "BAD_REQUEST")
+                        self.assertIn("queries must not be empty", str(ctx.exception))
+            mock_spend.assert_not_called()
+            mock_engine.assert_not_called()
+            self.assertFalse((self.snaps / "specs" / "empty_snap.json").exists())
+            self.assertFalse((self.snaps / "results" / "empty_snap.json").exists())
+
+    def test_engine_refuses_empty_queries_in_save_and_compare(self):
+        # Direct engine call with empty queries must return BAD_REQUEST
+        for verb in ("snapshot-save", "snapshot-compare"):
+            res = checks.engine_call(verb, {
+                "private_dir": self.ws.private,
+                "port": 9999,
+                "name": "empty_queries",
+                "queries": [],
+            })
+            self.assertFalse(res.get("ok"))
+            self.assertEqual(res.get("class"), "BAD_REQUEST")
+
 
 if __name__ == "__main__":
     unittest.main()
