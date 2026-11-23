@@ -6,6 +6,8 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- `pbz revert` takes the project transaction lock, refuses pending recovery, and preserves external object saves made during planning.
+
 - `pbz pull --rebase` preserves mirror deletions and reports upstream changes as conflicts without advancing their manifest or base.
 
 - Recovery preserves external saves made between its two rollback passes and keeps the transaction pending as a recovery conflict.

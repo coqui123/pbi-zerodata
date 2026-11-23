@@ -20,6 +20,7 @@ from .common import (PbzError, Project, Workspace, _contained, _reparse_link, an
 
 SKIP_DIRS = {".pbi", "daxqueries", "tmdlscripts", "customvisuals", "node_modules"}  # cultures: mirrored, see tokens
 JSON_EXT = (".json", ".pbir", ".pbism", ".platform")
+_UNREAD = object()
 
 
 def _path_excluded(path: str, root: str) -> bool:
@@ -210,26 +211,35 @@ def _post_mirror_hash(ws, rel: str) -> str | None | object:
 
 
 def mirror_changes(ws: Workspace, project: Project, man: dict, *, checked: bool = False) -> dict:
+    return _mirror_changes_observed(ws, project, man, checked=checked)[0]
+
+
+def _mirror_changes_observed(ws: Workspace, project: Project, man: dict, *, checked: bool = False) -> tuple[dict, dict[str, bytes | None | object]]:
+    """Classify changes and retain the observations that authorized each classification."""
     anchor_mirror(ws)
     files = man.get("files", {})
+    observed = {}
     changed, added, deleted = [], [], []
     prefixes = (project.name + ".SemanticModel/", project.name + ".Report/")
     for rel, info in files.items():
         p = os.path.join(ws.mirror, *rel.split("/"))
         if _path_outside_project(p, rel, ws, project):
+            # This boundary refusal deliberately does not read the target.
+            observed[rel] = _UNREAD
             changed.append(rel)
             continue
         raw = _checked_raw(p, ws.mirror)
+        observed[rel] = raw
         h = hashlib.sha256(raw).hexdigest() if raw is not None else None
         if h is None:
             if not (info.get("mirror") is None and info.get("lossy") is True):
                 deleted.append(rel)
         elif h != info.get("mirror"):
             changed.append(rel)
-    for rel in mirror_texts(ws, project):
+    for rel in _mirror_texts(ws, project, observed):
         if rel not in files:
             added.append(rel)
-    return {"changed": sorted(changed), "added": sorted(added), "deleted": sorted(deleted)}
+    return {"changed": sorted(changed), "added": sorted(added), "deleted": sorted(deleted)}, observed
 
 
 def excluded_mirror_additions(ws: Workspace, project: Project) -> list[str]:
@@ -1371,33 +1381,44 @@ def _prune_empty(path: str, stop: str) -> None:
 def revert(ws: Workspace, project: Project, paths: list[str] | None = None, obj: str | None = None) -> dict:
     """Discard mirror edits: whole files back to the last pulled / pushed text (`paths`, globs allowed), or
     one TMDL object (`obj` = "measure 'Table'[Name]" style: kind, table, name) back to its base block."""
-    man = load_manifest(ws, project)
-    if not man:
-        raise PbzError("NO_MIRROR", "run `pbz pull` first")
-    bdir = base_dir(ws, project)
-    if obj:
-        return _revert_object(ws, project, bdir, obj)
-    ch, _held = _select(mirror_changes(ws, project, man), paths or ["*"])
-    ops, done = [], []
-    readable = []
-    for rel in ch["changed"] + ch["deleted"]:
-        bp = os.path.join(bdir, *rel.split("/"))
-        _must_stay(bp, ws.private)
-        if not os.path.exists(bp):
-            continue
-        readable.append((rel, bp))
-    for rel, bp in readable:
-        _must_stay(bp, ws.private)
-        text, bom = _read_prepared(bp, rel)
-        ops.append(("write", os.path.join(ws.mirror, *rel.split("/")), text, bom))
-        done.append(rel)
-    for rel in ch["added"]:
-        ops.append(("delete", os.path.join(ws.mirror, *rel.split("/"))))
-        done.append(rel)
-    if ops:
-        commit_bytes(ops, root=anchor_mirror(ws))
-    return {"verb": "revert", "project": project.name, "files": sorted(done),
-            "result": "REVERTED" if done else "NOTHING_TO_REVERT"}
+    from .mirror_txn import transaction
+
+    def apply():
+        man = load_manifest(ws, project)
+        if not man:
+            raise PbzError("NO_MIRROR", "run `pbz pull` first")
+        bdir = base_dir(ws, project)
+        if obj:
+            return _revert_object(ws, project, bdir, obj)
+        changes, observed = _mirror_changes_observed(ws, project, man)
+        ch, _held = _select(changes, paths or ["*"])
+        for rel in ch["changed"] + ch["deleted"] + ch["added"]:
+            if observed[rel] is _UNREAD:
+                raise PbzError("RECOVERY_REQUIRED", f"{rel}: not inspected")
+        expected = {os.path.join(ws.mirror, *rel.split("/")): observed[rel]
+                    for rel in ch["changed"] + ch["deleted"] + ch["added"]}
+        ops, done = [], []
+        readable = []
+        for rel in ch["changed"] + ch["deleted"]:
+            bp = os.path.join(bdir, *rel.split("/"))
+            _must_stay(bp, ws.private)
+            if not os.path.exists(bp):
+                continue
+            readable.append((rel, bp))
+        for rel, bp in readable:
+            _must_stay(bp, ws.private)
+            text, bom = _read_prepared(bp, rel)
+            ops.append(("write", os.path.join(ws.mirror, *rel.split("/")), text, bom))
+            done.append(rel)
+        for rel in ch["added"]:
+            ops.append(("delete", os.path.join(ws.mirror, *rel.split("/"))))
+            done.append(rel)
+        if ops:
+            commit_bytes(ops, root=anchor_mirror(ws), expected=expected)
+        return {"verb": "revert", "project": project.name, "files": sorted(done),
+                "result": "REVERTED" if done else "NOTHING_TO_REVERT"}
+
+    return transaction(ws.mirror, apply, ws=ws, project=project)
 
 
 def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict:
@@ -1444,8 +1465,11 @@ def _revert_object(ws: Workspace, project: Project, bdir: str, obj: str) -> dict
         _brel, bdoc, bn = base
         new = apply_block(doc.text, tmdl.block_span(doc, n), bdoc.text[slice(*tmdl.block_span(bdoc, bn))])
     path = os.path.join(mdef, *rel.split("/"))
-    _text, bom = read_mirror_text(path, root=ws.mirror)
-    commit_bytes([("write", path, new, bom)], root=anchor_mirror(ws))
+    text, bom = read_mirror_text(path, root=ws.mirror)
+    if text != doc.text:
+        raise PbzError("RECOVERY_REQUIRED", "file changed before apply")
+    commit_bytes([("write", path, new, bom)], root=anchor_mirror(ws),
+                 expected={path: bom + doc.text.encode("utf-8")})
     return {"verb": "revert", "project": project.name, "object": f"{kind} {table}[{name}]",
             "result": "REVERTED", "files": [f"{project.name}.SemanticModel/definition/{rel}"]}
 
@@ -1467,6 +1491,10 @@ def history_dir(ws: Workspace, project: Project) -> str:
 
 def mirror_texts(ws: Workspace, project: Project) -> dict[str, str]:
     """{mirror-relative path: text} of the project's current mirror files (sanitized)."""
+    return _mirror_texts(ws, project)
+
+
+def _mirror_texts(ws: Workspace, project: Project, observed: dict[str, bytes | None | object] | None = None) -> dict[str, str]:
     anchor_mirror(ws)
     out = {}
     def unreadable(_err):
@@ -1501,7 +1529,10 @@ def mirror_texts(ws: Workspace, project: Project) -> dict[str, str]:
                 if _mirrored_name(f):
                     full = os.path.join(cur, f)
                     rel = f"{top}/" + os.path.relpath(full, base).replace("\\", "/")
-                    out[rel] = read_mirror_text(full, root=ws.mirror)[0]
+                    text, bom = read_mirror_text(full, root=ws.mirror)
+                    out[rel] = text
+                    if observed is not None and rel not in observed:
+                        observed[rel] = bom + text.encode("utf-8")
     return out
 
 
