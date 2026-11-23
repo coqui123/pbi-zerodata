@@ -7,7 +7,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 18.8
+    "weight": 18.3
   },
   {
     "id": "guard",
@@ -16,7 +16,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 32.2
+    "weight": 31.6
   },
   {
     "id": "checks",
@@ -34,7 +34,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 2.4
+    "weight": 2.3
   },
   {
     "id": "parity",
@@ -43,7 +43,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 14.2
+    "weight": 13.9
   },
   {
     "id": "bpa",
@@ -52,7 +52,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 4.2
+    "weight": 4.0
   },
   {
     "id": "tools",
@@ -61,7 +61,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 2.3
+    "weight": 1.9
   },
   {
     "id": "refactor",
@@ -70,7 +70,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 10.9
+    "weight": 10.7
   },
   {
     "id": "rename_bindings",
@@ -79,7 +79,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 22.0
+    "weight": 22.2
   },
   {
     "id": "authoring",
@@ -88,7 +88,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 18.6
+    "weight": 18.7
   },
   {
     "id": "selfcontained",
@@ -97,7 +97,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.6
+    "weight": 0.7
   },
   {
     "id": "governance",
@@ -106,7 +106,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 30.1
+    "weight": 22.5
   },
   {
     "id": "mcp",
@@ -115,7 +115,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 19.3
+    "weight": 20.7
   },
   {
     "id": "synth",
@@ -124,7 +124,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 5.5
+    "weight": 5.0
   },
   {
     "id": "consumers",
@@ -133,7 +133,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 4.8
+    "weight": 3.8
   },
   {
     "id": "visuals",
@@ -142,7 +142,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 11.8
+    "weight": 8.6
   },
   {
     "id": "style",
@@ -151,7 +151,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 7.1
+    "weight": 5.5
   },
   {
     "id": "reportedit",
@@ -160,7 +160,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 6.8
+    "weight": 10.4
   },
   {
     "id": "synthtest",
@@ -178,7 +178,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 3.3
+    "weight": 3.2
   },
   {
     "id": "modeling",
@@ -187,7 +187,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 12.5
+    "weight": 16.5
   },
   {
     "id": "workflow",
@@ -196,7 +196,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 10.6
+    "weight": 11.1
   },
   {
     "id": "components",
@@ -205,7 +205,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 35.0
+    "weight": 34.4
   },
   {
     "id": "a11y",
@@ -214,7 +214,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 6.9
+    "weight": 4.9
   },
   {
     "id": "synthedge",
@@ -223,7 +223,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 4.8
+    "weight": 4.6
   },
   {
     "id": "audit",
@@ -232,7 +232,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 3.9
+    "weight": 4.0
   },
   {
     "id": "consolidate",
@@ -241,7 +241,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 29.2
+    "weight": 28.8
   },
   {
     "id": "consolidate_atomic",
@@ -259,7 +259,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 6.4
+    "weight": 5.6
   },
   {
     "id": "images",
@@ -268,7 +268,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 8.3
+    "weight": 11.1
   },
   {
     "id": "improvement_core",
@@ -277,7 +277,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 1.1
+    "weight": 1.2
   },
   {
     "id": "desktop_evidence",
@@ -304,7 +304,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.7
+    "weight": 0.5
   },
   {
     "id": "consent",
@@ -322,7 +322,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.3
+    "weight": 0.4
   },
   {
     "id": "disclosure_gate",
@@ -331,7 +331,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 1.0
+    "weight": 1.1
   },
   {
     "id": "atomic_refactor",
@@ -340,7 +340,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.5
+    "weight": 0.6
   },
   {
     "id": "usage",
@@ -358,7 +358,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.8
+    "weight": 1.1
   },
   {
     "id": "governance_atomic",
@@ -376,7 +376,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 1.6
+    "weight": 1.7
   },
   {
     "id": "repair_props_atomic",
@@ -439,7 +439,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.5
+    "weight": 0.6
   },
   {
     "id": "images_atomic",
@@ -448,7 +448,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.6
+    "weight": 0.4
   },
   {
     "id": "edit_dryrun",
@@ -475,7 +475,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.6
+    "weight": 0.8
   },
   {
     "id": "recipe_rollback",
@@ -538,7 +538,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.4
+    "weight": 0.3
   },
   {
     "id": "consumers_atomic",
@@ -547,7 +547,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 3.5
+    "weight": 3.6
   },
   {
     "id": "synth_atomic",
@@ -556,7 +556,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 21.8
+    "weight": 22.6
   },
   {
     "id": "handoff_atomic",
@@ -592,7 +592,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 3.0
+    "weight": 3.1
   },
   {
     "id": "outcomes_mapping",
@@ -601,7 +601,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 5.2
+    "weight": 6.2
   },
   {
     "id": "revert_atomic",
@@ -610,7 +610,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 3.5
+    "weight": 13.8
   },
   {
     "id": "bpafix_atomic",
@@ -619,7 +619,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 1.7
+    "weight": 2.1
   },
   {
     "id": "pull_refusal",
@@ -628,7 +628,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 16.6
+    "weight": 15.6
   },
   {
     "id": "mirror_recovery_honesty",
@@ -637,7 +637,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 17.7
+    "weight": 28.1
   },
   {
     "id": "push_boundary_honesty",
@@ -646,7 +646,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 24.1
+    "weight": 17.1
   },
   {
     "id": "history_honesty",
@@ -655,7 +655,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 4.3
+    "weight": 3.9
   },
   {
     "id": "synthtest_atomic",
@@ -664,7 +664,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 1.9
+    "weight": 2.7
   },
   {
     "id": "memory_disclosure",
@@ -673,7 +673,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 12.3
+    "weight": 9.3
   },
   {
     "id": "docs_changelog",
@@ -682,7 +682,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 1.2
+    "weight": 0.9
   },
   {
     "id": "ci_registration",
@@ -691,7 +691,7 @@
     ],
     "windows": false,
     "engine": false,
-    "weight": 13.9
+    "weight": 14.3
   },
   {
     "id": "policy_atomic",
@@ -709,7 +709,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 3.5
+    "weight": 3.8
   },
   {
     "id": "mirror_writers_root",
@@ -727,7 +727,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 2.9
+    "weight": 3.1
   },
   {
     "id": "requirements_honesty",
@@ -736,7 +736,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 1.1
+    "weight": 1.0
   },
   {
     "id": "evidence",
@@ -745,7 +745,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 4.0
+    "weight": 4.4
   },
   {
     "id": "evidence_honesty",
@@ -754,7 +754,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 1.4
+    "weight": 1.3
   },
   {
     "id": "synthtest_state_paths",
@@ -763,7 +763,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.2
+    "weight": 0.3
   },
   {
     "id": "policy_failclosed",
@@ -781,7 +781,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.5
+    "weight": 0.6
   },
   {
     "id": "recipe_paths",
@@ -790,7 +790,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.4
+    "weight": 0.3
   },
   {
     "id": "mirror_reader_links",
@@ -799,7 +799,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 17.9
+    "weight": 19.2
   },
   {
     "id": "interactions_static",
@@ -808,7 +808,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 11.9
+    "weight": 11.5
   },
   {
     "id": "interactions_boundary",
@@ -817,7 +817,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 1.7
+    "weight": 2.4
   },
   {
     "id": "guard_protected_mutations",
@@ -853,7 +853,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 2.4
+    "weight": 2.3
   },
   {
     "id": "contract_verbs",
@@ -871,7 +871,7 @@
     ],
     "windows": true,
     "engine": false,
-    "weight": 7.5
+    "weight": 10.7
   },
   {
     "id": "plan_cli",
@@ -880,7 +880,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 7.7
+    "weight": 9.1
   },
   {
     "id": "followup_graph",
@@ -907,7 +907,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.4
+    "weight": 0.3
   },
   {
     "id": "followup_author",
@@ -916,7 +916,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 0.3
+    "weight": 0.4
   },
   {
     "id": "engine-offline",
@@ -926,7 +926,7 @@
     ],
     "windows": true,
     "engine": true,
-    "weight": 56.1
+    "weight": 58.2
   },
   {
     "id": "skip_capture",
@@ -935,7 +935,7 @@
     ],
     "windows": false,
     "engine": false,
-    "weight": 0.9
+    "weight": 0.8
   },
   {
     "id": "rewrite_qualify",
@@ -944,7 +944,7 @@
     ],
     "windows": false,
     "engine": false,
-    "weight": 2.9
+    "weight": 2.8
   },
   {
     "id": "rewrite_scopes",
@@ -971,7 +971,7 @@
     ],
     "windows": false,
     "engine": false,
-    "weight": 0.4
+    "weight": 0.3
   },
   {
     "id": "similar_scope",
@@ -980,7 +980,7 @@
     ],
     "windows": false,
     "engine": false,
-    "weight": 9.8
+    "weight": 12.6
   },
   {
     "id": "dax_binding_alignment",
@@ -989,7 +989,7 @@
     ],
     "windows": false,
     "engine": false,
-    "weight": 0.6
+    "weight": 0.7
   },
   {
     "id": "withheld_files",
@@ -997,7 +997,8 @@
       "tests/test_withheld_files.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 1.3
   },
   {
     "id": "rebase_deletes",
@@ -1005,7 +1006,8 @@
       "tests/test_rebase_deletes.py"
     ],
     "windows": false,
-    "engine": false
+    "engine": false,
+    "weight": 4.5
   },
   {
     "id": "ci_weights",
