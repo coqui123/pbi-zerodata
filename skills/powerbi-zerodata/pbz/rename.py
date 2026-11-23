@@ -1314,6 +1314,32 @@ def _measure_expression_edits(root, model, kind, home, old, new):
                 if sub:
                     edits.append((expr.start, expr.end,
                                   json.dumps(apply_edits(expr.value, sub), ensure_ascii=False)))
+            refs = m.get("references")
+            if refs is not None and kind in ("measure", "table"):
+                # Dependency records follow the expression: an object
+                # with entity and name and no schema string denotes a
+                # model measure (the consolidate merge rewrites the
+                # same records); a schema-bearing record denotes an
+                # extension measure and is left alone.
+                stack = [refs]
+                while stack:
+                    node = stack.pop()
+                    if isinstance(node, pbir.JArr):
+                        stack.extend(node.items)
+                    elif isinstance(node, pbir.JObj):
+                        ent = node.get("entity")
+                        name = node.get("name")
+                        schema = node.get("schema")
+                        if isinstance(ent, pbir.JStr) and isinstance(name, pbir.JStr) \
+                                and not isinstance(schema, pbir.JStr):
+                            if kind == "table" and _fold(ent.value) == _fold(old):
+                                edits.append((ent.start, ent.end,
+                                              json.dumps(new, ensure_ascii=False)))
+                            elif kind == "measure" and _fold(ent.value) == _fold(home) \
+                                    and _fold(name.value) == _fold(old):
+                                edits.append((name.start, name.end,
+                                              json.dumps(new, ensure_ascii=False)))
+                        stack.extend(v for _k, v in node.pairs)
     return edits
 
 

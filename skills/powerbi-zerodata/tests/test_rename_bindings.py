@@ -1878,6 +1878,36 @@ class RenameBindingsTests(unittest.TestCase):
         got = json.loads(path.read_text())["refs"][0]["queryRef"]
         self.assertEqual(got, "Sum(Sales.Amount)")
 
+    def _references_project(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tmeasure Net = 1\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "UseNet", "expression": "Sales[Net]",
+                 "references": {"measures": [{"entity": "Sales", "name": "Net"},
+                                             {"entity": "Sales", "name": "Net", "schema": "extension"}]}}]}]}))
+        return ws, project, ext_path
+
+    def test_measure_rename_references_record_follows(self):
+        ws, project, ext_path = self._references_project()
+        rename.rename(ws, project, "measure", "Net", "Margin")
+        ent = json.loads(ext_path.read_text())["entities"][0]["measures"][0]
+        self.assertEqual(ent["expression"], "Sales[Margin]")
+        recs = ent["references"]["measures"]
+        self.assertEqual(recs[0]["name"], "Margin")
+        self.assertEqual(recs[1]["name"], "Net")
+
+    def test_table_rename_references_record_entity_follows(self):
+        ws, project, ext_path = self._references_project()
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        recs = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["references"]["measures"]
+        self.assertEqual(recs[0]["entity"], "Revenue")
+        self.assertEqual(recs[1]["entity"], "Sales")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
