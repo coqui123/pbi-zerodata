@@ -1768,6 +1768,17 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
         self.assertEqual(m, expr)
 
+    def test_table_rename_nested_entities_array_untouched(self):
+        doc = {"payload": {"entities": [{"name": "Sales", "measures": [
+            {"name": "Local", "expression": "1"},
+            {"name": "UseLocal", "expression": "Sales[Local]"}]}]}}
+        ws, project, mdef, path = self._report_project(doc)
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        got = json.loads(path.read_text())
+        ent = got["payload"]["entities"][0]
+        self.assertEqual(ent["name"], "Sales")
+        self.assertEqual(ent["measures"][1]["expression"], "Sales[Local]")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

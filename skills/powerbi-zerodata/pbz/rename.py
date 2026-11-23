@@ -1213,25 +1213,17 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
 
 def _measure_expression_edits(root, model, kind, home, old, new):
     """Span edits for the DAX expression strings of report-extension
-    measures. Only direct measure entries of an entities array (the
-    reportExtensions.json shape) qualify; a name and expression object
-    anywhere else is not a measure and is never edited."""
+    measures. Only direct measure entries of the document's root
+    entities array (the reportExtensions.json shape, the same
+    traversal that renames the entity declarations) qualify; a name
+    and expression object anywhere else is not a measure and is
+    never edited."""
     edits = []
     entities = []
-
-    def find_entities(node):
-        if isinstance(node, pbir.JArr):
-            for v in node.items:
-                find_entities(v)
-            return
-        if not isinstance(node, pbir.JObj):
-            return
-        for k, v in node.pairs:
-            if k.value == "entities" and isinstance(v, pbir.JArr):
-                entities.extend(item for item in v.items if isinstance(item, pbir.JObj))
-            find_entities(v)
-
-    find_entities(root)
+    if isinstance(root, pbir.JObj):
+        ents = root.get("entities")
+        if isinstance(ents, pbir.JArr):
+            entities.extend(item for item in ents.items if isinstance(item, pbir.JObj))
     ext_measures = {}
     for ent in entities:
         nm = ent.get("name")
