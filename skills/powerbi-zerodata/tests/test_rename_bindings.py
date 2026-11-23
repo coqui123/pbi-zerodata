@@ -1943,6 +1943,32 @@ class RenameBindingsTests(unittest.TestCase):
         with self.assertRaises(PbzError):
             rename._extension_entities(project.mirror_report)
 
+    def test_extension_inventory_definition_link_refused(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        d = Path(project.mirror_report, "definition")
+        shutil.rmtree(d)
+        try:
+            d.symlink_to(Path(tempfile.mkdtemp()), target_is_directory=True)
+        except OSError:
+            return  # Windows may not grant symlink creation.
+        with self.assertRaises(PbzError) as ctx:
+            rename._extension_entities(project.mirror_report)
+        self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+
+    def test_extension_inventory_dangling_report_link_refused(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        rd = Path(project.mirror_report)
+        shutil.rmtree(rd)
+        try:
+            rd.symlink_to(Path(tempfile.mkdtemp()) / "missing-target", target_is_directory=True)
+        except OSError:
+            return  # Windows may not grant symlink creation.
+        with self.assertRaises(PbzError) as ctx:
+            rename._extension_entities(str(rd))
+        self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

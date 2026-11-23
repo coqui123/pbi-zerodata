@@ -8,7 +8,7 @@ import re
 import unicodedata
 
 from . import deps, lexers, mirror, pbir, tmdl
-from .common import PbzError, commit_bytes
+from .common import PbzError, commit_bytes, refuse_below
 from .tokens import apply_edits
 
 
@@ -700,6 +700,11 @@ def _single_wrapped(value):
 def _extension_entities(report_dir):
     """(entity name, [measure names]) pairs from reportExtensions.json."""
     path = os.path.join(report_dir, "definition", "reportExtensions.json")
+    # Validate the ancestor chain against the mirror root before any
+    # early return: a link on the report directory or on definition
+    # refuses even when the inventory file itself is absent, so an
+    # escaping path is never mistaken for a genuinely absent one.
+    refuse_below(path, os.path.dirname(report_dir))
     parent = os.path.dirname(path)
     if not os.path.lexists(parent):
         return []
