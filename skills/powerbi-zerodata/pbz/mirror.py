@@ -922,8 +922,6 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or _reparse_link(guard)
                 or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-        if info.st_size == 0:
-            os.write(guard_fd, b"\0")
         os.lseek(guard_fd, 0, os.SEEK_SET)
         try:
             if os.name == "nt":
@@ -934,6 +932,9 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
                 fcntl.flock(guard_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return {"verb": "recover", "result": "COMMIT_BUSY"}
+        if info.st_size == 0:
+            os.write(guard_fd, b"\0")
+            os.lseek(guard_fd, 0, os.SEEK_SET)
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
