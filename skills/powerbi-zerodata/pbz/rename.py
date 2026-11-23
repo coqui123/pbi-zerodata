@@ -1168,6 +1168,14 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
         for a, z in mask_spans:
             chars[a:z] = "1" * (z - a)
         bindings = deps.dax_bindings("".join(chars), cur, res).bindings
+        # A masked span touching an identifier character glues into a
+        # single phantom token (RETURN'B'[M] masks to RETURN111111);
+        # a binding that partially overlaps a mask span is that glue,
+        # never a real reference, so it is dropped.
+        bindings = [b for b in bindings
+                    if not any(b.start < z and b.end > a
+                               and not (a <= b.start and b.end <= z)
+                               for a, z in mask_spans)]
     else:
         bindings = raw_bindings
     if kind == "table":
