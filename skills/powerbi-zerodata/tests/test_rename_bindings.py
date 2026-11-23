@@ -1647,6 +1647,23 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
         self.assertEqual(m, "COUNTROWS(DATATABLE(\"K\", DECIMAL, {{1}})) + COUNTROWS('Archive')")
 
+    def test_column_rename_extension_ref_does_not_poison_row_inference(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn SortKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Decoy.tmdl"),
+               "table Decoy\n\tcolumn Limit\n\t\tdataType: int64\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Limit", "expression": "3"}]},
+            {"name": "Decoy", "measures": [
+                {"name": "M", "expression": "SUMX(TOPN(Budget [Limit], Sales, Sales[SortKey]), [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][1]["measures"][0]["expression"]
+        self.assertEqual(m, "SUMX(TOPN(Budget [Limit], Sales, Sales[SortKey]), [Net])")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
