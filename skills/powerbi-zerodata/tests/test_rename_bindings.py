@@ -1664,6 +1664,35 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][1]["measures"][0]["expression"]
         self.assertEqual(m, "SUMX(TOPN(Budget [Limit], Sales, Sales[SortKey]), [Net])")
 
+    def test_bare_extension_measure_does_not_poison_row_inference(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn SortKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Decoy.tmdl"),
+               "table Decoy\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn Limit\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Limit", "expression": "3"},
+                                            {"name": "M", "expression": "SUMX(TOPN([Limit], Sales, Sales[SortKey]), [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Decoy")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, "SUMX(TOPN([Limit], Sales, Sales[SortKey]), [Amount])")
+
+    def test_anchor_in_select_name_counts_for_bare_native_query_ref(self):
+        ws, project, mdef, path = self._report_project({
+            "Select": [{"Name": "Sales.Amount", "Expression": "Sales[Amount]"}],
+            "projections": [{"nativeQueryRef": "Amount"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn Amount\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        self.assertEqual(json.loads(path.read_text())["projections"][0]["nativeQueryRef"], "Net")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

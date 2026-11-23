@@ -731,7 +731,20 @@ def _doc_anchored(root, kind, home, old):
     if kind == "table":
         return True
     target = _fold(f"{home}.{old}")
-    return any(_fold(v) == target for _p, v in _report_strings(root))
+
+    def walk(node):
+        # Every string in the document counts, under any key: a semantic
+        # query stores the qualified path in a Select entry's Name, not
+        # only in the reference keys.
+        if isinstance(node, pbir.JStr):
+            return _fold(node.value) == target
+        if isinstance(node, pbir.JObj):
+            return any(walk(v) for _k, v in node.pairs)
+        if isinstance(node, pbir.JArr):
+            return any(walk(v) for v in node.items)
+        return False
+
+    return walk(root)
 
 
 def _report_string_rename(key, value, kind, home, old, new, field=None, model=None,
@@ -1047,14 +1060,15 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
                 raise PbzError("AMBIGUOUS",
                                f"a variable named {new} is defined in a report expression; nothing renamed")
     res = deps.Resolver(model)
-    if kind == "column" and _fold(old) in ext_names:
-        # An extension measure bears the target's name, so a bare reference
-        # denotes that measure under DAX rules, never the model column.
-        # Remove the resolver's unique-column fallback for this name so the
-        # binding surfaces as unresolved instead of a firm column binding;
-        # row-context and home bindings do not use that index.
-        res.by_column.pop(old.lower(), None)
-        res.by_column.pop(_fold(old), None)
+    if ext_names:
+        # A bare reference bearing an extension measure's name can denote
+        # that measure, so the resolver's unique-column fallback must not
+        # fire for any such name: the binding surfaces as unresolved
+        # instead of a firm column binding, and it cannot steer the
+        # resolver's row-table inference. Row-context and home bindings
+        # do not use that index.
+        for key in [k for k in res.by_column if _fold(k) in ext_names]:
+            res.by_column.pop(key, None)
 
     def _qualifier_entity(binding):
         if not binding.qualifier:
