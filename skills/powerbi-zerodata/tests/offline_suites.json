@@ -881,5 +881,13 @@
     ],
     "windows": false,
     "engine": false
+  },
+  {
+    "id": "withheld_files",
+    "argv": [
+      "tests/test_withheld_files.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]

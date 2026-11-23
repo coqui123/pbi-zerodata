@@ -222,7 +222,8 @@ def mirror_changes(ws: Workspace, project: Project, man: dict, *, checked: bool 
         raw = _checked_raw(p, ws.mirror)
         h = hashlib.sha256(raw).hexdigest() if raw is not None else None
         if h is None:
-            deleted.append(rel)
+            if not (info.get("mirror") is None and info.get("lossy") is True):
+                deleted.append(rel)
         elif h != info.get("mirror"):
             changed.append(rel)
     for rel in mirror_texts(ws, project):
