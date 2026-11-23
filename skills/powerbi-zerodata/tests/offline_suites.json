@@ -873,5 +873,13 @@
     ],
     "windows": false,
     "engine": false
+  },
+  {
+    "id": "dax_binding_alignment",
+    "argv": [
+      "tests/test_dax_binding_alignment.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]
