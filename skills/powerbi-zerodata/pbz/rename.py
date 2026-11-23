@@ -1234,7 +1234,9 @@ def _measure_expression_edits(root, model, kind, home, old, new):
                 mn = m.get("name") if isinstance(m, pbir.JObj) else None
                 if isinstance(mn, pbir.JStr):
                     names.add(_fold(mn.value))
-            ext_measures[_fold(nm.value)] = names
+            # Duplicate entries for one entity union their measure
+            # sets; a later entry never replaces an earlier one.
+            ext_measures.setdefault(_fold(nm.value), set()).update(names)
     for ent in entities:
         nm = ent.get("name")
         measures = ent.get("measures")

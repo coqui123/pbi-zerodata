@@ -1790,6 +1790,17 @@ class RenameBindingsTests(unittest.TestCase):
         self.assertEqual(ent["name"], "Sales")
         self.assertEqual(ent["measures"][1]["expression"], "Sales[Local]")
 
+    def test_column_rename_duplicate_entity_entries_union(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [{"name": "Amount", "expression": "1"}]},
+            {"name": "Budget", "measures": [{"name": "Forecast", "expression": "2"}]},
+            {"name": "Sales", "measures": [{"name": "UseIt", "expression": "Budget [Amount]"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][2]["measures"][0]["expression"]
+        self.assertEqual(m, "Budget [Amount]")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
