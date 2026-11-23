@@ -52,10 +52,14 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(b.ref, deps.Ref("column", "Sales", "Price"))
         self.assertTrue(b.uncertain)
 
-    def test_e2_explicit_source_is_product_and_canon_stays_uncertain(self):
+    def test_e2_keeps_home_ref_but_is_uncertain(self):
+        # Council round 2 revised the round 1 Product outcome: the existing
+        # similar_scope poison pairs pin this shape to the home ref with an
+        # uncertain flag, and the brief requires only that no editor acts on
+        # an occurrence whose owner cannot be established.
         b = self.price(E2)
-        self.assertEqual(b.ref, deps.Ref("column", "Product", "Price"))
-        self.assertFalse(b.uncertain)
+        self.assertEqual(b.ref, deps.Ref("column", "Sales", "Price"))
+        self.assertTrue(b.uncertain)
         self.assertTrue(similar.canon(E2, "Sales", self.res).uncertain)
 
     def test_qualify_no_ops(self):
@@ -95,21 +99,27 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(b.ref, deps.Ref("measure", "Sales", "Total Sales"))
         self.assertFalse(b.uncertain)
 
-    def test_narrowed_and_composite_sources_do_not_certify_whole_tables(self):
-        for source in (
-            "VALUES(Sales[Qty])", "ALL(Sales[Qty])",
-            'SELECTCOLUMNS(Sales, "P", Sales[Price])',
-            'CROSSJOIN(VALUES(Sales[Qty]), VALUES(Product[Price]))',
-            "SUMMARIZE(Sales, Sales[Qty])", "TREATAS(VALUES(Product[Price]), Sales[Qty])",
-            "UNION(Sales, Sales)", "GENERATE(Sales, Product)",
+    def test_composite_sources_keep_base_binding_decisions(self):
+        # Composite and projected source provenance is canon's domain (the
+        # similar_scope controls depend on it); deps decisions for sources in
+        # the table-operand position stay exactly at their base values.
+        for source, table in (
+            ("VALUES(Sales[Qty])", "Sales"), ("ALL(Sales[Qty])", "Sales"),
+            ('SELECTCOLUMNS(Sales, "P", Sales[Price])', "Sales"),
+            ('CROSSJOIN(VALUES(Sales[Qty]), VALUES(Product[Price]))', "Sales"),
+            ("SUMMARIZE(Sales, Sales[Qty])", "Sales"),
+            ("TREATAS(VALUES(Product[Price]), Sales[Qty])", "Product"),
+            ("UNION(Sales, Sales)", "Sales"), ("GENERATE(Sales, Product)", "Sales"),
         ):
             with self.subTest(source=source):
-                self.assertTrue(self.price(f"SUMX({source}, [Price])").uncertain)
+                b = self.price(f"SUMX({source}, [Price])")
+                self.assertEqual(b.ref, deps.Ref("column", table, "Price"))
+                self.assertFalse(b.uncertain)
 
     def test_parentheses_preserve_source_argument_role(self):
         b = self.price("SUMX(TOPN((Sales[Qty]), (Product)), [Price])")
-        self.assertEqual(b.ref.table, "Product")
-        self.assertFalse(b.uncertain)
+        self.assertEqual(b.ref, deps.Ref("column", "Sales", "Price"))
+        self.assertTrue(b.uncertain)
         expr = "VAR v = Product RETURN SUMX(FILTER((v), (Sales[Qty] > 0)), [Price])"
         self.assertTrue(self.price(expr).uncertain)
 
@@ -119,6 +129,45 @@ class BindingTests(unittest.TestCase):
         b = deps.dax_bindings(expr, "Sales", self.res).bindings[-1]
         self.assertEqual(b.ref.kind, "measure")
         self.assertTrue(b.uncertain)
+
+    def test_nested_predicate_and_orderby_refs_do_not_teach(self):
+        # Council round 2 (Neon): a table ref nested inside a predicate
+        # function and a column ref in a TOPN order-by argument are the same
+        # leak species as the brief's scalar witnesses.
+        b = self.price("VAR v = Product RETURN SUMX(FILTER(v, NOT ISEMPTY(Sales)), [Price])")
+        self.assertEqual(b.ref, deps.Ref("column", "Sales", "Price"))
+        self.assertTrue(b.uncertain)
+        b = self.price("VAR v = Product RETURN SUMX(TOPN(5, v, Sales[Price]), [Price])")
+        self.assertEqual(b.ref, deps.Ref("column", "Sales", "Price"))
+        self.assertTrue(b.uncertain)
+
+    def test_extension_fallback_under_unknown_frame_is_uncertain(self):
+        expr = 'VAR t = ADDCOLUMNS(Sales, "Amt", 1) RETURN SUMX(t, [Amt])'
+        b = deps.dax_bindings(expr, "Sales", self.res).bindings[-1]
+        self.assertEqual(b.ref.kind, "extension")
+        self.assertTrue(b.uncertain)
+
+    def test_index_omitted_relation_is_conservative(self):
+        # Whether an omitted INDEX relation is defined by its ORDERBY
+        # columns is engine semantics pbz does not prove; fail closed.
+        b = self.price("MAXX(INDEX(1, , ORDERBY(Product[Price], DESC)), [Price])")
+        self.assertEqual(b.ref, deps.Ref("column", "Sales", "Price"))
+        self.assertTrue(b.uncertain)
+
+    def test_direct_filter_table_keeps_pinned_decision(self):
+        # The similar_scope CalcA poison pair pins a bare table ref used
+        # directly as a CALCULATETABLE filter argument as the frame's
+        # teacher; canon marks the pair uncertain and merge refuses it.
+        # Recorded as a deferred residual in the item report.
+        texts_with_other = dict(texts())
+        texts_with_other["tables/Other.tmdl"] = (
+            "table Other\n\n\tcolumn Price\n\t\tdataType: int64\n")
+        res = deps.Resolver(tmdl.load_model("", texts=texts_with_other))
+        expr = "SUMX(CALCULATETABLE({ 1, 2 }, Other), [Price])"
+        b = [x for x in deps.dax_bindings(expr, "Sales", res).bindings
+             if expr[x.start:x.end] == "[Price]" and x.qualifier is None][-1]
+        self.assertEqual(b.ref, deps.Ref("column", "Other", "Price"))
+        self.assertFalse(b.uncertain)
 
 
 class PublicTests(unittest.TestCase):
