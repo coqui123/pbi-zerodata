@@ -1633,6 +1633,20 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
         self.assertEqual(m, "COUNTROWS(DATATABLE(\"K\", TEXT, {{\"x\"}})) + COUNTROWS('Archive')")
 
+    def test_table_rename_datatable_decimal_alias_untouched(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Decimal.tmdl"),
+               "table Decimal\n\tcolumn Code\n\t\tdataType: string\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Budget", "measures": [
+                {"name": "M", "expression": "COUNTROWS(DATATABLE(\"K\", DECIMAL, {{1}})) + COUNTROWS('Decimal')"}]}]}))
+        rename.rename(ws, project, "table", "Decimal", "Archive")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
+        self.assertEqual(m, "COUNTROWS(DATATABLE(\"K\", DECIMAL, {{1}})) + COUNTROWS('Archive')")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

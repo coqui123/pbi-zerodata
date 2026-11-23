@@ -1015,7 +1015,7 @@ def _pvs_property_node(node):
 _DAX_KEYWORDS = {_fold(w) for w in (
     "abs", "anchored", "and", "asc", "blanks", "boolean", "both", "break",
     "by",
-    "column", "currency", "datetime", "day", "default", "define",
+    "column", "currency", "datetime", "day", "decimal", "default", "define",
     "densify", "dense", "desc", "double", "else", "endaligned", "evaluate",
     "extending", "false",
     "first", "group", "hour", "in", "index", "int64", "integer", "last",
