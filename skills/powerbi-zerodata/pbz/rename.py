@@ -1022,6 +1022,13 @@ def _extension_entities(report_dir):
     # escaping path is never mistaken for a genuinely absent one.
     refuse_below(path, os.path.dirname(report_dir))
     parent = os.path.dirname(path)
+    # An existing ancestor that is not a directory is a broken path,
+    # never an absent inventory. Check it directly: on some platforms
+    # lstat of a path through a regular file reports not-found, which
+    # the absent() probe below would mistake for a missing component.
+    for anc in (report_dir, parent):
+        if os.path.lexists(anc) and not os.path.isdir(anc):
+            raise PbzError("UNSAFE_PATH", anc)
 
     def absent(p):
         # Genuinely absent means the lookup fails only because a

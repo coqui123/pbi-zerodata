@@ -204,15 +204,19 @@ def _report_area(file_kind: str, path: tuple) -> str:
     return {"sort": "sorts", "formatting": "conditional_formatting"}.get(via, "other_report")
 
 
-def _retarget_dax(expr: str, d, t, res) -> tuple[str, int]:
+def _retarget_dax(expr: str, d, t, res) -> tuple[str, int, bool]:
     """A DAX string with every reference to measure d pointing at measure t (requalified when the
-    tables differ). Returns (new text, references rewritten)."""
+    tables differ). Returns (new text, references rewritten, any edit emitted). The count filters
+    out no-op replacements (a binding whose name is fold-equal to the duplicate's, Greek final
+    sigma being the known shape, still emits [Aσ] for [Aσ]); the emitted flag keeps the caller's
+    reserialization decision exactly what it was when the count was the raw edit count."""
     text = expr
     edits = rename.dax_ref_edits(text, 0, len(text), "measure", d.table, d.name, t.name, cur=d.table, res=res)
-    count = len(edits)
+    count = sum(1 for s, e, r in edits if text[s:e] != r)
+    emitted = len(edits) > 0
     if d.table.lower() != t.table.lower():
         edits += move.dax_qualifier_edits(text, 0, len(text), d.name, d.table, t.table)
-    return apply_edits(text, edits), count
+    return apply_edits(text, edits), count, emitted
 
 
 def _alias_text(doc, node, target: str) -> str:
@@ -277,12 +281,58 @@ def _report_measure_edits(root, d, t, counts: dict, res) -> list[tuple[int, int,
                 continue
             ex = mm.get("expression")
             if isinstance(ex, pbir.JStr):
-                new, n = _retarget_dax(ex.value, d, t, res)
+                new, n, emitted = _retarget_dax(ex.value, d, t, res)
                 if n:
                     counts["report_measures"] += n
+                if emitted:
                     out.append((ex.start, ex.end, json.dumps(new, ensure_ascii=False)))
             refs(mm.get("references"))
     return out
+
+
+def _planner_expression_rewrites(root, d, t, model) -> int:
+    """References to the duplicate that the rename planner will rewrite in
+    report-extension measure expressions. Counted with the planner's own
+    DAX machinery on the same tree it is about to edit, because its
+    keyword-aware resolution rewrites shapes the raw retarget below
+    resolves differently (spurious qualifiers, keyword-touching brackets).
+    Mirrors the traversal and extension inventory of
+    rename._measure_expression_edits."""
+    entities = []
+    if isinstance(root, pbir.JObj):
+        ents = root.get("entities")
+        if isinstance(ents, pbir.JArr):
+            entities.extend(item for item in ents.items if isinstance(item, pbir.JObj))
+    ext_measures: dict[str, set] = {}
+    for ent in entities:
+        nm = ent.get("name")
+        measures = ent.get("measures")
+        if isinstance(nm, pbir.JStr) and isinstance(measures, pbir.JArr):
+            names = set()
+            for m in measures.items:
+                mn = m.get("name") if isinstance(m, pbir.JObj) else None
+                if isinstance(mn, pbir.JStr):
+                    names.add(rename._fold(mn.value))
+            ext_measures.setdefault(rename._fold(nm.value), set()).update(names)
+    total = 0
+    for ent in entities:
+        nm = ent.get("name")
+        measures = ent.get("measures")
+        if not (isinstance(nm, pbir.JStr) and isinstance(measures, pbir.JArr)):
+            continue
+        for m in measures.items:
+            if not isinstance(m, pbir.JObj):
+                continue
+            mn = m.get("name")
+            expr = m.get("expression")
+            if isinstance(expr, pbir.JStr) and isinstance(mn, pbir.JStr):
+                sub = rename._dax_string_edits(
+                    expr.value, model, "measure", t.table, d.name, t.name,
+                    nm.value, ext_measures)
+                # As in _retarget_dax, a fold-equal replacement rewrites
+                # nothing and is not counted.
+                total += sum(1 for s, e, r in sub if expr.value[s:e] != r)
+    return total
 
 
 def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, force: bool = False,
@@ -406,6 +456,13 @@ def merge(ws, project, dup: str, into: str, keep_alias: bool | None = None, forc
                     if a:
                         text = apply_edits(text, sorted(set(a)))
                         root = pbir.parse_json(text)
+                if fkind == "extensions":
+                    # The rename planner rewrites extension measure
+                    # expressions, so the retarget in c below finds
+                    # those references already gone. Count the planner's
+                    # rewrites here, with its own resolver on the same
+                    # tree; c counts only what it rewrites itself.
+                    counts["report_measures"] += _planner_expression_rewrites(root, d, t, model)
                 b = rename.pbir_ref_edits(root, model, "measure", t.table, d.name, t.name)
                 if b:
                     where = {f.prop_node.start: p for f, p in pbir.walk_fields_with_path(root, model) if f.prop_node is not None}

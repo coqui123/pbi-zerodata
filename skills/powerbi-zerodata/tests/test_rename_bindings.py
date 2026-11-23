@@ -1517,9 +1517,10 @@ class RenameBindingsTests(unittest.TestCase):
         _write(os.path.join(mdef, "tables", "ΟΣ.tmdl"),
                "table 'ΟΣ'\n\tcolumn Amount\n\t\tdataType: int64\n")
         model_path = Path(mdef, "model.tmdl")
-        model_path.write_text(model_path.read_text() + '\nannotation PBI_QueryOrder = ["οσ"]\n')
+        model_path.write_text(model_path.read_text(encoding="utf-8") + '\nannotation PBI_QueryOrder = ["οσ"]\n',
+                              encoding="utf-8")
         rename.rename(ws, project, "table", "ΟΣ", "Revenue")
-        self.assertIn('"Revenue"', model_path.read_text())
+        self.assertIn('"Revenue"', model_path.read_text(encoding="utf-8"))
 
     def test_column_rename_variation_hierarchy_follows(self):
         hl = {"HierarchyLevel": {"Expression": {"Hierarchy": {
@@ -1558,10 +1559,11 @@ class RenameBindingsTests(unittest.TestCase):
                "table Sales\n\tmeasure 'ΟΣ' = 1\n")
         cult = Path(mdef, "cultures", "en-US.tmdl")
         cult.parent.mkdir(parents=True, exist_ok=True)
-        cult.write_text("cultureInfo en-US\n\ttranslations\n\t\ttable Sales\n\t\t\tmeasure 'ΟΣ'\n\t\t\t\tcaption: Sigma\n")
+        cult.write_text("cultureInfo en-US\n\ttranslations\n\t\ttable Sales\n\t\t\tmeasure 'ΟΣ'\n\t\t\t\tcaption: Sigma\n",
+                        encoding="utf-8")
         rename.rename(ws, project, "measure", "οσ", "Total")
-        self.assertNotIn("ΟΣ", cult.read_text())
-        self.assertIn("Total", cult.read_text())
+        self.assertNotIn("ΟΣ", cult.read_text(encoding="utf-8"))
+        self.assertIn("Total", cult.read_text(encoding="utf-8"))
 
     def test_measure_rename_into_extension_measure_refused(self):
         ws, project, mdef, path = self._report_project({"refs": [{"queryRef": "Sales.Net"}]})
@@ -1929,7 +1931,7 @@ class RenameBindingsTests(unittest.TestCase):
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
                "table Sales\n\tcolumn '" + col1 + "'\n\t\tdataType: string\n\tcolumn 'İİİ.X'\n\t\tdataType: string\n")
         rename.rename(ws, project, "table", "Sales", "X")
-        self.assertEqual(json.loads(path.read_text())["refs"][0]["queryRef"], "X.İİİ.X.Y")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["refs"][0]["queryRef"], "X.İİİ.X.Y")
 
     def test_column_rename_destination_extension_spelling_invariant(self):
         for new_name in ("Region.Amount.\u0130", "Region.Amount.i\u0307"):
@@ -2685,7 +2687,7 @@ class RenameBindingsTests(unittest.TestCase):
             ws, project, mdef, path = self._report_project(
                 {"refs": [{"queryRef": f"{wrap}(Sales.Amount)"}]})
             rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
-            got = json.loads(path.read_text())["refs"][0]["queryRef"]
+            got = json.loads(path.read_text(encoding="utf-8"))["refs"][0]["queryRef"]
             self.assertEqual(got, f"{wrap}(Sales.Net)")
 
     def test_nearer_ambiguous_container_stops_field_inheritance(self):
@@ -3289,7 +3291,7 @@ class RenameBindingsTests(unittest.TestCase):
                              'tables/Sales.tmdl': 'table Sales\n\tcolumn Qty\n\tmeasure Dup = 1\n',
                              'tables/Other.tmdl': 'table Other\n\tcolumn Qty\n',
                          })))
-        self.assertEqual(retargeted, ('[Target] + [Qty]', 1))
+        self.assertEqual(retargeted, ('[Target] + [Qty]', 1, True))
         self.assertEqual([b.ref for b in bound], [deps.Ref('column', 'Sales', 'Qty')])
 
 
