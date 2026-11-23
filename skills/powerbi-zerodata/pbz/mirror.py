@@ -367,7 +367,8 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
     with tokens.WorkspaceLock(ws.private):
         tm = tokens.TokenMap(ws.private)
         new_files, lossy, counts = {}, [], {}
-        keep = set(pending["changed"] + pending["added"]) if rebase else set()
+        deleted = set(pending["deleted"]) if rebase else set()
+        keep = set(pending["changed"] + pending["added"]) | deleted if rebase else set()
         conflicts = []
         bdir = base_dir(ws, project)
         # Phase 1 tokenizes that capture. Nothing is written here, so a later refusal leaves the
@@ -387,7 +388,7 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
                 mtext = None
             old = man.get("files", {}).get(rel, {})
             item = {"rel": rel, "bom": bom, "mtext": mtext, "real_h": real_h, "old": old}
-            if rel in keep and old.get("real") != real_h:
+            if rel in keep and rel not in deleted and old.get("real") != real_h:
                 mine = os.path.join(ws.mirror, *rel.split("/"))
                 base = os.path.join(bdir, *rel.split("/"))
                 # Rebase inputs are checked before any content read. An aliased tracked
@@ -428,6 +429,12 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
         real_h, old = item["real_h"], item["old"]
         mpath = os.path.join(ws.mirror, *rel.split("/"))
         if rel in keep:
+            if rel in deleted:
+                # Mine is absent. Upstream drift conflicts without advancing its base.
+                if old.get("real") != real_h:
+                    conflicts.append(rel)
+                new_files[rel] = old
+                continue
             if old.get("real") == real_h:
                 new_files[rel] = old  # real unchanged; keep agent edits as they are
                 continue
