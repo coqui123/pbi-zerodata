@@ -2004,6 +2004,26 @@ class RenameBindingsTests(unittest.TestCase):
         with self.assertRaises(PbzError):
             rename._extension_entities(project.mirror_report)
 
+    def test_table_rename_bare_native_query_ref_wrapper_shaped_field_stays(self):
+        ws, project, mdef, path = self._report_project(
+            {"projections": [{"nativeQueryRef": "Sum(Sales.Amount)"}]})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Budget.tmdl"),
+               "table Budget\n\tcolumn 'Sum(Sales.Amount)'\n\t\tdataType: int64\n")
+        rename.rename(ws, project, "table", "Sales", "Revenue")
+        got = json.loads(path.read_text())["projections"][0]["nativeQueryRef"]
+        self.assertEqual(got, "Sum(Sales.Amount)")
+
+    def test_extension_inventory_measures_not_array_refuses(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"entities": [{"name": "Budget", "measures": {"name": "Total", "expression": "2"}}]}))
+        with self.assertRaises(PbzError):
+            rename._extension_entities(project.mirror_report)
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

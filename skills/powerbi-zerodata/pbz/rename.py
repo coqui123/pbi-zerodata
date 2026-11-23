@@ -616,7 +616,7 @@ _BLOCKED = object()
 
 
 def _table_rewrite_flagged(value, old, new, qualified, table=None, model=None, other_owned=(),
-                           other_extending=(), other_tables=()):
+                           other_extending=(), other_tables=(), key=None, ext_bare=()):
     """Rewrite one table reference in a report string, or return the value unchanged.
 
     A value rewrites when it is exactly a qualified object path of the old
@@ -666,6 +666,14 @@ def _table_rewrite_flagged(value, old, new, qualified, table=None, model=None, o
         return out, False
     wrapped = _wrapped_inner(value)
     if wrapped:
+        if key == "nativeQueryRef" and model is not None \
+                and _other_table_owns(model, old, value, other_owned, other_extending,
+                                      extensions_any=True, extra_tables=other_tables,
+                                      bare_fields=True, ext_bare=ext_bare):
+            # The literal string names another table's field: that
+            # reading is probed before the wrapped one, so the
+            # wrapper retry never runs on it.
+            return value, False
         inner = _rewrite(wrapped[1])
         if inner is not None and inner is not _BLOCKED:
             return f"{wrapped[0]}({inner})", True
@@ -752,6 +760,11 @@ def _extension_entities(report_dir):
                 continue
             measures = []
             ms = ent.get("measures")
+            if ms is not None and not isinstance(ms, pbir.JArr):
+                # A present, non-array measures container is a
+                # structurally unreadable inventory, like a non-array
+                # entities value: refuse rather than report it empty.
+                raise PbzError("REFUSED", "definition/reportExtensions.json")
             if isinstance(ms, pbir.JArr):
                 for m in ms.items:
                     mn = m.get("name") if isinstance(m, pbir.JObj) else None
@@ -978,7 +991,7 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
             if _tbl is not None:
                 return _table_rewrite_flagged(value, old, new, qualified | set(extra_qualified), _tbl, model,
                                       other_owned=extra_owned, other_extending=extra_extending,
-                                      other_tables=extra_tables)
+                                      other_tables=extra_tables, key=key, ext_bare=ext_bare)
             if _fold(value).startswith(_fold(old) + "."):
                 return _head_swap(value, old, new), False
             wrapped = _single_wrapped(value)
