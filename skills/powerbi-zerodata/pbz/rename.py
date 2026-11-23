@@ -700,17 +700,21 @@ def _single_wrapped(value):
 def _extension_entities(report_dir):
     """(entity name, [measure names]) pairs from reportExtensions.json."""
     path = os.path.join(report_dir, "definition", "reportExtensions.json")
-    if not os.path.lexists(path):
+    parent = os.path.dirname(path)
+    if not os.path.lexists(parent):
+        return []
+    if not os.path.lexists(path) and os.path.isdir(parent):
         return []
     # The inventory is mirror content: load it through the mirror read
     # guard, so a path escaping the mirror (a symlink to an external
-    # file) refuses instead of being read; only a genuinely absent
-    # file is an empty inventory.
+    # file) refuses instead of being read. Only a genuinely absent
+    # file is an empty inventory: a broken path or an unparseable
+    # file refuses rather than reporting that nothing is owned.
     text, _bom = mirror.read_mirror_text(path, root=os.path.dirname(report_dir))
     try:
         root = pbir.parse_json(text)
     except Exception:
-        return []
+        raise PbzError("REFUSED", "definition/reportExtensions.json") from None
     out = []
     ents = root.get("entities") if isinstance(root, pbir.JObj) else None
     if isinstance(ents, pbir.JArr):

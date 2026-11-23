@@ -1927,6 +1927,22 @@ class RenameBindingsTests(unittest.TestCase):
         finally:
             outside.unlink(missing_ok=True)
 
+    def test_extension_inventory_broken_path_refuses(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        d = Path(project.mirror_report, "definition")
+        shutil.rmtree(d)
+        d.write_text("not a directory")
+        with self.assertRaises(PbzError):
+            rename._extension_entities(project.mirror_report)
+
+    def test_extension_inventory_unparseable_refuses(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text("{")
+        with self.assertRaises(PbzError):
+            rename._extension_entities(project.mirror_report)
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
