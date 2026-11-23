@@ -1815,6 +1815,14 @@ class RenameBindingsTests(unittest.TestCase):
         other = Path(mdef, "tables", "Other.tmdl").read_text()
         self.assertIn("column Amount", other)
 
+    def test_column_rename_wrapper_spelling_fold_consistent(self):
+        for wrap in ("A\u0130", "Ai\u0307"):
+            ws, project, mdef, path = self._report_project(
+                {"refs": [{"queryRef": f"{wrap}(Sales.Amount)"}]})
+            rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+            got = json.loads(path.read_text())["refs"][0]["queryRef"]
+            self.assertEqual(got, f"{wrap}(Sales.Net)")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

@@ -393,12 +393,43 @@ def _canonical_target(model, kind, home, old):
     return table.name, old
 
 
+def _wrapper_head(value):
+    """(wrapper, index of '(') when value starts with a Name( head, else None.
+
+    The name scan is fold-consistent: a character continues the name
+    when it is alphanumeric, an underscore, or a combining mark,
+    since folding a precomposed letter can yield a combining mark
+    (İ folds to i plus a combining dot), and two spellings equal
+    under _fold must parse the same way."""
+    if not value or not (value[0] == "_" or value[0].isalpha()):
+        return None
+    i = 1
+    while i < len(value):
+        c = value[i]
+        if c == "_" or c.isalnum() or unicodedata.category(c).startswith("M"):
+            i += 1
+        else:
+            break
+    if i < len(value) and value[i] == "(":
+        return value[:i], i
+    return None
+
+
 def _wrapped_inner(value):
     """(wrapper, inner) when value is Name(...) with the final character closing it."""
-    m = re.match(r"([A-Za-z_][\w]*)\(", value)
-    if not m or not value.endswith(")"):
+    head = _wrapper_head(value)
+    if not head or not value.endswith(")"):
         return None
-    return m.group(1), value[m.end():-1]
+    wrapper, i = head
+    return wrapper, value[i + 1:-1]
+
+
+def _wrapped_call(value):
+    """(wrapper, inner) when value is one Name(inner) call with a nonempty inner."""
+    got = _wrapped_inner(value)
+    if not got or not got[1]:
+        return None
+    return got
 
 
 def _table_qualified(model, old):
@@ -624,11 +655,12 @@ def _table_rewrite(value, old, new, qualified, table=None, model=None, other_own
 
 def _single_wrapped(value):
     """(wrapper, inner) when value is exactly one Name(...) call, else None."""
-    m = re.match(r"([A-Za-z_][\w]*)\(", value)
-    if not m:
+    head = _wrapper_head(value)
+    if not head:
         return None
+    wrapper, start = head
     depth = 0
-    for i in range(m.end() - 1, len(value)):
+    for i in range(start, len(value)):
         if value[i] == "(":
             depth += 1
         elif value[i] == ")":
@@ -636,7 +668,7 @@ def _single_wrapped(value):
             if depth == 0:
                 if i != len(value) - 1:
                     return None
-                return m.group(1), value[m.end():i]
+                return wrapper, value[start + 1:i]
     return None
 
 
@@ -925,11 +957,11 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
             out = _follow(value)
             if out is not None:
                 return out, False
-            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
+            wrapped = _wrapped_call(value)
             if wrapped:
-                inner = _follow(wrapped.group(2))
+                inner = _follow(wrapped[1])
                 if inner is not None:
-                    return f"{wrapped.group(1)}({inner})", True
+                    return f"{wrapped[0]}({inner})", True
             return value, False
         field_kind = "column" if field.kind == "aggregation" else field.kind
         if field_kind != kind or _fold(field.table) != _fold(home) or _fold(field.name) != _fold(old):
@@ -939,10 +971,10 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
         if key == "nativeQueryRef" and _fold(value) == _fold(field.name):
             return new, False
         if field_kind == "column":
-            wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
-            if wrapped and _fold(wrapped.group(2)) in (
+            wrapped = _wrapped_call(value)
+            if wrapped and _fold(wrapped[1]) in (
                     _fold(f"{field.table}.{field.name}"), _fold(f"{home}.{old}")):
-                return f"{wrapped.group(1)}({home}.{new})", True
+                return f"{wrapped[0]}({home}.{new})", True
         return value, False
     if key in ("queryRef", "metadata", "nativeQueryRef") and _fold(value) == _fold(f"{home}.{old}") \
             and not _other_table_owns(model, home, value, extra_owned, extra_extending,
@@ -958,11 +990,11 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
                                   extra_tables=extra_tables):
         return value, False
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
-        wrapped = re.fullmatch(r"([A-Za-z_][\w]*)\((.+)\)", value)
-        if wrapped and _fold(wrapped.group(2)) == _fold(f"{home}.{old}") \
-                and not _other_table_owns(model, home, wrapped.group(2), extra_owned, extra_extending,
+        wrapped = _wrapped_call(value)
+        if wrapped and _fold(wrapped[1]) == _fold(f"{home}.{old}") \
+                and not _other_table_owns(model, home, wrapped[1], extra_owned, extra_extending,
                                           extra_tables=extra_tables):
-            return f"{wrapped.group(1)}({home}.{new})", True
+            return f"{wrapped[0]}({home}.{new})", True
     return value, False
 
 
