@@ -734,8 +734,15 @@ def _extension_entities(report_dir):
         root = pbir.parse_json(text)
     except Exception:
         raise PbzError("REFUSED", "definition/reportExtensions.json") from None
+    if not isinstance(root, pbir.JObj):
+        raise PbzError("REFUSED", "definition/reportExtensions.json")
+    ents = root.get("entities")
+    if ents is not None and not isinstance(ents, pbir.JArr):
+        # A structurally unreadable inventory (entities present but
+        # not an array) refuses rather than reporting that nothing
+        # is owned.
+        raise PbzError("REFUSED", "definition/reportExtensions.json")
     out = []
-    ents = root.get("entities") if isinstance(root, pbir.JObj) else None
     if isinstance(ents, pbir.JArr):
         for ent in ents.items:
             if not isinstance(ent, pbir.JObj):
@@ -1047,10 +1054,18 @@ def _report_string_rename_inner(key, value, kind, home, old, new, field=None, mo
                                   extra_tables=extra_tables):
         return value, False
     if kind == "column" and key in ("queryRef", "metadata", "nativeQueryRef"):
+        # A bare nativeQueryRef can name another table's field by its
+        # whole literal name, wrapper-shaped text included: that
+        # ownership blocks the wrapper retry just as it blocks the
+        # bare rewrite.
         wrapped = _wrapped_call(value)
         if wrapped and _fold(wrapped[1]) == _fold(f"{home}.{old}") \
                 and not _other_table_owns(model, home, wrapped[1], extra_owned, extra_extending,
-                                          extra_tables=extra_tables):
+                                          extra_tables=extra_tables) \
+                and not (key == "nativeQueryRef"
+                         and _other_table_owns(model, home, value, extra_owned, extra_extending,
+                                               extensions_any=True, extra_tables=extra_tables,
+                                               bare_fields=not anchored, ext_bare=ext_bare)):
             return f"{wrapped[0]}({home}.{new})", True
     return value, False
 
