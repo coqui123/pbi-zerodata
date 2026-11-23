@@ -1124,23 +1124,25 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
             and _fold(toks[0].value or toks[0].text) in _DAX_KEYWORDS
 
     mask_spans = []
+    ext_refs = []
     if ext_measures:
-        # A qualified reference to a report-only entity's extension
-        # measure (Budget [Limit]) is invisible to the model-only
-        # resolver as such: it mis-reads the bracket in the current
-        # context, and the mis-read can poison its row-table inference
-        # for later references. Mask the whole reference lexically so
-        # the resolver never sees it.
-        model_tables = {_fold(t.name) for t in model.tables.values()}
+        # A qualified reference to an entity's extension measure
+        # (Budget [Limit]) is invisible to the model-only resolver as
+        # such: it mis-reads the bracket in the current context, and
+        # the mis-read can poison its row-table inference for later
+        # references. Mask the whole reference lexically so the
+        # resolver never sees it; a table rename of that entity still
+        # rewrites the qualifier from the lexical span below.
         toks = lexers.significant(lexers.lex_dax(text))
         for i in range(len(toks) - 1):
             t0, t1 = toks[i], toks[i + 1]
             if t0.kind in ("ident", "table") and t1.kind == "bracket":
                 ent = _fold(t0.value or t0.text)
-                if ent in ext_measures and ent not in model_tables \
+                if ent in ext_measures \
                         and not (t0.kind == "ident" and ent in _DAX_KEYWORDS) \
                         and _fold(t1.value or t1.text) in ext_measures[ent]:
                     mask_spans.append((t0.start, t1.end))
+                    ext_refs.append((t0.start, t0.end, ent, t0.kind == "table"))
     raw_bindings = deps.dax_bindings(text, cur, res).bindings
     mask_spans += [b.qualifier for b in raw_bindings if _spurious_qualifier(b)]
     mask_spans += [(b.start, b.end) for b in raw_bindings if _keyword_self(b)]
@@ -1190,6 +1192,9 @@ def _dax_string_edits(text, model, kind, home, old, new, cur, ext_measures=None)
                 tok = lexers.significant(lexers.lex_dax(text[a:b]))[0]
                 if _fold(tok.value or tok.text) == low:
                     out.append((a, b, _dax_table(new, tok.kind == "table")))
+        for a, b, ent, quoted in ext_refs:
+            if ent == low:
+                out.append((a, b, _dax_table(new, quoted)))
         return out
     kept = [b for b in bindings if not _ext_bound(b)]
     return _binding_edits(kept, kind, home, old, new, text)

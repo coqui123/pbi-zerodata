@@ -1707,6 +1707,36 @@ class RenameBindingsTests(unittest.TestCase):
         m = json.loads(ext_path.read_text())["entities"][0]["measures"][0]["expression"]
         self.assertEqual(m, "COUNTROWS(DATATABLE(\"Flag\", LOGICAL, {{TRUE()}})) + COUNTROWS('Archive')")
 
+    def test_column_rename_model_table_extension_ref_does_not_poison_row_inference(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Sales.tmdl"),
+               "table Sales\n\tcolumn Amount\n\t\tdataType: int64\n\tcolumn SortKey\n\t\tdataType: int64\n")
+        _write(os.path.join(mdef, "tables", "Decoy.tmdl"),
+               "table Decoy\n\tcolumn Limit\n\t\tdataType: int64\n\tcolumn Amount\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Decoy", "measures": [{"name": "Limit", "expression": "3"},
+                                           {"name": "M", "expression": "SUMX(TOPN(Decoy [Limit], Sales, Sales[SortKey]), [Amount])"}]}]}))
+        rename.rename(ws, project, "column", "Amount", "Net", table="Sales")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, "SUMX(TOPN(Decoy [Limit], Sales, Sales[SortKey]), [Net])")
+
+    def test_table_rename_extension_ref_qualifier_still_follows(self):
+        ws, project, mdef, path = self._report_project({"refs": []})
+        for f in os.listdir(os.path.join(mdef, "tables")):
+            os.remove(os.path.join(mdef, "tables", f))
+        _write(os.path.join(mdef, "tables", "Decoy.tmdl"),
+               "table Decoy\n\tcolumn Limit\n\t\tdataType: int64\n")
+        ext_path = Path(project.mirror_report, "definition", "reportExtensions.json")
+        ext_path.write_text(json.dumps({"name": "extension", "entities": [
+            {"name": "Decoy", "measures": [{"name": "Limit", "expression": "3"},
+                                           {"name": "M", "expression": "Decoy [Limit] + COUNTROWS(Decoy)"}]}]}))
+        rename.rename(ws, project, "table", "Decoy", "Plan")
+        m = json.loads(ext_path.read_text())["entities"][0]["measures"][1]["expression"]
+        self.assertEqual(m, "Plan [Limit] + COUNTROWS(Plan)")
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),
