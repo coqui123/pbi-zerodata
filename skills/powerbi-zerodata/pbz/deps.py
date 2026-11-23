@@ -34,6 +34,8 @@ ROW_CONTEXT = ITERATORS - {"CALCULATE", "CALCULATETABLE", "COUNTROWS", "TOPN", "
                            "WINDOW", "RANK", "ROWNUMBER", "PARTITIONBY", "ORDERBY", "MATCHBY",
                            "NATURALINNERJOIN", "NATURALLEFTOUTERJOIN"}
 RELATIONSHIP_FUNCS = {"USERELATIONSHIP", "CROSSFILTER"}
+TOPNLIKE = {"TOPN", "SAMPLE", "INDEX", "OFFSET"}
+PREDICATE_HOSTS = {"FILTER", "CALCULATETABLE"}
 
 
 @dataclass(frozen=True)
@@ -134,7 +136,22 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
     rel_calls: list[dict] = []
     n = len(sig)
 
-    def add(ref: Ref, at: int, uncertain: bool = False):
+    def teaching_vetoed(k: int, ref: Ref) -> bool:
+        for j in range(k + 1, len(stack)):
+            g = stack[j]
+            if g["fn"] in TOPNLIKE and g["arg"] == 0:
+                return True
+            if g["fn"] in PREDICATE_HOSTS and g["arg"] >= 1:
+                if ref.kind == "table" and j == len(stack) - 1:
+                    continue
+                return True
+            if g["fn"] in TOPNLIKE and g["arg"] >= 2:
+                return True
+            if g["fn"] in TOPNLIKE and g["arg"] == 1 and g.get("contested_by") and ref.table != g["contested_by"]:
+                return True
+        return False
+
+    def add(ref: Ref, at: int, uncertain: bool = False, veto_teach: bool = False):
         tok = sig[at]
         qualified = at + 1 < n and sig[at + 1].kind == "bracket" and tok.kind in ("table", "ident")
         name = sig[at + 1] if qualified else tok
@@ -144,9 +161,17 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
         out.refs.append(ref)
         if ref.kind == "unresolved":
             out.unresolved.append(ref)
-        for fr in stack:
-            if fr["fn"] in ITERATORS and fr["arg"] == 0 and fr["row_table"] is None and ref.table and ref.kind in ("table", "column"):
-                fr["row_table"] = ref.table
+        if ref.kind in ("table", "column") and ref.table:
+            for g in stack:
+                if g["fn"] in TOPNLIKE and g["arg"] == 0 and not g.get("contested_by"):
+                    g["contested_by"] = ref.table
+        if veto_teach:
+            pass
+        else:
+            for k, fr in enumerate(stack):
+                if fr["fn"] in ITERATORS and fr["arg"] == 0 and fr["row_table"] is None and ref.table and ref.kind in ("table", "column"):
+                    if not teaching_vetoed(k, ref):
+                        fr["row_table"] = ref.table
         for rc in rel_calls:
             if rc["depth"] <= len(stack) and ref.kind == "column":
                 rc["cols"].append((ref.table, ref.name))
@@ -195,7 +220,17 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
             prev = sig[i - 1] if i else None
             uncertain = bool(prev and prev.end == t.start and prev.kind == "ident" and prev.text.upper() != "VAR"
                              and not res.table(prev.text))
-            add(_bare(t.value, home, res, row_home, row_tables(), extension), i, uncertain)
+            ref, source, supplier = _bare_full(t.value, home, res, row_home, row_tables(), extension)
+            taint = False
+            ctx = [(idx, fr) for idx, fr in enumerate(stack) if fr["fn"] in ROW_CONTEXT and fr["arg"] >= 1]
+            untaught = [idx for idx, fr in ctx if not fr["row_table"]]
+            if untaught:
+                if source == "row":
+                    sup = [idx for idx, fr in ctx if fr["row_table"] == supplier]
+                    taint = (not sup) or any(u > max(sup) for u in untaught)
+                else:
+                    taint = True
+            add(ref, i, uncertain or taint, veto_teach=taint)
         elif t.kind == "table":
             tab = res.table(t.value)
             add(Ref("table", tab, tab) if tab else Ref("unresolved", t.value, ""), i)
@@ -234,22 +269,26 @@ def dax_region(text, reg, res: Resolver) -> DaxDeps:
 
 
 def _bare(name: str, home: str, res: Resolver, row_home: bool, row_tables: list[str], extension: set[str]) -> Ref:
+    return _bare_full(name, home, res, row_home, row_tables, extension)[0]
+
+
+def _bare_full(name: str, home: str, res: Resolver, row_home: bool, row_tables: list[str], extension: set[str]):
     for rt in row_tables:
         if res.column(rt, name):
-            return Ref("column", rt, res.column(rt, name))
+            return Ref("column", rt, res.column(rt, name)), "row", rt
     if row_home and res.column(home, name):
-        return Ref("column", res.table(home) or home, res.column(home, name))
+        return Ref("column", res.table(home) or home, res.column(home, name)), "row_home", ""
     hit = res.measure(name)
     if hit:
-        return Ref("measure", hit[0], hit[1])
+        return Ref("measure", hit[0], hit[1]), "measure", ""
     if home and res.column(home, name):
-        return Ref("column", res.table(home) or home, res.column(home, name))
+        return Ref("column", res.table(home) or home, res.column(home, name)), "home", ""
     tabs = res.by_column.get(name.lower(), [])
     if len(tabs) == 1:
-        return Ref("column", tabs[0], res.column(tabs[0], name))
+        return Ref("column", tabs[0], res.column(tabs[0], name)), "unique", ""
     if name.lower() in extension:
-        return Ref("extension", "", name)
-    return Ref("unresolved", "", name)
+        return Ref("extension", "", name), "extension", ""
+    return Ref("unresolved", "", name), "unresolved", ""
 
 
 def m_bindings(expr: str, res: Resolver, own: str = "", base: int = 0,

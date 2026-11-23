@@ -1074,8 +1074,13 @@ def run(ws, project, threshold: float = 0.80, max_pairs: int = 100) -> dict:
     by_key: dict[tuple, list] = {}
     for m in ms:
         by_key.setdefault(tuple(canons[id(m)].words("hash")), []).append(m)
-    identical = [grp for grp in by_key.values() if len(grp) > 1]
-    group_of = {id(m): gi for gi, grp in enumerate(identical) for m in grp}
+    raw_identical = [grp for grp in by_key.values() if len(grp) > 1]
+    # Keep raw membership for suppression across all discovery buckets.
+    group_of = {id(m): gi for gi, grp in enumerate(raw_identical) for m in grp}
+    identical, identical_uncertain = [], []
+    for grp in raw_identical:
+        bucket = identical_uncertain if any(canons[id(m)].uncertain for m in grp) else identical
+        bucket.append(grp)
     # aliases
     aliases = []
     alias_pairs = set()
@@ -1166,6 +1171,8 @@ def run(ws, project, threshold: float = 0.80, max_pairs: int = 100) -> dict:
     return {"verb": "similar", "project": project.name, "measures": len(ms), "threshold": threshold,
             "identical": [{"measures": [lab[id(m)] for m in grp], "tables": sorted({m.table for m in grp})}
                           for grp in identical],
+            "identical_uncertain": [{"measures": [lab[id(m)] for m in grp], "tables": sorted({m.table for m in grp})}
+                                    for grp in identical_uncertain],
             "aliases": aliases, "same_shape": same_shape, "pairs": pairs[:max_pairs],
             "pairs_total": len(pairs)}
 

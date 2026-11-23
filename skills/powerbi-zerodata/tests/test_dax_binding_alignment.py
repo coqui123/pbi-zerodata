@@ -141,6 +141,14 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(b.ref, deps.Ref("column", "Sales", "Price"))
         self.assertTrue(b.uncertain)
 
+    def test_nested_topn_contest_is_recorded_for_every_frame(self):
+        # Diff council (Astra): contest recording must not depend on veto
+        # order; the inner TOPN's scalar witness is Sales, so its Product
+        # operand must not certify the occurrence.
+        b = self.price("SUMX(TOPN(COUNTROWS(Product), TOPN(COUNTROWS(Sales), Product)), [Price])")
+        self.assertEqual(b.ref, deps.Ref("column", "Sales", "Price"))
+        self.assertTrue(b.uncertain)
+
     def test_extension_fallback_under_unknown_frame_is_uncertain(self):
         expr = 'VAR t = ADDCOLUMNS(Sales, "Amt", 1) RETURN SUMX(t, [Amt])'
         b = deps.dax_bindings(expr, "Sales", self.res).bindings[-1]
