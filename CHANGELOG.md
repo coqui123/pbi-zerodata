@@ -6,6 +6,9 @@ honesty and atomicity notes.
 
 ## Unreleased
 
+- Push, status and pull no longer treat a withheld file's designed absence as a deletion,
+  while recreated withheld files remain refused as lossy.
+
 - Multiline dynamic format expressions (`formatStringDefinition`) written by `pbz format-expr`
   now reload as one complete DAX region on the measure, so deps, rename, usage and tokenization
   see every reference. Renaming a referenced measure updates its reference inside the format
