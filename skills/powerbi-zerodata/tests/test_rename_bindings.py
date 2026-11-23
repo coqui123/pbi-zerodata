@@ -1969,6 +1969,21 @@ class RenameBindingsTests(unittest.TestCase):
             rename._extension_entities(str(rd))
         self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
 
+    def test_extension_inventory_report_dir_file_refused(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        rd = Path(project.mirror_report)
+        shutil.rmtree(rd)
+        rd.write_text("not a directory")
+        with self.assertRaises(PbzError):
+            rename._extension_entities(str(rd))
+
+    def test_extension_inventory_missing_definition_is_empty(self):
+        import shutil
+        ws, project, mdef, path = self._report_project({"refs": []})
+        shutil.rmtree(Path(project.mirror_report, "definition"))
+        self.assertEqual(rename._extension_entities(project.mirror_report), [])
+
     def test_measure_rename_into_extension_measure_on_other_entity_refused(self):
         ws, project, mdef, path = self._report_project({"refs": []})
         _write(os.path.join(mdef, "tables", "Sales.tmdl"),

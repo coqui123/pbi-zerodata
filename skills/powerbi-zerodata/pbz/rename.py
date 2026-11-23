@@ -706,9 +706,23 @@ def _extension_entities(report_dir):
     # escaping path is never mistaken for a genuinely absent one.
     refuse_below(path, os.path.dirname(report_dir))
     parent = os.path.dirname(path)
-    if not os.path.lexists(parent):
+
+    def absent(p):
+        # Genuinely absent means the lookup fails only because a
+        # component does not exist; a non-directory component or any
+        # other failure is a broken path, not an absent one, and the
+        # guarded read below refuses it.
+        try:
+            os.lstat(p)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    if absent(report_dir) or absent(parent):
         return []
-    if not os.path.lexists(path) and os.path.isdir(parent):
+    if absent(path) and os.path.isdir(parent):
         return []
     # The inventory is mirror content: load it through the mirror read
     # guard, so a path escaping the mirror (a symlink to an external
