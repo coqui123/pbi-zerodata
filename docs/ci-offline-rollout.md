@@ -128,3 +128,43 @@ Acceptance tests were added to existing test files: CI machinery in
 `test_ci_registration.py`, scanner controls in `test_engine.py`, and installer and
 hook behavior in `test_mcp.py`. No new test suite file was created or existing test
 removed. Installer filesystem/concurrency fixtures run in normal Windows CI too.
+
+## Rollout outcome: Serial execution retained (Option D)
+
+Following two hosted execution attempts of static shard balancing (CI-4), the Model
+Council (Claude Fable 5.2 Thinking, GPT-6.2 Astra Thinking, Gemini Neon Thinking)
+reviewed the empirical evidence and unanimously adopted **Option D: Stay Serial**:
+
+1. **Empirical Measurement Findings**:
+   - **Attempt 1 (Serial-run basis)**: Pair imbalances of 64.4%, 21.8%, 29.5%, 43.0%,
+     37.8% (median 37.8%). Closed unmerged (PR #11).
+   - **Attempt 2 (Shard-context basis)**: Head A median 18.0%; Head B median 11.1%
+     (after council-confirmed adjustment). Closed unmerged (PR #16).
+   - Both attempts failed the predeclared 10% median raw imbalance gate across 5 hosted
+     pairs per head.
+
+2. **Observed Contributors and Limitations**:
+   - Shard-context suite overruns: a stable subset of suites ran measurably longer in
+     sharded execution than in serial (`rename_bindings` +11.8s, `components` +8.3s,
+     `governance` +5.0s, `guard` +4.2s). Attempt 2 used a shard-context timing basis;
+     its observed median imbalances were 18.0% for Head A and 11.1% for Head B,
+     compared with 37.8% in Attempt 1.
+   - Hosted runner variance: large remaining imbalances coincided with paired hosted
+     runners drawing mismatched hardware instances. In-sample replay predicted a
+     5.8% median imbalance, while live Head B pairs delivered 11.1%. These observations
+     are consistent with runner variance contributing to the remaining imbalance,
+     but do not isolate its causal effect. Static precomputed partitions cannot
+     adapt to runtime differences between paired runners.
+
+3. **Council Decision**:
+   - Rejected Option B (loosening acceptance criteria via runner speed normalization)
+     and Option C (suite splitting without eliminating runner variance).
+   - Adopted **Option D**: Leave `PBZ_OFFLINE_MODE` unset in repository variables,
+     keeping production CI on the verified serial runner (~5–7 minutes runtime against
+     a 60-minute budget).
+   - Two-shard execution machinery and runner options remain dormant and intact in the
+     codebase.
+   - **Reopen Threshold**: The rollout track remains closed unless serial runtimes exceed
+     acceptable engineering bounds (serial median runtime > 15 minutes) or dynamic
+     work-queue balancing (Option A) is scheduled.
+
