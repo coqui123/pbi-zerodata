@@ -65,6 +65,12 @@
       "argv": [
         "tests/test_dax_binding_alignment.py"
       ]
+    },
+    {
+      "id": "ci_weights",
+      "argv": [
+        "tests/test_ci_weights.py"
+      ]
     }
   ]
 }

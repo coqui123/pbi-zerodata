@@ -29,7 +29,7 @@ class CiRegistrationTests(unittest.TestCase):
         self.assertCountEqual([{k: e[k] for k in ('id', 'argv')} for e in self.entries],
                          inventory())
         self.assertEqual({e['id'] for e in json.loads((BASELINE.parent / 'offline_additions.json').read_text())['suites']},
-                         {'checks', 'rename_bindings', 'usage', 'evidence', 'skip_capture', 'rewrite_qualify', 'rewrite_scopes', 'dpapi_seam', 'similar_scope', 'formatstring_roundtrip', 'dax_binding_alignment'})
+                         {'checks', 'rename_bindings', 'usage', 'evidence', 'skip_capture', 'rewrite_qualify', 'rewrite_scopes', 'dpapi_seam', 'similar_scope', 'formatstring_roundtrip', 'dax_binding_alignment', 'ci_weights'})
         self.assertFalse({'checks', 'rename_bindings', 'usage', 'evidence'} &
                          {e['id'] for e in json.loads(BASELINE.read_text())['suites']})
         self.assertEqual(sum(e['argv'] == ['tests/test_engine.py', '--offline'] for e in self.entries), 1)
