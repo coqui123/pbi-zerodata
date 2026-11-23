@@ -889,5 +889,13 @@
     ],
     "windows": false,
     "engine": false
+  },
+  {
+    "id": "rebase_deletes",
+    "argv": [
+      "tests/test_rebase_deletes.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]
