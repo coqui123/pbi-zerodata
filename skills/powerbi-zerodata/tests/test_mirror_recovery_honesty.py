@@ -108,6 +108,150 @@ class RecoveryHonestyTests(unittest.TestCase):
     def test_recover_preserves_between_passes_external_deletion(self):
         self._recover_with_between_passes_save(b"before bytes", None)
 
+    def test_recover_preserves_external_deletion_immediately_after_second_check(self):
+        rel, target, directory, _journal = self._push_journal(b"before bytes")
+        real_must_stay = mirror._must_stay
+        calls = 0
+
+        def delete_after_second_check(path, trust):
+            nonlocal calls
+            real_must_stay(path, trust)
+            if path == target:
+                calls += 1
+                if calls == 2:
+                    os.remove(target)
+
+        with patch.object(mirror.desktop, "find_instance", return_value=None), \
+             patch.object(mirror, "_must_stay", side_effect=delete_after_second_check):
+            out = mirror.recover(self.ws, self.project, "between-passes")
+
+        self.assertEqual(calls, 2)
+        with open(os.path.join(directory, "journal.json")) as handle:
+            state = json.load(handle)["state"]
+        current = None
+        if os.path.lexists(target):
+            with open(target, "rb") as handle:
+                current = handle.read()
+        self.assertEqual(
+            {"content": current, "recovery": out, "state": state,
+             "pending": mirror.pending_recovery(self.ws, self.project)},
+            {"content": None, "recovery": {
+                "verb": "recover", "result": "RECOVERY_REQUIRED",
+                "transactions": [{"id": "between-passes", "result": "RECOVERY_CONFLICT",
+                                  "conflicts": [rel]}]},
+             "state": "RECOVERY_REQUIRED",
+             "pending": [{"id": "between-passes", "state": "RECOVERY_REQUIRED"}]})
+
+    def test_recover_preserves_external_recreation_after_second_check_deletion(self):
+        rel, target, directory, _journal = self._push_journal(b"before bytes")
+        recreated = b"external replacement bytes"
+        real_must_stay = mirror._must_stay
+        calls = 0
+
+        def delete_and_recreate_after_second_check(path, trust):
+            nonlocal calls
+            real_must_stay(path, trust)
+            if path == target:
+                calls += 1
+                if calls == 2:
+                    os.remove(target)
+
+        real_rename = os.rename
+        def rename_with_recreate(src, dst):
+            if src == target:
+                try:
+                    real_rename(src, dst)
+                except FileNotFoundError:
+                    with open(target, "wb") as handle:
+                        handle.write(recreated)
+                    raise
+            return real_rename(src, dst)
+
+        with patch.object(mirror.desktop, "find_instance", return_value=None), \
+             patch.object(mirror, "_must_stay", side_effect=delete_and_recreate_after_second_check), \
+             patch.object(mirror.os, "rename", side_effect=rename_with_recreate):
+            out = mirror.recover(self.ws, self.project, "between-passes")
+
+        self.assertEqual(calls, 2)
+        with open(os.path.join(directory, "journal.json")) as handle:
+            state = json.load(handle)["state"]
+        current = None
+        if os.path.lexists(target):
+            with open(target, "rb") as handle:
+                current = handle.read()
+        self.assertEqual(
+            {"content": current, "recovery": out, "state": state,
+             "pending": mirror.pending_recovery(self.ws, self.project)},
+            {"content": recreated, "recovery": {
+                "verb": "recover", "result": "RECOVERY_REQUIRED",
+                "transactions": [{"id": "between-passes", "result": "RECOVERY_CONFLICT",
+                                  "conflicts": [rel]}]},
+             "state": "RECOVERY_REQUIRED",
+             "pending": [{"id": "between-passes", "state": "RECOVERY_REQUIRED"}]})
+
+    def test_restore_transaction_preserves_external_deletion_immediately_after_second_check(self):
+        rel, target, directory, journal = self._push_journal(b"before bytes")
+        real_must_stay = mirror._must_stay
+        calls = 0
+
+        def delete_after_second_check(path, trust):
+            nonlocal calls
+            real_must_stay(path, trust)
+            if path == target:
+                calls += 1
+                if calls == 2:
+                    os.remove(target)
+
+        with patch.object(mirror, "_must_stay", side_effect=delete_after_second_check):
+            out = mirror._restore_transaction(self.ws, self.project, directory, journal, preserve_external=True)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(out["result"], "ROLLED_BACK")
+        self.assertIn("conflicts", out)
+        self.assertEqual(out["conflicts"], [rel])
+        self.assertFalse(os.path.lexists(target))
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "ROLLED_BACK")
+
+    def test_restore_transaction_multi_entry_preserves_deletion_and_restores_uncontested(self):
+        rels = [self.project.name + ".Report/definition/" + name + ".json"
+                for name in ("racing", "owned")]
+        targets = [mirror._real_path(self.ws, rel) for rel in rels]
+        before = (b"racing before bytes", b"owned before bytes")
+        after = (b"racing after bytes", b"owned after bytes")
+        for target, content in zip(targets, before):
+            common.replace_bytes(target, content, root=self.ws.root)
+        directory, journal = mirror._begin_transaction(
+            self.ws, self.project, "multi-entry-deletion",
+            [("workspace", rel, common.sha(aft)) for rel, aft in zip(rels, after)])
+        for target, content in zip(targets, after):
+            common.replace_bytes(target, content, root=self.ws.root)
+
+        real_must_stay = mirror._must_stay
+        calls = 0
+
+        def delete_racing_after_second_check(path, trust):
+            nonlocal calls
+            real_must_stay(path, trust)
+            if path == targets[0]:
+                calls += 1
+                if calls == 2:
+                    os.remove(targets[0])
+
+        with patch.object(mirror, "_must_stay", side_effect=delete_racing_after_second_check):
+            out = mirror._restore_transaction(self.ws, self.project, directory, journal, preserve_external=True)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(out["result"], "ROLLED_BACK")
+        self.assertIn("conflicts", out)
+        self.assertEqual(out["conflicts"], [rels[0]])
+        self.assertFalse(os.path.lexists(targets[0]))
+        self.assertTrue(os.path.lexists(targets[1]))
+        with open(targets[1], "rb") as handle:
+            self.assertEqual(handle.read(), before[1])
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "ROLLED_BACK")
+
     def test_recover_retries_after_partway_between_passes_conflict(self):
         rels = [self.project.name + ".Report/definition/" + name + ".json"
                 for name in ("racing", "owned")]
@@ -558,7 +702,8 @@ class MirrorEditJournalTests(unittest.TestCase):
             # The outsider has its own context, as a separate process would.
             from contextvars import Context
             Context().run(self._write, other_path, common.read_checked(other_path, root=self.ws.mirror) + b"\n")
-            with patch("pbz.validate.engine_call", return_value={"ok": True}):
+            with patch("pbz.validate.engine_call", return_value={"ok": True}), \
+                 patch("pbz.validate.report_author", return_value=[]):
                 pushed = Context().run(mirror.push, self.ws, other)
             self.assertEqual(pushed["result"], "PUSHED", pushed)
             self.assertNotEqual(common.read_text(other_real)[0], real_before)

@@ -828,6 +828,13 @@ def _restore_transaction(ws, project, directory, journal, *, preserve_external=F
         try:
             os.rename(target, quarantine)
         except FileNotFoundError:
+            if current is not None:
+                conflicts.append(entry["path"])
+                if not preserve_external:
+                    journal["state"] = "RECOVERY_REQUIRED"
+                    _journal_save(directory, journal)
+                    return {"result": "RECOVERY_CONFLICT", "conflicts": conflicts}
+                continue
             if entry["before"] is None:
                 restored = not os.path.lexists(target)
             else:
