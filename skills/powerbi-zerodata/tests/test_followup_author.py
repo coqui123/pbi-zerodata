@@ -111,6 +111,42 @@ class FollowupAuthorTests(unittest.TestCase):
             if line.startswith("FUNCTION"):
                 self.assertNotEqual(line.split("=", 1)[1].strip(), "")
 
+    def test_expand_preserves_literal_whitespace_and_comment_newlines(self):
+        """Expand must not collapse spaces inside string literals or remove newline after line comments."""
+        self._model(
+            "table Sales\n"
+            '\tmeasure M1 = "hello  world // not a comment"\n'
+            "\tmeasure M2 =\n"
+            "\t\t\t/* block comment */\n"
+            "\t\t\t[M1] + 1\n"
+            "\tmeasure M3 =\n"
+            "\t\t\t-- dash comment\n"
+            "\t\t\tFn1([M2]) // trailing comment\n"
+            "\tmeasure Root = [M3] + Fn2(1)\n"
+            "\tpartition Sales = m\n\t\tmode: import\n\t\tsource = let x = 1 in x\n",
+            "function Fn1 = (x : int64) =>\n"
+            "\t\t// fn comment\n"
+            '\t\tx + "two  spaces" // fn1 trailing comment\n'
+            "\tlineageTag: f1\n\n"
+            "function Fn2 = (y : int64) =>\n"
+            "\t\ty * 2\n"
+            "\tlineageTag: f2\n",
+        )
+        out = expand.run(self.ws, self.project, "[Root]")
+        self.assertIn('"hello  world // not a comment"', out["dax"])
+        self.assertRegex(out["dax"], r"/\* block comment \*/\s*\[M1\] \+ 1")
+        self.assertRegex(out["dax"], r"-- dash comment\n\s*Fn1\(\[M2\]\) // trailing comment\nMEASURE 'Sales'\[Root\] = \[M3\] \+ Fn2\(1\)")
+        self.assertRegex(out["dax"], r"// fn comment\n\s*x \+ \"two  spaces\" // fn1 trailing comment\nFUNCTION Fn2 = \(y : int64\) => y \* 2")
+        self.assertIn('"two  spaces"', out["dax"])
+
+    def test_expand_compact_dax_unit(self):
+        """Test _compact_dax token adjacency, escaped quotes, and empty/whitespace handling."""
+        self.assertEqual(expand._compact_dax("SUM(Sales[Amount])"), "SUM(Sales[Amount])")
+        self.assertEqual(expand._compact_dax(' "hello   world" '), '"hello   world"')
+        self.assertEqual(expand._compact_dax(' "a ""b"" c" '), '"a ""b"" c"')
+        self.assertEqual(expand._compact_dax("   \n\t   "), "")
+        self.assertEqual(expand._compact_dax("/* comment */ 123"), "/* comment */ 123")
+
     def test_unused_keeps_return_of_a_remaining_var(self):
         expr = "VAR keep = [Stay]\nVAR drop = [Gone]\nRETURN keep"
         out = rewrite._unused(expr)

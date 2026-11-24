@@ -6,8 +6,25 @@ from __future__ import annotations
 
 import os
 
-from . import deps, tmdl
+from . import deps, lexers, tmdl
 from .common import PbzError
+
+
+def _compact_dax(raw: str) -> str:
+    """Collapse whitespace between tokens while preserving string literals and comment newlines."""
+    toks = [t for t in lexers.lex_dax(raw) if t.kind != "ws"]
+    if not toks:
+        return ""
+    out = []
+    for i, tok in enumerate(toks):
+        if i > 0:
+            prev = toks[i - 1]
+            if prev.kind == "comment" and (prev.text.startswith("//") or prev.text.startswith("--")):
+                out.append("\n")
+            elif prev.end < tok.start:
+                out.append(" ")
+        out.append(tok.text)
+    return "".join(out).strip()
 
 
 def _measure(model, target: str):
@@ -68,7 +85,7 @@ def run(ws, project, target: str) -> dict:
         if node is None:
             return
         raw = _function_body(model, node)
-        body = " ".join(raw.split())
+        body = _compact_dax(raw)
         if not body:
             return
         info = deps.dax(raw, "", res, function=True)
@@ -99,7 +116,7 @@ def run(ws, project, target: str) -> dict:
     walk(root.name)
     lines = ["DEFINE"]
     for measure in order:
-        expr = " ".join(measure.expression.split())
+        expr = _compact_dax(measure.expression)
         lines.append(f"MEASURE '{measure.table}'[{measure.name}] = {expr}")
     for name in functions:
         lines.append(f"FUNCTION {name} = {bodies[name]}")
