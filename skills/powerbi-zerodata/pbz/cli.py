@@ -205,6 +205,16 @@ def cmd_init(ws, project, a):
     return res
 
 
+def _bounded_int(val: str, min_val: int = 1, max_val: int = 3600) -> int:
+    try:
+        n = int(val)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected an integer") from None
+    if n < min_val or n > max_val:
+        raise argparse.ArgumentTypeError(f"value must be between {min_val} and {max_val}") from None
+    return n
+
+
 def argument_parser():
     """Argparse tree only. Contract tests use this; it does not run a command."""
     return main(parser_only=True)
@@ -673,6 +683,9 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("path")
     p = sub.add_parser("watch", help="validation and best-practice passes; polls unless --once")
     p.add_argument("--once", action="store_true", help="a single pass")
+    p.add_argument("--rescan", action="store_true", help="force re-running validation even if files have not changed")
+    p.add_argument("--history", type=lambda v: _bounded_int(v, 1, 1000), default=50, help="max recent passes to retain in history (1 to 1000, default: 50)")
+    p.add_argument("--seconds", type=lambda v: _bounded_int(v, 1, 3600), default=5, help="polling interval in seconds (1 to 3600, default: 5)")
     p = sub.add_parser("perf", help="performance bands for a DAX query (no durations)")
     p.add_argument("--dax", required=True, help="DAX query")
     p.add_argument("--runs", type=int, default=1, help="1 to 20")
@@ -1250,7 +1263,8 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             out = scripts.export(ws, project, path) if a.action == "export" else scripts.apply(ws, project, path)
         elif a.cmd == "watch":
             from pbz import watch
-            out = watch.run(ws, project, once=a.once)
+            out = watch.run(ws, project, once=a.once, seconds=getattr(a, "seconds", 5),
+                            rescan=getattr(a, "rescan", False), max_passes=getattr(a, "history", 50))
         elif a.cmd == "perf":
             from pbz import perf
             out = perf.run(ws, project, a.dax, runs=a.runs, baseline=a.baseline, action=a.action)
