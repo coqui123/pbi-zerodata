@@ -57,6 +57,8 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
     elif code in UNAVAILABLE:
         status, rc = "UNAVAILABLE", 4
     elif code in INVALID or out.get("spec_valid") is False:
+        if code not in INVALID:
+            code = "SPEC_INVALID"
         status, rc = "INVALID", 2
     elif code in {"ROLLED_BACK", "FAILED"}:
         status, rc = "FAILED", 1
