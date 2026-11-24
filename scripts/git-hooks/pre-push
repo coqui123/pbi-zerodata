@@ -1,8 +1,26 @@
 #!/bin/sh
-# PBZ owned offline checks v1
-# Refuse the git command unless the offline suites in .github/workflows/tests.yml pass.
+# PBZ owned offline checks v1: local gate with advisory scope
+# Clarified under CI-7 Option A:
+# pre-push tests the local tree, not the outgoing pushed commits.
+# Protected hosted CI, not this local hook, is the authoritative merge gate.
 set -e
 root=$(git rev-parse --show-toplevel) || exit 1
+
+head_tree=$(git -C "$root" rev-parse --verify -q 'HEAD^{tree}' 2>/dev/null || echo "unknown")
+if [ "$head_tree" = "unknown" ]; then
+  dirty="unknown"
+elif status_output=$(git -C "$root" status --porcelain --untracked-files=normal 2>/dev/null); then
+  if [ -n "$status_output" ]; then
+    dirty="dirty"
+  else
+    dirty="clean"
+  fi
+else
+  dirty="unknown"
+fi
+
+echo "pbz: pre-push checks the local working tree, not outgoing commits (HEAD tree: $head_tree; working tree: $dirty); protected hosted CI is the merge authority" >&2
+
 cd "$root/skills/powerbi-zerodata" || exit 1
 export PYTHONIOENCODING=utf-8
 echo "pbz: building the engine, then running the offline CI suites"
