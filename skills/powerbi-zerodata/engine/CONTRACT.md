@@ -389,17 +389,23 @@ through `Buckets.Count` to `1k-9k` or `10k+`). Spool record counts are not emitt
 
 Compare uses the same rule as `pbz/perf.py` (`RATIO = 1.25`): if `old <= 0`, `NOISY`. Otherwise if
 `new/old > 1.25` or `new/old < 1/1.25`, then `NOISY` when `abs(new-old) <= spread`, else `SLOWER` when the ratio
-is over 1.25 and `FASTER` when it is under `1/1.25`. Otherwise `SAME`. `spread` is the wider of the saved and
-the new run-to-run ranges. Stdout carries the verdict only.
+is over 1.25 and `FASTER` when it is under `1/1.25`. Otherwise `SAME`.
+`spread` is intentionally the saved baseline run-to-run range (`oldSpread`) rather than the wider of the saved
+and new ranges, anchoring noise tolerance to the established baseline. Compare also intentionally emits `ratio_verdict`
+(`OVER_LIMIT` when `new > old * 1.25`, otherwise `WITHIN_LIMIT`), reporting raw threshold exceedance
+independently of spread noise filtering. For the timing comparison, stdout reports `verdict` and `ratio_verdict`,
+not the raw medians or spread.
 
 ```json
 {"ok": true, "verb": "perf", "timing": "BANDED", "duration_band": "100_500MS",
  "fe_share": "LOW", "se_queries": "1_5", "dq_events": "0", "cache_hit": "NONE",
  "callback": false, "agg_rewrite": "NONE", "trace": "CAPTURED", "verdict": "SAME",
+ "ratio_verdict": "WITHIN_LIMIT",
  "plan": {"CallbackDataID": "0", "Spool_Iterator": "1", "CrossApply": "0", "LargeMaterialization": "0"}}
 ```
 
-`verdict` is present only on a compare that had both medians. `baseline` is present only as `SAVED`
+Compare emits both `verdict` and `ratio_verdict` only after it reads the saved baseline successfully and the new
+run is complete and banded. `baseline` is present only as `SAVED`
 after `action: save`, or `MISSING` when a compare has no saved baseline. A trace that did not start is
 `{"ok": true, "verb": "perf", "timing": "UNAVAILABLE", "trace": "UNAVAILABLE"}`.
 
