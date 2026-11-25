@@ -42,19 +42,32 @@ def _tree(root: Path) -> tuple:
     return tuple(sorted(rows))
 
 
-def _public_snapshot(workspace: str, private_root: str, action: str, name: str, spec: str):
+def _public_cli(workspace: str, private_root: str, args: list):
     env = os.environ.copy()
     env["PBZ_PRIVATE_ROOT"] = private_root
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.pop("PBZ_SKIP_OUTPUT", None)
     return subprocess.run(
-        [sys.executable, "-I", CLI, "snapshot", action, name, "--spec", spec],
+        [sys.executable, "-I", CLI, *args],
         cwd=workspace,
         env=env,
         capture_output=True,
         text=True,
         timeout=90,
     )
+
+
+def _public_snapshot(workspace: str, private_root: str, action: str, name: str, spec: str):
+    return _public_cli(workspace, private_root, ["snapshot", action, name, "--spec", spec])
+
+
+def _public_budget(private_root: str, workspace: str) -> int:
+    wid = hashlib.sha256(guard.norm(os.path.abspath(workspace)).encode()).hexdigest()[:16]
+    path = Path(private_root) / wid / "state.json"
+    if not path.is_file():
+        return 0
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    return int(doc.get("snapshot_queries") or 0)
 
 
 class SnapshotStoreTests(unittest.TestCase):
@@ -590,6 +603,245 @@ class SnapshotStoreTests(unittest.TestCase):
             )
         self.assertTrue(res.get("ok"))
         self.assertEqual(_tree(self.snaps), before)
+
+    def _state_bytes(self):
+        path = checks._state_path(self.ws)
+        if not os.path.lexists(path):
+            return None
+        return Path(path).read_bytes()
+
+    def _refuse_before_port(self, spec, message):
+        before = _tree(self.snaps)
+        state = self._state_bytes()
+        with patch("pbz.desktop.require_port") as port, \
+             patch("pbz.checks.engine_call") as engine:
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(self.ws, None, "save", "different", spec)
+            self.assertEqual(ctx.exception.code, "BAD_REQUEST")
+            self.assertIn(message, str(ctx.exception))
+            port.assert_not_called()
+            engine.assert_not_called()
+        self.assertEqual(_tree(self.snaps), before)
+        self.assertEqual(self._state_bytes(), state)
+
+    def _reaches_port(self, spec):
+        before = _tree(self.snaps)
+        state = self._state_bytes()
+        with patch("pbz.desktop.require_port", side_effect=PbzError("ENGINE_UNAVAILABLE", "desktop down")) as port, \
+             patch("pbz.checks.engine_call") as engine:
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(self.ws, None, "save", "different", spec)
+            self.assertEqual(ctx.exception.code, "ENGINE_UNAVAILABLE")
+            port.assert_called_once()
+            engine.assert_not_called()
+        self.assertEqual(_tree(self.snaps), before)
+        self.assertEqual(self._state_bytes(), state)
+
+    def test_query_shape_is_rejected_before_port_or_spend(self):
+        bad_id = [
+            {"queries": [{"dax": "EVALUATE {1}"}]},
+            {"queries": [{"id": "", "dax": "EVALUATE {1}"}]},
+            {"queries": [{"id": "a" * 129, "dax": "EVALUATE {1}"}]},
+            {"queries": [{"id": "q1!", "dax": "EVALUATE {1}"}]},
+            {"queries": [{"id": 1, "dax": "EVALUATE {1}"}]},
+        ]
+        for spec in bad_id:
+            with self.subTest(spec=spec):
+                self._refuse_before_port(spec, "query id is invalid")
+        self._refuse_before_port(
+            {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}, {"id": "q1", "dax": "EVALUATE {2}"}]},
+            "duplicate query id",
+        )
+        for spec in (
+            {"queries": [{"id": "q1"}]},
+            {"queries": [{"id": "q1", "dax": ""}]},
+            {"queries": [{"id": "q1", "dax": "   "}]},
+            {"queries": [{"id": "q1", "dax": 1}]},
+        ):
+            with self.subTest(spec=spec):
+                self._refuse_before_port(spec, "dax is required")
+        for spec in (
+            {"queries": [{"id": "q1", "dax": "EVALUATE {1}", "keys": False}]},
+            {"queries": [{"id": "q1", "dax": "EVALUATE {1}", "keys": ["ok", 1]}]},
+            {"queries": [{"id": "q1", "dax": "EVALUATE {1}", "keys": {"a": "b"}}]},
+        ):
+            with self.subTest(spec=spec):
+                self._refuse_before_port(spec, "keys must be a list of strings")
+        accepted = [
+            {"queries": [{"id": "a" * 128, "dax": "EVALUATE {1}"}]},
+            {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]},
+            {"queries": [{"id": "q1", "dax": "EVALUATE {1}", "keys": None}]},
+            {"queries": [{"id": "q1", "dax": "EVALUATE {1}", "keys": "Person"}]},
+            {"queries": [{"id": "q1", "dax": "EVALUATE {1}", "keys": ["Person"]}]},
+            {"queries": [{"id": "q1", "dax": "EVALUATE {1}", "keys": []}]},
+            {"queries": [{"id": "A", "dax": "EVALUATE {1}"}, {"id": "a", "dax": "EVALUATE {2}"}]},
+        ]
+        for spec in accepted:
+            with self.subTest(spec=spec):
+                self._reaches_port(spec)
+
+    def test_specs_file_does_not_spend_or_call_engine(self):
+        (self.snaps / "results").mkdir()
+        result = self.snaps / "results" / "different.json"
+        original = b'{"queries":{"q1":{"rows":["kept"]}},"refreshed":"2026-01-01T00:00:00"}'
+        result.write_bytes(original)
+        (self.snaps / "specs").write_bytes(b"not-a-directory")
+        (self.snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        before = _tree(self.snaps)
+        state = self._state_bytes()
+
+        def overwrite(verb, payload, timeout=1800):
+            result.write_bytes(b"changed-by-engine")
+            return {"ok": True}
+
+        with patch("pbz.desktop.require_port", return_value=1) as port, \
+             patch("pbz.checks.engine_call", side_effect=overwrite) as engine:
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(
+                    self.ws, None, "save", "different",
+                    {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]},
+                )
+            self.assertEqual(ctx.exception.code, "CORRUPT_STATE")
+            port.assert_not_called()
+            engine.assert_not_called()
+        self.assertEqual(result.read_bytes(), original)
+        self.assertTrue((self.snaps / "specs").is_file())
+        self.assertEqual(_tree(self.snaps), before)
+        self.assertEqual(self._state_bytes(), state)
+
+    def test_result_directory_file_and_result_path_directory_are_corrupt(self):
+        (self.snaps / "results").write_bytes(b"not-a-directory")
+        before = _tree(self.snaps)
+        with patch("pbz.desktop.require_port") as port, patch("pbz.checks.engine_call") as engine:
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(
+                    self.ws, None, "save", "different",
+                    {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]},
+                )
+            self.assertEqual(ctx.exception.code, "CORRUPT_STATE")
+            port.assert_not_called()
+            engine.assert_not_called()
+        self.assertEqual(_tree(self.snaps), before)
+        (self.snaps / "results").unlink()
+        (self.snaps / "results").mkdir()
+        (self.snaps / "results" / "different.json").mkdir()
+        with patch("pbz.desktop.require_port") as port, patch("pbz.checks.engine_call") as engine:
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(
+                    self.ws, None, "save", "different",
+                    {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]},
+                )
+            self.assertEqual(ctx.exception.code, "CORRUPT_STATE")
+            port.assert_not_called()
+            engine.assert_not_called()
+
+    def test_private_root_file_is_corrupt_before_port(self):
+        parent = Path(self.ws.private).parent
+        name = Path(self.ws.private).name
+        if self.snaps.exists():
+            import shutil
+            shutil.rmtree(self.ws.private)
+        (parent / name).write_bytes(b"not-a-directory")
+        self.ws.private = str(parent / name)
+        with patch("pbz.desktop.require_port") as port, patch("pbz.checks.engine_call") as engine:
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(
+                    self.ws, None, "save", "different",
+                    {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]},
+                )
+            self.assertEqual(ctx.exception.code, "CORRUPT_STATE")
+            port.assert_not_called()
+            engine.assert_not_called()
+        self.assertEqual((parent / name).read_bytes(), b"not-a-directory")
+
+    def test_snapshot_link_is_unsafe_before_port(self):
+        from _junction import make_junction
+        external = self.snaps.parent / "outside-snapshots"
+        external.mkdir()
+        make_junction(self, str(self.snaps / "specs"), str(external))
+        before = _tree(self.snaps)
+        with patch("pbz.desktop.require_port") as port, patch("pbz.checks.engine_call") as engine:
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(
+                    self.ws, None, "save", "different",
+                    {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]},
+                )
+            self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
+            port.assert_not_called()
+            engine.assert_not_called()
+        self.assertEqual(_tree(self.snaps), before)
+
+    def test_spec_write_failure_does_not_refund_or_restore(self):
+        # Residual window. The engine write is not rolled back and the query stays spent.
+        written = b'{"queries":{"q1":{"rows":["engine"]}},"refreshed":"2026-01-01T00:00:00"}'
+
+        def fake_engine(verb, payload, timeout=1800):
+            dest = os.path.join(payload["private_dir"], "snapshots", "results", payload["name"] + ".json")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as handle:
+                handle.write(written)
+            return {"ok": True, "class": "OK"}
+
+        real_replace = os.replace
+
+        def fail_spec(src, dst):
+            parent = os.path.basename(os.path.dirname(dst))
+            if parent == "specs":
+                raise OSError("disk")
+            return real_replace(src, dst)
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine), \
+             patch("pbz.checks.os.replace", side_effect=fail_spec):
+            with self.assertRaises(OSError):
+                checks.snapshot(
+                    self.ws, None, "save", "different",
+                    {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]},
+                )
+        result = self.snaps / "results" / "different.json"
+        self.assertEqual(result.read_bytes(), written)
+        self.assertFalse((self.snaps / "specs" / "different.json").exists())
+        self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 1)
+
+    def test_public_cli_specs_file_leaves_tree_and_budget(self):
+        workspace, private, snaps = self._seed_public_tree()
+        (snaps / "results").mkdir()
+        (snaps / "results" / "different.json").write_bytes(
+            b'{"queries":{"q1":{"rows":["kept"]}},"refreshed":"2026-01-01T00:00:00"}'
+        )
+        (snaps / "specs").write_bytes(b"not-a-directory")
+        before = _tree(snaps)
+        self.assertEqual(_public_budget(private, workspace), 0)
+        proc = _public_snapshot(workspace, private, "save", "different", VALID_SPEC)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload.get("error"), "CORRUPT_STATE")
+        self.assertEqual(payload["outcome"]["status"], "FAILED")
+        self.assertEqual(payload["outcome"]["exit_code"], 2)
+        self.assertEqual(_tree(snaps), before)
+        self.assertEqual(_public_budget(private, workspace), 0)
+
+    def test_public_cli_explicit_empty_spec_does_not_use_saved_spec(self):
+        workspace, private, snaps = self._seed_public_tree()
+        (snaps / "specs").mkdir()
+        (snaps / "specs" / "different.json").write_text(VALID_SPEC, encoding="utf-8")
+        before = _tree(snaps)
+        for spec in ("{}", "null", '{"queries":[]}'):
+            with self.subTest(spec=spec):
+                proc = _public_snapshot(workspace, private, "compare", "different", spec)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                payload = json.loads(proc.stdout)
+                self.assertEqual(payload.get("error"), "BAD_REQUEST")
+                self.assertEqual(payload["outcome"]["status"], "INVALID")
+                self.assertEqual(_tree(snaps), before)
+                self.assertEqual(_public_budget(private, workspace), 0)
+        omitted = _public_cli(workspace, private, ["snapshot", "compare", "different"])
+        self.assertEqual(omitted.returncode, 4, omitted.stdout + omitted.stderr)
+        payload = json.loads(omitted.stdout)
+        self.assertEqual(payload.get("error"), "ENGINE_UNAVAILABLE")
+        self.assertEqual(payload["outcome"]["status"], "UNAVAILABLE")
+        self.assertEqual(_tree(snaps), before)
+        self.assertEqual(_public_budget(private, workspace), 0)
 
     def test_engine_refuses_empty_queries_in_save_and_compare(self):
         # Direct engine call with empty queries must return BAD_REQUEST
