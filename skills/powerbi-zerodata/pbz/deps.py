@@ -36,6 +36,33 @@ ROW_CONTEXT = ITERATORS - {"CALCULATE", "CALCULATETABLE", "COUNTROWS", "TOPN", "
 RELATIONSHIP_FUNCS = {"USERELATIONSHIP", "CROSSFILTER"}
 TOPNLIKE = {"TOPN", "SAMPLE", "INDEX", "OFFSET"}
 PREDICATE_HOSTS = {"FILTER", "CALCULATETABLE"}
+TRANSPARENT_WRAPPERS = frozenset({"", "FILTER", "CALCULATETABLE", "KEEPFILTERS"})
+COLUMN_PROJECTORS = frozenset({"VALUES", "DISTINCT", "ALL", "ALLSELECTED", "ALLNOBLANKROW"})
+
+
+def _is_table_arg(fr: dict) -> bool:
+    fn = fr.get("fn", "")
+    arg = fr.get("arg", 0)
+    if fn in TOPNLIKE:
+        return arg == 1
+    return fn in ITERATORS and arg == 0
+
+
+def _is_predicate_pos(fr: dict) -> bool:
+    fn = fr.get("fn", "")
+    arg = fr.get("arg", 0)
+    if fn == "FILTER":
+        return arg >= 1
+    if fn in ("CALCULATE", "CALCULATETABLE"):
+        return arg >= 1
+    if fn in TOPNLIKE:
+        return arg >= 2
+    if fn in ("GENERATE", "GENERATEALL"):
+        # In DAX GENERATE(Table1, Table2), Table2 (arg 1) is evaluated in row context of Table1.
+        # There is no boolean predicate argument, so this position is never a filter predicate.
+        return False
+    return fn in ITERATORS and arg >= 1
+
 
 
 @dataclass(frozen=True)
@@ -169,9 +196,77 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
             pass
         else:
             for k, fr in enumerate(stack):
-                if fr["fn"] in ITERATORS and fr["arg"] == 0 and fr["row_table"] is None and ref.table and ref.kind in ("table", "column"):
-                    if not teaching_vetoed(k, ref):
-                        fr["row_table"] = ref.table
+                if _is_table_arg(fr) and ref.table and ref.kind in ("table", "column"):
+                    frames = stack[k + 1:]
+                    cj_info = [(j, g) for j, g in enumerate(frames) if g["fn"] == "CROSSJOIN"]
+                    if cj_info:
+                        cj_idx, cj_fr = cj_info[-1]
+                        between = frames[:cj_idx]
+                        if not any(_is_predicate_pos(g) for g in between):
+                            fr["has_crossjoin"] = True
+                            if (
+                                fr.get("src_var")
+                                or cj_fr.get("src_var")
+                                or any(g.get("src_var") for g in between)
+                                or not all(g["fn"] in TRANSPARENT_WRAPPERS for g in between)
+                                or fr.get("fn") in TOPNLIKE
+                            ):
+                                fr["cj_opaque"] = True
+                            cj_arg = cj_fr["arg"]
+                            sub = frames[cj_idx + 1:]
+                            if any(_is_predicate_pos(g) for g in sub):
+                                pass
+                            elif teaching_vetoed(k, ref):
+                                cj_fr.setdefault("ops", {}).setdefault(cj_arg, []).append(("opaque", None, None))
+                                cj_fr["opaque"] = True
+                            elif len(sub) == 1 and sub[0]["fn"] in COLUMN_PROJECTORS and ref.kind == "column":
+                                cj_fr.setdefault("ops", {}).setdefault(cj_arg, []).append(("col", ref.table, ref.name))
+                            elif not sub and ref.kind == "table":
+                                prev = sig[at - 1] if at else None
+                                if prev is not None and prev.text in ("(", ","):
+                                    cj_fr.setdefault("ops", {}).setdefault(cj_arg, []).append(("tab", ref.table, None))
+                                else:
+                                    cj_fr.setdefault("ops", {}).setdefault(cj_arg, []).append(("opaque", None, None))
+                                    cj_fr["opaque"] = True
+                            elif all(g["arg"] == 0 and g["fn"] in (TRANSPARENT_WRAPPERS | COLUMN_PROJECTORS) for g in sub) and ref.kind == "table":
+                                cj_fr.setdefault("ops", {}).setdefault(cj_arg, []).append(("tab", ref.table, None))
+                            else:
+                                cj_fr.setdefault("ops", {}).setdefault(cj_arg, []).append(("opaque", None, None))
+                                cj_fr["opaque"] = True
+                    elif not teaching_vetoed(k, ref):
+                        if fr["row_table"] is None and not fr.get("has_crossjoin"):
+                            fr["row_table"] = ref.table
+                        if any(_is_predicate_pos(g) for g in frames) or any(g.get("arg", 0) != 0 for g in frames[:-1]):
+                            pass
+                        elif (
+                            fr.get("src_var")
+                            or any(g.get("src_var") for g in frames)
+                            or fr.get("fn") in TOPNLIKE
+                        ):
+                            fr["source_kind"] = "unknown"
+                        elif len(frames) == 0 and ref.kind == "table":
+                            if fr.get("source_kind") is None:
+                                fr["source_kind"] = "whole"
+                            elif fr.get("source_kind") != "whole" or fr.get("row_table") != ref.table:
+                                fr["source_kind"] = "unknown"
+                        elif all(g["fn"] in TRANSPARENT_WRAPPERS and g.get("arg", 0) == 0 for g in frames) and ref.kind == "table":
+                            if fr.get("source_kind") is None:
+                                fr["source_kind"] = "whole"
+                            elif fr.get("source_kind") != "whole" or fr.get("row_table") != ref.table:
+                                fr["source_kind"] = "unknown"
+                        elif (
+                            all(g["fn"] in TRANSPARENT_WRAPPERS and g.get("arg", 0) == 0 for g in frames[:-1])
+                            and len(frames) >= 1
+                            and frames[-1]["fn"] in COLUMN_PROJECTORS
+                            and ref.kind == "column"
+                        ):
+                            if fr.get("source_kind") is None or fr.get("source_kind") == "projected":
+                                fr["source_kind"] = "projected"
+                                fr.setdefault("projected_cols", set()).add((ref.table, ref.name))
+                            else:
+                                fr["source_kind"] = "unknown"
+                        else:
+                            fr["source_kind"] = "unknown"
         for rc in rel_calls:
             if rc["depth"] <= len(stack) and ref.kind == "column":
                 rc["cols"].append((ref.table, ref.name))
@@ -195,7 +290,33 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
                 if len(rc["cols"]) >= 2:
                     out.relationships.append((rc["fn"], rc["cols"][0], rc["cols"][1]))
             if stack:
-                stack.pop()
+                popped = stack.pop()
+                if popped.get("fn") == "CROSSJOIN":
+                    total = popped["arg"] + 1
+                    ops = popped.get("ops", {})
+                    is_opaque = (
+                        popped.get("opaque", False)
+                        or popped.get("src_var", False)
+                    )
+                    for a in range(total):
+                        if a not in ops or any(op[0] == "opaque" for op in ops[a]):
+                            is_opaque = True
+                    path_from_top = []
+                    for fr in reversed(stack):
+                        if _is_predicate_pos(fr):
+                            break
+                        if _is_table_arg(fr):
+                            fr["has_crossjoin"] = True
+                            fr["cj_ops"] = ops
+                            if (
+                                fr.get("src_var", False)
+                                or is_opaque
+                                or any(g.get("src_var", False) for g in path_from_top)
+                                or not all(g["fn"] in TRANSPARENT_WRAPPERS for g in path_from_top)
+                                or fr.get("fn") in TOPNLIKE
+                            ):
+                                fr["cj_opaque"] = True
+                        path_from_top.append(fr)
         elif t.kind == "op" and t.text == "," and stack:
             stack[-1]["arg"] += 1
         elif t.kind in ("table", "ident") and nxt is not None and nxt.kind == "bracket" and (
@@ -222,12 +343,113 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
                              and not res.table(prev.text))
             ref, source, supplier = _bare_full(t.value, home, res, row_home, row_tables(), extension)
             taint = False
+            supplier_idx = None
             ctx = [(idx, fr) for idx, fr in enumerate(stack) if fr["fn"] in ROW_CONTEXT and fr["arg"] >= 1]
-            untaught = [idx for idx, fr in ctx if not fr["row_table"]]
+            if any(fr.get("has_crossjoin") for _, fr in ctx):
+                def _check_outer_competes(chosen_table: str, chosen_column: str, curr_idx: int) -> bool:
+                    for j, g in ctx:
+                        if j < curr_idx:
+                            if g.get("has_crossjoin"):
+                                for op_list in g.get("cj_ops", {}).values():
+                                    for op in op_list:
+                                        if op[1]:
+                                            if op[0] == "col" and op[2].lower() == t.value.lower():
+                                                if op[1].lower() != chosen_table.lower() or op[2].lower() != chosen_column.lower():
+                                                    return True
+                                            elif op[0] == "tab" and res.column(op[1], t.value):
+                                                if op[1].lower() != chosen_table.lower() or res.column(op[1], t.value).lower() != chosen_column.lower():
+                                                    return True
+                            else:
+                                sk = g.get("source_kind")
+                                if sk == "whole" and g.get("row_table"):
+                                    g_tab = g["row_table"]
+                                    if res.column(g_tab, t.value):
+                                        if g_tab.lower() != chosen_table.lower() or res.column(g_tab, t.value).lower() != chosen_column.lower():
+                                            return True
+                                elif sk == "projected" and "projected_cols" in g:
+                                    for tab, c in g["projected_cols"]:
+                                        if c.lower() == t.value.lower():
+                                            if tab.lower() != chosen_table.lower() or c.lower() != chosen_column.lower():
+                                                return True
+                                else:
+                                    return True
+                    if row_home and bool(home):
+                        home_col = res.column(home, t.value)
+                        if home_col and (home.lower() != chosen_table.lower() or home_col.lower() != chosen_column.lower()):
+                            return True
+                    return False
+
+                for idx, fr in reversed(ctx):
+                    if fr.get("has_crossjoin"):
+                        supplying_ops = []
+                        ops = fr.get("cj_ops", {})
+                        for a, op_list in ops.items():
+                            for op_type, tab, col_name in op_list:
+                                if op_type == "col" and col_name and col_name.lower() == t.value.lower():
+                                    supplying_ops.append((a, tab, col_name))
+                                elif op_type == "tab" and tab and res.column(tab, t.value):
+                                    supplying_ops.append((a, tab, res.column(tab, t.value)))
+                        if supplying_ops:
+                            distinct_ops = {a for a, _, _ in supplying_ops}
+                            chosen_tab = supplying_ops[0][1]
+                            col = supplying_ops[0][2]
+                            ref = Ref("column", chosen_tab, col)
+                            source = "row"
+                            supplier = chosen_tab
+                            supplier_idx = idx
+                            outer_competes = _check_outer_competes(chosen_tab, col, idx)
+                            if (
+                                len(distinct_ops) > 1
+                                or fr.get("cj_opaque")
+                                or t.value.lower() in extension
+                                or res.measure(t.value) is not None
+                                or outer_competes
+                            ):
+                                taint = True
+                            break
+                        else:
+                            continue
+                    else:
+                        sk = fr.get("source_kind")
+                        if sk == "projected":
+                            matching = [c for tab, c in fr.get("projected_cols", set()) if c.lower() == t.value.lower()]
+                            if not matching:
+                                continue
+                            col = matching[0]
+                            rt = [tab for tab, c in fr["projected_cols"] if c.lower() == t.value.lower()][0]
+                        elif sk == "whole" and fr.get("row_table"):
+                            rt = fr["row_table"]
+                            col = res.column(rt, t.value)
+                            if not col:
+                                continue
+                        else:
+                            taint = True
+                            break
+
+                        ref = Ref("column", rt, col)
+                        source = "row"
+                        supplier = rt
+                        supplier_idx = idx
+                        outer_competes = _check_outer_competes(rt, col, idx)
+                        if (
+                            outer_competes
+                            or any(g.get("cj_opaque") for j, g in ctx if j > idx and g.get("has_crossjoin"))
+                            or t.value.lower() in extension
+                            or res.measure(t.value) is not None
+                        ):
+                            taint = True
+                        break
+
+            if any(fr.get("cj_opaque") for fr in stack if fr.get("has_crossjoin")):
+                taint = True
+            elif source not in ("extension", "measure", "row_home"):
+                if supplier_idx is None and any(fr.get("has_crossjoin") for _, fr in ctx):
+                    taint = True
+            untaught = [idx for idx, fr in ctx if not fr["row_table"] and not fr.get("has_crossjoin")]
             if untaught:
                 if source == "row":
-                    sup = [idx for idx, fr in ctx if fr["row_table"] == supplier]
-                    taint = (not sup) or any(u > max(sup) for u in untaught)
+                    sup = [supplier_idx] if supplier_idx is not None else [idx for idx, fr in ctx if fr["row_table"] == supplier]
+                    taint = taint or (not sup) or any(u > max(sup) for u in untaught)
                 else:
                     taint = True
             add(ref, i, uncertain or taint, veto_teach=taint)
@@ -236,6 +458,18 @@ def dax_bindings(expr: str, home: str, res: Resolver, row_home: bool = False,
             add(Ref("table", tab, tab) if tab else Ref("unresolved", t.value, ""), i)
         elif t.kind == "ident":
             low = t.text.lower()
+            if t.text.upper() == "VAR":
+                for g in reversed(stack):
+                    if _is_predicate_pos(g):
+                        break
+                    g["src_var"] = True
+                    if g["fn"] == "CROSSJOIN":
+                        g.setdefault("ops", {}).setdefault(g["arg"], []).append(("opaque", None, None))
+                        g["opaque"] = True
+                    elif g.get("has_crossjoin"):
+                        g["cj_opaque"] = True
+                    else:
+                        g["opaque"] = True
             if nxt is not None and nxt.kind == "op" and nxt.text == "(":
                 if low in res.functions:
                     add(Ref("function", "", res.functions[low]), i)

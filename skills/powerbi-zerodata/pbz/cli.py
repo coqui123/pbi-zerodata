@@ -11,7 +11,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     __package__ = "pbz"
 
-from pbz import checks, describe, desktop, dpapi, handoff, memscrub, mirror, policy, rename, scan, smoke, validate  # noqa: E402
+from pbz import checks, describe, desktop, dpapi, handoff, memscrub, mirror, policy, rename, scan, smoke, tokens, validate  # noqa: E402
 from pbz.common import (  # noqa: E402
     PbzError, _contained, _reparse_link, emit, engine_call, file_sha, find_workspace, pbz_state_path)
 
@@ -184,8 +184,9 @@ def _vendor_host(host: str) -> bool:
 def cmd_init(ws, project, a):
     pbz_state_path(ws)
     os.makedirs(ws.pbz_dir, exist_ok=True)
-    if not os.path.exists(ws.policy_path):
-        policy.save(ws, policy.load(ws))
+    with tokens.WorkspaceLock(ws.private):
+        if not os.path.exists(ws.policy_path):
+            policy.save(ws, policy.load(ws))
     dpapi.load_key(ws.private)
     sc = scan.scan(ws, apply=True)
     hosts = set()
@@ -202,6 +203,16 @@ def cmd_init(ws, project, a):
     if not mirror.load_manifest(ws, project):
         res["pull"] = mirror.pull(ws, project)
     return res
+
+
+def _bounded_int(val: str, min_val: int = 1, max_val: int = 3600) -> int:
+    try:
+        n = int(val)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected an integer") from None
+    if n < min_val or n > max_val:
+        raise argparse.ArgumentTypeError(f"value must be between {min_val} and {max_val}") from None
+    return n
 
 
 def argument_parser():
@@ -229,7 +240,10 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("capabilities", help="closed capability matrix: what pbz can and cannot certify")
     sub.add_parser("status", help="workspace, mirror, sync, Desktop and engine")
-    sub.add_parser("doctor", help="read-only OS-isolation checklist; changes nothing")
+    p = sub.add_parser("doctor", help="read-only OS-isolation checklist or CI diagnostics; changes nothing")
+    p.add_argument("target", nargs="?", choices=["ci"], default=None, help="optional target: 'ci' for CI/CD diagnostics")
+    p.add_argument("--offline", action="store_true", help="skip hosted checks and network requests")
+    p.add_argument("--branch", default=None, help="target branch for CI diagnostics (defaults to current branch)")
     sub.add_parser("init", help="create the policy, scan data-bearing files, and pull the first mirror")
     p = sub.add_parser("scan")
     p.add_argument("--dry-run", action="store_true")
@@ -672,6 +686,9 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("path")
     p = sub.add_parser("watch", help="validation and best-practice passes; polls unless --once")
     p.add_argument("--once", action="store_true", help="a single pass")
+    p.add_argument("--rescan", action="store_true", help="force re-running validation even if files have not changed")
+    p.add_argument("--history", type=lambda v: _bounded_int(v, 1, 1000), default=50, help="max recent passes to retain in history (1 to 1000, default: 50)")
+    p.add_argument("--seconds", type=lambda v: _bounded_int(v, 1, 3600), default=5, help="polling interval in seconds (1 to 3600, default: 5)")
     p = sub.add_parser("perf", help="performance bands for a DAX query (no durations)")
     p.add_argument("--dax", required=True, help="DAX query")
     p.add_argument("--runs", type=int, default=1, help="1 to 20")
@@ -694,7 +711,25 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             from pbz import interactiontest
             from pbz.outcomes import envelope
             if a.cmd == "doctor":
-                out = cmd_doctor()
+                if getattr(a, "offline", False) and getattr(a, "target", None) != "ci":
+                    raise PbzError("BAD_ARGUMENTS", "--offline requires 'pbz doctor ci'")
+                branch_arg = getattr(a, "branch", None)
+                if branch_arg is not None:
+                    if not isinstance(branch_arg, str) or not branch_arg.strip():
+                        raise PbzError("BAD_ARGUMENTS", "--branch cannot be empty")
+                    if (
+                        branch_arg != branch_arg.strip()
+                        or branch_arg.startswith("-")
+                        or not re.fullmatch(r"[A-Za-z0-9_./@+-]+", branch_arg)
+                    ):
+                        raise PbzError("BAD_ARGUMENTS", f"invalid --branch argument: {branch_arg}")
+                    if getattr(a, "target", None) != "ci":
+                        raise PbzError("BAD_ARGUMENTS", "--branch requires 'pbz doctor ci'")
+                if getattr(a, "target", None) == "ci":
+                    from pbz import doctor
+                    out = doctor.cmd_doctor_ci(ws_path=getattr(a, "workspace", None), offline=getattr(a, "offline", False), branch_override=branch_arg)
+                else:
+                    out = cmd_doctor()
             elif a.cmd == "capabilities":
                 from pbz.capabilities import matrix
                 out = matrix()
@@ -1249,7 +1284,8 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             out = scripts.export(ws, project, path) if a.action == "export" else scripts.apply(ws, project, path)
         elif a.cmd == "watch":
             from pbz import watch
-            out = watch.run(ws, project, once=a.once)
+            out = watch.run(ws, project, once=a.once, seconds=getattr(a, "seconds", 5),
+                            rescan=getattr(a, "rescan", False), max_passes=getattr(a, "history", 50))
         elif a.cmd == "perf":
             from pbz import perf
             out = perf.run(ws, project, a.dax, runs=a.runs, baseline=a.baseline, action=a.action)

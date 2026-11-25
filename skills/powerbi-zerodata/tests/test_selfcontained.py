@@ -108,9 +108,14 @@ def main() -> int:
 
     # ---------------------------------------------------------------- no third-party binaries at runtime
     src = ""
+    doctor_src = ""
     for f in sorted(os.listdir(os.path.join(SKILL, "pbz"))):
         if f.endswith(".py") and f != "guard.py":   # the guard names tools only to block them
-            src += open(os.path.join(SKILL, "pbz", f), encoding="utf-8").read()
+            text = open(os.path.join(SKILL, "pbz", f), encoding="utf-8").read()
+            if f == "doctor.py":
+                doctor_src = text
+            else:
+                src += text
     def odd_executables(source):
         calls = re.findall(r"subprocess\.run\(\s*\[([^\],]+)", source)
         allowed = {"exe", "str(exe)", "BRIDGE", "sys.executable", '"taskkill"'}
@@ -119,7 +124,9 @@ def main() -> int:
         return [c.strip() for c in calls if c.strip() not in allowed and not c.strip().startswith(("REPORT_AUTHOR", "args"))]
 
     odd = odd_executables(src)
+    doctor_calls = odd_executables(doctor_src)
     check(not odd, f"unexpected external executables: {odd}")
+    check(doctor_calls == ['"git"', '"git"'], f"doctor may call git only: {doctor_calls}")
     mcp_src = open(os.path.join(SKILL, "pbz", "mcp.py"), encoding="utf-8").read()
     check(src.count('"taskkill"') == 1 and mcp_src.count('"taskkill"') == 1,
           "taskkill must occur exactly once, in mcp.py")

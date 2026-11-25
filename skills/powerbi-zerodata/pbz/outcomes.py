@@ -19,6 +19,38 @@ def _row_failed(row: dict) -> bool:
             or _exec_error(row.get("result")) or _exec_error(row.get("status")))
 
 
+_ENGINE_CLASSES = {"SYNTAX", "UNKNOWN_OBJECT", "TYPE_MISMATCH", "CONVERSION", "CIRCULAR",
+                   "DUPLICATE_KEY", "TIMEOUT", "ENGINE_UNAVAILABLE", "BAD_REQUEST", "OTHER"}
+
+
+def _health_failure_code(out: dict) -> str | None:
+    """A health payload with errors is a failure. Evidence records that as FAIL."""
+    if out.get("verb") != "health":
+        return None
+    errors = out.get("errors")
+    if errors is None:
+        errors = out.get("objects_in_error")
+    if isinstance(errors, bool) or errors is None:
+        return None
+    if isinstance(errors, int):
+        return "ASSERTION_FAILED" if errors > 0 else None
+    if not isinstance(errors, list) or not errors:
+        return None
+    for item in errors:
+        if isinstance(item, dict):
+            cls = item.get("class")
+            if isinstance(cls, str) and cls in _ENGINE_CLASSES:
+                return "ERROR:" + cls
+    return "ASSERTION_FAILED"
+
+
+def _health_unprocessed(out: dict) -> bool:
+    if out.get("verb") != "health" or _health_failure_code(out):
+        return False
+    tables = out.get("unprocessed_tables")
+    return isinstance(tables, list) and len(tables) > 0
+
+
 def _smoke_incomplete(out: dict) -> bool:
     """Partial smoke coverage is inconclusive, not a successful execution."""
     if out.get("verb") != "smoke":
@@ -42,6 +74,7 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
     visual_rows = [r for r in out.get("visuals") or [] if isinstance(r, dict)]
     status, rc = "SUCCEEDED", 0
     reload = out.get("reload")
+    health_code = _health_failure_code(out)
     assertions = any(_row_failed(r) for r in query_rows) or any(_row_failed(r) for r in visual_rows)
     if out.get("result") == "PUSHED" and reload and reload != "RELOADED":
         status, code, rc = "PARTIAL", "APPLIED_RELOAD_FAILED", 5
@@ -57,6 +90,8 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
     elif code in UNAVAILABLE:
         status, rc = "UNAVAILABLE", 4
     elif code in INVALID or out.get("spec_valid") is False:
+        if code not in INVALID:
+            code = "SPEC_INVALID"
         status, rc = "INVALID", 2
     elif code in {"ROLLED_BACK", "FAILED"}:
         status, rc = "FAILED", 1
@@ -81,8 +116,13 @@ def envelope(out: dict, diagnostic: bool = False) -> tuple[dict, int]:
             status, code, rc = "FAILED", "ASSERTION_FAILED", 1
     elif assertions:
         status, code, rc = ("FINDINGS", "DIAGNOSTIC_FINDINGS", 0) if diagnostic else ("FAILED", "ASSERTION_FAILED", 1)
-    elif _smoke_incomplete(out) or any(
-            r.get("status") in {"EMPTY", "UNSUPPORTED", "BUDGET"} or r.get("result") in {"STALE_DATA", "NOT_COMPARABLE"}
+    elif health_code:
+        status, code, rc = "FAILED", health_code, 1
+    elif _health_unprocessed(out):
+        status, code, rc = "BLOCKED", "INCOMPLETE", 3
+    elif code in {"NEW", "MISSING"} or _smoke_incomplete(out) or any(
+            r.get("status") in {"EMPTY", "UNSUPPORTED", "BUDGET"}
+            or r.get("result") in {"STALE_DATA", "NOT_COMPARABLE", "NEW", "MISSING"}
             for r in query_rows):
         status, code, rc = "BLOCKED", "INCONCLUSIVE_EVIDENCE", 3
     elif out.get("status") == "BUDGET":

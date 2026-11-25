@@ -24,7 +24,8 @@ public static class Snapshots
         public List<string> ValueColumns => Columns.Where((_, i) => !KeyIdx.Contains(i)).ToList();
     }
 
-    static string FilePath(string pd, string name) => Path.Combine(pd, "snapshots", name + ".json");
+    static string FilePath(string pd, string name) => Path.Combine(pd, "snapshots", "results", name + ".json");
+    static string LegacyFilePath(string pd, string name) => Path.Combine(pd, "snapshots", name + ".json");
 
     static string Name(Req req)
     {
@@ -36,6 +37,7 @@ public static class Snapshots
     static List<(string Id, string Dax, List<string> Keys)> Queries(Req req)
     {
         var arr = req.Arr("queries") ?? throw new BadRequestException("queries is required");
+        if (arr.Count == 0) throw new BadRequestException("queries must not be empty");
         var list = new List<(string, string, List<string>)>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var n in arr)
@@ -153,6 +155,10 @@ public static class Snapshots
             ["refreshed"] = conn.LatestRefresh(),
             ["queries"] = stored,
         };
+        string dir = Path.Combine(pd, "snapshots", "results");
+        LinkGuard.Refuse(Path.Combine(pd, "snapshots"));
+        LinkGuard.Refuse(dir);
+        Directory.CreateDirectory(dir);
         Vault.WriteAtomic(FilePath(pd, name), doc.ToJsonString());
         return Ctx.Ok("snapshot-save", new JsonObject { ["name"] = name, ["queries"] = outArr });
     }
@@ -167,9 +173,27 @@ public static class Snapshots
         using var conn = Conn.Open(ctx, port);
         JsonObject? saved = null;
         string path = FilePath(pd, name);
+        string legacyPath = LegacyFilePath(pd, name);
         LinkGuard.Refuse(Path.Combine(pd, "snapshots"));
+        LinkGuard.Refuse(Path.Combine(pd, "snapshots", "results"));
         LinkGuard.Refuse(path);
-        if (File.Exists(path)) saved = JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8)) as JsonObject;
+        if (File.Exists(path))
+        {
+            saved = JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8)) as JsonObject;
+        }
+        else
+        {
+            LinkGuard.Refuse(legacyPath);
+            if (File.Exists(legacyPath))
+            {
+                var candidate = JsonNode.Parse(File.ReadAllText(legacyPath, Encoding.UTF8)) as JsonObject;
+                if (candidate != null && candidate["queries"] is JsonObject && candidate.ContainsKey("refreshed")
+                    && (candidate["refreshed"] == null || (candidate["refreshed"] is JsonValue jv && jv.TryGetValue<string>(out _))))
+                {
+                    saved = candidate;
+                }
+            }
+        }
         var savedQueries = saved?["queries"] as JsonObject;
         bool stale = saved != null && !string.Equals(saved["refreshed"]?.GetValue<string>(), conn.LatestRefresh(), StringComparison.Ordinal);
         var outArr = new JsonArray();

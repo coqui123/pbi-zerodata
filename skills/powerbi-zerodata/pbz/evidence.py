@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 from . import dpapi
 from .common import (
-    PbzError, SIZE_CAP, append_checked, pbz_state_path, read_checked, write_text, _reparse_link,
+    PbzError, SIZE_CAP, append_checked, is_snapshot_result_doc, pbz_state_path, read_checked, write_text, _reparse_link,
     _workspace_root, list_names)
 
 STAGES = ("PARSED", "BOUND", "LOADED", "EXECUTED", "STATIC_CONTRACT", "SYNTHETIC", "HANDOFF", "HUMAN_ACCEPTED")
@@ -1093,12 +1093,27 @@ def _status(e: dict | None, cur_m: str, cur_r: str, pending: bool, stage: str,
     return "CURRENT"
 
 
-def _state_names(ws, dirname: str) -> tuple[str, list[str]]:
+def _state_names(ws, dirname: str, base_dir: str | None = None) -> tuple[str, list[str]]:
     """Anchored directory listing. A link directory is UNSAFE_PATH. Link or hardlinked leaves are omitted, unopened."""
-    path = pbz_state_path(ws, dirname)
-    if not os.path.lexists(path):
-        return path, []
-    if _reparse_link(path) or not os.path.isdir(path):
+    if base_dir:
+        anchor = os.path.abspath(base_dir)
+        if _reparse_link(anchor):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    else:
+        anchor = pbz_state_path(ws)
+    curr = anchor
+    for seg in os.path.normpath(dirname).split(os.sep):
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        curr = os.path.join(curr, seg)
+        if not os.path.lexists(curr):
+            return curr, []
+        if _reparse_link(curr):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    path = curr
+    if not os.path.isdir(path):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     names = []
     for name in sorted(list_names(path)):
@@ -1118,10 +1133,45 @@ def _suggested_tests(ws, project, logic: list[str]) -> list[str]:
     out = []
     if logic:
         out.append("pbz check with a compiles check per changed measure: " + ", ".join(logic[:10]))
-    _snap, snap_names = _state_names(ws, "snapshots")
-    for name in snap_names:
-        if name.endswith(".json"):
-            out.append(f"pbz snapshot compare {name[:-5]}")
+    seen = set()
+    search_dirs = [
+        (ws.private, os.path.join("snapshots", "results"), True),
+        (ws.private, "snapshots", False),
+        (None, os.path.join("snapshots", "results"), True),
+        (None, "snapshots", False),
+    ]
+    for b_dir, s_dir, is_results in search_dirs:
+        _d, names = _state_names(ws, s_dir, base_dir=b_dir)
+        for name in names:
+            if is_results:
+                if name.endswith(".json"):
+                    stem = name[:-5]
+                    if stem and stem not in seen:
+                        seen.add(stem)
+                        out.append(f"pbz snapshot compare {stem}")
+            else:
+                if name.endswith(".json"):
+                    if name.endswith(".spec.json"):
+                        # Ambiguous: could be legacy spec for monthly (omit) or legacy result for monthly.spec (suggest)
+                        full_leaf = os.path.join(_d, name)
+                        try:
+                            root_anchor = _workspace_root(ws) if not b_dir else b_dir
+                            raw = read_checked(full_leaf, root=root_anchor)
+                            doc = json.loads(raw.decode("utf-8-sig"))
+                            if is_snapshot_result_doc(doc):
+                                stem = name[:-5]
+                                if stem and stem not in seen:
+                                    seen.add(stem)
+                                    out.append(f"pbz snapshot compare {stem}")
+                        except PbzError:
+                            raise
+                        except (OSError, ValueError):
+                            pass
+                    else:
+                        stem = name[:-5]
+                        if stem and stem not in seen:
+                            seen.add(stem)
+                            out.append(f"pbz snapshot compare {stem}")
     tdir, test_names = _state_names(ws, "synth-tests")
     names = {n.lower().strip("[]") for n in logic}
     for name in test_names:

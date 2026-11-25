@@ -262,7 +262,10 @@ class MemoryDisclosureTests(unittest.TestCase):
     def test_status_reports_linked_manifest_as_index_error(self):
         target = Path(self.tmp.name) / "manifest.json"
         target.write_text("{}")
-        Path(self.ws.private, "index-current.json").symlink_to(target)
+        try:
+            Path(self.ws.private, "index-current.json").symlink_to(target)
+        except OSError:
+            self.skipTest("file symlink is unavailable")
         with patch("pbz.cli.engine_call", return_value={"ok": True}):
             out = cli.cmd_status(self.ws, self.project, None)
         self.assertFalse(out["index"])

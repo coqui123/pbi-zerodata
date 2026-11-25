@@ -414,6 +414,8 @@ def _same(a, b, tol: float) -> bool:
     if a is None or b is None:
         return a is None and b is None
     if _number(a) and _number(b):
+        if tol == 0:
+            return a == b
         a, b = float(a), float(b)
         return a == b or abs(a - b) <= tol * max(abs(a), abs(b))
     return a == b
@@ -570,8 +572,8 @@ def _check_one(ws, project, model, c: dict) -> dict:
         col, dtp, t = _column(model, c["column"])
         pred = f"{col} = \"\"" if dtp == "string" else f"ISBLANK({col})"
         out = _offenders(ws, project,
-                         f"EVALUATE ROW(\"n\", {_calc(f'COUNTROWS({t})', where)}, \"o\", {_calc(f'CALCULATE(COUNTROWS({t}), {pred})', where)})",
-                         f"EVALUATE TOPN(5, {_calctable(f'CALCULATETABLE({t}, {pred})', where)})")
+                         f"EVALUATE ROW(\"n\", {_calc(f'COUNTROWS({t})', where)}, \"o\", {_calc(f'CALCULATE(COUNTROWS({t}), KEEPFILTERS({pred}))', where)})",
+                         f"EVALUATE TOPN(5, {_calctable(f'CALCULATETABLE({t}, KEEPFILTERS({pred}))', where)})")
         if "counterexample" in out:
             out["counterexample"] = {"blank_rows": out.get("offenders"), "example_rows": out["counterexample"]}
         return out

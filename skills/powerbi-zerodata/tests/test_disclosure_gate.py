@@ -532,7 +532,10 @@ class IndexGenerationTests(unittest.TestCase):
         target.mkdir()
         (target / "marker").write_text("keep")
         link = Path(self.ws.private) / ("index-" + "f" * 32)
-        link.symlink_to(target, target_is_directory=True)
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError:
+            self.skipTest("file symlink is unavailable")
         self.cls = "high"
         self.run_index(self.a)
         directories = [p for p in Path(self.ws.private).glob("index-*") if p.is_dir()]

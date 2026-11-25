@@ -101,8 +101,7 @@ public static class Checks
                 {
                     var c = Col(chk, "column", conn);
                     string t = Dax.QTable(c.Table.Name);
-                    var row = conn.Row1("EVALUATE ROW(\"n\", " + Dax.Calc("COUNTROWS(" + t + ")", where) +
-                                        ", \"o\", " + Dax.Calc("CALCULATE(COUNTROWS(" + t + "), " + c.BlankPredicate + ")", where) + ")");
+                    var row = conn.Row1(NoBlankKeysDax(t, c.BlankPredicate, where));
                     Offenders(res, ColumnStats.L(row[0]), ColumnStats.L(row[1]), ctx);
                     break;
                 }
@@ -122,9 +121,7 @@ public static class Checks
                         sign = d < 0 ? "NEG" : d == 0 ? "ZERO" : "POS";
                     }
                     var expect = J.StrList(chk, "expect");
-                    if (expect != null && expect.Any(e => e is not ("NEG" or "ZERO" or "POS" or "BLANK")))
-                        throw new BadRequestException("expect must be NEG, ZERO, POS or BLANK");
-                    res["status"] = expect == null || expect.Count == 0 || expect.Contains(sign) ? "PASS" : "FAIL";
+                    res["status"] = SignStatus(expect, sign);
                     res["sign"] = sign;
                     break;
                 }
@@ -488,15 +485,61 @@ public static class Checks
         return d.ToString("R", CultureInfo.InvariantCulture);
     }
 
+    /// <summary>Omitted expect passes. An empty list does not contain the sign, so it fails.</summary>
+    public static string SignStatus(List<string>? expect, string sign)
+    {
+        if (expect != null && expect.Any(e => e is not ("NEG" or "ZERO" or "POS" or "BLANK")))
+            throw new BadRequestException("expect must be NEG, ZERO, POS or BLANK");
+        return expect == null || expect.Contains(sign) ? "PASS" : "FAIL";
+    }
+
     /// <summary>BLANK equals BLANK only; numbers within relative tolerance; others by value.</summary>
     public static bool ValuesEqual(object? a, object? b, double tol)
     {
         if (a == null || b == null) return a == null && b == null;
-        if (Norm.IsNumeric(a) && Norm.IsNumeric(b)) return NumEqual(Norm.ToDouble(a), Norm.ToDouble(b), tol);
+        if (Norm.IsNumeric(a) && Norm.IsNumeric(b))
+        {
+            if (tol == 0) return ExactNumEqual(a, b);
+            return NumEqual(Norm.ToDouble(a), Norm.ToDouble(b), tol);
+        }
         if (a is DateTime da && b is DateTime db) return da == db;
         if (a is string sa && b is string sb) return string.Equals(sa, sb, StringComparison.Ordinal);
         if (a is bool ba && b is bool bb) return ba == bb;
         return string.Equals(Norm.Value(a), Norm.Value(b), StringComparison.Ordinal);
+    }
+
+    static bool IsIntegerType(object v) => v is long or int or short or sbyte or byte or ulong or uint or ushort;
+    static bool IsExactType(object v) => IsIntegerType(v) || v is decimal;
+
+    static bool ExactNumEqual(object a, object b)
+    {
+        if (IsExactType(a) && IsExactType(b))
+        {
+            return Convert.ToDecimal(a, CultureInfo.InvariantCulture) == Convert.ToDecimal(b, CultureInfo.InvariantCulture);
+        }
+
+        double da = Norm.ToDouble(a);
+        double db = Norm.ToDouble(b);
+        if (double.IsNaN(da) || double.IsNaN(db)) return false;
+
+        if (IsIntegerType(a) ^ IsIntegerType(b))
+        {
+            object exact = IsIntegerType(a) ? a : b;
+            double d = IsIntegerType(a) ? db : da;
+            if (double.IsInfinity(d)) return false;
+
+            if (exact is ulong u)
+            {
+                if (d < 0.0 || d >= 18446744073709551616.0) return false;
+                return (double)(ulong)d == d && (ulong)d == u;
+            }
+
+            if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) return false;
+            long l = Convert.ToInt64(exact, CultureInfo.InvariantCulture);
+            return (double)(long)d == d && (long)d == l;
+        }
+
+        return da == db;
     }
 
     static bool NumEqual(double a, double b, double tol)
@@ -532,4 +575,8 @@ public static class Checks
     }
 
     static ColumnMeta Col(JsonObject chk, string field, Conn conn) => conn.Meta.ResolveColumn(J.ReqStr(chk, field));
+
+    public static string NoBlankKeysDax(string table, string blankPredicate, IReadOnlyList<string> where)
+        => "EVALUATE ROW(\"n\", " + Dax.Calc("COUNTROWS(" + table + ")", where) +
+           ", \"o\", " + Dax.Calc("CALCULATE(COUNTROWS(" + table + "), KEEPFILTERS(" + blankPredicate + "))", where) + ")";
 }

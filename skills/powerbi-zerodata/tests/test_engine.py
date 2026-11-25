@@ -382,6 +382,67 @@ foreach (var pair in new[] {
     ("EVALUATE {\"a b\"}", "EVALUATE {\"ab\"}", false),
     ("EVALUATE {'a b'[x]}", "EVALUATE {'ab'[x]}", false)
 }) Assert((Normalize(pair.Item1) == Normalize(pair.Item2)) == pair.Item3, "query normalization: " + pair.Item1);
+// PR 4a: exact int64 and tol == 0 assertions on Checks.ValuesEqual
+Assert(!Checks.ValuesEqual(9007199254740993L, 9007199254740992L, 0.0), "exact int64 tol=0 inequality");
+Assert(Checks.ValuesEqual(9007199254740993L, 9007199254740993L, 0.0), "exact int64 tol=0 identity");
+Assert(!Checks.ValuesEqual(long.MaxValue, long.MaxValue - 1, 0.0), "int64 max tol=0 inequality");
+Assert(Checks.ValuesEqual(123, 123L, 0.0), "int vs long tol=0 identity");
+Assert(!Checks.ValuesEqual(123, 124L, 0.0), "int vs long tol=0 inequality");
+Assert(Checks.ValuesEqual(1L, 1.0, 0.0), "int vs float tol=0 identity");
+Assert(!Checks.ValuesEqual(1L, 1.5, 0.0), "int vs float tol=0 fractional inequality");
+Assert(!Checks.ValuesEqual(9007199254740993L, 9007199254740992.0, 0.0), "int vs float tol=0 precision inequality");
+Assert(!Checks.ValuesEqual(9007199254740992.0, 9007199254740993L, 0.0), "float vs int tol=0 precision inequality");
+Assert(Checks.ValuesEqual(9007199254740992L, 9007199254740992.0, 0.0), "int vs float tol=0 2^53 exact identity");
+Assert(Checks.ValuesEqual(9007199254740992.0, 9007199254740992L, 0.0), "float vs int tol=0 2^53 exact identity");
+Assert(!Checks.ValuesEqual(long.MaxValue, 9223372036854775808.0, 0.0), "long.MaxValue vs 2^63 double inequality");
+Assert(!Checks.ValuesEqual(9223372036854775808.0, long.MaxValue, 0.0), "2^63 double vs long.MaxValue inequality");
+Assert(Checks.ValuesEqual(long.MinValue, -9223372036854775808.0, 0.0), "long.MinValue vs -2^63 double identity");
+Assert(Checks.ValuesEqual(-9223372036854775808.0, long.MinValue, 0.0), "-2^63 double vs long.MinValue identity");
+Assert(Checks.ValuesEqual(9223372036854775808UL, 9223372036854775808.0, 0.0), "ulong 2^63 vs double identity");
+Assert(Checks.ValuesEqual(9223372036854775808.0, 9223372036854775808UL, 0.0), "double vs ulong 2^63 identity");
+Assert(!Checks.ValuesEqual(ulong.MaxValue, 18446744073709551616.0, 0.0), "ulong.MaxValue vs 2^64 double inequality");
+Assert(!Checks.ValuesEqual(18446744073709551616.0, ulong.MaxValue, 0.0), "2^64 double vs ulong.MaxValue inequality");
+Assert(Checks.ValuesEqual(ulong.MaxValue, ulong.MaxValue, 0.0), "ulong.MaxValue identity");
+Assert(!Checks.ValuesEqual(ulong.MaxValue, ulong.MaxValue - 1, 0.0), "ulong.MaxValue inequality");
+Assert(!Checks.ValuesEqual(double.PositiveInfinity, 1L, 0.0), "infinity vs long inequality");
+Assert(!Checks.ValuesEqual(1L, double.PositiveInfinity, 0.0), "long vs infinity inequality");
+Assert(!Checks.ValuesEqual(double.NaN, 1L, 0.0), "NaN vs long inequality");
+Assert(!Checks.ValuesEqual(1L, double.NaN, 0.0), "long vs NaN inequality");
+Assert(Checks.ValuesEqual(123.45m, 123.45m, 0.0), "decimal vs decimal identity");
+Assert(!Checks.ValuesEqual(123.45m, 123.46m, 0.0), "decimal vs decimal inequality");
+Assert(Checks.ValuesEqual(9007199254740993L, 9007199254740993m, 0.0), "long vs decimal 2^53 identity");
+Assert(Checks.ValuesEqual(9007199254740993m, 9007199254740993L, 0.0), "decimal vs long 2^53 identity");
+Assert(!Checks.ValuesEqual(9007199254740992L, 9007199254740993m, 0.0), "long vs decimal 2^53 inequality");
+Assert(!Checks.ValuesEqual(9007199254740993m, 9007199254740992L, 0.0), "decimal vs long 2^53 inequality");
+Assert(!Checks.ValuesEqual(9007199254740994L, 9007199254740993m, 0.0), "long vs decimal 2^53+1 inequality");
+Assert(!Checks.ValuesEqual(9007199254740993m, 9007199254740994L, 0.0), "decimal vs long 2^53+1 inequality");
+Assert(!Checks.ValuesEqual(9007199254740993m, 9007199254740992m, 0.0), "decimal vs decimal 2^53 inequality");
+Assert(Checks.ValuesEqual(9007199254740993m, 9007199254740993m, 0.0), "decimal vs decimal 2^53 identity");
+Assert(Checks.ValuesEqual(9007199254740993m, 9007199254740992.0, 0.0), "decimal vs double double-precision fallback identity");
+Assert(Checks.ValuesEqual(9007199254740992.0, 9007199254740993m, 0.0), "double vs decimal double-precision fallback identity");
+Assert(!Checks.ValuesEqual(1L, 1.000000000000000000001m, 0.0), "long vs decimal fractional inequality");
+Assert(!Checks.ValuesEqual(1.000000000000000000001m, 1L, 0.0), "decimal vs long fractional inequality");
+Assert(Checks.ValuesEqual(0.0, -0.0, 0.0), "signed zero float identity");
+Assert(Checks.ValuesEqual(0L, -0.0, 0.0), "signed zero int vs float identity");
+Assert(!Checks.ValuesEqual(double.NaN, double.NaN, 0.0), "NaN vs NaN inequality");
+Assert(!Checks.ValuesEqual(double.NaN, 0.0, 0.0), "NaN vs zero inequality");
+Assert(Checks.ValuesEqual(9007199254740993L, 9007199254740992L, 1e-9), "tol > 0 preserved for int64");
+Assert(Checks.ValuesEqual(100.0, 100.01, 0.01), "tol > 0 preserved for float");
+Assert(!Checks.ValuesEqual(100.0, 100.01, 0.00001), "tol > 0 tight tolerance");
+// PR 4b: Checks.NoBlankKeysDax wraps blank predicate in KEEPFILTERS
+string nbkDax = Checks.NoBlankKeysDax("'Hours'", "Hours[Person] = \"\"", new[] { "Hours[Hours] > 0" });
+Assert(nbkDax.Contains("KEEPFILTERS(Hours[Person] = \"\")"), "no_blank_keys wraps blank predicate in KEEPFILTERS with where");
+Assert(nbkDax == "EVALUATE ROW(\"n\", CALCULATE(COUNTROWS('Hours'), Hours[Hours] > 0), \"o\", CALCULATE(CALCULATE(COUNTROWS('Hours'), KEEPFILTERS(Hours[Person] = \"\")), Hours[Hours] > 0))", "no_blank_keys exact DAX with where");
+string nbkDaxNoWhere = Checks.NoBlankKeysDax("'Hours'", "Hours[Person] = \"\"", Array.Empty<string>());
+Assert(nbkDaxNoWhere == "EVALUATE ROW(\"n\", COUNTROWS('Hours'), \"o\", CALCULATE(COUNTROWS('Hours'), KEEPFILTERS(Hours[Person] = \"\")))", "no_blank_keys exact DAX without where");
+string nbkIsBlank = Checks.NoBlankKeysDax("'Hours'", "ISBLANK(Hours[ProjectID])", new[] { "Hours[Hours] > 0" });
+Assert(nbkIsBlank.Contains("KEEPFILTERS(ISBLANK(Hours[ProjectID]))"), "no_blank_keys wraps ISBLANK in KEEPFILTERS with where");
+string nbkSameCol = Checks.NoBlankKeysDax("'Hours'", "Hours[Person] = \"\"", new[] { "Hours[Person] <> \"\"" });
+Assert(nbkSameCol == "EVALUATE ROW(\"n\", CALCULATE(COUNTROWS('Hours'), Hours[Person] <> \"\"), \"o\", CALCULATE(CALCULATE(COUNTROWS('Hours'), KEEPFILTERS(Hours[Person] = \"\")), Hours[Person] <> \"\"))", "no_blank_keys exact DAX with same-column where");
+Assert(Checks.SignStatus(null, "POS") == "PASS", "omitted sign expect passes");
+Assert(Checks.SignStatus(new List<string>(), "POS") == "FAIL", "empty sign expect fails");
+Assert(Checks.SignStatus(new List<string> { "NEG" }, "POS") == "FAIL", "unlisted sign expect fails");
+Assert(Checks.SignStatus(new List<string> { "POS", "ZERO" }, "POS") == "PASS", "listed sign expect passes");
 string directory = Path.Combine(Path.GetTempPath(), "pbz-grouped-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
 try {
@@ -1063,6 +1124,9 @@ def test_live(env: Env, key_holder: dict) -> None:
         {"id": "nbk-person", "kind": "no_blank_keys", "column": "Hours[Person]"},
         {"id": "nbk-pid", "kind": "no_blank_keys", "column": "Hours[ProjectID]"},
         {"id": "nbk-dim", "kind": "no_blank_keys", "column": "Project[ProjectID]"},
+        # nbk-where tests that an outer where filter on the key column (Hours[Person] <> "")
+        # is preserved by KEEPFILTERS and not clobbered by the blank predicate (Hours[Person] = "")
+        {"id": "nbk-where", "kind": "no_blank_keys", "column": "Hours[Person]", "where": ["Hours[Person] <> \"\""]},
         {"id": "sign-pos", "kind": "sign", "expr": "[Total Hours]"},
         {"id": "sign-neg", "kind": "sign", "expr": "CALCULATE(SUM(Hours[Hours]), Hours[Hours] < 0)", "expect": ["NEG"]},
         {"id": "sign-blank", "kind": "sign", "expr": "CALCULATE([Total Hours], Project[Status] = \"Nope\")"},
@@ -1111,8 +1175,8 @@ def test_live(env: Env, key_holder: dict) -> None:
            and c.get("uq-email", {}).get("offenders_bucket") == "1-9" and c.get("uq-pid", {}).get("offenders_bucket") == "0", r)
     expect("check no_orphans: planted orphans FAIL; blank FK ignored; dates PASS",
            (st.get("orph-proj"), st.get("orph-person"), st.get("orph-date")) == ("FAIL", "PASS", "PASS"), r)
-    expect("check no_blank_keys: planted blank FAIL; ids PASS; dimension blank row not counted",
-           (st.get("nbk-person"), st.get("nbk-pid"), st.get("nbk-dim")) == ("FAIL", "PASS", "PASS"), r)
+    expect("check no_blank_keys: planted blank FAIL; ids PASS; dimension blank row not counted; where PASS",
+           (st.get("nbk-person"), st.get("nbk-pid"), st.get("nbk-dim"), st.get("nbk-where")) == ("FAIL", "PASS", "PASS", "PASS"), r)
     expect("check sign: POS / NEG / BLANK / ZERO vs expect POS -> FAIL",
            (c.get("sign-pos", {}).get("sign"), c.get("sign-neg", {}).get("sign"), c.get("sign-blank", {}).get("sign"), c.get("sign-zero", {}).get("sign"))
            == ("POS", "NEG", "BLANK", "ZERO") and st.get("sign-neg") == "PASS" and st.get("sign-zero") == "FAIL", r)
@@ -1141,7 +1205,7 @@ def test_live(env: Env, key_holder: dict) -> None:
     expect("snapshot-save: SAVED x3, failing query ERROR with class only",
            [s.get(k, {}).get("result") for k in ("q1", "q2", "q3")] == ["SAVED"] * 3 and s.get("qerr", {}).get("result") == "ERROR"
            and s.get("qerr", {}).get("class") == "OTHER", r)
-    snap = json.loads((env.pd / "snapshots" / "t1.json").read_text("utf-8"))
+    snap = json.loads((env.pd / "snapshots" / "results" / "t1.json").read_text("utf-8"))
     expect("snapshot file: HMAC rows + refreshed stamp, no raw cells",
            all(re.fullmatch(r"[0-9a-f]{64}", k) for k in snap["queries"]["q1"]["rows"]) and "refreshed" in snap
            and all(re.fullmatch(r"[0-9a-f]{64}", k) for k in snap["queries"]["q2"]["multiset"]))
@@ -1167,6 +1231,46 @@ def test_live(env: Env, key_holder: dict) -> None:
     r = engine("snapshot-compare", env.req(name="t1", queries=[q1b]), "snapshot-stale-diff")
     s = {q["id"]: q for q in (r or {}).get("queries", [])}
     expect("snapshot-compare after refresh with a changed query: STALE_DATA", s.get("q1", {}).get("result") == "STALE_DATA", r)
+
+    # snapshot namespace: monthly and monthly.spec do not collide in results/
+    r_monthly = engine("snapshot-save", env.req(name="monthly", queries=[q1]), "snapshot-monthly")
+    r_spec = engine("snapshot-save", env.req(name="monthly.spec", queries=[q2]), "snapshot-monthly-spec")
+    expect("snapshot non-collision: both monthly and monthly.spec save successfully",
+           bool((r_monthly or {}).get("ok") and (r_spec or {}).get("ok")))
+    expect("snapshot results files: separate results/monthly.json and results/monthly.spec.json exist",
+           (env.pd / "snapshots" / "results" / "monthly.json").is_file()
+           and (env.pd / "snapshots" / "results" / "monthly.spec.json").is_file())
+    r_cmp_monthly = engine("snapshot-compare", env.req(name="monthly", queries=[q1]), "compare-monthly")
+    r_cmp_spec = engine("snapshot-compare", env.req(name="monthly.spec", queries=[q2]), "compare-monthly-spec")
+    expect("snapshot compare non-collision: both compare independently as SAME",
+           [q.get("result") for q in (r_cmp_monthly or {}).get("queries", [])] == ["SAME"]
+           and [q.get("result") for q in (r_cmp_spec or {}).get("queries", [])] == ["SAME"])
+
+    # snapshot legacy fallback: read-only fallback to private_dir/snapshots/<name>.json
+    # 1. Save fresh baseline named 'legacy' with [q1, q2, q3]
+    r_save_leg = engine("snapshot-save", env.req(name="legacy", queries=[q1, q2, q3]), "snapshot-save-legacy")
+    expect("snapshot save fresh legacy baseline -> ok", bool((r_save_leg or {}).get("ok")))
+    primary_leg_file = env.pd / "snapshots" / "results" / "legacy.json"
+    legacy_file = env.pd / "snapshots" / "legacy.json"
+    # 2. Move result file to snapshots/legacy.json (primary becomes absent)
+    primary_bytes = primary_leg_file.read_bytes()
+    legacy_file.write_bytes(primary_bytes)
+    primary_leg_file.unlink()
+    # 3. Compare without intervening refresh: should read from legacy fallback, leave legacy bytes untouched
+    r_legacy = engine("snapshot-compare", env.req(name="legacy", queries=[q1, q2, q3]), "compare-legacy-fallback")
+    leg_queries = (r_legacy or {}).get("queries", [])
+    expect("snapshot legacy fallback: reads from snapshots/legacy.json when results/ missing",
+           not primary_leg_file.exists()
+           and legacy_file.read_bytes() == primary_bytes
+           and [q.get("id") for q in leg_queries] == ["q1", "q2", "q3"]
+           and [q.get("result") for q in leg_queries] == ["SAME", "SAME", "SAME"])
+
+    # snapshot legacy fallback: does not misread a spec file as a result document
+    spec_only_file = env.pd / "snapshots" / "unmigrated.spec.json"
+    spec_only_file.write_text(json.dumps({"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}), encoding="utf-8")
+    r_spec_only = engine("snapshot-compare", env.req(name="unmigrated.spec", queries=[q1]), "compare-spec-only")
+    expect("snapshot legacy fallback: does not misread a spec file as a result document (reports NEW)",
+           [q.get("result") for q in (r_spec_only or {}).get("queries", [])] == ["NEW"])
 
     # smoke
     r = engine("smoke", env.req(visuals=[

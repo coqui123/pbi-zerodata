@@ -4,8 +4,10 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 
 from .common import PbzError, Workspace, pbz_state_path, read_checked, write_text, _reparse_link
+from . import tokens
 
 DEFAULT = {
     "version": 1,
@@ -119,15 +121,36 @@ def save(ws: Workspace, pol: dict) -> None:
     write_text(path, body, root=ws.root)
 
 
+def _pause_for_tighten_hold() -> None:
+    """Test seam. Unset in production.
+
+    PBZ_TIGHTEN_HOLD is a directory. After this process has loaded policy and
+    before it saves, it writes held-<pid> and waits until release appears, so
+    another tightener blocks on the workspace lock instead of racing the save.
+    """
+    hold = os.environ.get("PBZ_TIGHTEN_HOLD")
+    if not hold:
+        return
+    os.makedirs(hold, exist_ok=True)
+    with open(os.path.join(hold, "held-" + str(os.getpid())), "w"):
+        pass
+    release = os.path.join(hold, "release")
+    deadline = time.monotonic() + 20
+    while not os.path.exists(release) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 def tighten(ws: Workspace, deny=(), deny_scripts=(), sensitive_hosts=()) -> dict:
     """Add entries (never removes). Returns what was added."""
-    pol = load(ws)
-    added = {"deny": [], "deny_scripts": [], "sensitive_hosts": []}
-    for key, items in (("deny", deny), ("deny_scripts", deny_scripts), ("sensitive_hosts", sensitive_hosts)):
-        for it in items:
-            if it not in pol[key]:
-                pol[key].append(it)
-                added[key].append(it)
-    if any(added.values()) or not os.path.exists(ws.policy_path):
-        save(ws, pol)
-    return added
+    with tokens.WorkspaceLock(ws.private):
+        pol = load(ws)
+        added = {"deny": [], "deny_scripts": [], "sensitive_hosts": []}
+        for key, items in (("deny", deny), ("deny_scripts", deny_scripts), ("sensitive_hosts", sensitive_hosts)):
+            for it in items:
+                if it not in pol[key]:
+                    pol[key].append(it)
+                    added[key].append(it)
+        if any(added.values()) or not os.path.exists(ws.policy_path):
+            _pause_for_tighten_hold()
+            save(ws, pol)
+        return added

@@ -126,6 +126,37 @@ class StateAtomicTests(unittest.TestCase):
             self.fail("allocator process deadlocked")
         self.assertEqual(process.exitcode, expected)
 
+    def test_extended_prefix_on_a_new_lock_stays_inside_private(self):
+        private = os.path.join(self.tmp.name, "private")
+        os.makedirs(private)
+        lock = os.path.join(private, "transactions", "A", ".commit-lock")
+        os.makedirs(os.path.dirname(lock))
+        real_realpath = os.path.realpath
+
+        def mixed(path):
+            resolved = real_realpath(path)
+            if os.path.normcase(resolved) == os.path.normcase(real_realpath(private)):
+                return resolved
+            if not resolved.startswith("\\\\?\\"):
+                return "\\\\?\\" + resolved
+            return resolved
+
+        with patch("pbz.common.os.path.realpath", side_effect=mixed):
+            from pbz import common
+            common._contained(lock, private)
+
+        def escaped(path):
+            resolved = real_realpath(path)
+            if os.path.normcase(resolved) == os.path.normcase(real_realpath(private)):
+                return resolved
+            return "\\\\?\\D:\\outside"
+
+        with patch("pbz.common.os.path.realpath", side_effect=escaped):
+            from pbz import common
+            with self.assertRaises(PbzError) as caught:
+                common._contained(lock, private)
+        self.assertEqual(caught.exception.code, "UNSAFE_PATH")
+
     def test_parallel_workspace_allocations_roundtrip_after_restart(self):
         root, private = self._allocation_projects()
         ctx = multiprocessing.get_context("spawn")

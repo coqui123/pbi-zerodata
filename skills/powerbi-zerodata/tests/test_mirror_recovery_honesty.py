@@ -108,6 +108,150 @@ class RecoveryHonestyTests(unittest.TestCase):
     def test_recover_preserves_between_passes_external_deletion(self):
         self._recover_with_between_passes_save(b"before bytes", None)
 
+    def test_recover_preserves_external_deletion_immediately_after_second_check(self):
+        rel, target, directory, _journal = self._push_journal(b"before bytes")
+        real_must_stay = mirror._must_stay
+        calls = 0
+
+        def delete_after_second_check(path, trust):
+            nonlocal calls
+            real_must_stay(path, trust)
+            if path == target:
+                calls += 1
+                if calls == 2:
+                    os.remove(target)
+
+        with patch.object(mirror.desktop, "find_instance", return_value=None), \
+             patch.object(mirror, "_must_stay", side_effect=delete_after_second_check):
+            out = mirror.recover(self.ws, self.project, "between-passes")
+
+        self.assertEqual(calls, 2)
+        with open(os.path.join(directory, "journal.json")) as handle:
+            state = json.load(handle)["state"]
+        current = None
+        if os.path.lexists(target):
+            with open(target, "rb") as handle:
+                current = handle.read()
+        self.assertEqual(
+            {"content": current, "recovery": out, "state": state,
+             "pending": mirror.pending_recovery(self.ws, self.project)},
+            {"content": None, "recovery": {
+                "verb": "recover", "result": "RECOVERY_REQUIRED",
+                "transactions": [{"id": "between-passes", "result": "RECOVERY_CONFLICT",
+                                  "conflicts": [rel]}]},
+             "state": "RECOVERY_REQUIRED",
+             "pending": [{"id": "between-passes", "state": "RECOVERY_REQUIRED"}]})
+
+    def test_recover_preserves_external_recreation_after_second_check_deletion(self):
+        rel, target, directory, _journal = self._push_journal(b"before bytes")
+        recreated = b"external replacement bytes"
+        real_must_stay = mirror._must_stay
+        calls = 0
+
+        def delete_and_recreate_after_second_check(path, trust):
+            nonlocal calls
+            real_must_stay(path, trust)
+            if path == target:
+                calls += 1
+                if calls == 2:
+                    os.remove(target)
+
+        real_rename = os.rename
+        def rename_with_recreate(src, dst):
+            if src == target:
+                try:
+                    real_rename(src, dst)
+                except FileNotFoundError:
+                    with open(target, "wb") as handle:
+                        handle.write(recreated)
+                    raise
+            return real_rename(src, dst)
+
+        with patch.object(mirror.desktop, "find_instance", return_value=None), \
+             patch.object(mirror, "_must_stay", side_effect=delete_and_recreate_after_second_check), \
+             patch.object(mirror.os, "rename", side_effect=rename_with_recreate):
+            out = mirror.recover(self.ws, self.project, "between-passes")
+
+        self.assertEqual(calls, 2)
+        with open(os.path.join(directory, "journal.json")) as handle:
+            state = json.load(handle)["state"]
+        current = None
+        if os.path.lexists(target):
+            with open(target, "rb") as handle:
+                current = handle.read()
+        self.assertEqual(
+            {"content": current, "recovery": out, "state": state,
+             "pending": mirror.pending_recovery(self.ws, self.project)},
+            {"content": recreated, "recovery": {
+                "verb": "recover", "result": "RECOVERY_REQUIRED",
+                "transactions": [{"id": "between-passes", "result": "RECOVERY_CONFLICT",
+                                  "conflicts": [rel]}]},
+             "state": "RECOVERY_REQUIRED",
+             "pending": [{"id": "between-passes", "state": "RECOVERY_REQUIRED"}]})
+
+    def test_restore_transaction_preserves_external_deletion_immediately_after_second_check(self):
+        rel, target, directory, journal = self._push_journal(b"before bytes")
+        real_must_stay = mirror._must_stay
+        calls = 0
+
+        def delete_after_second_check(path, trust):
+            nonlocal calls
+            real_must_stay(path, trust)
+            if path == target:
+                calls += 1
+                if calls == 2:
+                    os.remove(target)
+
+        with patch.object(mirror, "_must_stay", side_effect=delete_after_second_check):
+            out = mirror._restore_transaction(self.ws, self.project, directory, journal, preserve_external=True)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(out["result"], "ROLLED_BACK")
+        self.assertIn("conflicts", out)
+        self.assertEqual(out["conflicts"], [rel])
+        self.assertFalse(os.path.lexists(target))
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "ROLLED_BACK")
+
+    def test_restore_transaction_multi_entry_preserves_deletion_and_restores_uncontested(self):
+        rels = [self.project.name + ".Report/definition/" + name + ".json"
+                for name in ("racing", "owned")]
+        targets = [mirror._real_path(self.ws, rel) for rel in rels]
+        before = (b"racing before bytes", b"owned before bytes")
+        after = (b"racing after bytes", b"owned after bytes")
+        for target, content in zip(targets, before):
+            common.replace_bytes(target, content, root=self.ws.root)
+        directory, journal = mirror._begin_transaction(
+            self.ws, self.project, "multi-entry-deletion",
+            [("workspace", rel, common.sha(aft)) for rel, aft in zip(rels, after)])
+        for target, content in zip(targets, after):
+            common.replace_bytes(target, content, root=self.ws.root)
+
+        real_must_stay = mirror._must_stay
+        calls = 0
+
+        def delete_racing_after_second_check(path, trust):
+            nonlocal calls
+            real_must_stay(path, trust)
+            if path == targets[0]:
+                calls += 1
+                if calls == 2:
+                    os.remove(targets[0])
+
+        with patch.object(mirror, "_must_stay", side_effect=delete_racing_after_second_check):
+            out = mirror._restore_transaction(self.ws, self.project, directory, journal, preserve_external=True)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(out["result"], "ROLLED_BACK")
+        self.assertIn("conflicts", out)
+        self.assertEqual(out["conflicts"], [rels[0]])
+        self.assertFalse(os.path.lexists(targets[0]))
+        self.assertTrue(os.path.lexists(targets[1]))
+        with open(targets[1], "rb") as handle:
+            self.assertEqual(handle.read(), before[1])
+        with open(os.path.join(directory, "journal.json")) as handle:
+            self.assertEqual(json.load(handle)["state"], "ROLLED_BACK")
+
     def test_recover_retries_after_partway_between_passes_conflict(self):
         rels = [self.project.name + ".Report/definition/" + name + ".json"
                 for name in ("racing", "owned")]
@@ -558,7 +702,8 @@ class MirrorEditJournalTests(unittest.TestCase):
             # The outsider has its own context, as a separate process would.
             from contextvars import Context
             Context().run(self._write, other_path, common.read_checked(other_path, root=self.ws.mirror) + b"\n")
-            with patch("pbz.validate.engine_call", return_value={"ok": True}):
+            with patch("pbz.validate.engine_call", return_value={"ok": True}), \
+                 patch("pbz.validate.report_author", return_value=[]):
                 pushed = Context().run(mirror.push, self.ws, other)
             self.assertEqual(pushed["result"], "PUSHED", pushed)
             self.assertNotEqual(common.read_text(other_real)[0], real_before)
@@ -799,44 +944,51 @@ mirror_txn.transaction(ws.mirror, edit, ws=ws, project=project)
 
     def test_two_process_stale_lock_recovery(self):
         import subprocess
+        import time
         self._killed_child(write=True)
         self.assertNotEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
-        barrier = os.path.join(self.tmp.name, "recover-barrier")
+        hold = os.path.join(self.tmp.name, "recover-hold")
+        os.makedirs(hold)
         code = """
-import json, os, sys, time
+import json, os, sys
 from pbz import common, mirror
 ws = common.Workspace(sys.argv[1]); ws.private = sys.argv[2]
-project = ws.project()
-ready = sys.argv[3] + '.' + sys.argv[4]
-with open(ready, 'w'): pass
-while not os.path.exists(sys.argv[3]): time.sleep(.005)
-print(json.dumps(mirror.recover(ws, project)))
+print(json.dumps(mirror.recover(ws, ws.project())))
 """
         env = dict(os.environ)
         env["PYTHONPATH"] = SKILL + os.pathsep + env.get("PYTHONPATH", "")
-        children = [subprocess.Popen([sys.executable, "-c", code, self.ws.root, self.ws.private,
-                                      barrier, str(i)], env=env, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, text=True) for i in range(2)]
+        env["PBZ_RECOVER_HOLD"] = hold
+        children = [subprocess.Popen([sys.executable, "-c", code, self.ws.root, self.ws.private],
+                                     env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    for _ in range(2)]
         try:
-            import time
             deadline = time.monotonic() + 20
-            while not all(os.path.exists(barrier + '.' + str(i)) for i in range(2)):
-                if time.monotonic() > deadline:
-                    self.fail("recovery children failed to reach barrier")
+            collided = False
+            while time.monotonic() < deadline:
+                held = [name for name in os.listdir(hold) if name.startswith("held-")]
+                finished = [child for child in children if child.poll() is not None]
+                if len(held) > 1:
+                    self.fail("both recoverers entered the guard: " + " ".join(held))
+                if len(held) == 1 and len(finished) == 1:
+                    collided = True
+                    break
                 time.sleep(.01)
-            with open(barrier, "w"):
+            self.assertTrue(collided, "recoverers did not collide inside the guard")
+            with open(os.path.join(hold, "release"), "w"):
                 pass
             results = []
             for child in children:
                 stdout, stderr = child.communicate(timeout=30)
                 self.assertEqual(child.returncode, 0, stderr)
                 results.append(json.loads(stdout)["result"])
-            self.assertEqual(results.count("RECOVERED"), 1, results)
-            self.assertIn(next(r for r in results if r != "RECOVERED"),
-                          ("COMMIT_BUSY", "NOTHING_TO_RECOVER"))
+            self.assertEqual(sorted(results), ["COMMIT_BUSY", "RECOVERED"], results)
             self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
             self.assertFalse(mirror.pending_recovery(self.ws, self.project))
         finally:
+            release = os.path.join(hold, "release")
+            if not os.path.exists(release):
+                with open(release, "w"):
+                    pass
             for child in children:
                 if child.poll() is None:
                     child.kill()

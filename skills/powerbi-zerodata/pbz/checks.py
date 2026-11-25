@@ -14,7 +14,17 @@ import time
 
 from . import desktop, dpapi, lexers, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
-from .common import PbzError, _reparse_link, engine_call, read_checked
+from .common import (
+    PbzError,
+    _reparse_link,
+    engine_call,
+    is_snapshot_result_doc,
+    is_snapshot_spec_doc,
+    list_names,
+    read_checked,
+    remove_file,
+    replace_bytes,
+)
 
 ENGINE_KINDS = {"executes", "nonblank", "nonempty", "equal", "additive", "unique", "no_orphans",
                 "no_blank_keys", "sign", "subset"}
@@ -23,7 +33,7 @@ EXPR_FIELDS = ("expr", "left", "right", "column", "from", "to", "of")
 RLS_EXPECT = ("EMPTY", "NON_EMPTY", "LESS", "EQUAL", "OLS_INACCESSIBLE")
 _RLS_TEXT = ("query", "role", "user", "column", "table")
 _CHECK_STATUS = {"PASS", "FAIL", "EMPTY", "UNSUPPORTED", "ERROR"}
-_REFRESH_STATUS = frozenset({"PASS", "ERROR"})
+_REFRESH_STATUS = frozenset({"PASS", "ERROR", "UNSUPPORTED"})
 
 CHECK_REQUIRED = {
     **{k: ("expr",) for k in ("executes", "nonblank", "nonempty", "sign", "compiles")},
@@ -521,8 +531,12 @@ def _rewrite(c: dict) -> tuple[dict | None, str | None]:
     if kind == "filter_independent":
         col = c.get("column", "")
         expr = c.get("expr", "")
-        return {"id": c["id"], "kind": "equal", "left": expr, "right": f"CALCULATE({expr}, REMOVEFILTERS({col}))",
-                "by": c.get("by", []), "where": c.get("where", [])}, None
+        rewritten = {"id": c["id"], "kind": "equal", "left": expr,
+                     "right": f"CALCULATE({expr}, REMOVEFILTERS({col}))",
+                     "by": c.get("by", []), "where": c.get("where", [])}
+        if "tol" in c:
+            rewritten["tol"] = c["tol"]
+        return rewritten, None
     return c, None
 
 
@@ -918,12 +932,27 @@ def harden_index(ws, pol: dict) -> tuple[int, dict[str, bytes | None]]:
     return moved, pinned
 
 
-def _snapshot_spec_path(ws, name: str) -> str:
-    """One path segment under the private snapshots directory. No .., separator, or absolute name."""
+def _validate_snapshot_name(name: str) -> None:
+    """Validate snapshot name is a single path segment. Refuse .., separators, whitespace, or absolute paths."""
     if not isinstance(name, str) or not name or name != name.strip() or name in (".", ".."):
         raise PbzError("BAD_REQUEST", "snapshot name must be a single path segment")
     if ".." in name or any(ch in name for ch in "/\\:\x00") or os.path.isabs(name) or os.path.basename(name) != name:
         raise PbzError("BAD_REQUEST", "snapshot name must be a single path segment")
+
+
+def _snapshot_spec_path(ws, name: str) -> str:
+    """One path segment under the private snapshots/specs directory. No .., separator, or absolute name."""
+    _validate_snapshot_name(name)
+    root = os.path.abspath(os.path.join(ws.private, "snapshots", "specs"))
+    path = os.path.abspath(os.path.join(root, name + ".json"))
+    if os.path.dirname(path) != root:
+        raise PbzError("BAD_REQUEST", "snapshot name must be a single path segment")
+    return path
+
+
+def _legacy_snapshot_spec_path(ws, name: str) -> str:
+    """Legacy path segment under the private snapshots directory (read-only fallback)."""
+    _validate_snapshot_name(name)
     root = os.path.abspath(os.path.join(ws.private, "snapshots"))
     path = os.path.abspath(os.path.join(root, name + ".spec.json"))
     if os.path.dirname(path) != root:
@@ -931,7 +960,123 @@ def _snapshot_spec_path(ws, name: str) -> str:
     return path
 
 
+def migrate_snapshot_layout(ws) -> dict:
+    """Migrate legacy flat snapshots/ files into snapshots/results/ and snapshots/specs/.
+
+    Protected by WorkspaceLock. Safe, two-pass, idempotent, and fail-closed.
+    """
+    with tokens.WorkspaceLock(ws.private):
+        if _reparse_link(ws.private):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        snaps = os.path.abspath(os.path.join(ws.private, "snapshots"))
+        if os.path.lexists(snaps):
+            if _reparse_link(snaps) or not os.path.isdir(snaps):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+        results_dir = os.path.join(snaps, "results")
+        specs_dir = os.path.join(snaps, "specs")
+
+        # Refuse pre-existing reparse points or non-directories before planning
+        for d in (results_dir, specs_dir):
+            if os.path.lexists(d) and (_reparse_link(d) or not os.path.isdir(d)):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+        if not os.path.lexists(snaps):
+            return {"migrated": False, "results": [], "specs": []}
+
+        # Pass 1: Read-only validation & planning. Strictly no filesystem mutation occurs in this pass.
+        plan = []
+        planned_targets: dict[str, bytes] = {}
+        for name in sorted(list_names(snaps)):
+            if name in ("results", "specs"):
+                continue
+            old_path = os.path.join(snaps, name)
+            if _reparse_link(old_path):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+            if os.path.isdir(old_path):
+                continue
+            if not name.endswith(".json"):
+                continue
+
+            content = read_checked(old_path, root=ws.private)
+            try:
+                doc = json.loads(content.decode("utf-8-sig"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} has unparseable JSON")
+            if not isinstance(doc, dict):
+                raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} is not a JSON object")
+
+            # Content shape inspection:
+            # Query specs have "queries" as a list and must carry the .spec.json suffix.
+            # Results have "queries" as a dict and "refreshed" as str or null.
+            if is_snapshot_spec_doc(doc):
+                if not name.endswith(".spec.json"):
+                    raise PbzError("CORRUPT_STATE", f"spec-shaped legacy file {name} lacks .spec.json suffix")
+                base = name[:-10]
+                kind = "spec"
+                target = os.path.join(specs_dir, base + ".json")
+            elif is_snapshot_result_doc(doc):
+                kind = "result"
+                base = name[:-5]
+                target = os.path.join(results_dir, base + ".json")
+            else:
+                raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} has unrecognized shape")
+
+            try:
+                _validate_snapshot_name(base)
+            except PbzError:
+                raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} resolves to invalid name {base}")
+
+            if _reparse_link(target):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+            # Intra-plan and on-disk collision detection
+            if target in planned_targets:
+                if planned_targets[target] != content:
+                    raise PbzError("CONFLICT", f"snapshot migration conflict for target {os.path.basename(target)}")
+                plan.append((old_path, target, kind, base, content, True))
+            else:
+                planned_targets[target] = content
+                if os.path.lexists(target):
+                    existing = read_checked(target, root=ws.private)
+                    if existing != content:
+                        raise PbzError("CONFLICT", f"snapshot migration conflict for {name}")
+                    plan.append((old_path, target, kind, base, content, True))
+                else:
+                    plan.append((old_path, target, kind, base, content, False))
+
+        # Pass 2: Execution. Destination directories are created ONLY after Pass 1 validation succeeds.
+        if not plan:
+            return {"migrated": False, "results": [], "specs": []}
+
+        os.makedirs(results_dir, exist_ok=True)
+        os.makedirs(specs_dir, exist_ok=True)
+        if _reparse_link(results_dir) or _reparse_link(specs_dir):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+        migrated_results = []
+        migrated_specs = []
+        for old_path, target, kind, base, content, already_exists in plan:
+            if not already_exists:
+                replace_bytes(target, content, root=ws.private)
+            remove_file(old_path, root=ws.private)
+            if kind == "result":
+                migrated_results.append(base)
+            else:
+                migrated_specs.append(base)
+
+        return {
+            "migrated": bool(migrated_results or migrated_specs),
+            "results": sorted(migrated_results),
+            "specs": sorted(migrated_specs),
+        }
+
+
 def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
+    if action not in ("save", "compare"):
+        raise PbzError("BAD_REQUEST", f"unknown snapshot action {action}")
+    _validate_snapshot_name(name)
+    migrate_snapshot_layout(ws)
     spec_path = _snapshot_spec_path(ws, name)
     port = desktop.require_port(project)
     tm = tokens.TokenMap(ws.private)
@@ -941,6 +1086,8 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
         if unknown:
             raise PbzError("BAD_REQUEST", "unknown token in query " + str(q.get("id")))
         queries.append({"id": q.get("id"), "dax": dax, "keys": q.get("keys", [])})
+    if not queries:
+        raise PbzError("BAD_REQUEST", "queries must not be empty")
     verb = "snapshot-save" if action == "save" else "snapshot-compare"
     if not spend(ws, "snapshot_queries", max(1, len(queries))):
         return {"verb": verb, "status": "BUDGET", "note": "daily snapshot query budget reached; the user can reset it"}
@@ -978,8 +1125,23 @@ def saved_spec(ws, name: str) -> dict | None:
     except PbzError:
         return None
     try:
-        return json.loads(read_checked(path, root=ws.private).decode("utf-8"))
+        if os.path.lexists(path):
+            doc = json.loads(read_checked(path, root=ws.private).decode("utf-8-sig"))
+            if is_snapshot_spec_doc(doc):
+                return doc
+            return None
     except PbzError:
         raise
     except (OSError, ValueError):
         return None
+    try:
+        leg_path = _legacy_snapshot_spec_path(ws, name)
+        if os.path.lexists(leg_path):
+            doc = json.loads(read_checked(leg_path, root=ws.private).decode("utf-8-sig"))
+            if is_snapshot_spec_doc(doc):
+                return doc
+    except PbzError:
+        raise
+    except (OSError, ValueError):
+        return None
+    return None

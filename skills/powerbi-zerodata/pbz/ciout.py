@@ -6,16 +6,55 @@ a validate severity of error.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 
 from .common import PbzError, pbz_state_path, read_checked, write_text, _workspace_root
 
+MAX_BASELINE_BYTES = 1_000_000
+FINGERPRINT_VERSION = 1
+
+# XML 1.0 (5th ed.) valid characters:
+# #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+_XML_INVALID = re.compile(r"[^\x09\x0a\x0d\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+_V1_TOKEN_PATTERN = re.compile(r"^v1:[0-9a-f]{64}\Z")
+
+
+def _fp_v0(finding: dict) -> str:
+    """Legacy v0 delimiter fingerprint (used for backwards-compatible legacy baseline comparisons)."""
+    return "|".join(str(finding.get(k) or "") for k in ("rule", "code", "object", "where"))[:300]
+
+
+def _path_identity(finding: dict) -> str:
+    """`where` when present. `file` only when `where` is missing."""
+    where = finding.get("where")
+    if isinstance(where, str) and where != "":
+        return where
+    file = finding.get("file")
+    if isinstance(file, str):
+        return file
+    return ""
+
+
+def _fp_v1(finding: dict) -> str:
+    """Versioned v1 fingerprint: SHA-256 over canonical JSON array of identity fields."""
+    parts = [str(finding.get(k) or "") for k in ("rule", "code", "object")]
+    parts.append(_path_identity(finding))
+    blob = json.dumps(parts, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return "v1:" + hashlib.sha256(blob).hexdigest()
+
 
 def _fp(finding: dict) -> str:
-    return "|".join(str(finding.get(k) or "") for k in ("rule", "code", "object", "where"))[:300]
+    return _fp_v1(finding)
+
+
+def _xml_safe(val: str) -> str:
+    """Filter out characters invalid in XML 1.0."""
+    return _XML_INVALID.sub("", str(val or ""))
 
 
 def _high(finding: dict) -> bool:
@@ -23,11 +62,12 @@ def _high(finding: dict) -> bool:
     return sev in (3, "3", "error", "high")
 
 
-def _selected(findings, fail_on: str | None, baseline: set[str] | None):
+def _selected(findings, fail_on: str | None, baseline: set[str] | None, version: int = 1):
     if fail_on == "new":
         if baseline is None:
             raise PbzError("BAD_REQUEST", "--fail-on new requires --since")
-        return [f for f in findings if _fp(f) not in baseline]
+        fp_fn = _fp_v0 if version == 0 else _fp_v1
+        return [f for f in findings if fp_fn(f) not in baseline]
     if fail_on == "high":
         return [f for f in findings if _high(f)]
     if fail_on == "any":
@@ -42,21 +82,42 @@ def _baseline_path(ws, name: str) -> str:
     return pbz_state_path(ws, "baselines", safe + ".json")
 
 
-def load_baseline(ws, name: str) -> set[str]:
+def load_baseline(ws, name: str, return_version: bool = False) -> set[str] | tuple[int, set[str]]:
     path = _baseline_path(ws, name)
     if not os.path.lexists(path):
         raise PbzError("NOT_FOUND", "baseline")
     try:
-        doc = json.loads(read_checked(path, root=_workspace_root(ws), max_bytes=1_000_000).decode("utf-8"))
+        doc = json.loads(read_checked(path, root=_workspace_root(ws), max_bytes=MAX_BASELINE_BYTES).decode("utf-8"))
     except (OSError, UnicodeError, ValueError) as err:
         raise PbzError("REFUSED", "baseline is unusable") from err
-    return set(doc.get("ids") or [])
+    if not isinstance(doc, dict):
+        raise PbzError("REFUSED", "baseline is unusable")
+    raw_ids = doc.get("ids")
+    if not isinstance(raw_ids, list) or any(not isinstance(item, str) for item in raw_ids):
+        raise PbzError("REFUSED", "baseline is unusable")
+
+    if "fingerprint_version" not in doc:
+        # Legacy baseline (version 0)
+        version = 0
+    else:
+        v = doc["fingerprint_version"]
+        if isinstance(v, bool) or not isinstance(v, int) or v != 1:
+            raise PbzError("REFUSED", "unsupported baseline fingerprint version")
+        version = 1
+        if any(not _V1_TOKEN_PATTERN.fullmatch(item) for item in raw_ids):
+            raise PbzError("REFUSED", "malformed v1 baseline token")
+
+    ids = set(raw_ids)
+    return (version, ids) if return_version else ids
 
 
 def save_baseline(ws, name: str, findings) -> dict:
     path = _baseline_path(ws, name)
-    ids = sorted({_fp(f) for f in findings})
-    write_text(path, json.dumps({"ids": ids}) + "\n", root=_workspace_root(ws))
+    ids = sorted({_fp_v1(f) for f in findings})
+    body = json.dumps({"fingerprint_version": 1, "ids": ids}) + "\n"
+    if len(body.encode("utf-8")) > MAX_BASELINE_BYTES:
+        raise PbzError("REFUSED", f"baseline exceeds maximum size of {MAX_BASELINE_BYTES} bytes")
+    write_text(path, body, root=_workspace_root(ws))
     return {"baseline": name, "fingerprints": len(ids)}
 
 
@@ -124,13 +185,52 @@ def _write_report(fmt: str, path: str, findings, root: str) -> None:
                                   for f in findings[:500]]}],
         })
     elif fmt == "junit":
-        suite = ET.Element("testsuite", name="pbz", tests=str(max(len(findings), 1)))
-        if not findings:
+        total = len(findings)
+        truncated = total > 500
+        emitted_findings = findings[:500]
+        omitted = total - 500 if truncated else 0
+
+        if total == 0:
+            suite_tests = 1
+            suite_failures = 0
+        elif truncated:
+            suite_tests = 501
+            suite_failures = 501
+        else:
+            suite_tests = total
+            suite_failures = total
+
+        suite = ET.Element("testsuite", name="pbz", tests=str(suite_tests), failures=str(suite_failures),
+                           errors="0", skipped="0")
+
+        # Suite-level properties
+        suite_props = ET.SubElement(suite, "properties")
+        ET.SubElement(suite_props, "property", name="pbz.fingerprint_version", value="1")
+        ET.SubElement(suite_props, "property", name="pbz.total_findings", value=str(total))
+        ET.SubElement(suite_props, "property", name="pbz.emitted_findings", value=str(len(emitted_findings)))
+        ET.SubElement(suite_props, "property", name="pbz.omitted_findings", value=str(omitted))
+        ET.SubElement(suite_props, "property", name="pbz.truncated", value="true" if truncated else "false")
+
+        if total == 0:
             ET.SubElement(suite, "testcase", name="pbz")
-        for finding in findings[:500]:
-            case = ET.SubElement(suite, "testcase", name=str(finding.get("rule") or finding.get("code") or "pbz"),
-                                 classname=str(finding.get("object") or ""))
-            ET.SubElement(case, "failure", message=str(finding.get("object") or ""))
+        else:
+            for finding in emitted_findings:
+                rule_name = _xml_safe(finding.get("rule") or finding.get("code") or "pbz") or "pbz"
+                obj_name = _xml_safe(finding.get("object") or "")
+                case = ET.SubElement(suite, "testcase", name=rule_name, classname=obj_name)
+                props = ET.SubElement(case, "properties")
+                ET.SubElement(props, "property", name="pbz.fingerprint", value=_fp_v1(finding))
+                ET.SubElement(props, "property", name="pbz.fingerprint_version", value="1")
+                ET.SubElement(case, "failure", message=obj_name)
+
+            if truncated:
+                sentinel = ET.SubElement(suite, "testcase", name="pbz.truncated", classname="pbz.ciout")
+                sentinel_props = ET.SubElement(sentinel, "properties")
+                ET.SubElement(sentinel_props, "property", name="pbz.truncated", value="true")
+                ET.SubElement(sentinel_props, "property", name="pbz.omitted_findings", value=str(omitted))
+                ET.SubElement(sentinel, "failure", type="TRUNCATED",
+                              message=f"Report truncated: 500 of {total} findings shown ({omitted} omitted)")
+
         body = ET.tostring(suite, encoding="unicode")
     elif fmt == "trx":
         suite = ET.Element("TestRun")
@@ -147,10 +247,15 @@ def _write_report(fmt: str, path: str, findings, root: str) -> None:
 
 def attach(ws, out: dict, findings, *, fail_on: str | None = None, since: str | None = None,
            save: str | None = None, ci: str | None = None, fmt: str | None = None, report: str | None = None) -> dict:
-    baseline = load_baseline(ws, since) if since else None
+    if since:
+        version, baseline = load_baseline(ws, since, return_version=True)
+        if version == 0:
+            out["baseline_legacy"] = True
+    else:
+        version, baseline = 1, None
     if save:
         out["baseline_saved"] = save_baseline(ws, save, findings)
-    gated = _selected(findings, fail_on, baseline)
+    gated = _selected(findings, fail_on, baseline, version=version)
     if fail_on:
         out["gate"] = "FAIL" if gated else "PASS"
         out["gate_on"] = fail_on

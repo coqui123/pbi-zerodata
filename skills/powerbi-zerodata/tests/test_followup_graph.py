@@ -415,10 +415,14 @@ class WatchCountTests(unittest.TestCase):
     def test_report_findings_add_to_model_and_once_stays_single(self):
         findings = [{"severity": "error"}, {"severity": "warning"}]
         rules = {"model": {"findings": 2}, "report": {"findings": 3}}
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ws = Workspace(tmp.name)
+        project = type("Project", (), {})()
         with patch("pbz.watch.validate.run_mirror", return_value=findings), \
                 patch("pbz.watch.bpa.run", return_value=rules) as bpa_run, \
                 patch("pbz.watch.time.sleep") as sleep:
-            once = watch.run(object(), object(), once=True, seconds=9)
+            once = watch.run(ws, project, once=True, seconds=9)
         self.assertEqual(once, {"verb": "watch", "once": True, "passes": [
             {"validate": 2, "validate_errors": 1, "bpa": 5},
         ]})
@@ -429,13 +433,16 @@ class WatchCountTests(unittest.TestCase):
 
         def stop_after_two(*_args):
             calls["n"] += 1
+            if calls["n"] == 1:
+                with open(os.path.join(tmp.name, "policy.json"), "w", encoding="utf-8") as handle:
+                    handle.write("{}\n")
             if calls["n"] >= 2:
                 raise KeyboardInterrupt
 
         with patch("pbz.watch.validate.run_mirror", return_value=findings), \
                 patch("pbz.watch.bpa.run", return_value={"model": {"findings": 4}}) as bpa_run, \
                 patch("pbz.watch.time.sleep", side_effect=stop_after_two) as sleep:
-            polled = watch.run(object(), object(), once=False, seconds=9)
+            polled = watch.run(ws, project, once=False, seconds=9)
         self.assertEqual(len(polled["passes"]), 2)
         self.assertFalse(polled["once"])
         self.assertEqual(polled["passes"][0]["bpa"], 4)
@@ -447,7 +454,7 @@ class WatchCountTests(unittest.TestCase):
         with patch("pbz.watch.validate.run_mirror", return_value=[]), \
                 patch("pbz.watch.bpa.run", return_value={"report": {"findings": 3}}), \
                 patch("pbz.watch.time.sleep"):
-            report_only = watch.run(object(), object(), once=True)
+            report_only = watch.run(ws, project, once=True)
         self.assertEqual(report_only["passes"][0]["bpa"], 3)
 
 

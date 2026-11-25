@@ -123,11 +123,14 @@ public sealed class Ctx
             pd = Path.GetFullPath(pd);
             string logs = Path.Combine(pd, "logs");
             string snaps = Path.Combine(pd, "snapshots");
+            string results = Path.Combine(snaps, "results");
             LinkGuard.Refuse(logs);
             LinkGuard.Refuse(snaps);
+            LinkGuard.Refuse(results);
             Directory.CreateDirectory(pd);
             Directory.CreateDirectory(logs);
             Directory.CreateDirectory(snaps);
+            Directory.CreateDirectory(results);
             PrivateDir = pd;
         }
         int? t = req.Int("timeout_s");
