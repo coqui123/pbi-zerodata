@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,9 +15,46 @@ SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pbz import checks, evidence, tokens
+from pbz import checks, evidence, guard, tokens
 from pbz.common import PbzError
 from mirror_helpers import make_workspace
+from test_mirror_writers_root import _tiny
+
+CLI = os.path.join(SKILL, "pbz", "cli.py")
+VALID_SPEC = '{"queries":[{"id":"q1","dax":"EVALUATE {1}"}]}'
+LEGACY_RESULT = {"queries": {"q1": {"rows": ["abc123def456"]}}, "refreshed": "2026-01-01T00:00:00"}
+
+
+def _tree(root: Path) -> tuple:
+    """Relative path, entry type, and file byte hash for the whole snapshot directory."""
+    if not root.exists():
+        return (("ABSENT", "absent", ""),)
+    rows = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        filenames.sort()
+        for name in dirnames:
+            path = Path(dirpath) / name
+            rows.append((path.relative_to(root).as_posix(), "dir", ""))
+        for name in filenames:
+            path = Path(dirpath) / name
+            rows.append((path.relative_to(root).as_posix(), "file", hashlib.sha256(path.read_bytes()).hexdigest()))
+    return tuple(sorted(rows))
+
+
+def _public_snapshot(workspace: str, private_root: str, action: str, name: str, spec: str):
+    env = os.environ.copy()
+    env["PBZ_PRIVATE_ROOT"] = private_root
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.pop("PBZ_SKIP_OUTPUT", None)
+    return subprocess.run(
+        [sys.executable, "-I", CLI, "snapshot", action, name, "--spec", spec],
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
 
 
 class SnapshotStoreTests(unittest.TestCase):
@@ -327,6 +365,231 @@ class SnapshotStoreTests(unittest.TestCase):
             mock_engine.assert_not_called()
             self.assertFalse((self.snaps / "specs" / "empty_snap.json").exists())
             self.assertFalse((self.snaps / "results" / "empty_snap.json").exists())
+
+    def _seed_public_tree(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "ws"
+        root.mkdir()
+        _tiny(str(root))
+        private = Path(tmp.name) / "private"
+        private.mkdir()
+        wid = hashlib.sha256(guard.norm(os.path.abspath(root)).encode()).hexdigest()[:16]
+        snaps = private / wid / "snapshots"
+        snaps.mkdir(parents=True)
+        (snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        (snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        return str(root), str(private), snaps
+
+    def test_public_cli_empty_query_leaves_snapshot_tree(self):
+        # Public launcher. Desktop is not required. Empty queries are invalid before any port probe.
+        for action in ("compare", "save"):
+            with self.subTest(action=action):
+                workspace, private, snaps = self._seed_public_tree()
+                before = _tree(snaps)
+                proc = _public_snapshot(workspace, private, action, "different", '{"queries":[]}')
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                payload = json.loads(proc.stdout)
+                self.assertEqual(payload.get("error"), "BAD_REQUEST")
+                self.assertEqual(payload["outcome"]["status"], "INVALID")
+                self.assertEqual(payload["outcome"]["exit_code"], 2)
+                self.assertEqual(_tree(snaps), before)
+
+    def test_public_cli_valid_query_desktop_down_leaves_snapshot_tree(self):
+        for action in ("compare", "save"):
+            with self.subTest(action=action):
+                workspace, private, snaps = self._seed_public_tree()
+                before = _tree(snaps)
+                proc = _public_snapshot(workspace, private, action, "different", VALID_SPEC)
+                self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+                payload = json.loads(proc.stdout)
+                self.assertEqual(payload.get("error"), "ENGINE_UNAVAILABLE")
+                self.assertEqual(payload["outcome"]["status"], "UNAVAILABLE")
+                self.assertEqual(payload["outcome"]["exit_code"], 4)
+                self.assertEqual(_tree(snaps), before)
+
+    def test_public_cli_cold_snapshot_dir_stays_absent(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "ws"
+        root.mkdir()
+        _tiny(str(root))
+        private = Path(tmp.name) / "private"
+        private.mkdir()
+        wid = hashlib.sha256(guard.norm(os.path.abspath(root)).encode()).hexdigest()[:16]
+        snaps = private / wid / "snapshots"
+        self.assertFalse(snaps.exists())
+        proc = _public_snapshot(str(root), str(private), "save", "different", '{"queries":[]}')
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertFalse(snaps.exists())
+
+    def test_empty_queries_do_not_probe_port_or_spend(self):
+        with patch("pbz.desktop.require_port") as port, \
+             patch("pbz.checks.spend") as spend, \
+             patch("pbz.checks.engine_call") as engine:
+            for action in ("save", "compare"):
+                with self.assertRaises(PbzError) as ctx:
+                    checks.snapshot(self.ws, None, action, "different", {"queries": []})
+                self.assertEqual(ctx.exception.code, "BAD_REQUEST")
+            port.assert_not_called()
+            spend.assert_not_called()
+            engine.assert_not_called()
+
+    def test_unrelated_malformed_legacy_does_not_reject_another_name(self):
+        (self.snaps / "bad.json").write_text("{not-json", encoding="utf-8")
+        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        before = _tree(self.snaps)
+        with patch("pbz.desktop.require_port", side_effect=PbzError("ENGINE_UNAVAILABLE", "desktop down")):
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(self.ws, None, "save", "different", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
+            self.assertEqual(ctx.exception.code, "ENGINE_UNAVAILABLE")
+        self.assertEqual(_tree(self.snaps), before)
+
+    def test_malformed_requested_baseline_fails_before_port(self):
+        (self.snaps / "different.json").write_text("{not-json", encoding="utf-8")
+        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        before = _tree(self.snaps)
+        with patch("pbz.desktop.require_port") as port, \
+             patch("pbz.checks.engine_call") as engine, \
+             patch("pbz.checks.spend") as spend:
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(self.ws, None, "compare", "different", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
+            self.assertEqual(ctx.exception.code, "CORRUPT_STATE")
+            port.assert_not_called()
+            engine.assert_not_called()
+            spend.assert_not_called()
+        self.assertEqual(_tree(self.snaps), before)
+
+    def test_malformed_namespaced_result_does_not_fall_back_to_legacy(self):
+        (self.snaps / "results").mkdir()
+        (self.snaps / "results" / "different.json").write_text("{not-json", encoding="utf-8")
+        (self.snaps / "different.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        before = _tree(self.snaps)
+        with patch("pbz.desktop.require_port") as port, \
+             patch("pbz.checks.engine_call") as engine, \
+             patch("pbz.checks.spend") as spend:
+            with self.assertRaises(PbzError) as ctx:
+                checks.snapshot(
+                    self.ws, None, "compare", "different", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+                )
+            self.assertEqual(ctx.exception.code, "CORRUPT_STATE")
+            port.assert_not_called()
+            engine.assert_not_called()
+            spend.assert_not_called()
+        self.assertEqual(_tree(self.snaps), before)
+
+    def test_namespaced_result_wins_and_legacy_bytes_stay(self):
+        (self.snaps / "results").mkdir()
+        namespaced = {"queries": {"q1": {"rows": ["aa"]}}, "refreshed": "2026-02-01T00:00:00"}
+        legacy = {"queries": {"q1": {"rows": ["bb"]}}, "refreshed": "2026-01-01T00:00:00"}
+        (self.snaps / "results" / "different.json").write_text(json.dumps(namespaced), encoding="utf-8")
+        (self.snaps / "different.json").write_text(json.dumps(legacy), encoding="utf-8")
+        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        legacy_bytes = (self.snaps / "different.json").read_bytes()
+        notes_bytes = (self.snaps / "notes.txt").read_bytes()
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", return_value={"ok": True, "queries": [{"id": "q1", "result": "SAME"}]}) as engine, \
+             patch("pbz.checks.spend", return_value=True):
+            res = checks.snapshot(self.ws, None, "compare", "different", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
+        self.assertTrue(res.get("ok"))
+        engine.assert_called_once()
+        self.assertEqual((self.snaps / "different.json").read_bytes(), legacy_bytes)
+        self.assertEqual((self.snaps / "notes.txt").read_bytes(), notes_bytes)
+        self.assertEqual(json.loads((self.snaps / "results" / "different.json").read_text("utf-8")), namespaced)
+
+    def test_adapter_save_writes_only_the_named_snapshot(self):
+        # Adapter, not a live engine run. The stand-in writes only the namespaced result.
+        (self.snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        earlier_bytes = (self.snaps / "earlier.json").read_bytes()
+        notes_bytes = (self.snaps / "notes.txt").read_bytes()
+
+        def fake_engine(verb, payload, timeout=1800):
+            self.assertEqual(verb, "snapshot-save")
+            self.assertEqual(payload["name"], "different")
+            results = self.snaps / "results"
+            results.mkdir(parents=True, exist_ok=True)
+            (results / "different.json").write_text(
+                json.dumps({"queries": {"q1": {}}, "refreshed": "2026-03-01T00:00:00"}),
+                encoding="utf-8",
+            )
+            return {"ok": True, "queries": [{"id": "q1", "result": "SAVED"}]}
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine), \
+             patch("pbz.checks.spend", return_value=True):
+            res = checks.snapshot(
+                self.ws, None, "save", "different", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+            )
+        self.assertTrue(res.get("ok"))
+        self.assertEqual((self.snaps / "earlier.json").read_bytes(), earlier_bytes)
+        self.assertEqual((self.snaps / "notes.txt").read_bytes(), notes_bytes)
+        self.assertTrue((self.snaps / "results" / "different.json").is_file())
+        self.assertTrue((self.snaps / "specs" / "different.json").is_file())
+        self.assertFalse((self.snaps / "results" / "earlier.json").exists())
+
+    def test_adapter_compare_reads_legacy_result_in_place(self):
+        # Adapter, not a live engine run. Legacy result and spec stay at their original paths.
+        (self.snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        spec = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+        (self.snaps / "earlier.spec.json").write_text(json.dumps(spec), encoding="utf-8")
+        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        before = _tree(self.snaps)
+
+        def fake_engine(verb, payload, timeout=1800):
+            self.assertEqual(verb, "snapshot-compare")
+            self.assertTrue((self.snaps / "earlier.json").is_file())
+            self.assertFalse((self.snaps / "results" / "earlier.json").exists())
+            return {"ok": True, "queries": [{"id": "q1", "result": "SAME"}]}
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine), \
+             patch("pbz.checks.spend", return_value=True):
+            res = checks.snapshot(self.ws, None, "compare", "earlier", spec)
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(_tree(self.snaps), before)
+
+    def test_adapter_monthly_names_do_not_share_files(self):
+        # Adapter, not a live engine run. monthly and monthly.spec stay distinct.
+        def fake_engine(verb, payload, timeout=1800):
+            results = self.snaps / "results"
+            results.mkdir(parents=True, exist_ok=True)
+            (results / (payload["name"] + ".json")).write_text(
+                json.dumps({"queries": {"q1": {"name": payload["name"]}}, "refreshed": "2026-01-01T00:00:00"}),
+                encoding="utf-8",
+            )
+            return {"ok": True, "queries": [{"id": "q1", "result": "SAVED"}]}
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine), \
+             patch("pbz.checks.spend", return_value=True):
+            checks.snapshot(self.ws, None, "save", "monthly", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
+            first_result = (self.snaps / "results" / "monthly.json").read_bytes()
+            first_spec = (self.snaps / "specs" / "monthly.json").read_bytes()
+            checks.snapshot(self.ws, None, "save", "monthly.spec", {"queries": [{"id": "q1", "dax": "EVALUATE {2}"}]})
+        self.assertEqual((self.snaps / "results" / "monthly.json").read_bytes(), first_result)
+        self.assertEqual((self.snaps / "specs" / "monthly.json").read_bytes(), first_spec)
+        self.assertTrue((self.snaps / "results" / "monthly.spec.json").is_file())
+        self.assertTrue((self.snaps / "specs" / "monthly.spec.json").is_file())
+        self.assertNotEqual(
+            (self.snaps / "results" / "monthly.json").read_bytes(),
+            (self.snaps / "results" / "monthly.spec.json").read_bytes(),
+        )
+
+    def test_spec_shaped_legacy_file_stays_put(self):
+        # Adapter. A spec-shaped legacy file is not deleted or moved. The live engine
+        # case that reports NEW for this file is unchanged and is not run here.
+        doc = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+        (self.snaps / "unmigrated.spec.json").write_text(json.dumps(doc), encoding="utf-8")
+        before = _tree(self.snaps)
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", return_value={"ok": True, "queries": [{"id": "q1", "result": "NEW"}]}), \
+             patch("pbz.checks.spend", return_value=True):
+            res = checks.snapshot(
+                self.ws, None, "compare", "unmigrated.spec", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+            )
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(_tree(self.snaps), before)
 
     def test_engine_refuses_empty_queries_in_save_and_compare(self):
         # Direct engine call with empty queries must return BAD_REQUEST

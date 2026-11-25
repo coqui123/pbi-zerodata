@@ -1072,22 +1072,75 @@ def migrate_snapshot_layout(ws) -> dict:
         }
 
 
+def _snapshot_query_list(spec: dict | None) -> list:
+    """Reject an empty or unusable query list before any port, budget, or engine call."""
+    raw = spec.get("queries", []) if isinstance(spec, dict) else []
+    if not isinstance(raw, list) or not raw or any(not isinstance(q, dict) for q in raw):
+        raise PbzError("BAD_REQUEST", "queries must not be empty")
+    return raw
+
+
+def _snapshot_result_path(ws, name: str, *, namespaced: bool) -> str:
+    """Result path for one snapshot name. Does not create the directory."""
+    _validate_snapshot_name(name)
+    base = os.path.join(ws.private, "snapshots", "results") if namespaced else os.path.join(ws.private, "snapshots")
+    root = os.path.abspath(base)
+    path = os.path.abspath(os.path.join(root, name + ".json"))
+    if os.path.dirname(path) != root:
+        raise PbzError("BAD_REQUEST", "snapshot name must be a single path segment")
+    return path
+
+
+def _load_snapshot_json(ws, path: str):
+    """Read one snapshot file. A bad file is corrupt. Nothing is created or removed."""
+    try:
+        raw = read_checked(path, root=ws.private)
+        return json.loads(raw.decode("utf-8-sig"))
+    except PbzError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise PbzError("CORRUPT_STATE", "snapshot baseline is unreadable") from None
+
+
+def _require_usable_baseline(ws, name: str) -> None:
+    """Fail closed when this name's baseline cannot be read. Other files are ignored.
+
+    A namespaced result wins and is never replaced by a legacy file. A missing
+    baseline is left for the engine. A spec-shaped legacy file is not a result
+    and is left in place for the existing engine behavior.
+    """
+    namespaced = _snapshot_result_path(ws, name, namespaced=True)
+    if os.path.lexists(namespaced):
+        if not is_snapshot_result_doc(_load_snapshot_json(ws, namespaced)):
+            raise PbzError("CORRUPT_STATE", "snapshot baseline is not a result document")
+        return
+    legacy = _snapshot_result_path(ws, name, namespaced=False)
+    if not os.path.lexists(legacy):
+        return
+    doc = _load_snapshot_json(ws, legacy)
+    if is_snapshot_result_doc(doc) or is_snapshot_spec_doc(doc):
+        return
+    raise PbzError("CORRUPT_STATE", "snapshot baseline is not a result document")
+
+
 def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
     if action not in ("save", "compare"):
         raise PbzError("BAD_REQUEST", f"unknown snapshot action {action}")
     _validate_snapshot_name(name)
-    migrate_snapshot_layout(ws)
+    raw_queries = _snapshot_query_list(spec)
+    if action == "compare":
+        _require_usable_baseline(ws, name)
     spec_path = _snapshot_spec_path(ws, name)
-    port = desktop.require_port(project)
     tm = tokens.TokenMap(ws.private)
     queries = []
-    for q in (spec or {}).get("queries", []):
+    for q in raw_queries:
         dax, unknown = tokens.detokenize_dax(q.get("dax", ""), tm)
         if unknown:
             raise PbzError("BAD_REQUEST", "unknown token in query " + str(q.get("id")))
         queries.append({"id": q.get("id"), "dax": dax, "keys": q.get("keys", [])})
     if not queries:
         raise PbzError("BAD_REQUEST", "queries must not be empty")
+    port = desktop.require_port(project)
     verb = "snapshot-save" if action == "save" else "snapshot-compare"
     if not spend(ws, "snapshot_queries", max(1, len(queries))):
         return {"verb": verb, "status": "BUDGET", "note": "daily snapshot query budget reached; the user can reset it"}
