@@ -837,7 +837,12 @@ def main(argv=None, *, parser_only: bool = False) -> int:
         elif a.cmd == "probe":
             out = checks.probe(ws, project, a.table, a.columns)
         elif a.cmd == "snapshot":
-            spec = _spec(a.spec, ws) or (checks.saved_spec(ws, a.name) if a.action == "compare" else None)
+            # Omitted compare spec may reuse the saved spec. An explicit empty
+            # object is invalid and must not fall through to that saved spec.
+            if a.spec is None:
+                spec = checks.saved_spec(ws, a.name) if a.action == "compare" else None
+            else:
+                spec = _spec(a.spec, ws)
             if not spec:
                 raise PbzError("BAD_REQUEST", "--spec required")
             out = checks.snapshot(ws, project, a.action, a.name, spec)

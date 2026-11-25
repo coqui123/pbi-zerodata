@@ -1072,12 +1072,54 @@ def migrate_snapshot_layout(ws) -> dict:
         }
 
 
+_SNAPSHOT_ID = re.compile(r"\A[A-Za-z0-9_.:/\- ]{1,128}\Z")
+
+
 def _snapshot_query_list(spec: dict | None) -> list:
-    """Reject an empty or unusable query list before any port, budget, or engine call."""
+    """Reject a bad query list before any port, budget, or engine call.
+
+    Shape only. DAX syntax stays in the engine. A single string `keys` value is
+    the one-item list the engine already accepts. Missing `keys` means none.
+    """
     raw = spec.get("queries", []) if isinstance(spec, dict) else []
     if not isinstance(raw, list) or not raw or any(not isinstance(q, dict) for q in raw):
         raise PbzError("BAD_REQUEST", "queries must not be empty")
+    seen: set[str] = set()
+    for query in raw:
+        qid = query.get("id")
+        if not isinstance(qid, str) or _SNAPSHOT_ID.fullmatch(qid) is None:
+            raise PbzError("BAD_REQUEST", "query id is invalid")
+        if qid in seen:
+            raise PbzError("BAD_REQUEST", "duplicate query id")
+        seen.add(qid)
+        dax = query.get("dax")
+        if not isinstance(dax, str) or not dax.strip():
+            raise PbzError("BAD_REQUEST", "dax is required")
+        if "keys" in query and query.get("keys") is not None:
+            keys = query.get("keys")
+            if isinstance(keys, str):
+                continue
+            if not isinstance(keys, list) or any(not isinstance(item, str) for item in keys):
+                raise PbzError("BAD_REQUEST", "keys must be a list of strings")
     return raw
+
+
+def _preflight_snapshot_save(ws, name: str) -> None:
+    """Refuse a file or link where the named save needs a real directory. Create nothing."""
+    spec_path = _snapshot_spec_path(ws, name)
+    result_path = _snapshot_result_path(ws, name, namespaced=True)
+    snaps = os.path.join(ws.private, "snapshots")
+    directories = (ws.private, snaps, os.path.dirname(spec_path), os.path.dirname(result_path))
+    named = (spec_path, result_path)
+    for path in (*directories, *named):
+        if _reparse_link(path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    for path in directories:
+        if os.path.lexists(path) and not os.path.isdir(path):
+            raise PbzError("CORRUPT_STATE", "snapshot directory is not a directory")
+    for path in named:
+        if os.path.lexists(path) and not os.path.isfile(path):
+            raise PbzError("CORRUPT_STATE", "snapshot path is not a file")
 
 
 def _snapshot_result_path(ws, name: str, *, namespaced: bool) -> str:
@@ -1130,6 +1172,8 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
     raw_queries = _snapshot_query_list(spec)
     if action == "compare":
         _require_usable_baseline(ws, name)
+    if action == "save":
+        _preflight_snapshot_save(ws, name)
     spec_path = _snapshot_spec_path(ws, name)
     tm = tokens.TokenMap(ws.private)
     queries = []
