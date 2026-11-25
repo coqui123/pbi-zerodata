@@ -34,6 +34,8 @@ CLOSED_REASONS = {
     "SUITE_FAILED", "RATE_LIMITED", "DIRTY_WORKSPACE", "DIFF_INDEX_FAILED", "NOT_INSTALLED", "FOREIGN_HOOK",
     "HOOK_MODE_FAST", "LOCAL_OPT_IN_PRE_COMMIT_SKIPS_PRE_PUSH_FULL", "AMBIGUOUS_EVIDENCE", "MISSING_SUITES",
     "UNPROTECTED", "CHECKS_FAILED", "PENDING_CHECKS", "REQUIREMENTS_UNKNOWN",
+    "NOT_LAUNCHED", "SCAN_FAILED", "RUN_UNBOUND", "RETRIEVAL_UNAVAILABLE",
+    "CONFLICTING_EVIDENCE", "LANE_MISMATCH",
 }
 
 # Ruleset types that are not a CI gate. Every other type stays active and unproven.
@@ -395,6 +397,7 @@ _DIRECT_HOOK_HASHES = {
     "111c8b7f673d0aa0de4720a111632838d609ea71f5a30cc838ee2e974e6d569a", "3692298c54fb8de3ab867dbde0d45375d0b8611ac9049c3c40c3c5b06882553c",
     "5ae2b12c872881f0dc7e0eba43efb7f6afffb8ea189d4401faf6f0344baa057a", "8e473fe563a3328033763cdf5b5670a557746765aa8a21fae3eea62e1a790523",
     "d6245989a8964efcf6b1cc9e8eaf31ef0521ab506a55ac1781b00fa9db169410",
+    "ee4de5dcf8d7fe076883ca2d255c45b5b033a1b4ca06d19b00275446042cf037",
     "a427efa6804910f486e6446dbc4b74752529acb63bd2a1abc9f0b9e84e9381e2", "af7031fcfdb49ac6b76276abfbbbc2c38567bcee84cb96de4416f9f147e6e176",
     "f31b8114f3a1e1c3964fc06e5c4b0917828dc2ed732d6dcbb51ffc33491443b3", "fa59be176f7bfacd06f7565e2e6762913c4b68d0ec580748308418c55a8e96ce",
 }
@@ -1112,6 +1115,8 @@ def _serial_skip_status(serial_file: Path, candidate_dir: Path, approved_for_pla
         doc = json.loads(serial_file.read_text(encoding="utf-8"), object_pairs_hook=_json_object)
     except (OSError, ValueError, UnicodeDecodeError):
         return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+    if isinstance(doc, dict) and doc.get("lane") not in (None, "serial"):
+        return _res(approved_count, None, "unknown", "LANE_MISMATCH")
     if (
         not isinstance(doc, dict)
         or doc.get("schema") != 1
@@ -1147,6 +1152,8 @@ def _serial_skip_status(serial_file: Path, candidate_dir: Path, approved_for_pla
         code = row.get("exit_code")
         if isinstance(code, bool) or not isinstance(code, int) or code != 0 or row.get("error") is not None:
             return _res(approved_count, None, "mismatch", "SUITE_FAILED")
+        if row.get("launched") is not True:
+            return _res(approved_count, None, "unknown", "NOT_LAUNCHED")
         reasons = row.get("skip_reasons")
         if not isinstance(reasons, list):
             return _res(approved_count, None, "mismatch", "PARSE_ERROR")
@@ -1158,6 +1165,15 @@ def _serial_skip_status(serial_file: Path, candidate_dir: Path, approved_for_pla
                 return _res(approved_count, None, "mismatch", "PARSE_ERROR")
             if item:
                 observed[(row["id"], item)] += 1
+    scan = doc.get("scan")
+    if not isinstance(scan, dict) or scan.get("completed") is not True or scan.get("ok") is not True:
+        return _res(approved_count, None, "unknown", "SCAN_FAILED")
+    run = doc.get("run")
+    if not isinstance(run, dict) or any(
+        not isinstance(run.get(key), str) or not run.get(key).strip()
+        for key in ("id", "attempt", "workflow")
+    ):
+        return _res(approved_count, None, "unknown", "RUN_UNBOUND")
     if required_ids is not None and (len(seen_ids) != len(set(seen_ids)) or set(seen_ids) != set(required_ids)):
         return _res(approved_count, sum(observed.values()), "unknown", "MISSING_SUITES")
 
@@ -1398,10 +1414,11 @@ def _desktop_process_available() -> bool | None:
         return None
 
 
-def _verified_live_case(text: str, expected_sha: str | None) -> bool:
-    """True only for a PASS record whose revision is the captured commit."""
+def _live_acceptance(text: str, expected_sha: str | None) -> str:
+    """verified, conflict, or absent. Line order is not a clock."""
     if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
-        return False
+        return "absent"
+    grouped: dict[str, set[str]] = {}
     for line in text.splitlines():
         try:
             doc = json.loads(line)
@@ -1412,9 +1429,21 @@ def _verified_live_case(text: str, expected_sha: str | None) -> bool:
         revision = doc.get("revision") if isinstance(doc.get("revision"), str) else doc.get("sha")
         case = doc.get("case")
         result = doc.get("result")
-        if revision == expected_sha and isinstance(case, str) and case.strip() and result == "PASS":
-            return True
-    return False
+        if revision != expected_sha or not isinstance(case, str) or not case.strip():
+            continue
+        if result not in ("PASS", "FAIL"):
+            continue
+        grouped.setdefault(case, set()).add(result)
+    if any("PASS" in results and "FAIL" in results for results in grouped.values()):
+        return "conflict"
+    if any(results == {"PASS"} for results in grouped.values()):
+        return "verified"
+    return "absent"
+
+
+def _verified_live_case(text: str, expected_sha: str | None) -> bool:
+    """True only when a named case passed and no named case conflicts."""
+    return _live_acceptance(text, expected_sha) == "verified"
 
 
 def get_desktop_evidence(ws_path: str | Path | None = None, expected_sha: str | None = None) -> tuple[bool | None, str | None]:
@@ -1423,11 +1452,56 @@ def get_desktop_evidence(ws_path: str | Path | None = None, expected_sha: str | 
         log_file = Path(ws_path).resolve() / ".pbz" / "private" / "evidence.log"
         if log_file.is_file():
             try:
-                if _verified_live_case(log_file.read_text(encoding="utf-8", errors="replace"), expected_sha):
+                acceptance = _live_acceptance(
+                    log_file.read_text(encoding="utf-8", errors="replace"), expected_sha
+                )
+                if acceptance == "verified":
                     return True, None
+                if acceptance == "conflict":
+                    return False, "CONFLICTING_EVIDENCE"
             except (OSError, UnicodeDecodeError):
                 pass
     return (False, "NOT_RUN") if sys.platform == "win32" else (None, "UNAVAILABLE")
+
+
+def posix_exemption_status(doc, expected_ids: list | None) -> dict:
+    """Read a POSIX exemption report. This is not serial coverage for either OS."""
+    def _res(st, rsn, lane="posix"):
+        return {"status": st, "reason": rsn, "lane": lane}
+
+    if not isinstance(doc, dict) or doc.get("schema") != 1 or doc.get("lane") != "posix":
+        return _res("unknown", "PARSE_ERROR", None)
+    if not isinstance(doc.get("os"), str) or not doc.get("os").strip():
+        return _res("unknown", "PARSE_ERROR")
+    rows = doc.get("tests")
+    if not isinstance(rows, list) or not isinstance(expected_ids, list):
+        return _res("unknown", "PARSE_ERROR")
+    seen: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+            return _res("unknown", "PARSE_ERROR")
+        if row.get("outcome") != "passed":
+            return _res("mismatch", "SUITE_FAILED")
+        seen.append(row["id"])
+    if len(seen) != len(set(seen)) or set(seen) != set(expected_ids):
+        return _res("unknown", "MISSING_SUITES")
+    if doc.get("passed") is not True:
+        return _res("mismatch", "SUITE_FAILED")
+    return _res("verified", None)
+
+
+def _posix_lane_report(candidate_dir: Path | None, skill_dir: Path | None = None) -> dict:
+    """Diagnostic only. A verified exemption lane does not make the serial gate succeed."""
+    if candidate_dir is None or not (candidate_dir / "posix.json").is_file():
+        return {"status": "unknown", "reason": "NOT_RUN", "lane": "posix"}
+    base = skill_dir or Path(__file__).resolve().parents[1]
+    try:
+        expected_doc = json.loads((base / "tests" / "posix_tests.json").read_text(encoding="utf-8"))
+        report = json.loads((candidate_dir / "posix.json").read_text(encoding="utf-8"), object_pairs_hook=_json_object)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {"status": "unknown", "reason": "PARSE_ERROR", "lane": "posix"}
+    expected = expected_doc.get("tests") if isinstance(expected_doc, dict) else None
+    return posix_exemption_status(report, expected if isinstance(expected, list) else None)
 
 
 def evaluate_ci_outcome(ci_data: dict) -> str:
@@ -1511,6 +1585,7 @@ def evaluate_ci_outcome(ci_data: dict) -> str:
         and bp.get("status") == "protected"
         and required_checks_satisfied
         and sk.get("status") == "match"
+        and ci_data.get("artifact_provenance") == "authenticated"
     ):
         return "SUCCEEDED"
 
@@ -1661,6 +1736,10 @@ def cmd_doctor_ci(
         "desktop_evidence": desktop_present,
         "desktop_evidence_reason": desktop_reason,
         "desktop_available": _desktop_process_available(),
+        # Local files are not hosted artifacts. Retrieval is a separate design.
+        "artifact_provenance": "unavailable",
+        "artifact_provenance_reason": "RETRIEVAL_UNAVAILABLE",
+        "posix_lane": _posix_lane_report(observed_sidecars_dir),
     }
 
     return {
