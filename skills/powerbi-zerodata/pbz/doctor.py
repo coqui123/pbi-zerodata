@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,7 +32,8 @@ CLOSED_REASONS = {
     "UNEXPECTED_SKIPS", "MISSING_SKIPS", "ABSENT", "UNAVAILABLE", "GIT_UNAVAILABLE", "UNBORN",
     "PAGINATION_INCOMPLETE", "NO_SUCCESSFUL_CHECKS", "STALE_RUN", "PLATFORM_MISMATCH", "BRANCH_MISMATCH",
     "SUITE_FAILED", "RATE_LIMITED", "DIRTY_WORKSPACE", "DIFF_INDEX_FAILED", "NOT_INSTALLED", "FOREIGN_HOOK",
-    "HOOK_MODE_FAST", "UNPROTECTED", "CHECKS_FAILED", "PENDING_CHECKS", "REQUIREMENTS_UNKNOWN",
+    "HOOK_MODE_FAST", "LOCAL_OPT_IN_PRE_COMMIT_SKIPS_PRE_PUSH_FULL", "AMBIGUOUS_EVIDENCE", "MISSING_SUITES",
+    "UNPROTECTED", "CHECKS_FAILED", "PENDING_CHECKS", "REQUIREMENTS_UNKNOWN",
 }
 
 # Ruleset types that are not a CI gate. Every other type stays active and unproven.
@@ -392,6 +394,7 @@ def _hidden_index_edits(repo_root: Path, seen: set[Path]) -> tuple[bool | None, 
 _DIRECT_HOOK_HASHES = {
     "111c8b7f673d0aa0de4720a111632838d609ea71f5a30cc838ee2e974e6d569a", "3692298c54fb8de3ab867dbde0d45375d0b8611ac9049c3c40c3c5b06882553c",
     "5ae2b12c872881f0dc7e0eba43efb7f6afffb8ea189d4401faf6f0344baa057a", "8e473fe563a3328033763cdf5b5670a557746765aa8a21fae3eea62e1a790523",
+    "d6245989a8964efcf6b1cc9e8eaf31ef0521ab506a55ac1781b00fa9db169410",
     "a427efa6804910f486e6446dbc4b74752529acb63bd2a1abc9f0b9e84e9381e2", "af7031fcfdb49ac6b76276abfbbbc2c38567bcee84cb96de4416f9f147e6e176",
     "f31b8114f3a1e1c3964fc06e5c4b0917828dc2ed732d6dcbb51ffc33491443b3", "fa59be176f7bfacd06f7565e2e6762913c4b68d0ec580748308418c55a8e96ce",
 }
@@ -460,9 +463,14 @@ def get_hook_mode(repo_root: Path | None) -> str:
 
     rc, cfg = _run_git(["config", "--get", "pbz.requiredCI"], cwd=repo_root)
     if rc == 0:
-        val = cfg.strip().lower()
-        if not val:
+        raw = cfg.strip()
+        if not raw:
             return "unknown"
+        # Exact installer value. Pre-commit skips the suite. Pre-push stays advisory.
+        # This is not branch protection and it is not the full gate.
+        if raw == "main-offline-required":
+            return "main-offline-required"
+        val = raw.lower()
         if val in ("fast", "full"):
             return val
         return "unknown"
@@ -793,9 +801,13 @@ def get_hosted_checks(
             )
         )
 
+        # A satisfied required list is the authority. An optional skipped job
+        # must not force pending. With no required list, a skipped CI-named job still does.
+        required_satisfied = bool(req_list) and not has_missing_req
+        optional_skip_blocks = has_ci_skipped_or_neutral and not required_satisfied
         if has_failure:
             overall, rsn = "failure", "CHECKS_FAILED"
-        elif has_pending or has_ci_skipped_or_neutral or has_missing_req:
+        elif has_pending or optional_skip_blocks or has_missing_req:
             overall, rsn = "pending", "PENDING_CHECKS"
         elif success_count > 0 and has_ci_success:
             overall, rsn = "success", None
@@ -1091,11 +1103,131 @@ def _parse_skip_records(lines: list) -> tuple[set[str] | None, bool]:
     return out, True
 
 
+def _serial_skip_status(serial_file: Path, candidate_dir: Path, approved_for_plat: dict, approved_count, expected_sha, platform: str, required_ids: list | None) -> dict:
+    """Read the serial.json report the offline runner writes. Sidecars are not required."""
+    def _res(app, obs, st, rsn, unexp=None, miss=None):
+        return {"approved_count": app, "observed_count": obs, "status": st, "reason": rsn, "unexpected": unexp or [], "missing": miss or []}
+
+    try:
+        doc = json.loads(serial_file.read_text(encoding="utf-8"), object_pairs_hook=_json_object)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+    if (
+        not isinstance(doc, dict)
+        or doc.get("schema") != 1
+        or not isinstance(doc.get("shard"), str) or not doc.get("shard").strip()
+        or "executed" not in doc
+        or "sha" not in doc
+    ):
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+    sha = doc.get("sha")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+    if expected_sha and sha != expected_sha:
+        return _res(approved_count, None, "mismatch", "STALE_RUN")
+    identity = doc.get("identity")
+    os_name = identity.get("os") if isinstance(identity, dict) else None
+    if not isinstance(os_name, str) or not os_name.strip():
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+    reported = "windows" if "windows" in os_name.lower() else "posix"
+    if reported != platform:
+        return _res(approved_count, None, "mismatch", "PLATFORM_MISMATCH")
+    executed = doc.get("executed")
+    if not isinstance(executed, list) or not executed:
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+    if doc.get("ok") is not True:
+        return _res(approved_count, None, "mismatch", "SUITE_FAILED")
+
+    observed: Counter = Counter()
+    seen_ids: list[str] = []
+    for row in executed:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+            return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+        seen_ids.append(row["id"])
+        code = row.get("exit_code")
+        if isinstance(code, bool) or not isinstance(code, int) or code != 0 or row.get("error") is not None:
+            return _res(approved_count, None, "mismatch", "SUITE_FAILED")
+        reasons = row.get("skip_reasons")
+        if not isinstance(reasons, list):
+            return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+        for line in reasons:
+            if not isinstance(line, str):
+                return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+            item = _canonical_skip(line)
+            if item is None:
+                return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+            if item:
+                observed[(row["id"], item)] += 1
+    if required_ids is not None and (len(seen_ids) != len(set(seen_ids)) or set(seen_ids) != set(required_ids)):
+        return _res(approved_count, sum(observed.values()), "unknown", "MISSING_SUITES")
+
+    expected: Counter = Counter()
+    for suite_id, lines in approved_for_plat.items():
+        if not isinstance(suite_id, str) or not isinstance(lines, list):
+            return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+        for line in lines:
+            if not isinstance(line, str):
+                return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+            item = _canonical_skip(line)
+            if not item:
+                return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+            expected[(suite_id, item)] += 1
+
+    sidecars = sorted(candidate_dir.glob("*.skips.jsonl"))
+    if sidecars:
+        side: Counter = Counter()
+        for path in sidecars:
+            suite_name = path.name.removesuffix(".skips.jsonl")
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeDecodeError):
+                return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+            for line in lines:
+                item = _canonical_skip(line)
+                if item is None:
+                    return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+                if item:
+                    side[(suite_name, item)] += 1
+        if side != observed:
+            return _res(approved_count, sum(observed.values()), "unknown", "AMBIGUOUS_EVIDENCE")
+
+    if observed != expected:
+        extra = observed - expected
+        missing = expected - observed
+        if extra:
+            return _res(
+                sum(expected.values()), sum(observed.values()), "mismatch", "UNEXPECTED_SKIPS",
+                unexp=[f"{suite} {item}" for (suite, item), _n in sorted(extra.items())][:20],
+            )
+        return _res(
+            sum(expected.values()), sum(observed.values()), "mismatch", "MISSING_SKIPS",
+            miss=[f"{suite} {item}" for (suite, item), _n in sorted(missing.items())][:20],
+        )
+    return _res(sum(expected.values()), sum(observed.values()), "match", None)
+
+
+def _canonical_skip(line: str) -> str | None:
+    """One skip identity, an empty string for a blank line, or None when the line is not a record."""
+    s = line.strip()
+    if not s:
+        return ""
+    if s.startswith("PBZ_SKIP "):
+        s = s[len("PBZ_SKIP "):].strip()
+    try:
+        doc = json.loads(s, object_pairs_hook=_json_object)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(doc, dict) and isinstance(doc.get("test"), str) and isinstance(doc.get("reason"), str):
+        return json.dumps({"test": doc["test"], "reason": doc["reason"]}, sort_keys=True)
+    return None
+
+
 def get_skips_status(
     skill_dir: Path | None = None,
     observed_sidecars_dir: Path | None = None,
     expected_sha: str | None = None,
     require_provenance: bool = False,
+    platform: str | None = None,
 ) -> dict:
     """Compare observed test skips with approved offline_skips.json baseline across required suites."""
     def _res(app, obs, st, rsn, unexp=None, miss=None):
@@ -1113,7 +1245,7 @@ def get_skips_status(
     if not isinstance(data, dict):
         return _res(None, None, "unknown", "PARSE_ERROR")
 
-    plat = "windows" if sys.platform == "win32" else "posix"
+    plat = platform if platform in ("windows", "posix") else ("windows" if sys.platform == "win32" else "posix")
     approved_for_plat = data.get(plat)
     if not isinstance(approved_for_plat, dict):
         return _res(None, None, "unknown", "PARSE_ERROR")
@@ -1140,6 +1272,28 @@ def get_skips_status(
 
     if not candidate_dir or not candidate_dir.is_dir():
         return _res(approved_count, None, "unknown", "NOT_RUN")
+
+    serial_file = candidate_dir / "serial.json"
+    if serial_file.is_file():
+        required_ids = None
+        suites_path = base_skill / "tests" / "offline_suites.json"
+        if suites_path.is_file():
+            try:
+                listed = json.loads(suites_path.read_text(encoding="utf-8"), object_pairs_hook=_json_object)
+            except (OSError, ValueError, UnicodeDecodeError):
+                return _res(approved_count, None, "unknown", "PARSE_ERROR")
+            if not isinstance(listed, list) or not listed:
+                return _res(approved_count, None, "unknown", "PARSE_ERROR")
+            required_ids = []
+            for entry in listed:
+                if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"].strip():
+                    return _res(approved_count, None, "unknown", "PARSE_ERROR")
+                required_ids.append(entry["id"])
+            if len(required_ids) != len(set(required_ids)):
+                return _res(approved_count, None, "unknown", "PARSE_ERROR")
+        return _serial_skip_status(
+            serial_file, candidate_dir, approved_for_plat, approved_count, expected_sha, plat, required_ids,
+        )
 
     # 1. Discover provenance and validate presence, SHA, and platform first
     # (stale SHA / wrong OS fails closed to STALE_RUN / PLATFORM_MISMATCH before parsing sidecars)
@@ -1236,24 +1390,44 @@ def get_skips_status(
     return _res(approved_count, obs_count, "match", None)
 
 
-def get_desktop_evidence(ws_path: str | Path | None = None) -> tuple[bool | None, str | None]:
+def _desktop_process_available() -> bool | None:
+    """Whether a Desktop process is running. That fact is not a live test result."""
     try:
-        if desktop.processes():
-            return True, None
+        return bool(desktop.processes())
     except Exception:
-        pass
+        return None
 
+
+def _verified_live_case(text: str, expected_sha: str | None) -> bool:
+    """True only for a PASS record whose revision is the captured commit."""
+    if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+        return False
+    for line in text.splitlines():
+        try:
+            doc = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        revision = doc.get("revision") if isinstance(doc.get("revision"), str) else doc.get("sha")
+        case = doc.get("case")
+        result = doc.get("result")
+        if revision == expected_sha and isinstance(case, str) and case.strip() and result == "PASS":
+            return True
+    return False
+
+
+def get_desktop_evidence(ws_path: str | Path | None = None, expected_sha: str | None = None) -> tuple[bool | None, str | None]:
+    """Live synthetic acceptance for a named case. A running process is not acceptance."""
     if ws_path:
         log_file = Path(ws_path).resolve() / ".pbz" / "private" / "evidence.log"
         if log_file.is_file():
             try:
-                txt = log_file.read_text(encoding="utf-8", errors="replace")
-                if re.search(r'"stage"\s*:\s*"(?:LOADED|EXECUTED)"', txt):
+                if _verified_live_case(log_file.read_text(encoding="utf-8", errors="replace"), expected_sha):
                     return True, None
             except (OSError, UnicodeDecodeError):
                 pass
-
-    return (False, "ABSENT") if sys.platform == "win32" else (None, "UNAVAILABLE")
+    return (False, "NOT_RUN") if sys.platform == "win32" else (None, "UNAVAILABLE")
 
 
 def evaluate_ci_outcome(ci_data: dict) -> str:
@@ -1267,7 +1441,7 @@ def evaluate_ci_outcome(ci_data: dict) -> str:
         return "FAILED"
     if sk.get("status") == "mismatch":
         reason = sk.get("reason")
-        if reason in ("STALE_RUN", "PLATFORM_MISMATCH", "PARSE_ERROR", "MISSING_SKIPS"):
+        if reason in ("STALE_RUN", "PLATFORM_MISMATCH", "PARSE_ERROR", "MISSING_SKIPS", "AMBIGUOUS_EVIDENCE", "MISSING_SUITES"):
             return "INCOMPLETE"
         return "FAILED"
 
@@ -1463,9 +1637,11 @@ def cmd_doctor_ci(
         hosted_checks["status"] = "unknown"
         hosted_checks["reason"] = "REQUIREMENTS_UNKNOWN"
     skips = get_skips_status(skill_dir=None, observed_sidecars_dir=observed_sidecars_dir, expected_sha=sha, require_provenance=True)
-    desktop_present, desktop_reason = get_desktop_evidence(ws_path)
+    desktop_present, desktop_reason = get_desktop_evidence(ws_path, expected_sha=sha)
     if hook_mode == "full":
         hook_mode_reason = None
+    elif hook_mode == "main-offline-required":
+        hook_mode_reason = "LOCAL_OPT_IN_PRE_COMMIT_SKIPS_PRE_PUSH_FULL"
     elif hook_mode == "fast":
         hook_mode_reason = "HOOK_MODE_FAST"
     elif hook_mode == "not_installed":
@@ -1484,6 +1660,7 @@ def cmd_doctor_ci(
         "skips": skips,
         "desktop_evidence": desktop_present,
         "desktop_evidence_reason": desktop_reason,
+        "desktop_available": _desktop_process_available(),
     }
 
     return {

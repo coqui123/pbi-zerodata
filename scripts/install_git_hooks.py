@@ -14,7 +14,11 @@ SOURCE = os.path.join(ROOT, "scripts", "git-hooks")
 NAMES = ("pre-commit", "pre-push")
 # Exact shipped content, not a marker, establishes ownership. Add reviewed old
 # release digests here when the shipped hooks change.
-KNOWN = {"8e473fe563a3328033763cdf5b5670a557746765aa8a21fae3eea62e1a790523"}
+KNOWN = {
+    "5ae2b12c872881f0dc7e0eba43efb7f6afffb8ea189d4401faf6f0344baa057a",
+    "8e473fe563a3328033763cdf5b5670a557746765aa8a21fae3eea62e1a790523",
+    "942acbd400b0fad2be01ee84ee7a4b6c52eb7d2b16cde8703ab68b3ebaafa944",
+}
 
 
 def wrapper(name: str) -> bytes:

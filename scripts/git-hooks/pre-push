@@ -21,6 +21,9 @@ fi
 
 echo "pbz: pre-push checks the local working tree, not outgoing commits (HEAD tree: $head_tree; working tree: $dirty); protected hosted CI is the merge authority" >&2
 
+# Drop hook git variables so suite fixtures cannot commit into this repository.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR
+unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_QUARANTINE_PATH
 cd "$root/skills/powerbi-zerodata" || exit 1
 export PYTHONIOENCODING=utf-8
 echo "pbz: building the engine, then running the offline CI suites"

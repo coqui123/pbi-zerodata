@@ -1,2 +1,2 @@
 @echo off
-python -I "%~dp0..\pbz\cli.py" %*
+python -I -B "%~dp0..\pbz\cli.py" %*

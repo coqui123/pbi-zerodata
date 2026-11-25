@@ -3442,9 +3442,12 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
             blocked = doctor.get_hosted_checks(self.test_root, sha, offline=False, required_contexts=names)
         self.assertEqual(blocked["status"], "pending")
 
-    def _write_serial(self, folder: Path, body: dict) -> None:
+    def _write_serial(self, folder: Path, body: dict, platform: str) -> None:
+        doc = dict(body)
+        if "identity" not in doc:
+            doc["identity"] = {"os": "Windows-10" if platform == "windows" else "Linux-6"}
         folder.mkdir()
-        (folder / "serial.json").write_text(json.dumps(body), encoding="utf-8")
+        (folder / "serial.json").write_text(json.dumps(doc), encoding="utf-8")
 
     def _skip_skill(self, manifest: dict) -> Path:
         skill = self.test_root / "skip-skill"
@@ -3464,13 +3467,13 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
             ],
         }
         folder = self.test_root / "serial-ok"
-        self._write_serial(folder, body)
+        self._write_serial(folder, body, "windows")
         sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=folder, expected_sha=sha, platform="windows")
         self.assertEqual(sk["status"], "match")
         self.assertIsNone(sk["reason"])
         body["executed"][0]["skip_reasons"] = [line, line]
         dup = self.test_root / "serial-dup"
-        self._write_serial(dup, body)
+        self._write_serial(dup, body, "windows")
         dup_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=dup, expected_sha=sha, platform="windows")
         self.assertEqual(dup_sk["status"], "mismatch")
         self.assertEqual(dup_sk["reason"], "UNEXPECTED_SKIPS")
@@ -3480,23 +3483,44 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         sha = "b" * 40
         empty = {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": []}
         folder = self.test_root / "serial-empty"
-        self._write_serial(folder, empty)
+        self._write_serial(folder, empty, "posix")
         sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=folder, expected_sha=sha, platform="posix")
         self.assertNotEqual(sk["status"], "match")
         self.assertEqual(sk["reason"], "PARSE_ERROR")
         bare = self.test_root / "serial-bare"
-        self._write_serial(bare, {"sha": sha})
+        self._write_serial(bare, {"sha": sha}, "posix")
         bare_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=bare, expected_sha=sha, platform="posix")
         self.assertEqual(bare_sk["reason"], "PARSE_ERROR")
         stale = self.test_root / "serial-stale"
-        self._write_serial(stale, {"schema": 1, "shard": "serial", "sha": "c" * 40, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]})
+        self._write_serial(stale, {"schema": 1, "shard": "serial", "sha": "c" * 40, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
         stale_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=stale, expected_sha=sha, platform="posix")
         self.assertEqual(stale_sk["reason"], "STALE_RUN")
         zero = self.test_root / "serial-zero"
-        self._write_serial(zero, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]})
+        self._write_serial(zero, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
         zero_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=zero, expected_sha=sha, platform="posix")
         self.assertEqual(zero_sk["status"], "match")
         self.assertEqual(zero_sk["observed_count"], 0)
+        bad_ok = self.test_root / "serial-bad-ok"
+        self._write_serial(bad_ok, {"schema": 1, "shard": "serial", "sha": sha, "ok": False, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=bad_ok, expected_sha=sha, platform="posix")["reason"], "SUITE_FAILED")
+        bad_code = self.test_root / "serial-bad-code"
+        self._write_serial(bad_code, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 1, "error": None, "skip_reasons": []}]}, "posix")
+        self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=bad_code, expected_sha=sha, platform="posix")["reason"], "SUITE_FAILED")
+        amb = self.test_root / "serial-amb"
+        self._write_serial(amb, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        (amb / "s.skips.jsonl").write_text('PBZ_SKIP {"reason": "other", "test": "case_x"}\n', encoding="utf-8")
+        amb_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=amb, expected_sha=sha, platform="posix")
+        self.assertEqual(amb_sk["status"], "unknown")
+        self.assertEqual(amb_sk["reason"], "AMBIGUOUS_EVIDENCE")
+        wrong = self.test_root / "serial-wrong-os"
+        self._write_serial(wrong, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "identity": {"os": "Windows-10"}, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=wrong, expected_sha=sha, platform="posix")["reason"], "PLATFORM_MISMATCH")
+        (skill / "tests" / "offline_suites.json").write_text(json.dumps([{"id": "s"}, {"id": "other"}]), encoding="utf-8")
+        missing = self.test_root / "serial-missing-suite"
+        self._write_serial(missing, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        miss_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=missing, expected_sha=sha, platform="posix")
+        self.assertEqual(miss_sk["status"], "unknown")
+        self.assertEqual(miss_sk["reason"], "MISSING_SUITES")
 
     def test_desktop_process_is_not_live_evidence(self):
         with patch.object(doctor.desktop, "processes", return_value=[{"pid": 1}]):
@@ -3513,13 +3537,28 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         (log_dir / "evidence.log").write_text('{"stage":"LOADED"}\n', encoding="utf-8")
         live_old, _reason = doctor.get_desktop_evidence(self.test_root)
         self.assertIsNot(live_old, True)
+        sha = "d" * 40
         (log_dir / "evidence.log").write_text(
-            json.dumps({"revision": "d" * 40, "case": "legacy-fallback", "result": "PASS"}) + "\n",
+            json.dumps({"revision": sha, "case": "legacy-fallback", "result": "PASS"}) + "\n",
             encoding="utf-8",
         )
-        live_ok, live_reason = doctor.get_desktop_evidence(self.test_root)
+        unbound, _unbound_reason = doctor.get_desktop_evidence(self.test_root)
+        self.assertIsNot(unbound, True)
+        live_ok, live_reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
         self.assertIs(live_ok, True)
         self.assertIsNone(live_reason)
+        (log_dir / "evidence.log").write_text(
+            json.dumps({"revision": sha, "case": "legacy-fallback", "result": "FAILED"}) + "\n",
+            encoding="utf-8",
+        )
+        live_fail, _fail_reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+        self.assertIsNot(live_fail, True)
+        (log_dir / "evidence.log").write_text(
+            json.dumps({"revision": "e" * 40, "case": "legacy-fallback", "result": "PASS"}) + "\n",
+            encoding="utf-8",
+        )
+        live_stale, _stale_reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+        self.assertIsNot(live_stale, True)
 
     def test_public_launcher_writes_no_bytecode(self):
         repo = self.test_root / "launcher"
