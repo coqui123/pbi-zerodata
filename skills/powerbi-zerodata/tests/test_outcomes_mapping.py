@@ -24,6 +24,7 @@ CASES = [
     ({"result": "OK"}, "SUCCEEDED", "OK", 0),
     ({"status": "PASS"}, "SUCCEEDED", "PASS", 0),
     ({"action": "pulled"}, "SUCCEEDED", "pulled", 0),
+    ({"verb": "snapshot", "queries": [{"id": "q", "result": "SAME"}]}, "SUCCEEDED", "OK", 0),
 
     # PARTIAL (rc=5)
     ({"result": "PUSHED", "reload": "FAILED"}, "PARTIAL", "APPLIED_RELOAD_FAILED", 5),
@@ -41,6 +42,8 @@ CASES = [
     ({"status": "FAIL"}, "FAILED", "ASSERTION_FAILED", 1),
     ({"result": "DIFF"}, "FAILED", "ASSERTION_FAILED", 1),
     ({"results": [{"status": "FAIL"}]}, "FAILED", "ASSERTION_FAILED", 1),
+    ({"verb": "health", "ok": True, "errors": [{"kind": "measure", "class": "SYNTAX"}]},
+     "FAILED", "ERROR:SYNTAX", 1),
 
     # FAILED (rc=2: unhandled/generic error payload)
     # Known deviation / legacy behavior: unhandled error strings fall through to line 71-72
@@ -84,6 +87,12 @@ CASES = [
      "BLOCKED", "INCONCLUSIVE_EVIDENCE", 3),
     ({"results": [{"status": "EMPTY"}]}, "BLOCKED", "INCONCLUSIVE_EVIDENCE", 3),
     ({"results": [{"result": "STALE_DATA"}]}, "BLOCKED", "INCONCLUSIVE_EVIDENCE", 3),
+    ({"verb": "snapshot", "queries": [{"id": "q", "result": "NEW"}]},
+     "BLOCKED", "INCONCLUSIVE_EVIDENCE", 3),
+    ({"verb": "snapshot", "queries": [{"id": "q", "result": "MISSING"}]},
+     "BLOCKED", "INCONCLUSIVE_EVIDENCE", 3),
+    ({"verb": "health", "ok": True, "errors": [], "unprocessed_tables": ["Sales"]},
+     "BLOCKED", "INCOMPLETE", 3),
 
     # UNAVAILABLE (rc=4: engine down, timeout, unsupported)
     ({"ok": False, "error": "ENGINE_UNAVAILABLE"}, "UNAVAILABLE", "ENGINE_UNAVAILABLE", 4),

@@ -142,6 +142,8 @@ class FollowupAuthorTests(unittest.TestCase):
     def test_expand_compact_dax_unit(self):
         """Test _compact_dax token adjacency, escaped quotes, and empty/whitespace handling."""
         self.assertEqual(expand._compact_dax("SUM(Sales[Amount])"), "SUM(Sales[Amount])")
+        line_comment = chr(47) + chr(47) + " c\n1"
+        self.assertEqual(expand._compact_dax(line_comment), line_comment)
         self.assertEqual(expand._compact_dax(' "hello   world" '), '"hello   world"')
         self.assertEqual(expand._compact_dax(' "a ""b"" c" '), '"a ""b"" c"')
         self.assertEqual(expand._compact_dax("   \n\t   "), "")

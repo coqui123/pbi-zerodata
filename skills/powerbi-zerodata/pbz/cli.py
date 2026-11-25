@@ -240,7 +240,10 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("capabilities", help="closed capability matrix: what pbz can and cannot certify")
     sub.add_parser("status", help="workspace, mirror, sync, Desktop and engine")
-    sub.add_parser("doctor", help="read-only OS-isolation checklist; changes nothing")
+    p = sub.add_parser("doctor", help="read-only OS-isolation checklist or CI diagnostics; changes nothing")
+    p.add_argument("target", nargs="?", choices=["ci"], default=None, help="optional target: 'ci' for CI/CD diagnostics")
+    p.add_argument("--offline", action="store_true", help="skip hosted checks and network requests")
+    p.add_argument("--branch", default=None, help="target branch for CI diagnostics (defaults to current branch)")
     sub.add_parser("init", help="create the policy, scan data-bearing files, and pull the first mirror")
     p = sub.add_parser("scan")
     p.add_argument("--dry-run", action="store_true")
@@ -708,7 +711,25 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             from pbz import interactiontest
             from pbz.outcomes import envelope
             if a.cmd == "doctor":
-                out = cmd_doctor()
+                if getattr(a, "offline", False) and getattr(a, "target", None) != "ci":
+                    raise PbzError("BAD_ARGUMENTS", "--offline requires 'pbz doctor ci'")
+                branch_arg = getattr(a, "branch", None)
+                if branch_arg is not None:
+                    if not isinstance(branch_arg, str) or not branch_arg.strip():
+                        raise PbzError("BAD_ARGUMENTS", "--branch cannot be empty")
+                    if (
+                        branch_arg != branch_arg.strip()
+                        or branch_arg.startswith("-")
+                        or not re.fullmatch(r"[A-Za-z0-9_./@+-]+", branch_arg)
+                    ):
+                        raise PbzError("BAD_ARGUMENTS", f"invalid --branch argument: {branch_arg}")
+                    if getattr(a, "target", None) != "ci":
+                        raise PbzError("BAD_ARGUMENTS", "--branch requires 'pbz doctor ci'")
+                if getattr(a, "target", None) == "ci":
+                    from pbz import doctor
+                    out = doctor.cmd_doctor_ci(ws_path=getattr(a, "workspace", None), offline=getattr(a, "offline", False), branch_override=branch_arg)
+                else:
+                    out = cmd_doctor()
             elif a.cmd == "capabilities":
                 from pbz.capabilities import matrix
                 out = matrix()

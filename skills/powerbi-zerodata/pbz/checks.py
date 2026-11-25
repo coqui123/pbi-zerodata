@@ -33,7 +33,7 @@ EXPR_FIELDS = ("expr", "left", "right", "column", "from", "to", "of")
 RLS_EXPECT = ("EMPTY", "NON_EMPTY", "LESS", "EQUAL", "OLS_INACCESSIBLE")
 _RLS_TEXT = ("query", "role", "user", "column", "table")
 _CHECK_STATUS = {"PASS", "FAIL", "EMPTY", "UNSUPPORTED", "ERROR"}
-_REFRESH_STATUS = frozenset({"PASS", "ERROR"})
+_REFRESH_STATUS = frozenset({"PASS", "ERROR", "UNSUPPORTED"})
 
 CHECK_REQUIRED = {
     **{k: ("expr",) for k in ("executes", "nonblank", "nonempty", "sign", "compiles")},
@@ -531,8 +531,12 @@ def _rewrite(c: dict) -> tuple[dict | None, str | None]:
     if kind == "filter_independent":
         col = c.get("column", "")
         expr = c.get("expr", "")
-        return {"id": c["id"], "kind": "equal", "left": expr, "right": f"CALCULATE({expr}, REMOVEFILTERS({col}))",
-                "by": c.get("by", []), "where": c.get("where", [])}, None
+        rewritten = {"id": c["id"], "kind": "equal", "left": expr,
+                     "right": f"CALCULATE({expr}, REMOVEFILTERS({col}))",
+                     "by": c.get("by", []), "where": c.get("where", [])}
+        if "tol" in c:
+            rewritten["tol"] = c["tol"]
+        return rewritten, None
     return c, None
 
 

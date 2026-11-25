@@ -944,44 +944,51 @@ mirror_txn.transaction(ws.mirror, edit, ws=ws, project=project)
 
     def test_two_process_stale_lock_recovery(self):
         import subprocess
+        import time
         self._killed_child(write=True)
         self.assertNotEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
-        barrier = os.path.join(self.tmp.name, "recover-barrier")
+        hold = os.path.join(self.tmp.name, "recover-hold")
+        os.makedirs(hold)
         code = """
-import json, os, sys, time
+import json, os, sys
 from pbz import common, mirror
 ws = common.Workspace(sys.argv[1]); ws.private = sys.argv[2]
-project = ws.project()
-ready = sys.argv[3] + '.' + sys.argv[4]
-with open(ready, 'w'): pass
-while not os.path.exists(sys.argv[3]): time.sleep(.005)
-print(json.dumps(mirror.recover(ws, project)))
+print(json.dumps(mirror.recover(ws, ws.project())))
 """
         env = dict(os.environ)
         env["PYTHONPATH"] = SKILL + os.pathsep + env.get("PYTHONPATH", "")
-        children = [subprocess.Popen([sys.executable, "-c", code, self.ws.root, self.ws.private,
-                                      barrier, str(i)], env=env, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, text=True) for i in range(2)]
+        env["PBZ_RECOVER_HOLD"] = hold
+        children = [subprocess.Popen([sys.executable, "-c", code, self.ws.root, self.ws.private],
+                                     env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    for _ in range(2)]
         try:
-            import time
             deadline = time.monotonic() + 20
-            while not all(os.path.exists(barrier + '.' + str(i)) for i in range(2)):
-                if time.monotonic() > deadline:
-                    self.fail("recovery children failed to reach barrier")
+            collided = False
+            while time.monotonic() < deadline:
+                held = [name for name in os.listdir(hold) if name.startswith("held-")]
+                finished = [child for child in children if child.poll() is not None]
+                if len(held) > 1:
+                    self.fail("both recoverers entered the guard: " + " ".join(held))
+                if len(held) == 1 and len(finished) == 1:
+                    collided = True
+                    break
                 time.sleep(.01)
-            with open(barrier, "w"):
+            self.assertTrue(collided, "recoverers did not collide inside the guard")
+            with open(os.path.join(hold, "release"), "w"):
                 pass
             results = []
             for child in children:
                 stdout, stderr = child.communicate(timeout=30)
                 self.assertEqual(child.returncode, 0, stderr)
                 results.append(json.loads(stdout)["result"])
-            self.assertEqual(results.count("RECOVERED"), 1, results)
-            self.assertIn(next(r for r in results if r != "RECOVERED"),
-                          ("COMMIT_BUSY", "NOTHING_TO_RECOVER"))
+            self.assertEqual(sorted(results), ["COMMIT_BUSY", "RECOVERED"], results)
             self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
             self.assertFalse(mirror.pending_recovery(self.ws, self.project))
         finally:
+            release = os.path.join(hold, "release")
+            if not os.path.exists(release):
+                with open(release, "w"):
+                    pass
             for child in children:
                 if child.poll() is None:
                     child.kill()

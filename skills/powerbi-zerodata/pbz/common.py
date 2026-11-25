@@ -424,6 +424,22 @@ def _refuse_dotdot_through_link(path: str) -> None:
         stack.append(part)
 
 
+def _comparable_path(path: str) -> str:
+    """Drop a Windows ``\\\\?\\`` prefix so two realpaths compare as one path.
+
+    ``realpath`` keeps that prefix when a second lookup fails with a different
+    error than the first. Another process creating the directory causes that.
+    The prefix does not make the path a different location.
+    """
+    if os.name != "nt":
+        return path
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
 def _contained(path: str, root: str | None) -> None:
     """Refuse when a path component at or below `root` resolves outside that root.
 
@@ -443,7 +459,7 @@ def _contained(path: str, root: str | None) -> None:
     if rel == ".." or rel.startswith(".." + os.sep) or os.path.isabs(rel):
         raise PbzError("UNSAFE_PATH", "refusing to write through a link")
     try:
-        root_real = os.path.realpath(root_abs)
+        root_real = _comparable_path(os.path.realpath(root_abs))
     except OSError:
         raise PbzError("UNSAFE_PATH", "refusing to write through a link") from None
     current = os.path.dirname(path_abs)
@@ -452,7 +468,7 @@ def _contained(path: str, root: str | None) -> None:
         if below_root and _reparse_link(current):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         try:
-            real = os.path.realpath(current)
+            real = _comparable_path(os.path.realpath(current))
             if os.path.normcase(os.path.commonpath([real, root_real])) != os.path.normcase(root_real):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         except ValueError:
@@ -511,8 +527,8 @@ def anchor_mirror(ws) -> str:
     if os.path.lexists(mirror):
         _contained(mirror, root)
         try:
-            real = os.path.realpath(mirror)
-            root_real = os.path.realpath(root)
+            real = _comparable_path(os.path.realpath(mirror))
+            root_real = _comparable_path(os.path.realpath(root))
             if os.path.normcase(os.path.commonpath([real, root_real])) != os.path.normcase(root_real):
                 raise PbzError("UNSAFE_PATH", "refusing to write through a link")
         except ValueError:

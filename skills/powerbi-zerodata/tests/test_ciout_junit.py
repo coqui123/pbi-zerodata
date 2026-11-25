@@ -106,6 +106,16 @@ class CioutJUnitFingerprintingTests(unittest.TestCase):
         f4 = {"rule": "a", "code": "b|c", "object": "o", "where": "w"}
         self.assertNotEqual(ciout._fp(f3), ciout._fp(f4))
 
+    def test_file_fallback_when_where_missing(self):
+        """A missing where uses file. where wins when both are set."""
+        left = {"rule": "R", "code": "C", "object": "O", "file": "tables/" + ("A" * 320) + ".tmdl"}
+        right = {"rule": "R", "code": "C", "object": "O", "file": "tables/" + ("A" * 320) + "Z.tmdl"}
+        self.assertNotEqual(ciout._fp(left), ciout._fp(right))
+        via_where = {"rule": "R", "code": "C", "object": "O", "where": left["file"]}
+        self.assertEqual(ciout._fp(left), ciout._fp(via_where))
+        prefers_where = {"rule": "R", "code": "C", "object": "O", "where": left["file"], "file": "other.tmdl"}
+        self.assertEqual(ciout._fp(prefers_where), ciout._fp(via_where))
+
     def test_golden_vector(self):
         """Pin canonical golden vector so fingerprint computation cannot drift."""
         finding = {

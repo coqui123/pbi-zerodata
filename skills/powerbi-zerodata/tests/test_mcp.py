@@ -500,6 +500,25 @@ def call(mid, name, args=None) -> dict:
     return rpc(mid, "tools/call", {"name": name, "arguments": args or {}})
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        kernel.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 class OutputBudgetTests(unittest.TestCase):
     def run_child(self, code, timeout=5, mid=0):
         return mcp._bounded_output([sys.executable, "-c", code], os.getcwd(), os.environ.copy(), timeout, mid)
@@ -575,13 +594,27 @@ assert peak < 2000000, peak
 
     def test_timeout_kills_descendant_with_inherited_stdout(self):
         with tempfile.TemporaryDirectory() as tmp:
-            marker = str(Path(tmp, "child-survived"))
-            child = f"import time; from pathlib import Path; time.sleep(0.4); Path({marker!r}).write_text('survived')"
-            parent = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(20)"
+            pidfile = str(Path(tmp, "child.pid"))
+            child = (
+                "import os, time; from pathlib import Path; "
+                f"Path({pidfile!r}).write_text(str(os.getpid())); time.sleep(30)"
+            )
+            parent = (
+                "import subprocess, sys, time; "
+                f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+            )
             _code, raw, error = self.run_child(parent, timeout=0.15)
             self.assertEqual((raw, error), (b"", "TIMEOUT"))
-            time.sleep(0.5)
-            self.assertFalse(Path(marker).exists())
+            deadline = time.time() + 3
+            while not Path(pidfile).exists() and time.time() < deadline:
+                time.sleep(0.05)
+            if not Path(pidfile).exists():
+                return
+            pid = int(Path(pidfile).read_text())
+            gone = time.time() + 3
+            while _pid_alive(pid) and time.time() < gone:
+                time.sleep(0.05)
+            self.assertFalse(_pid_alive(pid))
 
     def test_decoded_limit(self):
         with patch.object(mcp, "DECODED_LIMIT", 10):

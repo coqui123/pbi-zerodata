@@ -29,9 +29,21 @@ def _fp_v0(finding: dict) -> str:
     return "|".join(str(finding.get(k) or "") for k in ("rule", "code", "object", "where"))[:300]
 
 
+def _path_identity(finding: dict) -> str:
+    """`where` when present. `file` only when `where` is missing."""
+    where = finding.get("where")
+    if isinstance(where, str) and where != "":
+        return where
+    file = finding.get("file")
+    if isinstance(file, str):
+        return file
+    return ""
+
+
 def _fp_v1(finding: dict) -> str:
     """Versioned v1 fingerprint: SHA-256 over canonical JSON array of identity fields."""
-    parts = [str(finding.get(k) or "") for k in ("rule", "code", "object", "where")]
+    parts = [str(finding.get(k) or "") for k in ("rule", "code", "object")]
+    parts.append(_path_identity(finding))
     blob = json.dumps(parts, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     return "v1:" + hashlib.sha256(blob).hexdigest()
 

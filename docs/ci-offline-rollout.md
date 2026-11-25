@@ -164,7 +164,16 @@ reviewed the empirical evidence and unanimously adopted **Option D: Stay Serial*
      a 60-minute budget).
    - Two-shard execution machinery and runner options remain dormant and intact in the
      codebase.
-   - **Reopen Threshold**: The rollout track remains closed unless serial runtimes exceed
-     acceptable engineering bounds (serial median runtime > 15 minutes) or dynamic
-     work-queue balancing (Option A) is scheduled.
+   - **Reopen Threshold**: The rollout track stays closed unless the serial median
+     runtime exceeds 15 minutes, or a written design for Option A is accepted first.
+     That design must name the cross-job claim mechanism and the serial/sharded
+     equivalence argument. Scheduling Option A without that design does not reopen
+     the track. Option C returns only as a companion to that design, and only if
+     suite grain is what blocks the gate.
+
+Reconfirmed 2026-11-24 by the same council (claude-fable-5.2-thinking,
+gpt-6.2-astra-thinking, gemini-4-neon-thinking). Decision D stands. The five-pair,
+10 percent raw wall-clock gate is unchanged. The stale-lock recovery test now
+collides inside the guard: one recoverer holds it, the other must return
+COMMIT_BUSY.
 

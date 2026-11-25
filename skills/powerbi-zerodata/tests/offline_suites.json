@@ -905,5 +905,37 @@
     ],
     "windows": false,
     "engine": false
+  },
+  {
+    "id": "ciout_junit",
+    "argv": [
+      "tests/test_ciout_junit.py"
+    ],
+    "windows": false,
+    "engine": false
+  },
+  {
+    "id": "pre_push",
+    "argv": [
+      "tests/test_pre_push.py"
+    ],
+    "windows": false,
+    "engine": false
+  },
+  {
+    "id": "watch",
+    "argv": [
+      "tests/test_watch.py"
+    ],
+    "windows": false,
+    "engine": false
+  },
+  {
+    "id": "doctor_ci",
+    "argv": [
+      "tests/test_doctor_ci.py"
+    ],
+    "windows": false,
+    "engine": false
   }
 ]

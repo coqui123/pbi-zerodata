@@ -563,44 +563,64 @@ class PolicyAtomicTests(unittest.TestCase):
         self.assertIn("concurrent-init.example.com", result["sensitive_hosts"])
 
     def test_two_process_concurrent_tighten(self):
-        """Two subprocesses tightening distinct hosts serialize and preserve both entries."""
-        barrier = os.path.join(self.tmp.name, "tighten-barrier")
+        """One tightener pauses between load and save. The other stays blocked. Both hosts persist."""
+        import time
+        hold = os.path.join(self.tmp.name, "tighten-hold")
+        os.makedirs(hold)
         code = """
-import os, sys, time
+import os, sys
 from pbz import common, policy
 ws = common.Workspace(sys.argv[1])
 ws.private = sys.argv[2]
-ready = sys.argv[3] + '.' + sys.argv[4]
-with open(ready, 'w'): pass
-while not os.path.exists(sys.argv[3]): time.sleep(.005)
-host = sys.argv[5]
-policy.tighten(ws, sensitive_hosts=[host])
+with open(os.path.join(sys.argv[3], "started-" + sys.argv[4]), "w"):
+    pass
+policy.tighten(ws, sensitive_hosts=[sys.argv[5]])
 """
         env = dict(os.environ)
         env["PYTHONPATH"] = SKILL + os.pathsep + env.get("PYTHONPATH", "")
+        env["PBZ_TIGHTEN_HOLD"] = hold
         children = [
             subprocess.Popen(
-                [sys.executable, "-c", code, self.ws.root, self.ws.private, barrier, str(i), f"proc-{i}.example.com"],
-                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                [sys.executable, "-c", code, self.ws.root, self.ws.private, hold, str(i), f"proc-{i}.example.com"],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             for i in range(2)
         ]
         try:
-            import time
             deadline = time.monotonic() + 20
-            while not all(os.path.exists(barrier + '.' + str(i)) for i in range(2)):
-                if time.monotonic() > deadline:
-                    self.fail("tighten children failed to reach barrier")
-                time.sleep(.01)
-            with open(barrier, "w"):
+            collided = False
+            while time.monotonic() < deadline:
+                names = os.listdir(hold)
+                held = [name for name in names if name.startswith("held-")]
+                started = [name for name in names if name.startswith("started-")]
+                finished = [child for child in children if child.poll() is not None]
+                if len(held) > 1:
+                    self.fail("both tighteners passed load before save: " + " ".join(held))
+                blocked = [name for name in names if name.startswith("blocked-")]
+                if len(held) == 1 and blocked and not finished:
+                    time.sleep(0.3)
+                    names = os.listdir(hold)
+                    held = [name for name in names if name.startswith("held-")]
+                    blocked = [name for name in names if name.startswith("blocked-")]
+                    finished = [child for child in children if child.poll() is not None]
+                    if len(held) == 1 and blocked and not finished:
+                        collided = True
+                        break
+                time.sleep(0.01)
+            self.assertTrue(collided, "tighteners did not pause between load and save")
+            with open(os.path.join(hold, "release"), "w"):
                 pass
             for child in children:
-                stdout, stderr = child.communicate(timeout=30)
+                _stdout, stderr = child.communicate(timeout=30)
                 self.assertEqual(child.returncode, 0, stderr)
             result = policy.load(self.ws)
             self.assertIn("proc-0.example.com", result["sensitive_hosts"])
             self.assertIn("proc-1.example.com", result["sensitive_hosts"])
         finally:
+            release = os.path.join(hold, "release")
+            if not os.path.exists(release):
+                with open(release, "w"):
+                    pass
             for child in children:
                 if child.poll() is None:
                     child.kill()

@@ -38,6 +38,35 @@ class ProbeChecksTests(unittest.TestCase):
             self.assertEqual(checks.probe(ws, project, "unknown", ["Explicit"])["columns"][0]["column"], "Explicit")
 
 
+class AdapterVerdictTests(unittest.TestCase):
+    def test_filter_independent_forwards_explicit_zero_tol(self):
+        rewritten, err = checks._rewrite({
+            "id": "fi", "kind": "filter_independent",
+            "expr": "[Total Sales]", "column": "'Customer'[Segment]", "tol": 0,
+        })
+        self.assertIsNone(err)
+        self.assertEqual(rewritten["kind"], "equal")
+        self.assertEqual(rewritten["tol"], 0)
+        self.assertIn("REMOVEFILTERS('Customer'[Segment])", rewritten["right"])
+
+    def test_filter_independent_omitted_tol_stays_omitted(self):
+        rewritten, err = checks._rewrite({
+            "id": "fi", "kind": "filter_independent",
+            "expr": "[Total Sales]", "column": "'Customer'[Segment]",
+        })
+        self.assertIsNone(err)
+        self.assertNotIn("tol", rewritten)
+
+    def test_refresh_keeps_unsupported(self):
+        ws = SimpleNamespace(private="private")
+        project = SimpleNamespace(name="Canary")
+        with patch.object(checks.desktop, "require_port", return_value=1), \
+                patch.object(checks, "engine_call", return_value={"ok": True, "status": "UNSUPPORTED"}):
+            out = checks.refresh(ws, project, ["Sales"])
+        self.assertEqual(out["status"], "UNSUPPORTED")
+        self.assertEqual(out["verb"], "refresh")
+
+
 class ExactInt64EqualTests(unittest.TestCase):
     def test_exact_int64_at_tol_zero(self):
         # Numbers exceeding 2^53 (9007199254740992) lose precision when cast to double

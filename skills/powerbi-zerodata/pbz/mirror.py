@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import stat
+import time
 import uuid
 
 from . import desktop, policy as policy_mod, tmdl, tokens, validate
@@ -909,6 +910,25 @@ def _process_alive(pid: int) -> bool:
         return True
 
 
+def _pause_for_recover_hold() -> None:
+    """Test seam. Unset in production.
+
+    PBZ_RECOVER_HOLD is a directory. After this process owns the recovery guard,
+    it writes held-<pid> and waits until release appears, so another recoverer
+    collides with the held guard instead of starting at the same moment.
+    """
+    hold = os.environ.get("PBZ_RECOVER_HOLD")
+    if not hold:
+        return
+    os.makedirs(hold, exist_ok=True)
+    with open(os.path.join(hold, "held-" + str(os.getpid())), "w"):
+        pass
+    release = os.path.join(hold, "release")
+    deadline = time.monotonic() + 20
+    while not os.path.exists(release) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 def recover(ws, project, transaction_id: str | None = None) -> dict:
     """Hold the project commit lock throughout undo, including recovery after process exit."""
     parent = _transaction_dir(ws, project)
@@ -942,6 +962,7 @@ def recover(ws, project, transaction_id: str | None = None) -> dict:
         if info.st_size == 0:
             os.write(guard_fd, b"\0")
             os.lseek(guard_fd, 0, os.SEEK_SET)
+        _pause_for_recover_hold()
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:

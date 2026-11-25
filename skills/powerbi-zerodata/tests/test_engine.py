@@ -439,6 +439,10 @@ string nbkIsBlank = Checks.NoBlankKeysDax("'Hours'", "ISBLANK(Hours[ProjectID])"
 Assert(nbkIsBlank.Contains("KEEPFILTERS(ISBLANK(Hours[ProjectID]))"), "no_blank_keys wraps ISBLANK in KEEPFILTERS with where");
 string nbkSameCol = Checks.NoBlankKeysDax("'Hours'", "Hours[Person] = \"\"", new[] { "Hours[Person] <> \"\"" });
 Assert(nbkSameCol == "EVALUATE ROW(\"n\", CALCULATE(COUNTROWS('Hours'), Hours[Person] <> \"\"), \"o\", CALCULATE(CALCULATE(COUNTROWS('Hours'), KEEPFILTERS(Hours[Person] = \"\")), Hours[Person] <> \"\"))", "no_blank_keys exact DAX with same-column where");
+Assert(Checks.SignStatus(null, "POS") == "PASS", "omitted sign expect passes");
+Assert(Checks.SignStatus(new List<string>(), "POS") == "FAIL", "empty sign expect fails");
+Assert(Checks.SignStatus(new List<string> { "NEG" }, "POS") == "FAIL", "unlisted sign expect fails");
+Assert(Checks.SignStatus(new List<string> { "POS", "ZERO" }, "POS") == "PASS", "listed sign expect passes");
 string directory = Path.Combine(Path.GetTempPath(), "pbz-grouped-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
 try {

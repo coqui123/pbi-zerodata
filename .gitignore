@@ -34,3 +34,7 @@ docs/round-*-plan.md
 *Feature Research and Implementation Plan.md
 
 ci-results/
+
+# Local review artifacts (do not publish)
+council_doctor_ci*.json
+scratch/

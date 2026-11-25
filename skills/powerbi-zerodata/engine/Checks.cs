@@ -121,9 +121,7 @@ public static class Checks
                         sign = d < 0 ? "NEG" : d == 0 ? "ZERO" : "POS";
                     }
                     var expect = J.StrList(chk, "expect");
-                    if (expect != null && expect.Any(e => e is not ("NEG" or "ZERO" or "POS" or "BLANK")))
-                        throw new BadRequestException("expect must be NEG, ZERO, POS or BLANK");
-                    res["status"] = expect == null || expect.Count == 0 || expect.Contains(sign) ? "PASS" : "FAIL";
+                    res["status"] = SignStatus(expect, sign);
                     res["sign"] = sign;
                     break;
                 }
@@ -485,6 +483,14 @@ public static class Checks
     {
         if (Math.Abs(d) < 1e15 && d == Math.Floor(d)) return ((long)d).ToString(CultureInfo.InvariantCulture);
         return d.ToString("R", CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Omitted expect passes. An empty list does not contain the sign, so it fails.</summary>
+    public static string SignStatus(List<string>? expect, string sign)
+    {
+        if (expect != null && expect.Any(e => e is not ("NEG" or "ZERO" or "POS" or "BLANK")))
+            throw new BadRequestException("expect must be NEG, ZERO, POS or BLANK");
+        return expect == null || expect.Contains(sign) ? "PASS" : "FAIL";
     }
 
     /// <summary>BLANK equals BLANK only; numbers within relative tolerance; others by value.</summary>

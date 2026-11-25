@@ -8,11 +8,15 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import MagicMock, patch
+
+SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, SKILL)
 
 from pbz import bpa, cli, common, guard, validate, watch
 from pbz.common import PbzError

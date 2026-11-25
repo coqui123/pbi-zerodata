@@ -43,6 +43,27 @@ STRUCTURAL_KEYS = {"$schema", "Entity", "Property", "Name", "Source", "visualTyp
 
 # ---------------------------------------------------------------- token map
 
+def _note_tighten_blocked() -> None:
+    """Test seam. Unset PBZ_TIGHTEN_HOLD is a no-op.
+
+    A loser that fails the non-blocking lock write records blocked-<pid> so a
+    test can see the process is inside the lock spin, not still starting.
+    """
+    hold = os.environ.get("PBZ_TIGHTEN_HOLD")
+    if not hold:
+        return
+    try:
+        os.makedirs(hold, exist_ok=True)
+        fd = os.open(
+            os.path.join(hold, "blocked-" + str(os.getpid())),
+            os.O_CREAT | os.O_WRONLY,
+            0o600,
+        )
+        os.close(fd)
+    except OSError:
+        return
+
+
 class WorkspaceLock:
     """Process-owned allocator lock; keep its inode so waiting writers share it.
 
@@ -81,6 +102,7 @@ class WorkspaceLock:
                             raise
                         if time.monotonic() >= deadline:
                             raise PbzError("COMMIT_BUSY", "workspace allocator lock timed out") from None
+                        _note_tighten_blocked()
                         time.sleep(0.02)
             else:
                 import fcntl
@@ -94,6 +116,7 @@ class WorkspaceLock:
                             raise
                         if time.monotonic() >= deadline:
                             raise PbzError("COMMIT_BUSY", "workspace allocator lock timed out") from None
+                        _note_tighten_blocked()
                         time.sleep(0.02)
             self._verify_identity(path)
             if os.fstat(self.fd).st_size == 0:

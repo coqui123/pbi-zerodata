@@ -368,7 +368,8 @@ class FollowupStateTests(unittest.TestCase):
             lambda: checks.health(self.ws, self.project),
             lambda: checks.probe(self.ws, self.project, "T", None),
             lambda: checks.index(self.ws, self.project),
-            lambda: checks.snapshot(self.ws, self.project, "save", "snap", None),
+            lambda: checks.snapshot(self.ws, self.project, "save", "snap",
+                                    {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}),
         )
         with patch("pbz.checks.desktop.require_port", return_value=1), \
                 patch("pbz.checks.engine_call", return_value=bad):
