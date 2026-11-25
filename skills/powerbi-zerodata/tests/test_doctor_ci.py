@@ -19,6 +19,9 @@ from pbz import doctor, outcomes
 from pbz.cli import main
 from pbz.common import PbzError
 
+# Labeled replay of an authenticated artifact. Not hosted evidence.
+_REPLAY_PROVENANCE = "authenticated"
+
 
 def _checks_then_statuses(checks_stdout: str, statuses_stdout: str = "[]"):
     def run(cmd, **kwargs):
@@ -76,6 +79,7 @@ class DoctorCiTests(unittest.TestCase):
             },
             "desktop_evidence": False,
             "desktop_evidence_reason": "ABSENT",
+            "artifact_provenance": _REPLAY_PROVENANCE,
         }
         res = doctor.evaluate_ci_outcome(ci_data)
         self.assertEqual(res, "SUCCEEDED")
@@ -263,6 +267,7 @@ class DoctorCiTests(unittest.TestCase):
                 "skips": {"status": "match"},
                 "desktop_evidence": ev,
                 "desktop_evidence_reason": reason,
+                "artifact_provenance": _REPLAY_PROVENANCE,
             }
             res = doctor.evaluate_ci_outcome(ci_data)
             self.assertEqual(res, "SUCCEEDED")
@@ -637,6 +642,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
                 "hosted_checks": hc_satisfied,
                 "branch_protection": {"status": "protected", "required_contexts": ["serial", "offline"]},
                 "skips": {"status": "match"},
+                "artifact_provenance": _REPLAY_PROVENANCE,
             }
             self.assertEqual(doctor.evaluate_ci_outcome(ci_satisfied), "SUCCEEDED")
 
@@ -1327,6 +1333,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
                 ],
             },
             "skips": {"status": "match"},
+            "artifact_provenance": _REPLAY_PROVENANCE,
         }
         self.assertEqual(doctor.evaluate_ci_outcome(ci_sec_satisfied), "SUCCEEDED")
 
@@ -1373,6 +1380,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
                 ],
             },
             "skips": {"status": "match"},
+            "artifact_provenance": _REPLAY_PROVENANCE,
         }
         self.assertEqual(doctor.evaluate_ci_outcome(ci_correct_app), "SUCCEEDED")
 
@@ -1405,6 +1413,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
             "branch_protection": {"status": "protected", "required_contexts": [long_name]},
             "hosted_checks": hc,
             "skips": {"status": "match"},
+            "artifact_provenance": _REPLAY_PROVENANCE,
         }
         self.assertEqual(doctor.evaluate_ci_outcome(ci_long), "SUCCEEDED")
 
@@ -1509,6 +1518,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
                 ],
             },
             "skips": {"status": "match"},
+            "artifact_provenance": _REPLAY_PROVENANCE,
         }
         self.assertEqual(doctor.evaluate_ci_outcome(ci_both_apps), "SUCCEEDED")
 
@@ -1968,6 +1978,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
                 ],
             },
             "skips": {"status": "match"},
+            "artifact_provenance": _REPLAY_PROVENANCE,
         }
         self.assertEqual(doctor.evaluate_ci_outcome(ci), "INCOMPLETE")
         ci["branch_protection"]["required_contexts"] = []
@@ -3021,7 +3032,8 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(good_remotes, [clean])
         self.assertEqual(set(good_slugs), {"owner/a"})
         self.assertEqual(good["ci"]["hosted_checks"]["status"], "success")
-        self.assertEqual(good["status"], "SUCCEEDED")
+        self.assertEqual(good["status"], "INCOMPLETE")
+        self.assertEqual(good["ci"]["artifact_provenance_reason"], "RETRIEVAL_UNAVAILABLE")
 
         for padded in (" " + clean, clean + " "):
             bad, bad_slugs, bad_remotes = run(padded)
@@ -3120,7 +3132,8 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(good_remotes, [colon])
         self.assertEqual(set(good_slugs), {"owner/a"})
         self.assertEqual(good["ci"]["hosted_checks"]["status"], "success")
-        self.assertEqual(good["status"], "SUCCEEDED")
+        self.assertEqual(good["status"], "INCOMPLETE")
+        self.assertEqual(good["ci"]["artifact_provenance_reason"], "RETRIEVAL_UNAVAILABLE")
 
     def test_replace_ref_does_not_invent_ancestry(self):
         """A graft must not make a foreign commit a member of the protected branch."""
@@ -3461,9 +3474,11 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         sha = "a" * 40
         body = {
             "schema": 1, "shard": "serial", "sha": sha, "ok": True,
+            "scan": {"completed": True, "ok": True},
+            "run": {"id": "9", "attempt": "1", "workflow": "tests"},
             "executed": [
-                {"id": "suite_a", "exit_code": 0, "error": None, "skip_reasons": [line]},
-                {"id": "suite_b", "exit_code": 0, "error": None, "skip_reasons": []},
+                {"id": "suite_a", "exit_code": 0, "error": None, "skip_reasons": [line], "launched": True},
+                {"id": "suite_b", "exit_code": 0, "error": None, "skip_reasons": [], "launched": True},
             ],
         }
         folder = self.test_root / "serial-ok"
@@ -3498,8 +3513,8 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         zero = self.test_root / "serial-zero"
         self._write_serial(zero, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
         zero_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=zero, expected_sha=sha, platform="posix")
-        self.assertEqual(zero_sk["status"], "match")
-        self.assertEqual(zero_sk["observed_count"], 0)
+        self.assertEqual(zero_sk["status"], "unknown")
+        self.assertEqual(zero_sk["reason"], "NOT_LAUNCHED")
         bad_ok = self.test_root / "serial-bad-ok"
         self._write_serial(bad_ok, {"schema": 1, "shard": "serial", "sha": sha, "ok": False, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
         self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=bad_ok, expected_sha=sha, platform="posix")["reason"], "SUITE_FAILED")
@@ -3507,7 +3522,12 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self._write_serial(bad_code, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 1, "error": None, "skip_reasons": []}]}, "posix")
         self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=bad_code, expected_sha=sha, platform="posix")["reason"], "SUITE_FAILED")
         amb = self.test_root / "serial-amb"
-        self._write_serial(amb, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        self._write_serial(amb, {
+            "schema": 1, "shard": "serial", "sha": sha, "ok": True,
+            "scan": {"completed": True, "ok": True},
+            "run": {"id": "9", "attempt": "1", "workflow": "tests"},
+            "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": [], "launched": True}],
+        }, "posix")
         (amb / "s.skips.jsonl").write_text('PBZ_SKIP {"reason": "other", "test": "case_x"}\n', encoding="utf-8")
         amb_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=amb, expected_sha=sha, platform="posix")
         self.assertEqual(amb_sk["status"], "unknown")
@@ -3517,10 +3537,60 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=wrong, expected_sha=sha, platform="posix")["reason"], "PLATFORM_MISMATCH")
         (skill / "tests" / "offline_suites.json").write_text(json.dumps([{"id": "s"}, {"id": "other"}]), encoding="utf-8")
         missing = self.test_root / "serial-missing-suite"
-        self._write_serial(missing, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        self._write_serial(missing, {
+            "schema": 1, "shard": "serial", "sha": sha, "ok": True,
+            "scan": {"completed": True, "ok": True},
+            "run": {"id": "9", "attempt": "1", "workflow": "tests"},
+            "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": [], "launched": True}],
+        }, "posix")
         miss_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=missing, expected_sha=sha, platform="posix")
         self.assertEqual(miss_sk["status"], "unknown")
         self.assertEqual(miss_sk["reason"], "MISSING_SUITES")
+        bound = {
+            "schema": 1, "shard": "serial", "sha": sha, "ok": True,
+            "scan": {"completed": True, "ok": True},
+            "run": {"id": "9", "attempt": "1", "workflow": "tests"},
+            "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": [], "launched": False}],
+        }
+        launched = self.test_root / "serial-not-launched"
+        self._write_serial(launched, bound, "posix")
+        self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=launched, expected_sha=sha, platform="posix")["reason"], "NOT_LAUNCHED")
+        for scan, folder_name in (
+            (None, "serial-scan-missing"),
+            ({"completed": False, "ok": True}, "serial-scan-open"),
+            ({"completed": True, "ok": False}, "serial-scan-bad"),
+        ):
+            body = {
+                "schema": 1, "shard": "serial", "sha": sha, "ok": True,
+                "run": {"id": "9", "attempt": "1", "workflow": "tests"},
+                "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": [], "launched": True}],
+            }
+            if scan is not None:
+                body["scan"] = scan
+            folder = self.test_root / folder_name
+            self._write_serial(folder, body, "posix")
+            self.assertEqual(
+                doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=folder, expected_sha=sha, platform="posix")["reason"],
+                "SCAN_FAILED",
+            )
+        unbound = self.test_root / "serial-unbound"
+        self._write_serial(unbound, {
+            "schema": 1, "shard": "serial", "sha": sha, "ok": True,
+            "scan": {"completed": True, "ok": True},
+            "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": [], "launched": True}],
+        }, "posix")
+        self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=unbound, expected_sha=sha, platform="posix")["reason"], "RUN_UNBOUND")
+        lane = self.test_root / "serial-lane"
+        self._write_serial(lane, {
+            "schema": 1, "shard": "serial", "sha": sha, "ok": True, "lane": "posix",
+            "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}],
+        }, "posix")
+        self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=lane, expected_sha=sha, platform="posix")["reason"], "LANE_MISMATCH")
+        posix_doc = self.test_root / "serial-posix-report"
+        self._write_serial(posix_doc, {"schema": 1, "lane": "posix", "os": "Linux-6", "passed": True, "tests": []}, "posix")
+        posix_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=posix_doc, expected_sha=sha, platform="posix")
+        self.assertEqual(posix_sk["status"], "unknown")
+        self.assertEqual(posix_sk["reason"], "LANE_MISMATCH")
 
     def test_desktop_process_is_not_live_evidence(self):
         with patch.object(doctor.desktop, "processes", return_value=[{"pid": 1}]):
@@ -3547,6 +3617,15 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         live_ok, live_reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
         self.assertIs(live_ok, True)
         self.assertIsNone(live_reason)
+        for first, second in (("PASS", "FAIL"), ("FAIL", "PASS")):
+            (log_dir / "evidence.log").write_text(
+                json.dumps({"revision": sha, "case": "legacy-fallback", "result": first}) + "\n"
+                + json.dumps({"revision": sha, "case": "legacy-fallback", "result": second}) + "\n",
+                encoding="utf-8",
+            )
+            conflict, conflict_reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+            self.assertIs(conflict, False)
+            self.assertEqual(conflict_reason, "CONFLICTING_EVIDENCE")
         (log_dir / "evidence.log").write_text(
             json.dumps({"revision": sha, "case": "legacy-fallback", "result": "FAILED"}) + "\n",
             encoding="utf-8",
@@ -3588,6 +3667,88 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(after_cfg, before_cfg)
         self.assertEqual(after_pyc, before_pyc)
         self.assertEqual(list(repo.rglob("*.pyc")), [])
+
+    def test_labeled_replay_can_succeed_and_local_file_cannot(self):
+        # artifact_provenance authenticated is a labeled replay, not hosted evidence.
+        base = {
+            "sha": "a" * 40,
+            "dirty": False,
+            "hook_mode": "full",
+            "hosted_checks": {
+                "checked_sha": "a" * 40,
+                "status": "success",
+                "checks": [{"name": "tests", "status": "completed", "conclusion": "success"}],
+            },
+            "branch_protection": {"status": "protected"},
+            "skips": {"status": "match"},
+        }
+        self.assertEqual(doctor.evaluate_ci_outcome(base), "INCOMPLETE")
+        replay = dict(base)
+        replay["artifact_provenance"] = _REPLAY_PROVENANCE
+        self.assertEqual(doctor.evaluate_ci_outcome(replay), "SUCCEEDED")
+        local = dict(replay)
+        local["artifact_provenance"] = "unavailable"
+        self.assertEqual(doctor.evaluate_ci_outcome(local), "INCOMPLETE")
+
+    def test_posix_exemption_is_not_serial_coverage(self):
+        ids = json.loads((SKILL / "tests" / "posix_tests.json").read_text(encoding="utf-8"))["tests"]
+        rows = [{"id": item, "outcome": "passed"} for item in ids]
+        doc = {"schema": 1, "lane": "posix", "os": "Linux-6", "passed": True, "tests": rows}
+        got = doctor.posix_exemption_status(doc, ids)
+        self.assertEqual(got["status"], "verified")
+        self.assertIsNone(got["reason"])
+        self.assertEqual(got["lane"], "posix")
+        duplicate = dict(doc)
+        duplicate["tests"] = rows + [rows[0]]
+        self.assertEqual(doctor.posix_exemption_status(duplicate, ids)["reason"], "MISSING_SUITES")
+        short = dict(doc)
+        short["tests"] = rows[:-1]
+        self.assertEqual(doctor.posix_exemption_status(short, ids)["reason"], "MISSING_SUITES")
+        failed = dict(doc)
+        failed["tests"] = [{**rows[0], "outcome": "failed"}, *rows[1:]]
+        self.assertEqual(doctor.posix_exemption_status(failed, ids)["status"], "mismatch")
+        self.assertEqual(doctor.posix_exemption_status(failed, ids)["reason"], "SUITE_FAILED")
+        flag = dict(doc)
+        flag["passed"] = False
+        self.assertEqual(doctor.posix_exemption_status(flag, ids)["reason"], "SUITE_FAILED")
+        wrong = dict(doc)
+        wrong["lane"] = "serial"
+        parsed = doctor.posix_exemption_status(wrong, ids)
+        self.assertEqual(parsed["reason"], "PARSE_ERROR")
+        self.assertIsNone(parsed["lane"])
+        ci = {
+            "sha": "a" * 40,
+            "dirty": False,
+            "hook_mode": "full",
+            "hosted_checks": {
+                "checked_sha": "a" * 40,
+                "status": "success",
+                "checks": [{"name": "tests", "status": "completed", "conclusion": "success"}],
+            },
+            "branch_protection": {"status": "protected"},
+            "skips": {"status": "unknown", "reason": "NOT_RUN"},
+            "artifact_provenance": _REPLAY_PROVENANCE,
+            "posix_lane": got,
+        }
+        self.assertEqual(doctor.evaluate_ci_outcome(ci), "INCOMPLETE")
+
+    def test_official_pre_push_bytes_are_trusted(self):
+        raw = (SKILL.parents[1] / "scripts" / "git-hooks" / "pre-push").read_bytes()
+        lf = raw.replace(b"\r\n", b"\n")
+        self.assertEqual(doctor._check_hook_content(raw), "direct")
+        self.assertEqual(doctor._check_hook_content(lf), "direct")
+        self.assertIsNone(doctor._check_hook_content(lf.replace(b"set -e", b"set +e", 1)))
+        hook = self.test_root / ".git" / "hooks" / "pre-push"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_bytes(raw)
+        with patch.object(doctor.sys, "platform", "linux"), \
+             patch.object(doctor.os, "access", return_value=False), \
+             patch.object(doctor, "_run_git", return_value=(0, ".git/hooks/pre-push")):
+            self.assertEqual(doctor.get_hook_mode(self.test_root), "foreign")
+        with patch.object(doctor.sys, "platform", "linux"), \
+             patch.object(doctor.os, "access", return_value=True), \
+             patch.object(doctor, "_run_git", side_effect=[(0, ".git/hooks/pre-push"), (1, "")]):
+            self.assertEqual(doctor.get_hook_mode(self.test_root), "full")
 
 
 if __name__ == "__main__":
