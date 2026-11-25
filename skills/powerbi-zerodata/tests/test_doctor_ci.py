@@ -1121,6 +1121,8 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         repo = self.test_root / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        for key, value in (("user.email", "t@example.com"), ("user.name", "t")):
+            subprocess.run(["git", "-C", str(repo), "config", key, value], check=True, capture_output=True)
         test_file = repo / "README.md"
         test_file.write_text("hello\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
