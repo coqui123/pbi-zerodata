@@ -120,6 +120,30 @@ class PrePushHookTests(unittest.TestCase):
         self.assertIn("working tree: clean", proc.stderr)
         self.assertIn("protected hosted CI is the merge authority", proc.stderr)
 
+    def test_suite_does_not_keep_hook_git_dir(self):
+        """The offline suite must not inherit the hook git directory or index."""
+        mock = self.test_root / "skills" / "powerbi-zerodata" / "tests" / "run_offline.py"
+        mock.write_text(
+            "import os\n"
+            "print('DIR|' + os.environ.get('GIT_DIR', ''))\n"
+            "print('IDX|' + os.environ.get('GIT_INDEX_FILE', ''))\n",
+            encoding="utf-8",
+        )
+        readme = self.test_root / "README.md"
+        readme.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.test_root), "add", "."], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(self.test_root), "commit", "-m", "init"], check=True, env=self.env)
+        git_dir = subprocess.run(
+            ["git", "-C", str(self.test_root), "rev-parse", "--absolute-git-dir"],
+            check=True, capture_output=True, text=True, env=self.env,
+        ).stdout.strip()
+        proc = self._run_hook(extra_env={"GIT_DIR": git_dir, "GIT_INDEX_FILE": str(Path(git_dir) / "index")})
+        text = proc.stdout.replace("\r\n", "\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DIR|\n", text)
+        self.assertIn("IDX|\n", text)
+        self.assertNotIn(git_dir, text)
+
     def test_unstaged_modification_reports_dirty(self):
         """Unstaged modification causes working tree to report dirty."""
         f = self.test_root / "README.md"

@@ -3362,6 +3362,233 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(out["ci"]["branch_protection"]["reason"], "BRANCH_MISMATCH")
         self.assertNotEqual(out["status"], "SUCCEEDED")
 
+    def _git(self, repo: Path, *args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    def test_installer_opt_in_is_recognized_and_not_green(self):
+        """Real installer plus the public CLI. The opt-in is not unknown and not a green envelope."""
+        import importlib.util
+        repo = self.test_root / "installed"
+        repo.mkdir()
+        self._git(repo, "init", "-b", "main")
+        self._git(repo, "config", "user.email", "t@example.com")
+        self._git(repo, "config", "user.name", "t")
+        (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "A")
+        root = SKILL.parents[1]
+        spec = importlib.util.spec_from_file_location("install_git_hooks", root / "scripts" / "install_git_hooks.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        installer.install(str(repo), str(root / "scripts" / "git-hooks"))
+        self._git(repo, "config", "pbz.requiredCI", "main-offline-required")
+        self.assertEqual(doctor.get_hook_mode(repo), "main-offline-required")
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        proc = subprocess.run(
+            [sys.executable, "-I", str(SKILL / "pbz" / "cli.py"), "doctor", "ci", "--offline"],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["ci"]["hook_mode"], "main-offline-required")
+        self.assertEqual(payload["ci"]["hook_mode_reason"], "LOCAL_OPT_IN_PRE_COMMIT_SKIPS_PRE_PUSH_FULL")
+        self.assertNotEqual(payload["status"], "SUCCEEDED")
+        self.assertEqual(payload["ci"]["branch_protection"]["status"], "unknown")
+        hook = repo / ".git" / "hooks" / "pre-push"
+        hook.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+        self.assertEqual(doctor.get_hook_mode(repo), "foreign")
+        self._git(repo, "config", "pbz.requiredCI", "not-the-installer")
+        hook.write_bytes((root / "scripts" / "git-hooks" / "pre-push").read_bytes())
+        if sys.platform != "win32":
+            hook.chmod(hook.stat().st_mode | 0o111)
+        self.assertEqual(doctor.get_hook_mode(repo), "unknown")
+        green = {
+            "sha": "a" * 40,
+            "dirty": False,
+            "hook_mode": "main-offline-required",
+            "hosted_checks": {
+                "status": "success",
+                "checked_sha": "a" * 40,
+                "checks": [{"name": "tests", "status": "completed", "conclusion": "success"}],
+            },
+            "branch_protection": {"status": "protected"},
+            "skips": {"status": "match"},
+        }
+        self.assertEqual(doctor.evaluate_ci_outcome(green), "INCOMPLETE")
+
+    def test_optional_shard_skip_does_not_force_pending(self):
+        sha = "a" * 40
+        names = ["offline", "vendor-validator", "posix", "serial"]
+        runs = [
+            {"name": name, "status": "completed", "conclusion": "success", "head_sha": sha, "app": {"slug": "github-actions", "id": 1}}
+            for name in names
+        ]
+        runs.append({"name": "shard", "status": "completed", "conclusion": "skipped", "head_sha": sha, "app": {"slug": "github-actions", "id": 1}})
+        runs.append({"name": "rollout-gate", "status": "completed", "conclusion": "skipped", "head_sha": sha, "app": {"slug": "github-actions", "id": 1}})
+        runs.append({"name": "live-synth", "status": "completed", "conclusion": "skipped", "head_sha": sha, "app": {"slug": "github-actions", "id": 1}})
+        payload = json.dumps({"total_count": len(runs), "check_runs": runs})
+        with patch.object(doctor.shutil, "which", return_value="gh"), \
+             patch.object(doctor.subprocess, "run", side_effect=_checks_then_statuses(payload)), \
+             patch.object(doctor, "get_repo_slug", return_value="coqui123/pbi-zerodata"):
+            ok = doctor.get_hosted_checks(self.test_root, sha, offline=False, required_contexts=names)
+        self.assertEqual(ok["status"], "success")
+        self.assertIsNone(ok["reason"])
+        pending = json.loads(payload)
+        pending["check_runs"][0]["status"] = "in_progress"
+        pending["check_runs"][0]["conclusion"] = None
+        with patch.object(doctor.shutil, "which", return_value="gh"), \
+             patch.object(doctor.subprocess, "run", side_effect=_checks_then_statuses(json.dumps(pending))), \
+             patch.object(doctor, "get_repo_slug", return_value="coqui123/pbi-zerodata"):
+            blocked = doctor.get_hosted_checks(self.test_root, sha, offline=False, required_contexts=names)
+        self.assertEqual(blocked["status"], "pending")
+
+    def _write_serial(self, folder: Path, body: dict, platform: str) -> None:
+        doc = dict(body)
+        if "identity" not in doc:
+            doc["identity"] = {"os": "Windows-10" if platform == "windows" else "Linux-6"}
+        folder.mkdir()
+        (folder / "serial.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    def _skip_skill(self, manifest: dict) -> Path:
+        skill = self.test_root / "skip-skill"
+        (skill / "tests").mkdir(parents=True)
+        (skill / "tests" / "offline_skips.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return skill
+
+    def test_serial_artifact_multiset_matches(self):
+        line = 'PBZ_SKIP {"reason": "because", "test": "case_one"}'
+        skill = self._skip_skill({"windows": {"suite_a": [line]}, "posix": {}})
+        sha = "a" * 40
+        body = {
+            "schema": 1, "shard": "serial", "sha": sha, "ok": True,
+            "executed": [
+                {"id": "suite_a", "exit_code": 0, "error": None, "skip_reasons": [line]},
+                {"id": "suite_b", "exit_code": 0, "error": None, "skip_reasons": []},
+            ],
+        }
+        folder = self.test_root / "serial-ok"
+        self._write_serial(folder, body, "windows")
+        sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=folder, expected_sha=sha, platform="windows")
+        self.assertEqual(sk["status"], "match")
+        self.assertIsNone(sk["reason"])
+        body["executed"][0]["skip_reasons"] = [line, line]
+        dup = self.test_root / "serial-dup"
+        self._write_serial(dup, body, "windows")
+        dup_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=dup, expected_sha=sha, platform="windows")
+        self.assertEqual(dup_sk["status"], "mismatch")
+        self.assertEqual(dup_sk["reason"], "UNEXPECTED_SKIPS")
+
+    def test_serial_artifact_rejects_false_successes(self):
+        skill = self._skip_skill({"windows": {}, "posix": {}})
+        sha = "b" * 40
+        empty = {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": []}
+        folder = self.test_root / "serial-empty"
+        self._write_serial(folder, empty, "posix")
+        sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=folder, expected_sha=sha, platform="posix")
+        self.assertNotEqual(sk["status"], "match")
+        self.assertEqual(sk["reason"], "PARSE_ERROR")
+        bare = self.test_root / "serial-bare"
+        self._write_serial(bare, {"sha": sha}, "posix")
+        bare_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=bare, expected_sha=sha, platform="posix")
+        self.assertEqual(bare_sk["reason"], "PARSE_ERROR")
+        stale = self.test_root / "serial-stale"
+        self._write_serial(stale, {"schema": 1, "shard": "serial", "sha": "c" * 40, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        stale_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=stale, expected_sha=sha, platform="posix")
+        self.assertEqual(stale_sk["reason"], "STALE_RUN")
+        zero = self.test_root / "serial-zero"
+        self._write_serial(zero, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        zero_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=zero, expected_sha=sha, platform="posix")
+        self.assertEqual(zero_sk["status"], "match")
+        self.assertEqual(zero_sk["observed_count"], 0)
+        bad_ok = self.test_root / "serial-bad-ok"
+        self._write_serial(bad_ok, {"schema": 1, "shard": "serial", "sha": sha, "ok": False, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=bad_ok, expected_sha=sha, platform="posix")["reason"], "SUITE_FAILED")
+        bad_code = self.test_root / "serial-bad-code"
+        self._write_serial(bad_code, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 1, "error": None, "skip_reasons": []}]}, "posix")
+        self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=bad_code, expected_sha=sha, platform="posix")["reason"], "SUITE_FAILED")
+        amb = self.test_root / "serial-amb"
+        self._write_serial(amb, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        (amb / "s.skips.jsonl").write_text('PBZ_SKIP {"reason": "other", "test": "case_x"}\n', encoding="utf-8")
+        amb_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=amb, expected_sha=sha, platform="posix")
+        self.assertEqual(amb_sk["status"], "unknown")
+        self.assertEqual(amb_sk["reason"], "AMBIGUOUS_EVIDENCE")
+        wrong = self.test_root / "serial-wrong-os"
+        self._write_serial(wrong, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "identity": {"os": "Windows-10"}, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        self.assertEqual(doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=wrong, expected_sha=sha, platform="posix")["reason"], "PLATFORM_MISMATCH")
+        (skill / "tests" / "offline_suites.json").write_text(json.dumps([{"id": "s"}, {"id": "other"}]), encoding="utf-8")
+        missing = self.test_root / "serial-missing-suite"
+        self._write_serial(missing, {"schema": 1, "shard": "serial", "sha": sha, "ok": True, "executed": [{"id": "s", "exit_code": 0, "error": None, "skip_reasons": []}]}, "posix")
+        miss_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=missing, expected_sha=sha, platform="posix")
+        self.assertEqual(miss_sk["status"], "unknown")
+        self.assertEqual(miss_sk["reason"], "MISSING_SUITES")
+
+    def test_desktop_process_is_not_live_evidence(self):
+        with patch.object(doctor.desktop, "processes", return_value=[{"pid": 1}]):
+            live, reason = doctor.get_desktop_evidence(self.test_root)
+            if sys.platform == "win32":
+                self.assertIs(live, False)
+                self.assertEqual(reason, "NOT_RUN")
+            else:
+                self.assertIsNone(live)
+                self.assertEqual(reason, "UNAVAILABLE")
+            self.assertIs(doctor._desktop_process_available(), True)
+        log_dir = self.test_root / ".pbz" / "private"
+        log_dir.mkdir(parents=True)
+        (log_dir / "evidence.log").write_text('{"stage":"LOADED"}\n', encoding="utf-8")
+        live_old, _reason = doctor.get_desktop_evidence(self.test_root)
+        self.assertIsNot(live_old, True)
+        sha = "d" * 40
+        (log_dir / "evidence.log").write_text(
+            json.dumps({"revision": sha, "case": "legacy-fallback", "result": "PASS"}) + "\n",
+            encoding="utf-8",
+        )
+        unbound, _unbound_reason = doctor.get_desktop_evidence(self.test_root)
+        self.assertIsNot(unbound, True)
+        live_ok, live_reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+        self.assertIs(live_ok, True)
+        self.assertIsNone(live_reason)
+        (log_dir / "evidence.log").write_text(
+            json.dumps({"revision": sha, "case": "legacy-fallback", "result": "FAILED"}) + "\n",
+            encoding="utf-8",
+        )
+        live_fail, _fail_reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+        self.assertIsNot(live_fail, True)
+        (log_dir / "evidence.log").write_text(
+            json.dumps({"revision": "e" * 40, "case": "legacy-fallback", "result": "PASS"}) + "\n",
+            encoding="utf-8",
+        )
+        live_stale, _stale_reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+        self.assertIsNot(live_stale, True)
+
+    def test_public_launcher_writes_no_bytecode(self):
+        repo = self.test_root / "launcher"
+        repo.mkdir()
+        self._git(repo, "init", "-b", "main")
+        self._git(repo, "config", "user.email", "t@example.com")
+        self._git(repo, "config", "user.name", "t")
+        (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "A")
+        before = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1", "-uall"], check=True, capture_output=True, text=True).stdout
+        before_cfg = subprocess.run(["git", "-C", str(repo), "config", "--local", "--list"], check=True, capture_output=True, text=True).stdout
+        for stale in SKILL.rglob("*.pyc"):
+            stale.unlink(missing_ok=True)
+        before_pyc = {p.relative_to(SKILL).as_posix() for p in SKILL.rglob("*.pyc")}
+        cmd = SKILL / "bin" / "pbz.cmd"
+        env = os.environ.copy()
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        env.pop("PYTHONPYCACHEPREFIX", None)
+        for _ in range(2):
+            proc = subprocess.run(["cmd", "/c", str(cmd), "doctor", "ci", "--offline"], cwd=repo, capture_output=True, text=True, timeout=60, env=env)
+            self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        after = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1", "-uall"], check=True, capture_output=True, text=True).stdout
+        after_cfg = subprocess.run(["git", "-C", str(repo), "config", "--local", "--list"], check=True, capture_output=True, text=True).stdout
+        after_pyc = {p.relative_to(SKILL).as_posix() for p in SKILL.rglob("*.pyc")}
+        self.assertEqual(after, before)
+        self.assertEqual(after_cfg, before_cfg)
+        self.assertEqual(after_pyc, before_pyc)
+        self.assertEqual(list(repo.rglob("*.pyc")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

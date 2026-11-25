@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-exec python -I "$(dirname "$(readlink -f "$0")")/../pbz/cli.py" "$@"
+exec python -I -B "$(dirname "$(readlink -f "$0")")/../pbz/cli.py" "$@"
