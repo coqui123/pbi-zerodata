@@ -549,6 +549,48 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertTrue(res.get("ok"))
         self.assertEqual(_tree(self.snaps), before)
 
+    def test_adapter_monthly_names_do_not_share_files(self):
+        # Adapter, not a live engine run. monthly and monthly.spec stay distinct.
+        def fake_engine(verb, payload, timeout=1800):
+            results = self.snaps / "results"
+            results.mkdir(parents=True, exist_ok=True)
+            (results / (payload["name"] + ".json")).write_text(
+                json.dumps({"queries": {"q1": {"name": payload["name"]}}, "refreshed": "2026-01-01T00:00:00"}),
+                encoding="utf-8",
+            )
+            return {"ok": True, "queries": [{"id": "q1", "result": "SAVED"}]}
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine), \
+             patch("pbz.checks.spend", return_value=True):
+            checks.snapshot(self.ws, None, "save", "monthly", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
+            first_result = (self.snaps / "results" / "monthly.json").read_bytes()
+            first_spec = (self.snaps / "specs" / "monthly.json").read_bytes()
+            checks.snapshot(self.ws, None, "save", "monthly.spec", {"queries": [{"id": "q1", "dax": "EVALUATE {2}"}]})
+        self.assertEqual((self.snaps / "results" / "monthly.json").read_bytes(), first_result)
+        self.assertEqual((self.snaps / "specs" / "monthly.json").read_bytes(), first_spec)
+        self.assertTrue((self.snaps / "results" / "monthly.spec.json").is_file())
+        self.assertTrue((self.snaps / "specs" / "monthly.spec.json").is_file())
+        self.assertNotEqual(
+            (self.snaps / "results" / "monthly.json").read_bytes(),
+            (self.snaps / "results" / "monthly.spec.json").read_bytes(),
+        )
+
+    def test_spec_shaped_legacy_file_stays_put(self):
+        # Adapter. A spec-shaped legacy file is not deleted or moved. The live engine
+        # case that reports NEW for this file is unchanged and is not run here.
+        doc = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+        (self.snaps / "unmigrated.spec.json").write_text(json.dumps(doc), encoding="utf-8")
+        before = _tree(self.snaps)
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", return_value={"ok": True, "queries": [{"id": "q1", "result": "NEW"}]}), \
+             patch("pbz.checks.spend", return_value=True):
+            res = checks.snapshot(
+                self.ws, None, "compare", "unmigrated.spec", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+            )
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(_tree(self.snaps), before)
+
     def test_engine_refuses_empty_queries_in_save_and_compare(self):
         # Direct engine call with empty queries must return BAD_REQUEST
         for verb in ("snapshot-save", "snapshot-compare"):
