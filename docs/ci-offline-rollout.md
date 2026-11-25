@@ -5,7 +5,10 @@ The normal inventory is `skills/powerbi-zerodata/tests/offline_suites.json`.
 including the separate synth provenance invocation. Do not regenerate the baseline
 from the manifest. Only `test_e2e.py` is excluded as a whole script. Timing weights
 are optional: the engine's 37.6 seconds comes from the plan's single measured run;
-other weights default to one until measurements are available. Allocation is
+other weights default to one until measurements are available. `tests/ci_weights.py`
+can recompute dormant shard weights from hosted sharded reports and refuses serial
+reports. Checked-in weights stay as they are. Serial execution does not schedule
+from that recompute. Allocation is
 longest-first, serial inside each fresh Windows VM, with a separate publish per VM.
 No engine artifact transfer is used.
 

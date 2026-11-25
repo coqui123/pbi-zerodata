@@ -107,6 +107,12 @@
       "argv": [
         "tests/test_doctor_ci.py"
       ]
+    },
+    {
+      "id": "ci_weights",
+      "argv": [
+        "tests/test_ci_weights.py"
+      ]
     }
   ]
 }
