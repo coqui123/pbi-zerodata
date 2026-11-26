@@ -11,12 +11,15 @@ import stat
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 from . import desktop, dpapi, lexers, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
 from .common import (
     PbzError,
     _reparse_link,
+    create_kill_on_close_job,
     engine_call,
     is_snapshot_result_doc,
     is_snapshot_spec_doc,
@@ -1109,8 +1112,9 @@ def _preflight_snapshot_save(ws, name: str) -> None:
     spec_path = _snapshot_spec_path(ws, name)
     result_path = _snapshot_result_path(ws, name, namespaced=True)
     snaps = os.path.join(ws.private, "snapshots")
-    directories = (ws.private, snaps, os.path.dirname(spec_path), os.path.dirname(result_path))
-    named = (spec_path, result_path)
+    pair = _SnapshotPair(ws, name)
+    directories = (ws.private, snaps, os.path.dirname(spec_path), os.path.dirname(result_path), pair.pending)
+    named = (spec_path, result_path, pair.lock, pair.journal, pair.staged)
     for path in (*directories, *named):
         if _reparse_link(path):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
@@ -1165,62 +1169,477 @@ def _require_usable_baseline(ws, name: str) -> None:
     raise PbzError("CORRUPT_STATE", "snapshot baseline is not a result document")
 
 
+def _snapshot_recovery_error(note="snapshot publication needs recovery"):
+    return PbzError("RECOVERY_REQUIRED", note)
+
+
+def _snapshot_sync_dir(directory):
+    if os.name != "nt":
+        try:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as error:
+            raise _snapshot_recovery_error() from error
+
+
+def _snapshot_mkdir(directory):
+    try:
+        os.mkdir(directory)
+    except FileExistsError:
+        if not os.path.isdir(directory):
+            raise
+    else:
+        _snapshot_sync_dir(os.path.dirname(directory))
+
+
+def _snapshot_write(path, data, prefix, *, verify=None):
+    directory = os.path.dirname(path)
+    fd, temp_path = tempfile.mkstemp(prefix=prefix, dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError as error:
+                raise _snapshot_recovery_error() from error
+        if _reparse_link(directory) or _reparse_link(path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        if verify is not None:
+            verify()
+        os.replace(temp_path, path)
+        temp_path = None
+        _snapshot_sync_dir(directory)
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+
+
+def _snapshot_hash(path, *, sync=False):
+    with open(path, "r+b" if sync and os.name == "nt" else "rb") as handle:
+        data = handle.read()
+        if sync:
+            os.fsync(handle.fileno())
+    return hashlib.sha256(data).hexdigest()
+
+
+def _snapshot_optional_hash(path):
+    try:
+        return _snapshot_hash(path)
+    except FileNotFoundError:
+        return None
+
+
+def _snapshot_open_lock(path, readonly):
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes as w
+
+        create = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+        create.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.c_void_p,
+                           w.DWORD, w.DWORD, w.HANDLE]
+        create.restype = w.HANDLE
+        invalid = ctypes.c_void_p(-1).value
+        while True:
+            handle = create(path, 0x80000000 if readonly else 0xC0000000,
+                            0, None, 3 if readonly else 4, 0x80, None)
+            if handle != invalid:
+                return handle
+            error = ctypes.get_last_error()
+            if error != 32:  # ERROR_SHARING_VIOLATION
+                raise ctypes.WinError(error)
+            time.sleep(0.02)
+
+    fd = os.open(path, os.O_RDONLY if readonly else os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        _lock_fd(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _snapshot_close_handle(handle):
+    if os.name == "nt":
+        import ctypes
+
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(handle))
+    else:
+        os.close(handle)
+
+
+_SNAPSHOT_JOURNAL_FIELDS = (
+    "version", "state", "before_result", "before_spec", "before_coherent",
+    "staged_spec", "new_result",
+)
+_SNAPSHOT_JOURNAL_ANNOTATIONS = ("superseding", "result_foreign")
+
+
+class _SnapshotPair:
+    def __init__(self, ws, name):
+        self.name = name
+        self.result = _snapshot_result_path(ws, name, namespaced=True)
+        self.spec = _snapshot_spec_path(ws, name)
+        self.root = os.path.dirname(os.path.dirname(self.result))
+        self.pending = os.path.join(self.root, "pending")
+        self.lock = os.path.join(self.pending, name + ".lock")
+        self.journal = os.path.join(self.pending, name + ".journal.json")
+        self.staged = os.path.join(self.pending, name + ".spec.next")
+
+    @contextmanager
+    def locked(self, action):
+        try:
+            private = os.path.dirname(self.root)
+            if not os.path.isdir(private):
+                os.makedirs(private, exist_ok=True)
+            _snapshot_mkdir(self.root)
+            _snapshot_mkdir(self.pending)
+            handle = _snapshot_open_lock(self.lock, False)
+        except OSError as error:
+            if action == "save":
+                raise PbzError("LOCAL_STATE_UNAVAILABLE") from error
+            try:
+                handle = _snapshot_open_lock(self.lock, True)
+            except OSError as fallback:
+                if os.path.lexists(self.journal):
+                    raise _snapshot_recovery_error() from fallback
+                raise PbzError("LOCAL_STATE_UNAVAILABLE") from fallback
+        try:
+            yield handle
+        finally:
+            # The child may still hold the same POSIX open file description.
+            _snapshot_close_handle(handle)
+
+    def hashes(self):
+        try:
+            return _snapshot_optional_hash(self.result), _snapshot_optional_hash(self.spec)
+        except OSError as error:
+            raise _snapshot_recovery_error() from error
+
+    def sync_file_entry(self, path, expected):
+        if expected is not None:
+            _snapshot_hash(path, sync=True)
+        directory = os.path.dirname(path)
+        if os.name != "nt":
+            if expected is None:
+                try:
+                    os.stat(directory)
+                except FileNotFoundError:
+                    return
+            _snapshot_sync_dir(directory)
+
+    def remove(self, expected):
+        try:
+            self.sync_file_entry(self.result, expected[0])
+            self.sync_file_entry(self.spec, expected[1])
+            _snapshot_sync_dir(self.root)
+            if self.hashes() != expected:
+                raise _snapshot_recovery_error()
+            os.unlink(self.journal)
+            try:
+                os.unlink(self.staged)
+            except OSError:
+                pass  # An orphan without a journal does not govern the pair.
+            _snapshot_sync_dir(self.pending)
+        except OSError as error:
+            raise _snapshot_recovery_error() from error
+
+    def write_journal(self, journal):
+        ordered = {key: journal[key] for key in _SNAPSHOT_JOURNAL_FIELDS}
+        ordered.update((key, journal[key]) for key in _SNAPSHOT_JOURNAL_ANNOTATIONS if key in journal)
+        _snapshot_write(self.journal, json.dumps(ordered).encode(), self.name + ".journal.")
+
+    def stage(self, data):
+        _snapshot_write(self.staged, data, self.name + ".spec.")
+
+    def read_journal(self):
+        try:
+            with open(self.journal, "rb") as handle:
+                journal = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, RecursionError) as error:
+            raise PbzError("CORRUPT_STATE", "unreadable snapshot journal") from error
+        if not _valid_snapshot_journal(journal):
+            raise PbzError("CORRUPT_STATE", "invalid snapshot journal")
+        return journal
+
+    def staged_bytes(self, journal):
+        try:
+            data = Path(self.staged).read_bytes()
+        except OSError:
+            return None
+        return data if hashlib.sha256(data).hexdigest() == journal["staged_spec"] else None
+
+    def complete(self, journal, data):
+        if data is None:
+            raise _snapshot_recovery_error()
+        new_pair = journal["new_result"], journal["staged_spec"]
+        try:
+            _snapshot_mkdir(os.path.dirname(self.spec))
+            expected = new_pair[0], journal["before_spec"]
+            _snapshot_write(self.spec, data, "snapshot-spec.", verify=lambda: self.require_pair(expected))
+            if self.hashes() != new_pair:
+                raise _snapshot_recovery_error()
+            self.remove(new_pair)
+        except (OSError, PbzError) as error:
+            if isinstance(error, PbzError) and error.code == "RECOVERY_REQUIRED":
+                raise
+            raise _snapshot_recovery_error() from error
+
+    def require_pair(self, expected):
+        if self.hashes() != expected:
+            raise _snapshot_recovery_error()
+
+    def revalidate_save(self, journal, before):
+        live = self.hashes()
+        if live != before:
+            if live[0] != before[0] and not journal.get("result_foreign"):
+                try:
+                    self.write_journal({**journal, "result_foreign": True})
+                except (OSError, PbzError) as error:
+                    raise _snapshot_recovery_error() from error
+            raise _snapshot_recovery_error()
+
+    def recover(self, action):
+        journal = self.read_journal()
+        if journal is None:
+            return None, None
+        live = self.hashes()
+        before = journal["before_result"], journal["before_spec"]
+        new = journal["new_result"], journal["staged_spec"]
+        published = journal["state"] == "RESULT_PUBLISHED"
+        known_results = (before[0], new[0]) if published else (before[0],)
+        if live[0] in known_results and (journal.get("superseding") or journal.get("result_foreign")):
+            try:
+                self.sync_file_entry(self.result, live[0])
+                _snapshot_sync_dir(self.root)
+                if _snapshot_optional_hash(self.result) != live[0]:
+                    raise _snapshot_recovery_error()
+                journal = {key: value for key, value in journal.items()
+                           if key not in _SNAPSHOT_JOURNAL_ANNOTATIONS}
+                self.write_journal(journal)
+            except OSError as error:
+                raise _snapshot_recovery_error() from error
+            live = self.hashes()
+
+        if published and live == new:
+            self.remove(live)
+            return None, None
+        if published and live == (new[0], before[1]):
+            data = self.staged_bytes(journal)
+            if data is not None:
+                self.complete(journal, data)
+                return None, None
+            # The higher-priority completion rule has a missing or invalid stage.
+            # A save may still supersede; compare cannot use this generation.
+        elif live == before and journal["before_coherent"]:
+            self.remove(live)
+            return None, None
+
+        if (action == "save" and not journal.get("result_foreign")
+                and live[1] in (before[1], new[1])
+                and (not published or live[0] in known_results or journal.get("superseding"))):
+            return journal, live
+        raise _snapshot_recovery_error()
+
+    def finish_refusal(self, journal, before, original, *, superseding, never_wrote,
+                       self_flag=False, keep_journal=False):
+        """Resolve a non-completing exit with a confirmed child exit or no dispatch."""
+        cause = original if isinstance(original, Exception) else None
+        note = original.code if isinstance(original, PbzError) else (
+            "snapshot save failed" if cause is not None else original)
+        try:
+            live = self.hashes()
+            if self_flag and (never_wrote or live == before):
+                cleared = {key: value for key, value in journal.items() if key != "superseding"}
+                try:
+                    self.write_journal(cleared)
+                except (OSError, PbzError):
+                    if never_wrote and live[0] != before[0]:
+                        # Read back which version survived if the clear failed after replace.
+                        current = self.read_journal()
+                        self.write_journal({**current, "result_foreign": True})
+                    raise
+            elif never_wrote and live[0] != before[0]:
+                if not journal.get("result_foreign"):
+                    self.write_journal({**journal, "result_foreign": True})
+            if not superseding and not keep_journal and live == before:
+                self.remove(before)
+        except (OSError, PbzError) as error:
+            raise _snapshot_recovery_error(note) from (cause if cause is not None else error)
+        if (never_wrote and live != before) or live[1] != before[1] or (not superseding and live != before):
+            raise _snapshot_recovery_error(note) from cause
+
+
+def _valid_snapshot_journal(journal):
+    fields = set(_SNAPSHOT_JOURNAL_FIELDS)
+    annotations = set(_SNAPSHOT_JOURNAL_ANNOTATIONS)
+    if (not isinstance(journal, dict) or not fields <= journal.keys()
+            or journal.keys() - fields - annotations
+            or type(journal["version"]) is not int or journal["version"] != 1
+            or type(journal["before_coherent"]) is not bool
+            or any(journal[key] is not True for key in annotations & journal.keys())):
+        return False
+
+    def valid_hash(value):
+        return isinstance(value, str) and re.fullmatch("[0-9a-f]{64}", value) is not None
+
+    return (valid_hash(journal["staged_spec"])
+            and all(journal[key] is None or valid_hash(journal[key])
+                    for key in ("before_result", "before_spec"))
+            and ((journal["state"] == "PREPARED" and journal["new_result"] is None
+                  and journal["before_coherent"] and "superseding" not in journal)
+                 or (journal["state"] == "RESULT_PUBLISHED" and valid_hash(journal["new_result"]))))
+
+
+def _snapshot_request(ws, project, name, raw_queries):
+    tm = tokens.TokenMap(ws.private)
+    queries = []
+    for q in raw_queries:
+        dax, unknown = tokens.detokenize_dax(q["dax"], tm)
+        if unknown:
+            raise PbzError("BAD_REQUEST", "unknown token in query " + q["id"])
+        queries.append({"id": q["id"], "dax": dax, "keys": q.get("keys", [])})
+    return {"private_dir": ws.private, "port": desktop.require_port(project),
+            "name": name, "queries": queries}
+
+
+def _snapshot_budget(verb):
+    return {"verb": verb, "status": "BUDGET",
+            "note": "daily snapshot query budget reached; the user can reset it"}
+
+
+def _snapshot_engine_error(res):
+    return PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
+
+
+def _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, before):
+    verb = "snapshot-save"
+    superseding = journal is not None
+    try:
+        request = _snapshot_request(ws, project, pair.name, raw_queries)
+        data = json.dumps(spec).encode()
+    except Exception as error:
+        if superseding:
+            pair.finish_refusal(journal, before, error, superseding=True, never_wrote=True)
+        raise
+
+    if not superseding:
+        before = pair.hashes()
+    candidate = {
+        "version": 1, "state": "PREPARED", "before_result": before[0],
+        "before_spec": before[1], "before_coherent": not superseding,
+        "staged_spec": hashlib.sha256(data).hexdigest(), "new_result": None,
+    }
+    if not superseding:
+        try:
+            pair.stage(data)
+            pair.write_journal(candidate)
+        except OSError as error:
+            raise PbzError("LOCAL_STATE_UNAVAILABLE") from error
+        journal = candidate
+
+    pair.revalidate_save(journal, before)
+    try:
+        charged = spend(ws, "snapshot_queries", len(raw_queries))
+    except Exception as error:
+        pair.finish_refusal(journal, before, error, superseding=superseding, never_wrote=True)
+        raise
+    if not charged:
+        pair.finish_refusal(journal, before, "BUDGET", superseding=superseding, never_wrote=True)
+        return _snapshot_budget(verb)
+
+    try:
+        for directory in (os.path.dirname(pair.root), pair.root, pair.pending):
+            _snapshot_sync_dir(directory)
+    except PbzError as error:
+        pair.finish_refusal(journal, before, error, superseding=superseding,
+                            never_wrote=True, keep_journal=True)
+        raise
+    pair.revalidate_save(journal, before)
+
+    self_flag = superseding and journal["state"] == "RESULT_PUBLISHED" and not journal.get("superseding")
+    if self_flag:
+        journal = {**journal, "superseding": True}
+        try:
+            pair.write_journal(journal)
+        except (OSError, PbzError) as error:
+            raise _snapshot_recovery_error() from error
+
+    inheritance = ({"inherit_handles": (handle,), "kill_on_close_job": job}
+                   if os.name == "nt" else {"pass_fds": (handle,)})
+    res = engine_call(verb, request, timeout=1800, **inheritance)
+    state = res.get("payload_state")
+    succeeded = res.get("ok") and any(isinstance(q, dict) and q.get("result") == "SAVED"
+                                      for q in res.get("queries") or [])
+    if not succeeded:
+        error = None if res.get("ok") else _snapshot_engine_error(res)
+        original = error if error is not None else "all queries failed"
+        if state not in ("not_sent", "may_have_been_sent"):
+            raise _snapshot_recovery_error(str(original)) from error
+        pair.finish_refusal(journal, before, original, superseding=superseding,
+                            self_flag=self_flag, never_wrote=state == "not_sent" or error is None)
+        if error is not None:
+            raise error
+    else:
+        try:
+            new_result = _snapshot_hash(pair.result, sync=True)
+            _snapshot_sync_dir(os.path.dirname(pair.result))
+            _snapshot_sync_dir(pair.root)
+            if superseding:
+                pair.stage(data)
+        except (OSError, PbzError) as error:
+            refusal = _snapshot_recovery_error()
+            if superseding and self_flag:
+                pair.finish_refusal(journal, before, error, superseding=True,
+                                    self_flag=True, never_wrote=False)
+            raise refusal from error
+        published = {**candidate, "state": "RESULT_PUBLISHED", "new_result": new_result}
+        try:
+            pair.write_journal(published)
+        except (OSError, PbzError) as error:
+            raise _snapshot_recovery_error() from error
+        pair.complete(published, pair.staged_bytes(published))
+    return {**{key: value for key, value in res.items() if key != "payload_state"}, "verb": verb}
+
+
 def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
     if action not in ("save", "compare"):
         raise PbzError("BAD_REQUEST", f"unknown snapshot action {action}")
     _validate_snapshot_name(name)
-    raw_queries = _snapshot_query_list(spec)
-    if action == "compare":
-        _require_usable_baseline(ws, name)
-    if action == "save":
-        _preflight_snapshot_save(ws, name)
-    spec_path = _snapshot_spec_path(ws, name)
-    tm = tokens.TokenMap(ws.private)
-    queries = []
-    for q in raw_queries:
-        dax, unknown = tokens.detokenize_dax(q.get("dax", ""), tm)
-        if unknown:
-            raise PbzError("BAD_REQUEST", "unknown token in query " + str(q.get("id")))
-        queries.append({"id": q.get("id"), "dax": dax, "keys": q.get("keys", [])})
-    if not queries:
-        raise PbzError("BAD_REQUEST", "queries must not be empty")
-    port = desktop.require_port(project)
-    verb = "snapshot-save" if action == "save" else "snapshot-compare"
-    if not spend(ws, "snapshot_queries", max(1, len(queries))):
-        return {"verb": verb, "status": "BUDGET", "note": "daily snapshot query budget reached; the user can reset it"}
-    res = engine_call(verb, {"private_dir": ws.private, "port": port, "name": name, "queries": queries}, timeout=1800)
-    if not res.get("ok"):
-        raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
-    if action == "save":
-        results = res.get("queries") or []
-        if not any(isinstance(q, dict) and q.get("result") == "SAVED" for q in results):
-            # No query succeeded: leave any existing spec untouched and
-            # create nothing on a first-ever all-failed save. The failed
-            # per-query verdicts and the charge already spent stand.
-            res["verb"] = verb
-            return res
-        directory = os.path.dirname(spec_path)
-        if _reparse_link(ws.private) or _reparse_link(directory) or _reparse_link(spec_path):
-            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-        os.makedirs(directory, exist_ok=True)
-        if _reparse_link(directory) or _reparse_link(spec_path):
-            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-        fd, tmp = tempfile.mkstemp(prefix="snapshot-spec.", dir=directory)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(spec or {}, handle)
-            if _reparse_link(directory) or _reparse_link(spec_path):
-                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-            os.replace(tmp, spec_path)
-            tmp = ""
-        finally:
-            if tmp:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-    res["verb"] = verb
-    return res
+    raw_queries = None if action == "compare" and spec is None else _snapshot_query_list(spec)
+    _preflight_snapshot_save(ws, name)
+    pair = _SnapshotPair(ws, name)
+    job = create_kill_on_close_job() if action == "save" and os.name == "nt" else None
+    try:
+        with pair.locked(action) as handle:
+            journal, before = pair.recover(action)
+            if action == "save":
+                return _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, before)
+            if raw_queries is None:
+                spec = saved_spec(ws, name)
+                if spec is None:
+                    raise PbzError("BAD_REQUEST", "--spec required")
+                raw_queries = _snapshot_query_list(spec)
+            _require_usable_baseline(ws, name)
+            request = _snapshot_request(ws, project, name, raw_queries)
+            verb = "snapshot-compare"
+            if not spend(ws, "snapshot_queries", len(raw_queries)):
+                return _snapshot_budget(verb)
+            res = engine_call(verb, request, timeout=1800)
+            if not res.get("ok"):
+                raise _snapshot_engine_error(res)
+            return {**res, "verb": verb}
+    finally:
+        if job is not None:
+            _snapshot_close_handle(job)
 
 
 def saved_spec(ws, name: str) -> dict | None:
