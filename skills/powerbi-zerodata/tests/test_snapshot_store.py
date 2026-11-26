@@ -42,6 +42,11 @@ def _tree(root: Path) -> tuple:
     return tuple(sorted(rows))
 
 
+def _tree_with_pending_lock(before, name):
+    lock = (f"pending/{name}.lock", "file", hashlib.sha256(b"").hexdigest())
+    return tuple(sorted((*before, ("pending", "dir", ""), lock)))
+
+
 def _public_cli(workspace: str, private_root: str, args: list):
     env = os.environ.copy()
     env["PBZ_PRIVATE_ROOT"] = private_root
@@ -354,8 +359,15 @@ class SnapshotStoreTests(unittest.TestCase):
             import shutil
             shutil.rmtree(self.snaps)
         self.assertFalse(self.snaps.exists())
+        def fake_engine(verb, payload, timeout=1800, **kwargs):
+            results = self.snaps / "results"
+            results.mkdir()
+            (results / (payload["name"] + ".json")).write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+
         with patch("pbz.desktop.require_port", return_value=1234), \
-             patch("pbz.checks.engine_call", return_value={"ok": True, "class": "OK", "queries": [{"id": "q1", "result": "SAVED"}]}), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine), \
              patch("pbz.checks.spend", return_value=True):
             res = checks.snapshot(self.ws, None, "save", "fresh_snap", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
             self.assertTrue(res.get("ok"))
@@ -373,7 +385,9 @@ class SnapshotStoreTests(unittest.TestCase):
                         with self.assertRaises(PbzError) as ctx:
                             checks.snapshot(self.ws, None, action, "empty_snap", empty_spec)
                         self.assertEqual(ctx.exception.code, "BAD_REQUEST")
-                        self.assertIn("queries must not be empty", str(ctx.exception))
+                        message = ("--spec required" if action == "compare" and empty_spec is None
+                                   else "queries must not be empty")
+                        self.assertIn(message, str(ctx.exception))
             mock_spend.assert_not_called()
             mock_engine.assert_not_called()
             self.assertFalse((self.snaps / "specs" / "empty_snap.json").exists())
@@ -419,7 +433,7 @@ class SnapshotStoreTests(unittest.TestCase):
                 self.assertEqual(payload.get("error"), "ENGINE_UNAVAILABLE")
                 self.assertEqual(payload["outcome"]["status"], "UNAVAILABLE")
                 self.assertEqual(payload["outcome"]["exit_code"], 4)
-                self.assertEqual(_tree(snaps), before)
+                self.assertEqual(_tree(snaps), _tree_with_pending_lock(before, "different"))
 
     def test_public_cli_cold_snapshot_dir_stays_absent(self):
         tmp = tempfile.TemporaryDirectory()
@@ -456,7 +470,7 @@ class SnapshotStoreTests(unittest.TestCase):
             with self.assertRaises(PbzError) as ctx:
                 checks.snapshot(self.ws, None, "save", "different", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
             self.assertEqual(ctx.exception.code, "ENGINE_UNAVAILABLE")
-        self.assertEqual(_tree(self.snaps), before)
+        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "different"))
 
     def test_malformed_requested_baseline_fails_before_port(self):
         (self.snaps / "different.json").write_text("{not-json", encoding="utf-8")
@@ -471,7 +485,7 @@ class SnapshotStoreTests(unittest.TestCase):
             port.assert_not_called()
             engine.assert_not_called()
             spend.assert_not_called()
-        self.assertEqual(_tree(self.snaps), before)
+        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "different"))
 
     def test_malformed_namespaced_result_does_not_fall_back_to_legacy(self):
         (self.snaps / "results").mkdir()
@@ -489,7 +503,7 @@ class SnapshotStoreTests(unittest.TestCase):
             port.assert_not_called()
             engine.assert_not_called()
             spend.assert_not_called()
-        self.assertEqual(_tree(self.snaps), before)
+        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "different"))
 
     def test_namespaced_result_wins_and_legacy_bytes_stay(self):
         (self.snaps / "results").mkdir()
@@ -517,7 +531,7 @@ class SnapshotStoreTests(unittest.TestCase):
         earlier_bytes = (self.snaps / "earlier.json").read_bytes()
         notes_bytes = (self.snaps / "notes.txt").read_bytes()
 
-        def fake_engine(verb, payload, timeout=1800):
+        def fake_engine(verb, payload, timeout=1800, **kwargs):
             self.assertEqual(verb, "snapshot-save")
             self.assertEqual(payload["name"], "different")
             results = self.snaps / "results"
@@ -526,7 +540,7 @@ class SnapshotStoreTests(unittest.TestCase):
                 json.dumps({"queries": {"q1": {}}, "refreshed": "2026-03-01T00:00:00"}),
                 encoding="utf-8",
             )
-            return {"ok": True, "queries": [{"id": "q1", "result": "SAVED"}]}
+            return {"ok": True, "payload_state": "may_have_been_sent", "queries": [{"id": "q1", "result": "SAVED"}]}
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine), \
@@ -549,29 +563,29 @@ class SnapshotStoreTests(unittest.TestCase):
         (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
         before = _tree(self.snaps)
 
-        def fake_engine(verb, payload, timeout=1800):
+        def fake_engine(verb, payload, timeout=1800, **kwargs):
             self.assertEqual(verb, "snapshot-compare")
             self.assertTrue((self.snaps / "earlier.json").is_file())
             self.assertFalse((self.snaps / "results" / "earlier.json").exists())
-            return {"ok": True, "queries": [{"id": "q1", "result": "SAME"}]}
+            return {"ok": True, "payload_state": "may_have_been_sent", "queries": [{"id": "q1", "result": "SAME"}]}
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine), \
              patch("pbz.checks.spend", return_value=True):
             res = checks.snapshot(self.ws, None, "compare", "earlier", spec)
         self.assertTrue(res.get("ok"))
-        self.assertEqual(_tree(self.snaps), before)
+        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "earlier"))
 
     def test_adapter_monthly_names_do_not_share_files(self):
         # Adapter, not a live engine run. monthly and monthly.spec stay distinct.
-        def fake_engine(verb, payload, timeout=1800):
+        def fake_engine(verb, payload, timeout=1800, **kwargs):
             results = self.snaps / "results"
             results.mkdir(parents=True, exist_ok=True)
             (results / (payload["name"] + ".json")).write_text(
                 json.dumps({"queries": {"q1": {"name": payload["name"]}}, "refreshed": "2026-01-01T00:00:00"}),
                 encoding="utf-8",
             )
-            return {"ok": True, "queries": [{"id": "q1", "result": "SAVED"}]}
+            return {"ok": True, "payload_state": "may_have_been_sent", "queries": [{"id": "q1", "result": "SAVED"}]}
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine), \
@@ -602,7 +616,7 @@ class SnapshotStoreTests(unittest.TestCase):
                 self.ws, None, "compare", "unmigrated.spec", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
             )
         self.assertTrue(res.get("ok"))
-        self.assertEqual(_tree(self.snaps), before)
+        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "unmigrated.spec"))
 
     def _state_bytes(self):
         path = checks._state_path(self.ws)
@@ -624,8 +638,10 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(_tree(self.snaps), before)
         self.assertEqual(self._state_bytes(), state)
 
-    def _reaches_port(self, spec):
+    def _reaches_port(self, spec, *, creates_lock=False):
         before = _tree(self.snaps)
+        if creates_lock:
+            before = _tree_with_pending_lock(before, "different")
         state = self._state_bytes()
         with patch("pbz.desktop.require_port", side_effect=PbzError("ENGINE_UNAVAILABLE", "desktop down")) as port, \
              patch("pbz.checks.engine_call") as engine:
@@ -667,8 +683,10 @@ class SnapshotStoreTests(unittest.TestCase):
         ):
             with self.subTest(spec=spec):
                 self._refuse_before_port(spec, "keys must be a list of strings")
+        boundary = {"queries": [{"id": "a" * 128, "dax": "EVALUATE {1}"}]}
+        with self.subTest(spec=boundary):
+            self._reaches_port(boundary, creates_lock=True)
         accepted = [
-            {"queries": [{"id": "a" * 128, "dax": "EVALUATE {1}"}]},
             {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]},
             {"queries": [{"id": "q1", "dax": "EVALUATE {1}", "keys": None}]},
             {"queries": [{"id": "q1", "dax": "EVALUATE {1}", "keys": "Person"}]},
@@ -690,9 +708,9 @@ class SnapshotStoreTests(unittest.TestCase):
         before = _tree(self.snaps)
         state = self._state_bytes()
 
-        def overwrite(verb, payload, timeout=1800):
+        def overwrite(verb, payload, timeout=1800, **kwargs):
             result.write_bytes(b"changed-by-engine")
-            return {"ok": True}
+            return {"ok": True, "payload_state": "may_have_been_sent"}
 
         with patch("pbz.desktop.require_port", return_value=1) as port, \
              patch("pbz.checks.engine_call", side_effect=overwrite) as engine:
@@ -772,15 +790,15 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(_tree(self.snaps), before)
 
     def test_spec_write_failure_does_not_refund_or_restore(self):
-        # Residual window. The engine write is not rolled back and the query stays spent.
+        # Recovery is required. The engine write is not rolled back and the query stays spent.
         written = b'{"queries":{"q1":{"rows":["engine"]}},"refreshed":"2026-01-01T00:00:00"}'
 
-        def fake_engine(verb, payload, timeout=1800):
+        def fake_engine(verb, payload, timeout=1800, **kwargs):
             dest = os.path.join(payload["private_dir"], "snapshots", "results", payload["name"] + ".json")
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as handle:
                 handle.write(written)
-            return {"ok": True, "class": "OK", "queries": [{"id": "q1", "result": "SAVED"}]}
+            return {"ok": True, "payload_state": "may_have_been_sent", "class": "OK", "queries": [{"id": "q1", "result": "SAVED"}]}
 
         real_replace = os.replace
 
@@ -793,11 +811,12 @@ class SnapshotStoreTests(unittest.TestCase):
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine), \
              patch("pbz.checks.os.replace", side_effect=fail_spec):
-            with self.assertRaises(OSError):
+            with self.assertRaises(PbzError) as ctx:
                 checks.snapshot(
                     self.ws, None, "save", "different",
                     {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]},
                 )
+        self.assertEqual(ctx.exception.code, "RECOVERY_REQUIRED")
         result = self.snaps / "results" / "different.json"
         self.assertEqual(result.read_bytes(), written)
         self.assertFalse((self.snaps / "specs" / "different.json").exists())
@@ -840,7 +859,7 @@ class SnapshotStoreTests(unittest.TestCase):
         payload = json.loads(omitted.stdout)
         self.assertEqual(payload.get("error"), "ENGINE_UNAVAILABLE")
         self.assertEqual(payload["outcome"]["status"], "UNAVAILABLE")
-        self.assertEqual(_tree(snaps), before)
+        self.assertEqual(_tree(snaps), _tree_with_pending_lock(before, "different"))
         self.assertEqual(_public_budget(private, workspace), 0)
 
     # PR A red tests: a save where no query succeeds must not publish.
@@ -865,8 +884,8 @@ class SnapshotStoreTests(unittest.TestCase):
     def test_all_failed_save_preserves_spec_and_charge(self):
         spec_path, spec_bytes = self._seed_good_pair()
 
-        def fake_engine(verb, payload, timeout=1800):
-            return {"ok": True, "verb": "snapshot-save", "name": "different",
+        def fake_engine(verb, payload, timeout=1800, **kwargs):
+            return {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
                     "queries": [{"id": "q1", "result": "ERROR", "class": "OTHER"}]}
 
         with patch("pbz.desktop.require_port", return_value=1), \
@@ -881,8 +900,8 @@ class SnapshotStoreTests(unittest.TestCase):
         spec_path, spec_bytes = self._seed_good_pair()
         spec = {"queries": [{"id": f"q{i}", "dax": f"EVALUATE {{{i}}}"} for i in (1, 2, 3)]}
 
-        def fake_engine(verb, payload, timeout=1800):
-            return {"ok": True, "verb": "snapshot-save", "name": "different",
+        def fake_engine(verb, payload, timeout=1800, **kwargs):
+            return {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
                     "queries": [{"id": q["id"], "result": "ERROR", "class": "OTHER"}
                                 for q in payload["queries"]]}
 
@@ -894,8 +913,8 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(spec_path.read_bytes(), spec_bytes)
 
     def test_first_all_failed_save_creates_no_spec_and_no_temp(self):
-        def fake_engine(verb, payload, timeout=1800):
-            return {"ok": True, "verb": "snapshot-save", "name": "different",
+        def fake_engine(verb, payload, timeout=1800, **kwargs):
+            return {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
                     "queries": [{"id": "q1", "result": "ERROR", "class": "OTHER"}]}
 
         with patch("pbz.desktop.require_port", return_value=1), \
@@ -914,7 +933,7 @@ class SnapshotStoreTests(unittest.TestCase):
                 # own failure, independent of what the previous case wrote.
                 spec_path, spec_bytes = self._seed_good_pair()
                 with patch("pbz.desktop.require_port", return_value=1), \
-                     patch("pbz.checks.engine_call", return_value=dict(response)):
+                     patch("pbz.checks.engine_call", return_value=dict(response, payload_state="may_have_been_sent")):
                     checks.snapshot(self.ws, None, "save", "different", self._NEW_SPEC)
                 self.assertEqual(spec_path.read_bytes(), spec_bytes)
 
@@ -925,8 +944,8 @@ class SnapshotStoreTests(unittest.TestCase):
         # the real engine in tests/test_engine.py.
         spec_path, _spec_bytes = self._seed_good_pair()
 
-        def fake_engine(verb, payload, timeout=1800):
-            return {"ok": True, "verb": "snapshot-save", "name": "different",
+        def fake_engine(verb, payload, timeout=1800, **kwargs):
+            return {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
                     "queries": [{"id": "q1", "result": "SAVED"}]}
 
         with patch("pbz.desktop.require_port", return_value=1), \
@@ -988,8 +1007,10 @@ class SnapshotPairPublicationTests(unittest.TestCase):
             dax = payload["queries"][0]["dax"]
             expected = "EVALUATE {2}" if self.result.read_bytes() == self._NEW_RESULT else "EVALUATE {1}"
             verdict = "MATCH" if dax == expected else "DRIFT"
-        return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
-                "queries": [{"id": "q1", "result": verdict}]}
+        response = {"ok": True, "class": "OK", "queries": [{"id": "q1", "result": verdict}]}
+        if verb == "snapshot-save":
+            response["payload_state"] = "may_have_been_sent"
+        return response
 
     def _save(self):
         return checks.snapshot(self.ws, None, "save", "different", self._NEW_SPEC)
@@ -1490,6 +1511,26 @@ with ExitStack() as stack:
         self._assert_class("RECOVERY_REQUIRED", self._save)
         self.assertEqual(_tree(self.snaps), before)
         self.engine.assert_not_called()
+
+    def test_case_16_absent_pair_directories_allow_cleanup(self):
+        with patch("pbz.checks.spend", return_value=False):
+            self.assertEqual(self._save()["status"], "BUDGET")
+        self.engine.assert_not_called()
+        self.assertFalse(self.journal.exists())
+        self.assertFalse(self.staged.exists())
+
+        interrupted = self._start_snapshot_script(
+            '    stack.enter_context(patch("pbz.checks.spend", side_effect=lambda *args: os._exit(71)))'
+        )
+        _, stderr = interrupted.communicate(timeout=10)
+        self.assertEqual(interrupted.returncode, 71, stderr)
+        self.assertTrue(self.journal.exists())
+        completed = self._public_child("compare")
+        self.assertEqual(json.loads(completed.stdout)["error"], "BAD_REQUEST")
+        self.assertFalse(self.journal.exists())
+        self.assertFalse(self.staged.exists())
+        self.assertFalse(self.result.parent.exists())
+        self.assertFalse(self.spec.parent.exists())
 
     def test_case_18_supersede_prepared_foreign_result(self):
         self._seed_pair()
@@ -2020,16 +2061,61 @@ with ExitStack() as stack:
 
     @unittest.skipUnless(os.name == "posix", "POSIX child cleanup")
     def test_case_30_unconfirmed_timeout_retains_prepared_journal(self):
-        self._seed_pair()
-        self.engine.side_effect = None
-        self.engine.return_value = {"ok": False, "class": "TIMEOUT", "payload_state": "unconfirmed"}
-        error = self._assert_class("RECOVERY_REQUIRED", self._save)
-        self.assertEqual(error.__cause__.code, "TIMEOUT")
-        self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 1)
-        self.assertEqual(json.loads(self.journal.read_bytes())["state"], "PREPARED")
-        self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
-        self.result.write_bytes(self._NEW_RESULT)
-        self._assert_public_block()
+        self._assert_native_timeout_kill_retry(superseding=False, fail_twice=True)
+
+    def test_case_31_payload_state_on_engine_return_paths(self):
+        from pbz import common, engine
+        from unittest.mock import Mock
+
+        options = {"pass_fds": (1,)}
+        verb = "snapshot-save"
+        child = Mock()
+        with patch.object(engine, "ENGINE_EXE", sys.executable), \
+             patch.object(engine.subprocess, "Popen", return_value=child) as start:
+            for queries in ([{"id": "q1", "result": "SAVED"}], []):
+                raw = {"ok": True, "verb": verb, "name": "different", "queries": queries,
+                       "payload_state": "spoofed"}
+                child.communicate.return_value = json.dumps(raw).encode(), None
+                response = engine.call(verb, {}, **options)
+                self.assertTrue(response["ok"])
+                self.assertEqual(response["queries"], queries)
+                self.assertEqual(response["payload_state"], "may_have_been_sent")
+            child.communicate.side_effect = subprocess.TimeoutExpired(verb, 1)
+            response = engine.call(verb, {}, **options)
+            self.assertEqual((response["class"], response["payload_state"]),
+                             ("TIMEOUT", "may_have_been_sent"))
+
+            start.side_effect = OSError("spawn failure")
+            response = engine.call(verb, {}, **options)
+            self.assertEqual((response["class"], response["payload_state"]),
+                             ("ENGINE_UNAVAILABLE", "not_sent"))
+            start.reset_mock()
+            response = engine.call(verb, {"bad": object()}, **options)
+            self.assertEqual((response["class"], response["payload_state"]), ("BAD_REQUEST", "not_sent"))
+            start.assert_not_called()
+
+        with patch.object(engine, "ENGINE_EXE", sys.executable), \
+             patch.object(engine.ctypes, "WinDLL", create=True, side_effect=OSError("setup failure")), \
+             patch.object(engine.subprocess, "Popen") as start:
+            response = engine.call(verb, {}, inherit_handles=(1,))
+        self.assertEqual((response["class"], response["payload_state"]), ("OTHER", "not_sent"))
+        start.assert_not_called()
+
+        missing = Path(self.ws.root) / "missing-engine"
+        with patch.object(engine, "ENGINE_EXE", missing):
+            response = engine.call(verb, {}, **options)
+        self.assertEqual((response["class"], response["payload_state"]), ("ENGINE_UNAVAILABLE", "not_sent"))
+
+        real_import = __import__
+
+        def fail_engine_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if level == 1 and "engine" in fromlist:
+                raise ImportError("injected engine import failure")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch("builtins.__import__", side_effect=fail_engine_import):
+            response = common.engine_call(verb, {}, **options)
+        self.assertEqual((response["class"], response["payload_state"]), ("ENGINE_UNAVAILABLE", "not_sent"))
 
     def test_case_32_fresh_stage_hard_link_is_safe_across_interruption(self):
         for interruption in ("before-stage", "after-stage"):

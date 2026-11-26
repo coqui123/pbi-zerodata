@@ -363,7 +363,7 @@ class FollowupStateTests(unittest.TestCase):
         os.makedirs(tables)
         with open(os.path.join(tables, "T.tmdl"), "w", encoding="utf-8") as handle:
             handle.write("table T\n\n\tcolumn A\n\t\tdataType: int64\n")
-        bad = {"ok": False, "class": "not-closed"}
+        bad = {"ok": False, "class": "not-closed", "payload_state": "may_have_been_sent"}
         calls = (
             lambda: checks.health(self.ws, self.project),
             lambda: checks.probe(self.ws, self.project, "T", None),
