@@ -361,6 +361,8 @@ class DoctorCiTests(unittest.TestCase):
 
         # 4. Arbitrary pbz.requiredCI string resolves to unknown
         hook_file.write_text("#!/bin/sh\nset -e\nexec python tests/run_offline.py\n", encoding="utf-8")
+        if sys.platform != "win32":
+            hook_file.chmod(hook_file.stat().st_mode | 0o111)
         with patch.object(doctor, "_run_git", side_effect=[(0, ".git/hooks/pre-push"), (0, "invalid_custom_mode")]):
             mode = doctor.get_hook_mode(self.test_root)
             self.assertEqual(mode, "unknown")
@@ -415,11 +417,15 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
 
         # 9b. Target script tampered / no-op -> foreign
         target_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        if sys.platform != "win32":
+            target_script.chmod(target_script.stat().st_mode | 0o111)
         with patch.object(doctor, "_run_git", side_effect=[(0, ".git/hooks/pre-push")]):
             self.assertEqual(doctor.get_hook_mode(self.test_root), "foreign")
 
         # 9c. Target script valid direct runner -> full
         target_script.write_text("#!/bin/sh\nset -e\nexec python tests/run_offline.py\n", encoding="utf-8")
+        if sys.platform != "win32":
+            target_script.chmod(target_script.stat().st_mode | 0o111)
         with patch.object(doctor, "_run_git", side_effect=[(0, ".git/hooks/pre-push"), (1, "")]):
             self.assertEqual(doctor.get_hook_mode(self.test_root), "full")
 
@@ -908,8 +914,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(sk["status"], "unknown")
         self.assertEqual(sk["reason"], "NOT_RUN")
         self.assertIsNone(sk["observed_count"])
-        if sys.platform == "win32":
-            self.assertEqual(sk["approved_count"], 12)
+        self.assertIsNone(sk["approved_count"])
 
     def test_doctor_ci_skip_status_matching_artifact(self):
         """When prior sidecars match approved manifest per-suite, skips report match."""
@@ -921,6 +926,10 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         for suite_id, lines in manifest_data.get(plat, {}).items():
             (sidecars_dir / f"{suite_id}.skips.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+        (sidecars_dir / "provenance.json").write_text(
+            json.dumps({"sha": "1" * 40, "platform": plat, "exit_code": 0, "status": "passed"}),
+            encoding="utf-8",
+        )
         sk = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_dir)
         self.assertEqual(sk["status"], "match")
         self.assertIsNone(sk["reason"])
@@ -942,7 +951,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         # Sidecar with test_b
         (sidecars_dir / "mcp.skips.jsonl").write_text(f'PBZ_SKIP {{"test": "{test_b}", "reason": "reason"}}\n', encoding="utf-8")
 
-        sk = doctor.get_skips_status(skill_dir=custom_skill, observed_sidecars_dir=sidecars_dir)
+        sk = doctor.get_skips_status(skill_dir=custom_skill, observed_sidecars_dir=sidecars_dir, platform="windows")
         self.assertEqual(sk["status"], "mismatch")
         self.assertEqual(sk["reason"], "UNEXPECTED_SKIPS")
         self.assertIn(json.dumps({"reason": "reason", "test": test_b}, sort_keys=True), sk["unexpected"])
@@ -982,7 +991,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         # 2. Platform mismatch in provenance.json
         other_plat = "posix" if plat == "windows" else "windows"
         (sidecars_dir / "provenance.json").write_text(json.dumps({"sha": "1" * 40, "platform": other_plat}), encoding="utf-8")
-        sk_plat = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_dir, expected_sha="1" * 40)
+        sk_plat = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_dir, expected_sha="1" * 40, platform=plat)
         self.assertEqual(sk_plat["status"], "mismatch")
         self.assertEqual(sk_plat["reason"], "PLATFORM_MISMATCH")
 
@@ -1003,7 +1012,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         sidecars_missing.mkdir()
         (sidecars_missing / "mcp.skips.jsonl").write_text("", encoding="utf-8")
         if plat == "windows":
-            sk_missing = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_missing)
+            sk_missing = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_missing, platform="windows")
             self.assertEqual(sk_missing["status"], "unknown")
             self.assertEqual(sk_missing["reason"], "MISSING_SKIPS")
             self.assertIn("suite:mirror_recovery_honesty", sk_missing["missing"])
@@ -1046,6 +1055,10 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         sidecars_both = self.test_root / "sidecars_both"
         sidecars_both.mkdir()
         (sidecars_both / "unauthorized_extra.skips.jsonl").write_text('PBZ_SKIP {"test": "x", "reason": "y"}\n', encoding="utf-8")
+        (sidecars_both / "provenance.json").write_text(
+            json.dumps({"sha": "1" * 40, "platform": plat, "exit_code": 0, "status": "passed"}),
+            encoding="utf-8",
+        )
         sk_both = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_both)
         self.assertEqual(sk_both["status"], "mismatch")
         self.assertEqual(sk_both["reason"], "UNEXPECTED_SKIPS")
@@ -1056,6 +1069,10 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         sidecars_unexp_and_missing.mkdir()
         # Provide only mcp suite, but with an unapproved skip record (while other required suites are absent)
         (sidecars_unexp_and_missing / "mcp.skips.jsonl").write_text('PBZ_SKIP {"test": "unapproved.test", "reason": "rogue"}\n', encoding="utf-8")
+        (sidecars_unexp_and_missing / "provenance.json").write_text(
+            json.dumps({"sha": "1" * 40, "platform": plat, "exit_code": 0, "status": "passed"}),
+            encoding="utf-8",
+        )
         sk_unexp_and_miss = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_unexp_and_missing)
         self.assertEqual(sk_unexp_and_miss["status"], "mismatch")
         self.assertEqual(sk_unexp_and_miss["reason"], "UNEXPECTED_SKIPS")
@@ -1072,6 +1089,10 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         for suite_id, lines in manifest_data.get(plat, {}).items():
             (sidecars_extra / f"{suite_id}.skips.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
         (sidecars_extra / "unauthorized_suite.skips.jsonl").write_text('PBZ_SKIP {"test": "x", "reason": "y"}\n', encoding="utf-8")
+        (sidecars_extra / "provenance.json").write_text(
+            json.dumps({"sha": "1" * 40, "platform": plat, "exit_code": 0, "status": "passed"}),
+            encoding="utf-8",
+        )
         sk_extra = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_extra)
         self.assertEqual(sk_extra["status"], "mismatch")
         self.assertEqual(sk_extra["reason"], "UNEXPECTED_SKIPS")
@@ -3853,13 +3874,17 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         for stale in SKILL.rglob("*.pyc"):
             stale.unlink(missing_ok=True)
         before_pyc = {p.relative_to(SKILL).as_posix() for p in SKILL.rglob("*.pyc")}
-        cmd = SKILL / "bin" / "pbz.cmd"
+        if sys.platform == "win32":
+            cmd = ["cmd", "/c", str(SKILL / "bin" / "pbz.cmd"), "doctor", "ci", "--offline"]
+        else:
+            cmd = ["bash", str(SKILL / "bin" / "pbz"), "doctor", "ci", "--offline"]
         env = os.environ.copy()
         env.pop("PYTHONDONTWRITEBYTECODE", None)
         env.pop("PYTHONPYCACHEPREFIX", None)
         for _ in range(2):
-            proc = subprocess.run(["cmd", "/c", str(cmd), "doctor", "ci", "--offline"], cwd=repo, capture_output=True, text=True, timeout=60, env=env)
+            proc = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=60, env=env)
             self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["outcome"]["exit_code"], 3)
         after = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1", "-uall"], check=True, capture_output=True, text=True).stdout
         after_cfg = subprocess.run(["git", "-C", str(repo), "config", "--local", "--list"], check=True, capture_output=True, text=True).stdout
         after_pyc = {p.relative_to(SKILL).as_posix() for p in SKILL.rglob("*.pyc")}
