@@ -3592,6 +3592,206 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(posix_sk["status"], "unknown")
         self.assertEqual(posix_sk["reason"], "LANE_MISMATCH")
 
+    def _public_repo(self) -> tuple[Path, str]:
+        repo = self.test_root / "public-repo"
+        repo.mkdir()
+        self._git(repo, "init", "-b", "main")
+        self._git(repo, "config", "user.email", "t@example.com")
+        self._git(repo, "config", "user.name", "t")
+        (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "A")
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        return repo, sha
+
+    def _windows_serial_body(self, sha: str, skip_map: dict) -> dict:
+        suites = json.loads((SKILL / "tests" / "offline_suites.json").read_text(encoding="utf-8"))
+        executed = []
+        for entry in suites:
+            suite_id = entry["id"]
+            executed.append({
+                "id": suite_id, "exit_code": 0, "error": None,
+                "skip_reasons": list(skip_map.get(suite_id, [])), "launched": True,
+            })
+        return {
+            "schema": 1, "shard": "serial", "sha": sha, "ok": True,
+            "identity": {"os": "Windows-2022Server-10.0.20348-SP0"},
+            "scan": {"completed": True, "ok": True},
+            "run": {"id": "9", "attempt": "1", "workflow": "tests"},
+            "executed": executed,
+        }
+
+    def _posix_report_doc(self) -> dict:
+        ids = json.loads((SKILL / "tests" / "posix_tests.json").read_text(encoding="utf-8"))["tests"]
+        return {
+            "schema": 1, "lane": "posix", "os": "Linux-6.8.0", "passed": True,
+            "tests": [{"id": item, "outcome": "passed"} for item in ids],
+        }
+
+    def _public_doctor_ci(self, repo: Path, evidence: Path) -> dict:
+        with patch.dict(os.environ, {"PBZ_SKIP_OUTPUT": str(evidence)}):
+            return doctor.cmd_doctor_ci(ws_path=repo, offline=True)
+
+    def test_windows_serial_report_read_on_posix_reviewer(self):
+        """Public CLI: a Windows serial report whose skips match the Windows baseline is read on that lane."""
+        repo, sha = self._public_repo()
+        manifest_data = json.loads((SKILL / "tests" / "offline_skips.json").read_text(encoding="utf-8"))
+        evidence = self.test_root / "evidence-win-serial"
+        self._write_serial(evidence, self._windows_serial_body(sha, manifest_data["windows"]), "windows")
+        result = self._public_doctor_ci(repo, evidence)
+        sk = result["ci"]["skips"]
+        self.assertEqual(sk["status"], "match")
+        self.assertIsNone(sk["reason"])
+        self.assertEqual(sk["approved_count"], 12)
+
+    def test_windows_serial_report_posix_only_match_is_content_mismatch(self):
+        """Public CLI: a Windows serial report matching only the empty POSIX baseline mismatches on Windows content."""
+        repo, sha = self._public_repo()
+        evidence = self.test_root / "evidence-win-serial-posix-only"
+        self._write_serial(evidence, self._windows_serial_body(sha, {}), "windows")
+        result = self._public_doctor_ci(repo, evidence)
+        sk = result["ci"]["skips"]
+        self.assertEqual(sk["status"], "mismatch")
+        self.assertEqual(sk["reason"], "MISSING_SKIPS")
+        self.assertNotEqual(sk["reason"], "PLATFORM_MISMATCH")
+
+    def test_posix_json_named_through_public_cli(self):
+        """Public CLI: a supplied posix.json is reported as the named POSIX exemption lane, never overall success."""
+        repo, _sha = self._public_repo()
+        evidence = self.test_root / "evidence-posix-only"
+        evidence.mkdir()
+        (evidence / "posix.json").write_text(json.dumps(self._posix_report_doc()), encoding="utf-8")
+        result = self._public_doctor_ci(repo, evidence)
+        lane = result["ci"]["posix_lane"]
+        self.assertEqual(lane["status"], "verified")
+        self.assertEqual(lane["lane"], "posix")
+        self.assertNotEqual(result["status"], "SUCCEEDED")
+        self.assertEqual(result["status"], "INCOMPLETE")
+
+    def test_posix_json_does_not_change_serial_status(self):
+        """Public CLI: posix.json beside a Windows serial report is named, and the skip status stays the Windows comparison."""
+        repo, sha = self._public_repo()
+        manifest_data = json.loads((SKILL / "tests" / "offline_skips.json").read_text(encoding="utf-8"))
+        evidence = self.test_root / "evidence-serial-plus-posix"
+        self._write_serial(evidence, self._windows_serial_body(sha, manifest_data["windows"]), "windows")
+        (evidence / "posix.json").write_text(json.dumps(self._posix_report_doc()), encoding="utf-8")
+        result = self._public_doctor_ci(repo, evidence)
+        sk = result["ci"]["skips"]
+        self.assertEqual(sk["status"], "match")
+        self.assertIsNone(sk["reason"])
+        lane = result["ci"]["posix_lane"]
+        self.assertEqual(lane["status"], "verified")
+        self.assertEqual(lane["lane"], "posix")
+        self.assertNotEqual(result["status"], "SUCCEEDED")
+        self.assertEqual(result["status"], "INCOMPLETE")
+
+    def test_sidecar_duplicate_skip_cannot_pass(self):
+        """Legacy sidecars compare as multisets: duplicating one approved skip record is a mismatch."""
+        line = 'PBZ_SKIP {"test": "case_one", "reason": "because"}'
+        skill = self._skip_skill({"windows": {"suite_a": [line]}, "posix": {"suite_a": [line]}})
+        exact = self.test_root / "sidecar-exact"
+        exact.mkdir()
+        (exact / "suite_a.skips.jsonl").write_text(line + "\n", encoding="utf-8")
+        ok = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=exact, platform="windows")
+        self.assertEqual(ok["status"], "match")
+        dup = self.test_root / "sidecar-dup"
+        dup.mkdir()
+        (dup / "suite_a.skips.jsonl").write_text(line + "\n" + line + "\n", encoding="utf-8")
+        dup_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=dup, platform="windows")
+        self.assertEqual(dup_sk["status"], "mismatch")
+        self.assertEqual(dup_sk["reason"], "UNEXPECTED_SKIPS")
+
+    def test_sidecar_dropped_duplicate_cannot_pass(self):
+        """Legacy sidecars compare as multisets: dropping one copy of a twice-approved skip record is a mismatch."""
+        line = 'PBZ_SKIP {"test": "case_one", "reason": "because"}'
+        skill = self._skip_skill({"windows": {"suite_a": [line, line]}, "posix": {"suite_a": [line, line]}})
+        exact = self.test_root / "sidecar-exact-twice"
+        exact.mkdir()
+        (exact / "suite_a.skips.jsonl").write_text(line + "\n" + line + "\n", encoding="utf-8")
+        ok = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=exact, platform="windows")
+        self.assertEqual(ok["status"], "match")
+        dropped = self.test_root / "sidecar-dropped"
+        dropped.mkdir()
+        (dropped / "suite_a.skips.jsonl").write_text(line + "\n", encoding="utf-8")
+        dropped_sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=dropped, platform="windows")
+        self.assertEqual(dropped_sk["status"], "mismatch")
+        self.assertEqual(dropped_sk["reason"], "MISSING_SKIPS")
+
+    def test_empty_directory_stays_not_run(self):
+        """Invariant: an empty evidence directory is unknown NOT_RUN before and after the fix."""
+        empty = self.test_root / "evidence-empty"
+        empty.mkdir()
+        sk = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=empty)
+        self.assertEqual(sk["status"], "unknown")
+        self.assertEqual(sk["reason"], "NOT_RUN")
+
+    def test_empty_baseline_affirmative_provenance_matches(self):
+        """Public CLI: affirmative posix provenance with zero sidecars matches the empty POSIX baseline."""
+        repo, sha = self._public_repo()
+        evidence = self.test_root / "evidence-empty-baseline"
+        evidence.mkdir()
+        (evidence / "provenance.json").write_text(
+            json.dumps({"sha": sha, "platform": "posix", "exit_code": 0, "status": "passed"}),
+            encoding="utf-8",
+        )
+        result = self._public_doctor_ci(repo, evidence)
+        sk = result["ci"]["skips"]
+        self.assertEqual(sk["status"], "match")
+        self.assertIsNone(sk["reason"])
+
+    def test_legacy_sidecars_without_lane_fail_closed(self):
+        """Helper-level: legacy sidecars with no lane source return unknown PRODUCER_PLATFORM_UNKNOWN, not a reviewer-OS match."""
+        line = 'PBZ_SKIP {"test": "case_one", "reason": "because"}'
+        plat = "windows" if sys.platform == "win32" else "posix"
+        skill = self._skip_skill({plat: {"suite_a": [line]}})
+        sidecars = self.test_root / "sidecar-laneless"
+        sidecars.mkdir()
+        (sidecars / "suite_a.skips.jsonl").write_text(line + "\n", encoding="utf-8")
+        sk = doctor.get_skips_status(skill_dir=skill, observed_sidecars_dir=sidecars)
+        self.assertEqual(sk["status"], "unknown")
+        self.assertEqual(sk["reason"], "PRODUCER_PLATFORM_UNKNOWN")
+
+    def test_posix_launcher_runs_doctor(self):
+        """The POSIX launcher bin/pbz runs doctor ci --offline and returns exit 3 with parseable doctor JSON.
+
+        bin/pbz is tracked with mode 100644, so the supported invocation is
+        through a shell; the test runs it with bash rather than claiming
+        direct execution works. On Windows the test returns without running:
+        a unittest skip would be recorded as a PBZ_SKIP record for this
+        suite (tests/ci_suite.py), and the approved Windows baseline holds
+        no doctor_ci skip records. The launcher runs with a controlled PATH
+        that provides python3 and the shell utilities but no python, so the
+        base failure (the launcher execs python) is deterministic on any
+        POSIX host, and no ambient PBZ_SKIP_OUTPUT leaks into the run.
+        """
+        if sys.platform == "win32":
+            return
+        repo = self.test_root / "launcher-posix"
+        repo.mkdir()
+        self._git(repo, "init", "-b", "main")
+        self._git(repo, "config", "user.email", "t@example.com")
+        self._git(repo, "config", "user.name", "t")
+        (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "A")
+        tool_bin = self.test_root / "launcher-bin"
+        tool_bin.mkdir()
+        (tool_bin / "python3").symlink_to(sys.executable)
+        for tool in ("git", "bash", "sh", "env", "dirname", "readlink", "basename", "uname"):
+            resolved = shutil.which(tool)
+            self.assertIsNotNone(resolved, tool)
+            (tool_bin / tool).symlink_to(resolved)
+        env = os.environ.copy()
+        env["PATH"] = str(tool_bin)
+        env.pop("PBZ_SKIP_OUTPUT", None)
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        env.pop("PYTHONPYCACHEPREFIX", None)
+        launcher = SKILL / "bin" / "pbz"
+        proc = subprocess.run(["bash", str(launcher), "doctor", "ci", "--offline"], cwd=repo, capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertEqual(data["outcome"]["exit_code"], 3)
+
     def test_desktop_process_is_not_live_evidence(self):
         with patch.object(doctor.desktop, "processes", return_value=[{"pid": 1}]):
             live, reason = doctor.get_desktop_evidence(self.test_root)
