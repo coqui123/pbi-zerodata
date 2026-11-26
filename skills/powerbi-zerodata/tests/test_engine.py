@@ -1219,6 +1219,34 @@ def test_live(env: Env, key_holder: dict) -> None:
            and s.get("q9", {}).get("result") == "NEW" and s.get("q2", {}).get("result") == "MISSING", r)
     r = engine("snapshot-compare", env.req(name="never-saved", queries=[q1]), "snapshot-new")
     expect("snapshot-compare without baseline: NEW", [q.get("result") for q in (r or {}).get("queries", [])] == ["NEW"], r)
+
+    # PR A: a save where every query fails must not publish (real engine).
+    qerr2 = {"id": "qerr2", "dax": f"EVALUATE ROW(\"e\", ERROR(\"{req_canary('-SNAPERR-')}\"))"}
+    r = engine("snapshot-save", env.req(name="af", queries=[q1, q2]), "snapshot-af-seed")
+    expect("snapshot af seed save: ok", bool((r or {}).get("ok")), r)
+    s = {q["id"]: q for q in (r or {}).get("queries", [])}
+    expect("snapshot af seed save: verdicts SAVED x2",
+           s.get("q1", {}).get("result") == "SAVED" and s.get("q2", {}).get("result") == "SAVED", r)
+    af_path = env.pd / "snapshots" / "results" / "af.json"
+    expect("snapshot af seed save: baseline file exists", af_path.is_file(), r)
+    af_bytes = af_path.read_bytes() if af_path.is_file() else None
+    r = engine("snapshot-save", env.req(name="af", queries=[qerr, qerr2]), "snapshot-af-all-failed")
+    s = {q["id"]: q for q in (r or {}).get("queries", [])}
+    expect("snapshot all-failed save: verdicts ERROR x2",
+           s.get("qerr", {}).get("result") == "ERROR" and s.get("qerr2", {}).get("result") == "ERROR", r)
+    expect("snapshot all-failed save: baseline bytes unchanged",
+           af_bytes is not None and af_path.is_file() and af_path.read_bytes() == af_bytes, r)
+    r = engine("snapshot-save", env.req(name="af-never", queries=[qerr]), "snapshot-af-first")
+    expect("snapshot first all-failed save: verdict ERROR",
+           ((r or {}).get("queries") or [{}])[0].get("result") == "ERROR", r)
+    expect("snapshot first all-failed save: no result file created",
+           not (env.pd / "snapshots" / "results" / "af-never.json").exists(), r)
+    qzero = {"id": "qzero", "dax": "EVALUATE TOPN(0, SUMMARIZECOLUMNS(DimDate[Year], \"m\", [Total Hours]))"}
+    r = engine("snapshot-save", env.req(name="af-zero", queries=[qzero]), "snapshot-af-zero")
+    expect("snapshot zero-row success: verdict SAVED",
+           [q.get("result") for q in (r or {}).get("queries", [])] == ["SAVED"], r)
+    expect("snapshot zero-row success: result file written",
+           (env.pd / "snapshots" / "results" / "af-zero.json").is_file(), r)
     r = engine("snapshot-save", env.req(name="../escape", queries=[q1]), "snapshot-bad-name")
     expect("snapshot bad name -> BAD_REQUEST", r and r["ok"] is False and r["class"] == "BAD_REQUEST", r)
     r = engine("snapshot-save", env.req(name="t2", queries=[{"id": "tmsl", "dax": "{\"refresh\": {\"type\": \"full\", \"objects\": []}}"}]), "snapshot-tmsl")
