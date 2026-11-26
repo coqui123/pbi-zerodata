@@ -133,6 +133,8 @@ APPROVED_WINDOWS = {
              'POSIX native communicate fault'),
             ('__main__.SnapshotPairPublicationTests.test_case_33_posix_drain_probe_excludes_contender',
              'POSIX shell drain probe'),
+            ('__main__.SnapshotPairPublicationTests.test_journal_without_read_permission_is_unreadable',
+             'needs a non-root POSIX process so journal read permission is enforced'),
         ]
     ],
 }

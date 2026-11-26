@@ -1035,10 +1035,17 @@ from unittest.mock import patch
 
 sys.path.insert(0, sys.argv[1])
 from test_snapshot_store import SnapshotPairPublicationTests as Suite
+from pbz import checks
 from pbz import cli
 
 action, interruption, explicit, engine_failure, valid_spec, result = sys.argv[2:]
 replace = os.replace
+real_unlink = os.unlink
+real_isfile = os.path.isfile
+real_open_lock = checks._snapshot_open_lock
+_lock_path = Path(os.environ["PBZ_TEST_PAIR_LOCK"])
+_journal_name = _lock_path.name[:-len(".lock")] + ".journal.json" if _lock_path.name.endswith(".lock") else _lock_path.name
+JOURNAL_NORM = os.path.normcase(os.path.abspath(str(_lock_path.with_name(_journal_name))))
 
 def interrupted_replace(src, dst):
     destination = Path(dst)
@@ -1049,6 +1056,32 @@ def interrupted_replace(src, dst):
     replace(src, dst)
     if interruption == "after-stage" and destination.name.endswith(".spec.next"):
         os._exit(71)
+
+unlink_state = {"fired": False}
+
+def blocking_unlink(path, *args, **kwargs):
+    if (not unlink_state["fired"]
+            and os.path.normcase(os.path.abspath(os.fspath(path))) == JOURNAL_NORM):
+        unlink_state["fired"] = True
+        print("at-journal-unlink", file=sys.stderr, flush=True)
+        if not sys.stdin.readline():
+            os._exit(72)
+    return real_unlink(path, *args, **kwargs)
+
+isfile_state = {"fired": False}
+
+def watching_isfile(path):
+    if (not isfile_state["fired"]
+            and os.path.normcase(os.path.abspath(os.fspath(path))) == JOURNAL_NORM):
+        isfile_state["fired"] = True
+        print("journal-observed", file=sys.stderr, flush=True)
+        if not sys.stdin.readline():
+            os._exit(72)
+    return real_isfile(path)
+
+def announcing_open_lock(path, readonly=False):
+    print("at-lock-wait", file=sys.stderr, flush=True)
+    return real_open_lock(path, readonly)
 
 def fake_engine(verb, payload, timeout=1800, **kwargs):
     if interruption == "hold-at-engine":
@@ -1084,6 +1117,11 @@ with ExitStack() as stack:
     stack.enter_context(patch("pbz.evidence.record"))
     stack.enter_context(patch("pbz.checks.engine_call", side_effect=fake_engine))
     stack.enter_context(patch("pbz.checks.os.replace", side_effect=interrupted_replace))
+    if interruption == "hold-at-journal-unlink":
+        stack.enter_context(patch("os.unlink", side_effect=blocking_unlink))
+    if interruption == "watch-journal-type":
+        stack.enter_context(patch("os.path.isfile", side_effect=watching_isfile))
+        stack.enter_context(patch("pbz.checks._snapshot_open_lock", side_effect=announcing_open_lock))
     if interruption == "watch-lock":
         import fcntl
         lock = Path(os.environ["PBZ_TEST_PAIR_LOCK"])
@@ -1646,6 +1684,57 @@ with ExitStack() as stack:
         self.assertEqual(json.loads(self.journal.read_bytes())["state"], "RESULT_PUBLISHED")
         self._assert_public_compare("MATCH")
         self._assert_completed()
+
+    def test_case_30_compare_racing_journal_cleanup(self):
+        self._seed_pair()
+        saver = self._start_public_child("save", "hold-at-journal-unlink")
+        try:
+            self.assertEqual(self._child_signal(saver), "at-journal-unlink")
+            compare = self._start_public_child("compare", "watch-journal-type")
+            try:
+                signal = self._child_signal(compare)
+                self.assertIn(
+                    signal, ("journal-observed", "at-lock-wait"),
+                    "unexpected compare schedule signal: %r" % (signal,),
+                )
+                print("schedule-signal: " + signal, file=sys.stderr, flush=True)
+                out, err = saver.communicate("\n", timeout=10)
+                self.assertEqual(saver.returncode, 0, out + err)
+                if signal == "journal-observed":
+                    out_c, err_c = compare.communicate("\n", timeout=10)
+                else:
+                    out_c, err_c = compare.communicate(timeout=10)
+                self.assertEqual(self.result.read_bytes(), self._NEW_RESULT,
+                                 "schedule-signal: " + signal)
+                self.assertEqual(
+                    hashlib.sha256(self.result.read_bytes()).hexdigest(),
+                    hashlib.sha256(self._NEW_RESULT).hexdigest(),
+                    "schedule-signal: " + signal)
+                self.assertEqual(self.spec.read_bytes(), self.new_spec_bytes,
+                                 "schedule-signal: " + signal)
+                self.assertFalse(self.journal.exists(), "schedule-signal: " + signal)
+                self.assertFalse(self.staged.exists(), "schedule-signal: " + signal)
+                self.assertEqual(compare.returncode, 0,
+                                 "schedule-signal: %s\n%s%s" % (signal, out_c, err_c))
+                self.assertEqual(json.loads(out_c)["queries"][0]["result"], "MATCH",
+                                 "schedule-signal: " + signal)
+            finally:
+                self._stop_child(compare)
+        finally:
+            self._stop_child(saver)
+        self._assert_public_compare("MATCH")
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0,
+                         "needs a non-root POSIX process so journal read permission is enforced")
+    def test_journal_without_read_permission_is_unreadable(self):
+        self._seed_pair()
+        self._write_journal("PREPARED")
+        self.journal.chmod(0)
+        try:
+            exc = self._assert_class("CORRUPT_STATE", self._compare)
+            self.assertEqual(exc.detail, "unreadable snapshot journal")
+        finally:
+            self.journal.chmod(0o644)
 
 
     @unittest.skipUnless(os.name == "posix", "POSIX flock observer")
