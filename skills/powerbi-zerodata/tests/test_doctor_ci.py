@@ -3013,7 +3013,10 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         run_overrides=None, newer_run=None, final_run_overrides=None, final_newer_run=None,
         upload_output="{digest_line}", other_output="", omit_suite=False,
         build_status="completed", build_conclusion="success", optional_skipped=False,
-        duplicate_artifact=False,
+        duplicate_artifact=False, report_run_id=None, report_attempt=None,
+        report_workflow=None, report_run_omit=None,
+        drop_identity=False, malformed_identity=False, blank_identity=False,
+        oversized_identity=False,
     ):
         # Response shapes and upload log modeled on GitHub Actions run 45782287275.
         repo_slug = "owner/repo"
@@ -3023,6 +3026,14 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         baseline = json.loads((SKILL / "tests" / "offline_skips.json").read_text(encoding="utf-8"))
         report = self._windows_serial_body(sha, baseline["windows"])
         report["run"]["id"] = str(run_id)
+        if report_run_id is not None:
+            report["run"]["id"] = report_run_id
+        if report_attempt is not None:
+            report["run"]["attempt"] = report_attempt
+        if report_workflow is not None:
+            report["run"]["workflow"] = report_workflow
+        if report_run_omit is not None:
+            del report["run"][report_run_omit]
         if omit_suite:
             report["executed"].pop()
         serial = json.dumps(report).encode("utf-8")
@@ -3140,12 +3151,28 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
             self.assertEqual(slug, repo_slug)
             return 200, binary_responses[path], None
 
+        real_get_hosted_artifact_evidence = doctor.get_hosted_artifact_evidence
+
+        def get_hosted_artifact_evidence(*args, **kwargs):
+            result = real_get_hosted_artifact_evidence(*args, **kwargs)
+            if drop_identity:
+                result = result.copy()
+                result.pop("identity", None)
+            elif malformed_identity:
+                result = {**result, "identity": {"id": 45782287275, "attempt": "1", "workflow": "tests"}}
+            elif blank_identity:
+                result = {**result, "identity": {"id": "", "attempt": "1", "workflow": "tests"}}
+            elif oversized_identity:
+                result = {**result, "identity": {"id": "0" * 5000, "attempt": "1", "workflow": "tests"}}
+            return result
+
         with patch.object(doctor, "_find_repo_root", return_value=self.test_root), \
              patch.object(doctor, "get_head_sha", return_value=(sha, None)), \
              patch.object(doctor, "get_dirty_status", return_value=(False, None)), \
              patch.object(doctor, "get_hook_mode", return_value="full"), \
              patch.object(doctor, "_run_git", side_effect=git), \
              patch.object(doctor, "_api_get", side_effect=api), \
+             patch.object(doctor, "get_hosted_artifact_evidence", side_effect=get_hosted_artifact_evidence), \
              patch.object(doctor, "_api_get_bytes", side_effect=api_bytes, create=True), \
              patch.object(doctor, "get_desktop_evidence", return_value=(False, "NOT_INSTALLED")):
             if via_main:
@@ -3209,6 +3236,42 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertNotEqual(ci["artifact_provenance"], "authenticated")
         self.assertEqual(ci["artifact_provenance_reason"], reason)
         return ci
+
+    def test_hosted_artifact_rejects_report_from_wrong_run(self):
+        ci = self._assert_hosted_artifact_rejection(
+            "RUN_ID_MISMATCH", report_run_id="45782287274",
+        )
+        self.assertEqual(ci["skips"]["reason"], "RUN_ID_MISMATCH")
+
+    def test_hosted_artifact_rejects_report_from_wrong_attempt(self):
+        ci = self._assert_hosted_artifact_rejection(
+            "RUN_ATTEMPT_MISMATCH", report_attempt="2",
+        )
+        self.assertEqual(ci["skips"]["reason"], "RUN_ATTEMPT_MISMATCH")
+
+    def test_hosted_artifact_rejects_report_from_wrong_workflow(self):
+        ci = self._assert_hosted_artifact_rejection(
+            "RUN_WORKFLOW_MISMATCH", report_workflow=".github/workflows/tests.yml",
+        )
+        self.assertEqual(ci["skips"]["reason"], "RUN_WORKFLOW_MISMATCH")
+
+    def test_hosted_artifact_rejects_report_without_run_attempt(self):
+        self._assert_hosted_artifact_rejection("RUN_UNBOUND", report_run_omit="attempt")
+
+    def test_hosted_artifact_rejects_report_with_numeric_run_id(self):
+        self._assert_hosted_artifact_rejection("RUN_UNBOUND", report_run_id=45782287275)
+
+    def test_hosted_artifact_reports_identity_unavailable_when_missing(self):
+        self._assert_hosted_artifact_rejection("ARTIFACT_IDENTITY_UNAVAILABLE", drop_identity=True)
+
+    def test_hosted_artifact_reports_identity_unavailable_when_malformed(self):
+        self._assert_hosted_artifact_rejection("ARTIFACT_IDENTITY_UNAVAILABLE", malformed_identity=True)
+
+    def test_hosted_artifact_reports_identity_unavailable_when_blank(self):
+        self._assert_hosted_artifact_rejection("ARTIFACT_IDENTITY_UNAVAILABLE", blank_identity=True)
+
+    def test_hosted_artifact_reports_identity_unavailable_when_oversized(self):
+        self._assert_hosted_artifact_rejection("ARTIFACT_IDENTITY_UNAVAILABLE", oversized_identity=True)
 
     def test_hosted_artifact_reports_expired(self):
         self._assert_hosted_artifact_rejection("ARTIFACT_EXPIRED", expired=True)
