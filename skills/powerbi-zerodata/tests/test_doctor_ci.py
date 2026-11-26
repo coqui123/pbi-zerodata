@@ -3112,7 +3112,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
                 return 200, next(run_responses), None
             return 200, responses[path], None
 
-        def api_bytes(slug, path, cwd=None, timeout=5):
+        def api_bytes(slug, path, cwd=None, timeout=5, max_bytes=None):
             self.assertEqual(slug, repo_slug)
             return 200, binary_responses[path], None
 
