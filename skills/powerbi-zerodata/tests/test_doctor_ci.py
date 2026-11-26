@@ -934,6 +934,23 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(sk_fresh["reason"], "PLATFORM_MISMATCH")
         self.assertIsNone(sk_fresh["approved_count"])
 
+    def test_doctor_ci_skip_provenance_platform_substring_is_not_a_lane(self):
+        """A provenance platform that merely contains a family substring is unmappable, not a lane."""
+        sidecars_dir = self.test_root / "sidecars_substring"
+        sidecars_dir.mkdir()
+        (sidecars_dir / "provenance.json").write_text(json.dumps({"sha": "1" * 40, "platform": "notlinux", "exit_code": 0, "status": "passed"}), encoding="utf-8")
+        sk = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_dir, expected_sha="1" * 40, require_provenance=True)
+        self.assertEqual(sk["status"], "mismatch")
+        self.assertEqual(sk["reason"], "PARSE_ERROR")
+        self.assertIsNone(sk["approved_count"])
+
+        # Control: a versioned producer OS string still maps to its lane and
+        # satisfies the empty posix baseline on affirmative provenance.
+        (sidecars_dir / "provenance.json").write_text(json.dumps({"sha": "1" * 40, "platform": "Linux-6.8.0", "exit_code": 0, "status": "passed"}), encoding="utf-8")
+        sk_linux = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_dir, expected_sha="1" * 40, require_provenance=True)
+        self.assertEqual(sk_linux["status"], "match")
+        self.assertEqual(sk_linux["approved_count"], 0)
+
     def test_doctor_ci_skip_status_matching_artifact(self):
         """When prior sidecars match approved manifest per-suite, skips report match."""
         sidecars_dir = self.test_root / "sidecars"
