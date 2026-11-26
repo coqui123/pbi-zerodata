@@ -1,6 +1,7 @@
 """Unit tests for Phase 6 F1: pbz doctor ci read-only diagnostics."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -3004,6 +3006,354 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(out["ci"]["branch_protection"]["required_contexts"], ["build"])
         self.assertNotEqual(out["ci"]["hosted_checks"]["status"], "success")
         self.assertNotEqual(out["status"], "SUCCEEDED")
+
+    def _replay_hosted_artifact(
+        self, *, local_copy=False, run_attempt=1, expired=False,
+        job_conclusion="success", digest_mismatch=False, via_main=False,
+        run_overrides=None, newer_run=None, final_run_overrides=None, final_newer_run=None,
+        upload_output="{digest_line}", other_output="", omit_suite=False,
+        build_status="completed", build_conclusion="success", optional_skipped=False,
+        duplicate_artifact=False,
+    ):
+        # Response shapes and upload log modeled on GitHub Actions run 45782287275.
+        repo_slug = "owner/repo"
+        origin = f"https://github.com/{repo_slug}.git"
+        sha = "a" * 40
+        run_id, job_id, artifact_id, repo_id = 45782287275, 21, 31, 41
+        baseline = json.loads((SKILL / "tests" / "offline_skips.json").read_text(encoding="utf-8"))
+        report = self._windows_serial_body(sha, baseline["windows"])
+        report["run"]["id"] = str(run_id)
+        if omit_suite:
+            report["executed"].pop()
+        serial = json.dumps(report).encode("utf-8")
+        with io.BytesIO() as buffer:
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("serial.json", serial)
+            zip_bytes = buffer.getvalue()
+        digest = hashlib.sha256(zip_bytes).hexdigest()
+        if digest_mismatch:
+            # Keep the log and record linked so the downloaded bytes fail the digest check.
+            digest = hashlib.sha256(zip_bytes + b"changed").hexdigest()
+
+        evidence = None
+        artifacts = [{
+            "id": artifact_id, "name": "serial", "expired": expired,
+            "digest": f"sha256:{digest}",
+            "workflow_run": {
+                "id": run_id, "repository_id": repo_id, "head_repository_id": repo_id,
+                "head_branch": "main", "head_sha": sha,
+            },
+        }]
+        if duplicate_artifact:
+            artifacts.append({**artifacts[0], "id": artifact_id + 1})
+        digest_line = f"SHA256 digest of uploaded artifact zip is {digest}"
+        binary_responses = {
+            f"actions/jobs/{job_id}/logs": (
+                "##[group]Run actions/upload-artifact@v4\n"
+                "##[endgroup]\n"
+                "Finished uploading artifact content to blob storage!\n"
+                f"{upload_output.format(digest_line=digest_line)}\n"
+                f"{other_output.format(digest_line=digest_line)}"
+            ).encode("utf-8"),
+        }
+        if local_copy:
+            artifacts.clear()
+            evidence = self.test_root / "local-evidence"
+            evidence.mkdir()
+            (evidence / "serial.json").write_bytes(serial)
+        else:
+            for artifact in artifacts:
+                binary_responses[f"actions/artifacts/{artifact['id']}/zip"] = zip_bytes
+
+        runs_path = f"actions/workflows/tests.yml/runs?head_sha={sha}&per_page=100"
+        run = {
+            "id": run_id, "name": "tests", "path": ".github/workflows/tests.yml",
+            "head_sha": sha, "status": "completed", "conclusion": "success",
+            "run_attempt": run_attempt,
+            "repository": {"id": repo_id, "full_name": repo_slug},
+            "head_repository": {"id": repo_id, "full_name": repo_slug},
+        }
+        run.update(run_overrides or {})
+        initial_runs = [run]
+        if newer_run is not None:
+            initial_runs.append({**run, "id": run_id + 1, **newer_run})
+        final_runs = [{**run, **(final_run_overrides or {})}, *initial_runs[1:]]
+        if final_newer_run is not None:
+            final_runs.append({**run, "id": run_id + 1, **final_newer_run})
+        run_responses = iter(
+            {"total_count": len(records), "workflow_runs": records}
+            for records in (initial_runs, final_runs)
+        )
+        build = {
+            "name": "build", "status": build_status, "conclusion": build_conclusion,
+            "head_sha": sha, "app": {"slug": "github-actions", "id": 1},
+        }
+        checks = [build]
+        if optional_skipped:
+            checks.append({**build, "name": "optional", "status": "completed", "conclusion": "skipped"})
+        responses = {
+            "branches/main/protection": {
+                "url": f"https://api.github.com/repos/{repo_slug}/branches/main/protection",
+                "required_status_checks": {"strict": True, "contexts": ["build"]},
+                "enforce_admins": {"enabled": True},
+                "required_pull_request_reviews": None,
+            },
+            "rules/branches/main?per_page=100": [],
+            f"commits/{sha}/check-runs?per_page=100&filter=all": {
+                "total_count": len(checks), "check_runs": checks,
+            },
+            f"commits/{sha}/statuses?per_page=100": [],
+            f"actions/runs/{run_id}/attempts/1/jobs?per_page=100": {
+                "total_count": 1,
+                "jobs": [{
+                    "id": job_id, "name": "serial", "run_id": run_id, "run_attempt": 1,
+                    "head_sha": sha, "status": "completed", "conclusion": job_conclusion,
+                }],
+            },
+            f"actions/runs/{run_id}/artifacts?per_page=100": {
+                "total_count": len(artifacts), "artifacts": artifacts,
+            },
+        }
+
+        def git(args, cwd=None, timeout=5):
+            if args == ["remote", "get-url", "origin"]:
+                return 0, origin
+            if args[0] == "symbolic-ref":
+                return 0, "refs/heads/main"
+            if args[0] == "rev-parse" and args[-1] == "refs/remotes/origin/main":
+                return 0, sha
+            if args[0] == "ls-remote" and "--get-url" in args:
+                return 0, args[-1]
+            if args[0] == "ls-remote" and args[-2:] == [origin, "refs/heads/main"]:
+                return 0, f"{sha}\trefs/heads/main"
+            if args[0] == "merge-base":
+                return 0, ""
+            return 1, ""
+
+        def api(slug, path, cwd=None, timeout=5):
+            self.assertEqual(slug, repo_slug)
+            if path == runs_path:
+                return 200, next(run_responses), None
+            return 200, responses[path], None
+
+        def api_bytes(slug, path, cwd=None, timeout=5, max_bytes=None):
+            self.assertEqual(slug, repo_slug)
+            return 200, binary_responses[path], None
+
+        with patch.object(doctor, "_find_repo_root", return_value=self.test_root), \
+             patch.object(doctor, "get_head_sha", return_value=(sha, None)), \
+             patch.object(doctor, "get_dirty_status", return_value=(False, None)), \
+             patch.object(doctor, "get_hook_mode", return_value="full"), \
+             patch.object(doctor, "_run_git", side_effect=git), \
+             patch.object(doctor, "_api_get", side_effect=api), \
+             patch.object(doctor, "_api_get_bytes", side_effect=api_bytes, create=True), \
+             patch.object(doctor, "get_desktop_evidence", return_value=(False, "NOT_INSTALLED")):
+            if via_main:
+                env = {"PBZ_SKIP_OUTPUT": str(evidence)} if local_copy else {}
+                with patch.dict(os.environ, env), patch("sys.stdout", io.StringIO()) as stdout:
+                    if not local_copy:
+                        os.environ.pop("PBZ_SKIP_OUTPUT", None)
+                    rc = main(["doctor", "ci"])
+                    return json.loads(stdout.getvalue()), rc
+            return doctor.cmd_doctor_ci(
+                ws_path=self.test_root, offline=False, observed_sidecars_dir=evidence,
+            )
+
+    def test_hosted_artifact_can_succeed_and_local_copy_cannot(self):
+        with self.subTest(evidence="hosted"):
+            data, rc = self._replay_hosted_artifact(via_main=True)
+            ci = data["ci"]
+            self.assertEqual(ci["branch_protection"]["status"], "protected")
+            self.assertEqual(ci["hosted_checks"]["status"], "success")
+            self.assertEqual(
+                data["outcome"]["status"], "SUCCEEDED",
+                f"exit={rc}, artifact_provenance={ci['artifact_provenance']}, "
+                f"reason={ci.get('artifact_provenance_reason')}",
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(ci["artifact_provenance"], "authenticated")
+            self.assertEqual(ci["skips"]["status"], "match")
+
+        with self.subTest(evidence="local copy"):
+            data, rc = self._replay_hosted_artifact(local_copy=True, via_main=True)
+            self.assertEqual(data["ci"]["skips"]["status"], "match")
+            self.assertNotEqual(data["outcome"]["status"], "SUCCEEDED")
+            self.assertNotEqual(rc, 0)
+            self.assertNotEqual(data["ci"]["artifact_provenance"], "authenticated")
+
+    def test_hosted_artifact_rejects_stale_attempt(self):
+        data, rc = self._replay_hosted_artifact(run_attempt=2, via_main=True)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(data["outcome"]["status"], "SUCCEEDED")
+
+    def test_hosted_artifact_rejects_expired_artifact(self):
+        data, rc = self._replay_hosted_artifact(expired=True, via_main=True)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(data["outcome"]["status"], "SUCCEEDED")
+
+    def test_hosted_artifact_rejects_failed_producing_job(self):
+        data, rc = self._replay_hosted_artifact(job_conclusion="failure", via_main=True)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(data["outcome"]["status"], "SUCCEEDED")
+
+    def test_hosted_artifact_rejects_digest_mismatch(self):
+        data, rc = self._replay_hosted_artifact(digest_mismatch=True, via_main=True)
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(data["outcome"]["status"], "SUCCEEDED")
+
+    def _assert_hosted_artifact_rejection(self, reason, **replay_options):
+        data, rc = self._replay_hosted_artifact(via_main=True, **replay_options)
+        self.assertNotEqual(data["outcome"]["status"], "SUCCEEDED")
+        self.assertNotEqual(rc, 0)
+        ci = data["ci"]
+        self.assertNotEqual(ci["artifact_provenance"], "authenticated")
+        self.assertEqual(ci["artifact_provenance_reason"], reason)
+        return ci
+
+    def test_hosted_artifact_reports_expired(self):
+        self._assert_hosted_artifact_rejection("ARTIFACT_EXPIRED", expired=True)
+
+    def test_hosted_artifact_reports_ambiguous_runs(self):
+        self._assert_hosted_artifact_rejection("ARTIFACT_RUN_AMBIGUOUS", newer_run={})
+
+    def test_hosted_artifact_reports_ambiguous_artifacts(self):
+        self._assert_hosted_artifact_rejection("ARTIFACT_AMBIGUOUS", duplicate_artifact=True)
+
+    def test_hosted_artifact_reports_superseded_run(self):
+        self._assert_hosted_artifact_rejection(
+            "ARTIFACT_RUN_SUPERSEDED", newer_run={"conclusion": "failure"},
+        )
+
+    def test_hosted_artifact_reports_ambiguous_attempt(self):
+        # The artifact and log remain available even if attempt 1's job failed.
+        for job_conclusion in ("success", "failure"):
+            with self.subTest(attempt_one_job=job_conclusion):
+                self._assert_hosted_artifact_rejection(
+                    "ARTIFACT_ATTEMPT_AMBIGUOUS", run_attempt=2, job_conclusion=job_conclusion,
+                )
+
+    def test_hosted_artifact_reports_unverified_job_link(self):
+        cases = {
+            "absent": {"upload_output": ""},
+            "different digest": {
+                "upload_output": f"SHA256 digest of uploaded artifact zip is {'0' * 64}",
+            },
+            "unrelated step": {
+                "upload_output": "",
+                "other_output": "##[group]Run unrelated-step\n{digest_line}\n",
+            },
+            "duplicate fragment": {
+                "other_output": "##[group]Run unrelated-step\nEchoed {digest_line} again\n",
+            },
+        }
+        for name, options in cases.items():
+            with self.subTest(log=name):
+                self._assert_hosted_artifact_rejection("ARTIFACT_JOB_LINK_UNVERIFIED", **options)
+
+    def test_hosted_artifact_reports_digest_mismatch(self):
+        self._assert_hosted_artifact_rejection("ARTIFACT_DIGEST_MISMATCH", digest_mismatch=True)
+
+    def test_hosted_artifact_reports_run_changed_at_revalidation(self):
+        for options in ({"final_run_overrides": {"run_attempt": 2}}, {"final_newer_run": {}}):
+            with self.subTest(**options):
+                self._assert_hosted_artifact_rejection("ARTIFACT_RUN_CHANGED", **options)
+
+    def test_hosted_artifact_rejects_wrong_run_record(self):
+        cases = (
+            ({"repository": {"id": 41, "full_name": "owner/other"}}, "ARTIFACT_RUN_SUPERSEDED"),
+            ({"path": ".github/workflows/other.yml"}, "ARTIFACT_RUN_SUPERSEDED"),
+            ({"head_sha": "b" * 40}, "ARTIFACT_RUN_NOT_FOUND"),
+        )
+        for overrides, reason in cases:
+            with self.subTest(**overrides):
+                self._assert_hosted_artifact_rejection(reason, run_overrides=overrides)
+
+    def test_hosted_artifact_reports_missing_suite(self):
+        ci = self._assert_hosted_artifact_rejection("MISSING_SUITES", omit_suite=True)
+        self.assertNotEqual(ci["skips"]["status"], "match")
+        self.assertEqual(ci["skips"]["reason"], "MISSING_SUITES")
+
+    def test_hosted_artifact_cannot_override_required_checks(self):
+        for status, conclusion in (("completed", "failure"), ("in_progress", None)):
+            with self.subTest(status=status, conclusion=conclusion):
+                data, rc = self._replay_hosted_artifact(
+                    build_status=status, build_conclusion=conclusion, via_main=True,
+                )
+                self.assertNotEqual(rc, 0)
+                self.assertNotEqual(data["outcome"]["status"], "SUCCEEDED")
+                self.assertEqual(data["ci"]["artifact_provenance"], "authenticated")
+                self.assertIsNone(data["ci"]["artifact_provenance_reason"])
+
+    def test_hosted_artifact_succeeds_with_skipped_optional_check(self):
+        data, rc = self._replay_hosted_artifact(optional_skipped=True, via_main=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(data["outcome"]["status"], "SUCCEEDED")
+        self.assertEqual(data["ci"]["artifact_provenance"], "authenticated")
+
+    def test_hosted_artifact_redirect_scopes_authorization_to_api_host(self):
+        payload = b"artifact"
+        storage_url = "https://storage.example.invalid/artifact.zip"
+        requests = []
+
+        def open_redirect(request, timeout):
+            requests.append(request)
+            handler, = build_opener.call_args.args
+            self.assertIsInstance(handler, doctor._ArtifactRedirectHandler)
+            requests.append(handler.redirect_request(request, None, 302, "Found", {}, storage_url))
+            return io.BytesIO(payload)
+
+        with patch.object(doctor.shutil, "which", return_value=None), \
+             patch.dict(os.environ, GITHUB_TOKEN="replay-token"), \
+             patch.object(doctor.urllib.request, "build_opener") as build_opener:
+            build_opener.return_value.open.side_effect = open_redirect
+            result = doctor._api_get_bytes("owner/repo", "actions/artifacts/31/zip", max_bytes=len(payload))
+
+        self.assertEqual(result, (200, payload, None))
+        original, redirected = requests
+        self.assertEqual(original.get_header("Authorization"), "Bearer replay-token")
+        self.assertEqual(redirected.full_url, storage_url)
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+        handler, = build_opener.call_args.args
+        same_host = handler.redirect_request(
+            original, None, 302, "Found", {}, "https://api.github.com/download",
+        )
+        self.assertEqual(same_host.get_header("Authorization"), "Bearer replay-token")
+
+    def test_hosted_artifact_reports_unsafe_temp_storage(self):
+        temp_parent = self.test_root / "scratch"
+        temp_parent.mkdir()
+        with patch.dict(os.environ, TMPDIR=str(temp_parent)), \
+             patch.object(doctor.tempfile, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory) as storage:
+            self._assert_hosted_artifact_rejection("ARTIFACT_STORAGE_UNSAFE")
+        storage.assert_not_called()
+        self.assertEqual(list(temp_parent.iterdir()), [])
+        self.assertEqual(list(self.test_root.iterdir()), [temp_parent])
+
+    def test_hosted_artifact_cleans_up_transient_storage(self):
+        temporary_directory = tempfile.TemporaryDirectory
+        for run_changed in (False, True):
+            with self.subTest(run_changed=run_changed):
+                created = []
+
+                def record_directory(*args, **kwargs):
+                    directory = temporary_directory(*args, **kwargs)
+                    # Keep it alive so finalization cannot mask missing cleanup.
+                    created.append(directory)
+                    self.addCleanup(directory.cleanup)
+                    return directory
+
+                with patch.object(doctor.tempfile, "TemporaryDirectory", side_effect=record_directory):
+                    if run_changed:
+                        self._assert_hosted_artifact_rejection(
+                            "ARTIFACT_RUN_CHANGED", final_run_overrides={"run_attempt": 2},
+                        )
+                    else:
+                        data = self._replay_hosted_artifact()
+                        self.assertEqual(data["status"], "SUCCEEDED")
+                        self.assertEqual(data["ci"]["artifact_provenance"], "authenticated")
+                self.assertEqual(len(created), 1)
+                self.assertFalse(Path(created[0].name).exists())
 
     def test_same_name_tag_does_not_retarget_branch(self):
         """A tag named main must not send membership or protection to heads/main."""

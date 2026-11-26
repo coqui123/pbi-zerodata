@@ -4,17 +4,23 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import http.client
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+import zipfile
+import zlib
+from pathlib import Path, PureWindowsPath
 
 from . import desktop
 
@@ -631,6 +637,331 @@ def _api_get(slug: str | None, path: str, cwd: Path | None = None, timeout: int 
             return -1, {}, "API_ERROR"
 
     return -1, {}, "NO_GH"
+
+
+class _ArtifactRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and urllib.parse.urlsplit(redirected.full_url).hostname != "api.github.com":
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+def _read_bounded_stdout(stdout, max_bytes: int) -> bytearray:
+    payload = bytearray()
+    while len(payload) <= max_bytes:
+        chunk = stdout.read1(min(65536, max_bytes + 1 - len(payload)))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    return payload
+
+
+def _api_get_bytes(
+    slug: str | None, path: str, cwd: Path | None = None, timeout: int = 5, *,
+    max_bytes: int | None = None,
+) -> tuple[int, bytes, str | None]:
+    if not slug:
+        return -1, b"", "NO_REMOTE"
+
+    def _err_reason(code: int, msg: str) -> tuple[int, str]:
+        m = " ".join(msg.lower().split())
+        if code == 404 and m in {
+            "branch not protected",
+            "http 404: branch not protected",
+            "gh: branch not protected (http 404)",
+        }:
+            return 404, "UNPROTECTED"
+        if code == 404 or "not found" in m:
+            return 404, "NOT_FOUND"
+        if "rate limit" in m or code == 429:
+            return 403, "RATE_LIMITED"
+        if any(net in m for net in ("could not resolve", "failed to connect", "connection refused", "network is unreachable")):
+            return -1, "OFFLINE"
+        if code in (401, 403) or any(k in m for k in ("bad credentials", "unauthorized", "permission")):
+            return code or 401, "UNAUTHENTICATED" if (code == 401 or "credentials" in m) else "PERMISSION_DENIED"
+        return code or -1, "API_ERROR"
+
+    gh_bin, token = shutil.which("gh"), os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if gh_bin:
+        try:
+            cmd = [
+                gh_bin, "api", "--allow-escape-sequences", "--hostname", "github.com",
+                f"repos/{slug}/{path}", "--header", "Accept: application/vnd.github+json",
+            ]
+            with subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                if max_bytes is None:
+                    try:
+                        stdout, stderr_bytes = proc.communicate(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        raise
+                else:
+                    deadline = time.monotonic() + timeout
+                    # Drain stderr concurrently so a full pipe cannot block stdout.
+                    with ThreadPoolExecutor(max_workers=2) as readers:
+                        try:
+                            stderr_result = readers.submit(proc.stderr.read)
+                            stdout_result = readers.submit(_read_bounded_stdout, proc.stdout, max_bytes)
+                            payload = stdout_result.result(timeout=deadline - time.monotonic())
+                            if len(payload) > max_bytes and proc.poll() in (None, 0):
+                                return -1, b"", "ARTIFACT_TOO_LARGE"
+                            stderr_bytes = stderr_result.result(timeout=deadline - time.monotonic())
+                            proc.wait(timeout=deadline - time.monotonic())
+                            stdout = bytes(payload)
+                        finally:
+                            if proc.poll() is None:
+                                proc.kill()
+            if proc.returncode == 0:
+                return 200, stdout, None
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+            m_http = re.search(r"HTTP\s+(\d{3})", stderr)
+            code, reason = _err_reason(int(m_http.group(1)) if m_http else proc.returncode, stderr)
+            return code, b"", reason
+        except (subprocess.TimeoutExpired, TimeoutError):
+            return -1, b"", "TIMEOUT"
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return -1, b"", "API_ERROR"
+
+    if token:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{slug}/{path}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "User-Agent": "pbz-doctor-ci"},
+        )
+        try:
+            opener = urllib.request.build_opener(_ArtifactRedirectHandler())
+            with opener.open(req, timeout=timeout) as resp:
+                payload = resp.read() if max_bytes is None else resp.read(max_bytes + 1)
+                if max_bytes is not None and len(payload) > max_bytes:
+                    return -1, b"", "ARTIFACT_TOO_LARGE"
+                return 200, payload, None
+        except urllib.error.HTTPError as e:
+            try:
+                with e:
+                    payload = e.read() if max_bytes is None else e.read(max_bytes + 1)
+                parsed = json.loads(payload.decode("utf-8"), object_pairs_hook=_json_object)
+                raw_msg = parsed.get("message") if isinstance(parsed, dict) else None
+                msg = raw_msg if isinstance(raw_msg, str) else ""
+            except Exception:
+                msg = ""
+            code, reason = _err_reason(e.code, msg)
+            return code, b"", reason
+        except (urllib.error.URLError, TimeoutError, http.client.HTTPException):
+            return -1, b"", "OFFLINE"
+        except (ValueError, OSError):
+            return -1, b"", "API_ERROR"
+    return -1, b"", "NO_GH"
+
+
+_ARTIFACT_SIZE_LIMIT = 64 * 1024 * 1024
+
+
+def _artifact_record(record, **fields) -> bool:
+    # Exact types keep JSON booleans from passing integer binding checks.
+    return isinstance(record, dict) and all(
+        key in record and type(record[key]) in types for key, types in fields.items()
+    )
+
+
+def _artifact_list(slug, path, key, repo_root, timeout) -> tuple[list, str | None]:
+    code, data, reason = _api_get(slug, path, cwd=repo_root, timeout=timeout)
+    if code != 200 or reason:
+        return [], "RETRIEVAL_UNAVAILABLE"
+    if not _artifact_record(data, total_count=(int,), **{key: (list,)}) or data["total_count"] < 0:
+        return [], "ARTIFACT_BINDING_MISMATCH"
+    items = data[key]
+    if data["total_count"] > len(items):
+        return [], "API_PAGINATION_INCOMPLETE"
+    return items, None
+
+
+def _select_artifact_run(repo_root, sha, slug, timeout) -> tuple[dict | None, str | None]:
+    runs, reason = _artifact_list(
+        slug, f"actions/workflows/tests.yml/runs?head_sha={sha}&per_page=100",
+        "workflow_runs", repo_root, timeout,
+    )
+    if reason:
+        return None, reason
+
+    for run in runs:
+        if not _artifact_record(
+            run, id=(int,), head_sha=(str,), repository=(dict,), head_repository=(dict,),
+            path=(str,), name=(str,), status=(str,), conclusion=(str, type(None)), run_attempt=(int,),
+        ) or not all(
+            _artifact_record(run[key], id=(int,), full_name=(str,)) for key in ("repository", "head_repository")
+        ):
+            return None, "ARTIFACT_BINDING_MISMATCH"
+
+    matching_sha = [run for run in runs if run["head_sha"] == sha]
+    if not matching_sha:
+        return None, "ARTIFACT_RUN_NOT_FOUND"
+    candidates = [
+        run for run in matching_sha
+        if run["repository"]["full_name"] == slug and run["head_repository"]["full_name"] == slug
+        and run["path"] == ".github/workflows/tests.yml" and run["name"] == "tests"
+        and run["status"] == "completed" and run["conclusion"] == "success"
+    ]
+    if max(matching_sha, key=lambda run: run["id"]) not in candidates:
+        return None, "ARTIFACT_RUN_SUPERSEDED"
+    if len(candidates) != 1:
+        return None, "ARTIFACT_RUN_AMBIGUOUS"
+    return candidates[0], None
+
+
+def _artifact_log_matches(log: bytes, digest: str) -> bool:
+    text = log.decode("utf-8", errors="replace")
+    fragment = f"SHA256 digest of uploaded artifact zip is {digest}"
+    if text.count(fragment) != 1:
+        return False
+
+    timestamp = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z ")
+    digest_message = re.compile(r"SHA256 digest of uploaded artifact zip is ([0-9a-fA-F]{64})")
+    upload_step = False
+    upload_finished = False
+    digest_seen = False
+    for line in text.split("\n"):
+        message = timestamp.sub("", line.removesuffix("\r"), count=1)
+        if message.startswith("##[group]"):
+            upload_step = message.startswith("##[group]Run actions/upload-artifact@")
+            upload_finished = False
+        elif message == "Finished uploading artifact content to blob storage!":
+            upload_finished = True
+        elif match := digest_message.fullmatch(message):
+            if digest_seen or not (upload_step and upload_finished and match[1] == digest):
+                return False
+            digest_seen = True
+    return digest_seen
+
+
+def _read_hosted_serial(payload: bytes) -> tuple[bytes | None, str | None]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            for entry in archive.infolist():
+                path = PureWindowsPath(entry.filename)
+                if path.anchor or ".." in path.parts or (entry.external_attr >> 16) & 0o170000 == 0o120000:
+                    return None, "ARTIFACT_STORAGE_UNSAFE"
+            if sum(entry.file_size for entry in archive.infolist()) > _ARTIFACT_SIZE_LIMIT:
+                return None, "ARTIFACT_TOO_LARGE"
+            reports = [entry for entry in archive.infolist() if entry.filename == "serial.json"]
+            if len(reports) != 1:
+                return None, "ARTIFACT_CONTENT_MISSING"
+            with archive.open(reports[0]) as report:
+                contents = report.read(_ARTIFACT_SIZE_LIMIT + 1)
+            if len(contents) > _ARTIFACT_SIZE_LIMIT:
+                return None, "ARTIFACT_TOO_LARGE"
+            return contents, None
+    except (OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile, zlib.error):
+        return None, "ARTIFACT_CONTENT_MISSING"
+
+
+def get_hosted_artifact_evidence(repo_root: Path, sha: str, slug: str, timeout: int) -> dict:
+    run, reason = _select_artifact_run(repo_root, sha, slug, timeout)
+    if reason:
+        return {"reason": reason}
+    run_id, attempt = run["id"], run["run_attempt"]
+    if attempt != 1:
+        return {"reason": "ARTIFACT_ATTEMPT_AMBIGUOUS"}
+
+    jobs, reason = _artifact_list(
+        slug, f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100", "jobs", repo_root, timeout,
+    )
+    if reason:
+        return {"reason": reason}
+    if not all(_artifact_record(job, id=(int,), name=(str,)) for job in jobs):
+        return {"reason": "ARTIFACT_BINDING_MISMATCH"}
+    serial_jobs = [job for job in jobs if job["name"] == "serial"]
+    if len(serial_jobs) != 1:
+        return {"reason": "ARTIFACT_JOB_AMBIGUOUS" if serial_jobs else "ARTIFACT_JOB_NOT_FOUND"}
+    job = serial_jobs[0]
+    if not _artifact_record(
+        job, run_id=(int,), run_attempt=(int,), head_sha=(str,), status=(str,), conclusion=(str, type(None)),
+    ):
+        return {"reason": "ARTIFACT_BINDING_MISMATCH"}
+    if (
+        (job["run_id"], job["run_attempt"], job["head_sha"]) != (run_id, attempt, sha)
+        or job["status"] != "completed" or job["conclusion"] != "success"
+    ):
+        return {"reason": "ARTIFACT_JOB_NOT_SUCCESSFUL"}
+
+    artifacts, reason = _artifact_list(
+        slug, f"actions/runs/{run_id}/artifacts?per_page=100", "artifacts", repo_root, timeout,
+    )
+    if reason:
+        return {"reason": reason}
+    if not all(_artifact_record(artifact, id=(int,), name=(str,)) for artifact in artifacts):
+        return {"reason": "ARTIFACT_BINDING_MISMATCH"}
+    serial_artifacts = [artifact for artifact in artifacts if artifact["name"] == "serial"]
+    if len(serial_artifacts) != 1:
+        return {"reason": "ARTIFACT_AMBIGUOUS" if serial_artifacts else "ARTIFACT_NOT_FOUND"}
+    artifact = serial_artifacts[0]
+    if not _artifact_record(artifact, expired=(bool,), workflow_run=(dict,)):
+        return {"reason": "ARTIFACT_BINDING_MISMATCH"}
+    if artifact["expired"]:
+        return {"reason": "ARTIFACT_EXPIRED"}
+    binding = artifact["workflow_run"]
+    if not _artifact_record(binding, id=(int,), head_sha=(str,), repository_id=(int,), head_repository_id=(int,)):
+        return {"reason": "ARTIFACT_BINDING_MISMATCH"}
+    if (
+        binding["id"] != run_id or binding["head_sha"] != sha
+        or not binding["repository_id"] == binding["head_repository_id"] == run["repository"]["id"]
+    ):
+        return {"reason": "ARTIFACT_BINDING_MISMATCH"}
+    digest = artifact.get("digest")
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        return {"reason": "ARTIFACT_DIGEST_UNAVAILABLE"}
+    digest = digest.removeprefix("sha256:")
+
+    job_id, artifact_id = job["id"], artifact["id"]
+    code, log, reason = _api_get_bytes(
+        slug, f"actions/jobs/{job_id}/logs", cwd=repo_root, timeout=timeout, max_bytes=_ARTIFACT_SIZE_LIMIT,
+    )
+    if code != 200 or reason:
+        return {"reason": "ARTIFACT_TOO_LARGE" if reason == "ARTIFACT_TOO_LARGE" else "RETRIEVAL_UNAVAILABLE"}
+    if not _artifact_log_matches(log, digest):
+        return {"reason": "ARTIFACT_JOB_LINK_UNVERIFIED"}
+
+    code, payload, reason = _api_get_bytes(
+        slug, f"actions/artifacts/{artifact_id}/zip", cwd=repo_root, timeout=timeout, max_bytes=_ARTIFACT_SIZE_LIMIT,
+    )
+    if code != 200 or reason:
+        return {"reason": "ARTIFACT_TOO_LARGE" if reason == "ARTIFACT_TOO_LARGE" else "RETRIEVAL_UNAVAILABLE"}
+    if len(payload) > _ARTIFACT_SIZE_LIMIT:
+        return {"reason": "ARTIFACT_TOO_LARGE"}
+    if hashlib.sha256(payload).hexdigest() != digest:
+        return {"reason": "ARTIFACT_DIGEST_MISMATCH"}
+    contents, reason = _read_hosted_serial(payload)
+    if reason:
+        return {"reason": reason}
+
+    storage = None
+    keep_storage = False
+    try:
+        try:
+            resolved_repo = repo_root.resolve()
+            raw = os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp"
+            temp_parent = Path(raw).resolve()
+            if temp_parent.is_relative_to(resolved_repo):
+                return {"reason": "ARTIFACT_STORAGE_UNSAFE"}
+            storage = tempfile.TemporaryDirectory(dir=temp_parent)
+            directory = Path(storage.name).resolve()
+            if directory.is_relative_to(resolved_repo):
+                return {"reason": "ARTIFACT_STORAGE_UNSAFE"}
+            (directory / "serial.json").write_bytes(contents)
+        except (OSError, RuntimeError):
+            return {"reason": "ARTIFACT_STORAGE_UNSAFE"}
+
+        current, reason = _select_artifact_run(repo_root, sha, slug, timeout)
+        fields = ("id", "run_attempt", "repository", "head_repository", "head_sha", "path", "name", "status", "conclusion")
+        if reason or any(current[field] != run[field] for field in fields):
+            return {"reason": "ARTIFACT_RUN_CHANGED"}
+        keep_storage = True
+        return {
+            "storage": storage, "directory": directory,
+            "binding": {"run_id": run_id, "attempt": attempt, "job_id": job_id, "artifact_id": artifact_id},
+        }
+    finally:
+        if storage is not None and not keep_storage:
+            storage.cleanup()
 
 
 def _context_proven(checks, ctx_name: str, expected_app) -> bool:
@@ -1895,7 +2226,26 @@ def cmd_doctor_ci(
         hosted_checks["status"] = "unknown"
         hosted_checks["reason"] = "REQUIREMENTS_UNKNOWN"
     evidence_dir = _resolve_evidence_dir(observed_sidecars_dir)
-    skips = get_skips_status(skill_dir=None, observed_sidecars_dir=evidence_dir, expected_sha=sha, require_provenance=True, evidence_dir_resolved=True)
+    artifact_binding = None
+    artifact_reason = "RETRIEVAL_UNAVAILABLE"
+    hosted_evidence = {}
+    if not offline and isinstance(origin_slug, str) and origin_slug and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
+        hosted_evidence = get_hosted_artifact_evidence(repo_root, sha, origin_slug, timeout)
+        artifact_reason = hosted_evidence.get("reason")
+    storage = hosted_evidence.get("storage")
+    try:
+        skips = get_skips_status(
+            skill_dir=None, observed_sidecars_dir=hosted_evidence.get("directory", evidence_dir),
+            expected_sha=sha, require_provenance=True, evidence_dir_resolved=True,
+        )
+        if storage is not None:
+            if skips.get("status") == "match":
+                artifact_binding = hosted_evidence["binding"]
+            else:
+                artifact_reason = skips.get("reason") or "SKIPS_NOT_MATCH"
+    finally:
+        if storage is not None:
+            storage.cleanup()
     desktop_present, desktop_reason = get_desktop_evidence(ws_path, expected_sha=sha)
     if hook_mode == "full":
         hook_mode_reason = None
@@ -1920,11 +2270,13 @@ def cmd_doctor_ci(
         "desktop_evidence": desktop_present,
         "desktop_evidence_reason": desktop_reason,
         "desktop_available": _desktop_process_available(),
-        # Local files are not hosted artifacts. Retrieval is a separate design.
-        "artifact_provenance": "unavailable",
-        "artifact_provenance_reason": "RETRIEVAL_UNAVAILABLE",
+        "artifact_provenance": "authenticated" if artifact_binding else "unavailable",
+        "artifact_provenance_reason": artifact_reason,
         "posix_lane": _posix_lane_report(evidence_dir),
     }
+
+    if artifact_binding:
+        ci_data["artifact_binding"] = artifact_binding
 
     return {
         "verb": "doctor",
