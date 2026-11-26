@@ -981,6 +981,18 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(sk["status"], "mismatch")
         self.assertEqual(sk["reason"], "PARSE_ERROR")
 
+    def test_sidecar_listing_matches_glob_semantics(self):
+        """The scandir sidecar listing returns exactly what Path.glob returns for the same directory.
+
+        Glob matching follows the platform (case-insensitive on Windows), so a
+        case-variant sidecar name must not be overlooked there.
+        """
+        sidecars_dir = self.test_root / "sidecars_case"
+        sidecars_dir.mkdir()
+        for name in ("engine.skips.jsonl", "upper.SKIPS.JSONL", "longs.ſkips.jsonl", "notes.txt"):
+            (sidecars_dir / name).write_text("", encoding="utf-8")
+        self.assertEqual(doctor._list_sidecar_files(sidecars_dir), sorted(sidecars_dir.glob("*.skips.jsonl")))
+
     def test_doctor_ci_skip_status_matching_artifact(self):
         """When prior sidecars match approved manifest per-suite, skips report match."""
         sidecars_dir = self.test_root / "sidecars"

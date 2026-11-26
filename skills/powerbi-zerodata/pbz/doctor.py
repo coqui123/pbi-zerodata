@@ -1,6 +1,7 @@
 """Read-only diagnostics for OS isolation and CI/CD readiness. Never modifies files or state."""
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import http.client
 import json
@@ -1241,7 +1242,9 @@ def _serial_skip_status(serial_doc, candidate_dir: Path, approved_for_plat: dict
                 return _res(approved_count, None, "mismatch", "PARSE_ERROR")
             expected[(suite_id, item)] += 1
 
-    sidecars = sorted(candidate_dir.glob("*.skips.jsonl"))
+    sidecars = _list_sidecar_files(candidate_dir)
+    if sidecars is None:
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
     if sidecars:
         side: Counter = Counter()
         for path in sidecars:
@@ -1288,6 +1291,34 @@ def _canonical_skip(line: str) -> str | None:
     if isinstance(doc, dict) and isinstance(doc.get("test"), str) and isinstance(doc.get("reason"), str):
         return json.dumps({"test": doc["test"], "reason": doc["reason"]}, sort_keys=True)
     return None
+
+
+_SIDECAR_MATCH = re.compile(
+    fnmatch.translate("*.skips.jsonl"),
+    re.NOFLAG if os.path.normcase("Aa") == "Aa" else re.IGNORECASE,
+).match
+
+
+def _list_sidecar_files(candidate_dir: Path) -> list[Path] | None:
+    """List the *.skips.jsonl entries in a directory, or None when it cannot be enumerated.
+
+    Path.glob silently yields nothing for a directory the process may search
+    but not read, which would hide existing sidecars; os.scandir surfaces
+    that failure so the caller can fail closed. Matching compiles the same
+    translated pattern glob uses, with re.IGNORECASE on platforms whose
+    paths fold case, so it agrees with glob even for Unicode case foldings;
+    every name-matching entry is returned (directories and broken symlinks
+    reach the read sites, which fail closed on them, as they did under glob).
+    """
+    try:
+        with os.scandir(candidate_dir) as entries:
+            return sorted(
+                Path(entry.path)
+                for entry in entries
+                if _SIDECAR_MATCH(entry.name)
+            )
+    except OSError:
+        return None
 
 
 def get_skips_status(
@@ -1482,7 +1513,9 @@ def get_skips_status(
     # selected baseline with no approved suites is a match instead; when the
     # baseline has approved suites, all of them are missing here, exactly as
     # the step 6 comparison reports for a partially supplied directory.
-    observed_files = sorted(candidate_dir.glob("*.skips.jsonl"))
+    observed_files = _list_sidecar_files(candidate_dir)
+    if observed_files is None:
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
     if not observed_files:
         affirmative = (
             prov_data is not None
