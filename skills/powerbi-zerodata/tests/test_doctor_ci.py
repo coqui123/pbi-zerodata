@@ -3856,8 +3856,10 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         through a shell; the test runs it with bash rather than claiming
         direct execution works. On Windows the test returns without running:
         a unittest skip would be recorded as a PBZ_SKIP record for this
-        suite (tests/ci_suite.py), and the approved Windows baseline holds
-        no doctor_ci skip records. The launcher runs with a controlled PATH
+        suite (tests/ci_suite.py), and the approved Windows baseline declares
+        no skip record for this test (its one doctor_ci record belongs to the
+        unlistable-directory regression test), so a skip here would fail the
+        inventory as an unexpected skip. The launcher runs with a controlled PATH
         that provides python3 and the shell utilities but no python, so the
         base failure (the launcher execs python) is deterministic on any
         POSIX host, and no ambient PBZ_SKIP_OUTPUT leaks into the run.
