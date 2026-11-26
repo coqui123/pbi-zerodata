@@ -1114,7 +1114,7 @@ def _preflight_snapshot_save(ws, name: str) -> None:
     snaps = os.path.join(ws.private, "snapshots")
     pair = _SnapshotPair(ws, name)
     directories = (ws.private, snaps, os.path.dirname(spec_path), os.path.dirname(result_path), pair.pending)
-    named = (spec_path, result_path, pair.lock, pair.journal, pair.staged)
+    named = (spec_path, result_path, pair.lock)
     for path in (*directories, *named):
         if _reparse_link(path):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")
@@ -1291,6 +1291,20 @@ class _SnapshotPair:
         self.lock = os.path.join(self.pending, name + ".lock")
         self.journal = os.path.join(self.pending, name + ".journal.json")
         self.staged = os.path.join(self.pending, name + ".spec.next")
+
+    def validate_transient(self):
+        for path in (self.journal, self.staged):
+            if _reparse_link(path):
+                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        for path in (self.journal, self.staged):
+            try:
+                info = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise PbzError("CORRUPT_STATE", "snapshot path is not a file") from error
+            if not stat.S_ISREG(info.st_mode):
+                raise PbzError("CORRUPT_STATE", "snapshot path is not a file")
 
     @contextmanager
     def locked(self, action):
@@ -1620,6 +1634,7 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
     job = create_kill_on_close_job() if action == "save" and os.name == "nt" else None
     try:
         with pair.locked(action) as handle:
+            pair.validate_transient()
             journal, before = pair.recover(action)
             if action == "save":
                 return _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, before)

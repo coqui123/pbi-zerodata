@@ -1620,15 +1620,25 @@ with ExitStack() as stack:
         self.port.assert_not_called()
         self.engine.assert_not_called()
 
-    def _assert_pending_refused(self, code):
+    def _assert_pending_refused(self, code, *, lock_file=False, detail=None):
         before = _tree(self.snaps)
+        if lock_file:
+            expected = list(before)
+            for row in _tree_with_pending_lock((), "different"):
+                if row not in expected:
+                    expected.append(row)
+            expected = tuple(sorted(expected))
+        else:
+            expected = before
         for operation in (self._save, self._compare):
             with self.subTest(action=operation.__name__):
                 self.engine.reset_mock()
-                self._assert_class(code, operation)
+                exc = self._assert_class(code, operation)
+                if detail is not None:
+                    self.assertEqual(exc.detail, detail)
                 self.engine.assert_not_called()
                 self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 0)
-                self.assertEqual(_tree(self.snaps), before)
+                self.assertEqual(_tree(self.snaps), expected)
 
     def test_case_23_pending_directory_is_a_file(self):
         self._seed_pair()
@@ -1638,7 +1648,8 @@ with ExitStack() as stack:
     def test_case_23_pending_journal_is_a_directory(self):
         self._seed_pair()
         self.journal.mkdir(parents=True)
-        self._assert_pending_refused("CORRUPT_STATE")
+        self._assert_pending_refused("CORRUPT_STATE", lock_file=True,
+                                     detail="snapshot path is not a file")
 
     def test_case_23_pending_directory_link(self):
         from _junction import make_junction
@@ -1663,7 +1674,8 @@ with ExitStack() as stack:
             if os.name != "nt":
                 raise
             self.skipTest(f"creating a file symlink is unavailable: {exc}")
-        self._assert_pending_refused("UNSAFE_PATH")
+        self._assert_pending_refused("UNSAFE_PATH", lock_file=True,
+                                     detail="refusing to write through a link")
         self.assertEqual(outside.read_bytes(), b"target survives")
 
     def test_case_29_interrupt_at_port_preserves_annotations(self):
