@@ -1107,13 +1107,29 @@ def _parse_skip_records(lines: list) -> tuple[Counter | None, bool]:
 
 
 def _lane_from_os_string(value: str) -> str | None:
-    """Map a producer OS string to a lane. Both families or neither fails closed to None."""
-    text = value.strip().lower()
-    has_windows = "windows" in text
-    has_posix = any(token in text for token in ("linux", "darwin", "macos"))
-    if has_windows == has_posix:
+    """Map a producer OS string to a lane. Both families or neither fails closed to None.
+
+    The producer writes platform.platform() strings (Windows-10-...,
+    Linux-6..., macOS-14...), whose first token is the OS name. The lane
+    is that first token matched exactly against the family names; exact
+    family tokens of both families anywhere in the string still fail
+    closed, and a family name that is not the leading token, or is only
+    a substring or prefix of one (notlinux, linuxish), is not a lane.
+    """
+    tokens = re.split(r"[^a-z0-9]+", value.strip().lower())
+
+    def _family(token: str) -> str | None:
+        if token == "windows":
+            return "windows"
+        if token in ("linux", "darwin", "macos"):
+            return "posix"
         return None
-    return "windows" if has_windows else "posix"
+
+    families = {_family(token) for token in tokens} - {None}
+    if len(families) != 1:
+        return None
+    lane = families.pop()
+    return lane if _family(tokens[0]) == lane else None
 
 
 def _lane_from_platform_value(value: str) -> str | None:
