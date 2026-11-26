@@ -42,6 +42,7 @@ CLOSED_REASONS = {
     "HOOK_MODE_FAST", "LOCAL_OPT_IN_PRE_COMMIT_SKIPS_PRE_PUSH_FULL", "AMBIGUOUS_EVIDENCE", "MISSING_SUITES",
     "UNPROTECTED", "CHECKS_FAILED", "PENDING_CHECKS", "REQUIREMENTS_UNKNOWN",
     "NOT_LAUNCHED", "SCAN_FAILED", "RUN_UNBOUND", "RETRIEVAL_UNAVAILABLE",
+    "RUN_ID_MISMATCH", "RUN_ATTEMPT_MISMATCH", "RUN_WORKFLOW_MISMATCH",
     "CONFLICTING_EVIDENCE", "LANE_MISMATCH", "PRODUCER_PLATFORM_UNKNOWN",
 }
 
@@ -854,6 +855,10 @@ def _read_hosted_serial(payload: bytes) -> tuple[bytes | None, str | None]:
         return None, "ARTIFACT_CONTENT_MISSING"
 
 
+def _canonical_positive_decimal(value) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value) is not None
+
+
 def get_hosted_artifact_evidence(repo_root: Path, sha: str, slug: str, timeout: int) -> dict:
     run, reason = _select_artifact_run(repo_root, sha, slug, timeout)
     if reason:
@@ -957,6 +962,7 @@ def get_hosted_artifact_evidence(repo_root: Path, sha: str, slug: str, timeout: 
         keep_storage = True
         return {
             "storage": storage, "directory": directory,
+            "identity": {"id": str(run_id), "attempt": str(attempt), "workflow": run["name"]},
             "binding": {"run_id": run_id, "attempt": attempt, "job_id": job_id, "artifact_id": artifact_id},
         }
     finally:
@@ -1484,7 +1490,7 @@ def _resolve_evidence_dir(observed_sidecars_dir: Path | None) -> Path | None:
     return None
 
 
-def _serial_skip_status(serial_doc, candidate_dir: Path, approved_for_plat: dict, approved_count, expected_sha, platform: str, required_ids: list | None) -> dict:
+def _serial_skip_status(serial_doc, candidate_dir: Path, approved_for_plat: dict, approved_count, expected_sha, platform: str, required_ids: list | None, *, expected_run=None) -> dict:
     """Validate the serial.json report the offline runner writes, parsed once by the caller.
 
     The same parsed document drives lane selection in get_skips_status and
@@ -1558,6 +1564,13 @@ def _serial_skip_status(serial_doc, candidate_dir: Path, approved_for_plat: dict
         for key in ("id", "attempt", "workflow")
     ):
         return _res(approved_count, None, "unknown", "RUN_UNBOUND")
+    if expected_run is not None:
+        if run["id"] != expected_run["id"]:
+            return _res(approved_count, None, "mismatch", "RUN_ID_MISMATCH")
+        if run["attempt"] != expected_run["attempt"]:
+            return _res(approved_count, None, "mismatch", "RUN_ATTEMPT_MISMATCH")
+        if run["workflow"] != expected_run["workflow"]:
+            return _res(approved_count, None, "mismatch", "RUN_WORKFLOW_MISMATCH")
     if required_ids is not None and (len(seen_ids) != len(set(seen_ids)) or set(seen_ids) != set(required_ids)):
         return _res(approved_count, sum(observed.values()), "unknown", "MISSING_SUITES")
 
@@ -1659,6 +1672,8 @@ def get_skips_status(
     require_provenance: bool = False,
     platform: str | None = None,
     evidence_dir_resolved: bool = False,
+    *,
+    expected_run=None,
 ) -> dict:
     """Compare observed test skips with approved offline_skips.json baseline across required suites."""
     def _res(app, obs, st, rsn, unexp=None, miss=None):
@@ -1780,6 +1795,7 @@ def get_skips_status(
                 return _res(_count_for(determined), None, "unknown", "PARSE_ERROR")
         return _serial_skip_status(
             serial_doc, candidate_dir, data.get(compare_platform, {}), _count_for(determined), expected_sha, compare_platform, required_ids,
+            expected_run=expected_run,
         )
 
     # Legacy (non-serial) evidence.
@@ -2233,13 +2249,25 @@ def cmd_doctor_ci(
         hosted_evidence = get_hosted_artifact_evidence(repo_root, sha, origin_slug, timeout)
         artifact_reason = hosted_evidence.get("reason")
     storage = hosted_evidence.get("storage")
+    identity = hosted_evidence.get("identity")
+    identity_valid = (
+        storage is not None
+        and isinstance(identity, dict)
+        and _canonical_positive_decimal(identity.get("id"))
+        and _canonical_positive_decimal(identity.get("attempt"))
+        and isinstance(identity.get("workflow"), str)
+        and bool(identity["workflow"].strip())
+    )
     try:
         skips = get_skips_status(
             skill_dir=None, observed_sidecars_dir=hosted_evidence.get("directory", evidence_dir),
             expected_sha=sha, require_provenance=True, evidence_dir_resolved=True,
+            expected_run=identity if identity_valid else None,
         )
         if storage is not None:
-            if skips.get("status") == "match":
+            if not identity_valid:
+                artifact_reason = "ARTIFACT_IDENTITY_UNAVAILABLE"
+            elif skips.get("status") == "match":
                 artifact_binding = hosted_evidence["binding"]
             else:
                 artifact_reason = skips.get("reason") or "SKIPS_NOT_MATCH"
