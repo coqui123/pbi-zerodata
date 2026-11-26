@@ -1,5 +1,8 @@
 {
   "windows": {
+    "doctor_ci": [
+      "PBZ_SKIP {\"test\": \"__main__.DoctorCiTests.test_doctor_ci_skip_unreadable_evidence_dir_is_not_a_match\", \"reason\": \"needs a non-root POSIX process so directory read permission is enforced\"}"
+    ],
     "mcp": [
       "PBZ_SKIP {\"test\": \"__main__.GitHookTests.test_chain_bytes_args_stdin_and_status\", \"reason\": \"direct shell hook execution is POSIX-only\"}",
       "PBZ_SKIP {\"test\": \"__main__.GitHookTests.test_non_executable_host_is_ignored\", \"reason\": \"executable mode semantics require POSIX\"}",
