@@ -916,6 +916,24 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertIsNone(sk["observed_count"])
         self.assertIsNone(sk["approved_count"])
 
+    def test_doctor_ci_skip_stale_provenance_precedes_platform_conflict(self):
+        """A stale provenance SHA keeps STALE_RUN precedence over a lane conflict, with approved_count None."""
+        sidecars_dir = self.test_root / "sidecars_stale_conflict"
+        sidecars_dir.mkdir()
+        (sidecars_dir / "provenance.json").write_text(json.dumps({"sha": "0" * 40, "platform": "posix", "exit_code": 0, "status": "passed"}), encoding="utf-8")
+        (sidecars_dir / "engine.skips.jsonl").write_text("", encoding="utf-8")
+        sk = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_dir, expected_sha="1" * 40, require_provenance=True, platform="windows")
+        self.assertEqual(sk["status"], "mismatch")
+        self.assertEqual(sk["reason"], "STALE_RUN")
+        self.assertIsNone(sk["approved_count"])
+
+        # Control: the same disagreement with a fresh SHA is a platform conflict.
+        (sidecars_dir / "provenance.json").write_text(json.dumps({"sha": "1" * 40, "platform": "posix", "exit_code": 0, "status": "passed"}), encoding="utf-8")
+        sk_fresh = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_dir, expected_sha="1" * 40, require_provenance=True, platform="windows")
+        self.assertEqual(sk_fresh["status"], "mismatch")
+        self.assertEqual(sk_fresh["reason"], "PLATFORM_MISMATCH")
+        self.assertIsNone(sk_fresh["approved_count"])
+
     def test_doctor_ci_skip_status_matching_artifact(self):
         """When prior sidecars match approved manifest per-suite, skips report match."""
         sidecars_dir = self.test_root / "sidecars"
