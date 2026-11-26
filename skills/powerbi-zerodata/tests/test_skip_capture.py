@@ -22,6 +22,13 @@ from ci_manifest import MANIFEST, allocate
 
 
 APPROVED_WINDOWS = {
+    'doctor_ci': [
+        'PBZ_SKIP ' + json.dumps({'test': test, 'reason': reason})
+        for test, reason in [
+            ('__main__.DoctorCiTests.test_doctor_ci_skip_unreadable_evidence_dir_is_not_a_match',
+             'needs a non-root POSIX process so directory read permission is enforced'),
+        ]
+    ],
     'mcp': [
         'PBZ_SKIP ' + json.dumps({'test': test, 'reason': reason})
         for test, reason in [

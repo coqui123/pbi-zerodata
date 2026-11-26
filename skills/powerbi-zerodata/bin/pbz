@@ -1,2 +1,7 @@
 #!/usr/bin/env bash
-exec python -I -B "$(dirname "$(readlink -f "$0")")/../pbz/cli.py" "$@"
+if command -v python3 >/dev/null 2>&1; then
+  PY=python3
+else
+  PY=python
+fi
+exec "$PY" -I -B "$(dirname "$(readlink -f "$0")")/../pbz/cli.py" "$@"

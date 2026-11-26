@@ -1,6 +1,7 @@
 """Read-only diagnostics for OS isolation and CI/CD readiness. Never modifies files or state."""
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import http.client
 import json
@@ -35,7 +36,7 @@ CLOSED_REASONS = {
     "HOOK_MODE_FAST", "LOCAL_OPT_IN_PRE_COMMIT_SKIPS_PRE_PUSH_FULL", "AMBIGUOUS_EVIDENCE", "MISSING_SUITES",
     "UNPROTECTED", "CHECKS_FAILED", "PENDING_CHECKS", "REQUIREMENTS_UNKNOWN",
     "NOT_LAUNCHED", "SCAN_FAILED", "RUN_UNBOUND", "RETRIEVAL_UNAVAILABLE",
-    "CONFLICTING_EVIDENCE", "LANE_MISMATCH",
+    "CONFLICTING_EVIDENCE", "LANE_MISMATCH", "PRODUCER_PLATFORM_UNKNOWN",
 }
 
 # Ruleset types that are not a CI gate. Every other type stays active and unproven.
@@ -1085,8 +1086,8 @@ def get_branch_protection(repo_root: Path | None, branch: str | None, branch_rea
     return _res("unknown", "NOT_FOUND")
 
 
-def _parse_skip_records(lines: list) -> tuple[set[str] | None, bool]:
-    out = set()
+def _parse_skip_records(lines: list) -> tuple[Counter | None, bool]:
+    out: Counter = Counter()
     for line in lines:
         if not isinstance(line, str):
             return None, False
@@ -1098,7 +1099,7 @@ def _parse_skip_records(lines: list) -> tuple[set[str] | None, bool]:
         try:
             d = json.loads(s, object_pairs_hook=_json_object)
             if isinstance(d, dict) and "test" in d and isinstance(d["test"], str) and "reason" in d and isinstance(d["reason"], str):
-                out.add(json.dumps({"test": d["test"], "reason": d["reason"]}, sort_keys=True))
+                out[json.dumps({"test": d["test"], "reason": d["reason"]}, sort_keys=True)] += 1
             else:
                 return None, False
         except (ValueError, TypeError):
@@ -1106,14 +1107,64 @@ def _parse_skip_records(lines: list) -> tuple[set[str] | None, bool]:
     return out, True
 
 
-def _serial_skip_status(serial_file: Path, candidate_dir: Path, approved_for_plat: dict, approved_count, expected_sha, platform: str, required_ids: list | None) -> dict:
-    """Read the serial.json report the offline runner writes. Sidecars are not required."""
+def _lane_from_os_string(value: str) -> str | None:
+    """Map a producer OS string to a lane. Both families or neither fails closed to None.
+
+    The producer writes platform.platform() strings (Windows-10-...,
+    Linux-6..., macOS-14...), whose first token is the OS name. The lane
+    is that first token matched exactly against the family names; exact
+    family tokens of both families anywhere in the string still fail
+    closed, and a family name that is not the leading token, or is only
+    a substring or prefix of one (notlinux, linuxish), is not a lane.
+    """
+    tokens = re.split(r"[^a-z0-9]+", value.strip().lower())
+
+    def _family(token: str) -> str | None:
+        if token == "windows":
+            return "windows"
+        if token in ("linux", "darwin", "macos"):
+            return "posix"
+        return None
+
+    families = {_family(token) for token in tokens} - {None}
+    if len(families) != 1:
+        return None
+    lane = families.pop()
+    return lane if _family(tokens[0]) == lane else None
+
+
+def _lane_from_platform_value(value: str) -> str | None:
+    """Canonical lane for a provenance platform field or an explicit platform argument."""
+    text = value.strip().lower()
+    if text in ("windows", "posix"):
+        return text
+    return _lane_from_os_string(value)
+
+
+def _resolve_evidence_dir(observed_sidecars_dir: Path | None) -> Path | None:
+    """One shared evidence directory resolution: the explicit argument first, else PBZ_SKIP_OUTPUT."""
+    if observed_sidecars_dir:
+        return observed_sidecars_dir
+    raw_skip = os.environ.get("PBZ_SKIP_OUTPUT")
+    if raw_skip:
+        p = Path(raw_skip)
+        if p.is_dir():
+            return p
+    return None
+
+
+def _serial_skip_status(serial_doc, candidate_dir: Path, approved_for_plat: dict, approved_count, expected_sha, platform: str, required_ids: list | None) -> dict:
+    """Validate the serial.json report the offline runner writes, parsed once by the caller.
+
+    The same parsed document drives lane selection in get_skips_status and
+    every check here, so the report cannot change between the two reads.
+    Sidecars are not required.
+    """
     def _res(app, obs, st, rsn, unexp=None, miss=None):
         return {"approved_count": app, "observed_count": obs, "status": st, "reason": rsn, "unexpected": unexp or [], "missing": miss or []}
 
-    try:
-        doc = json.loads(serial_file.read_text(encoding="utf-8"), object_pairs_hook=_json_object)
-    except (OSError, ValueError, UnicodeDecodeError):
+    doc = serial_doc
+    if doc is None:
         return _res(approved_count, None, "mismatch", "PARSE_ERROR")
     if isinstance(doc, dict) and doc.get("lane") not in (None, "serial"):
         return _res(approved_count, None, "unknown", "LANE_MISMATCH")
@@ -1134,7 +1185,9 @@ def _serial_skip_status(serial_file: Path, candidate_dir: Path, approved_for_pla
     os_name = identity.get("os") if isinstance(identity, dict) else None
     if not isinstance(os_name, str) or not os_name.strip():
         return _res(approved_count, None, "mismatch", "PARSE_ERROR")
-    reported = "windows" if "windows" in os_name.lower() else "posix"
+    reported = _lane_from_os_string(os_name)
+    if reported is None:
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
     if reported != platform:
         return _res(approved_count, None, "mismatch", "PLATFORM_MISMATCH")
     executed = doc.get("executed")
@@ -1189,7 +1242,9 @@ def _serial_skip_status(serial_file: Path, candidate_dir: Path, approved_for_pla
                 return _res(approved_count, None, "mismatch", "PARSE_ERROR")
             expected[(suite_id, item)] += 1
 
-    sidecars = sorted(candidate_dir.glob("*.skips.jsonl"))
+    sidecars = _list_sidecar_files(candidate_dir)
+    if sidecars is None:
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
     if sidecars:
         side: Counter = Counter()
         for path in sidecars:
@@ -1238,12 +1293,41 @@ def _canonical_skip(line: str) -> str | None:
     return None
 
 
+_SIDECAR_MATCH = re.compile(
+    fnmatch.translate("*.skips.jsonl"),
+    re.NOFLAG if os.path.normcase("Aa") == "Aa" else re.IGNORECASE,
+).match
+
+
+def _list_sidecar_files(candidate_dir: Path) -> list[Path] | None:
+    """List the *.skips.jsonl entries in a directory, or None when it cannot be enumerated.
+
+    Path.glob silently yields nothing for a directory the process may search
+    but not read, which would hide existing sidecars; os.scandir surfaces
+    that failure so the caller can fail closed. Matching compiles the same
+    translated pattern glob uses, with re.IGNORECASE on platforms whose
+    paths fold case, so it agrees with glob even for Unicode case foldings;
+    every name-matching entry is returned (directories and broken symlinks
+    reach the read sites, which fail closed on them, as they did under glob).
+    """
+    try:
+        with os.scandir(candidate_dir) as entries:
+            return sorted(
+                Path(entry.path)
+                for entry in entries
+                if _SIDECAR_MATCH(entry.name)
+            )
+    except OSError:
+        return None
+
+
 def get_skips_status(
     skill_dir: Path | None = None,
     observed_sidecars_dir: Path | None = None,
     expected_sha: str | None = None,
     require_provenance: bool = False,
     platform: str | None = None,
+    evidence_dir_resolved: bool = False,
 ) -> dict:
     """Compare observed test skips with approved offline_skips.json baseline across required suites."""
     def _res(app, obs, st, rsn, unexp=None, miss=None):
@@ -1261,80 +1345,154 @@ def get_skips_status(
     if not isinstance(data, dict):
         return _res(None, None, "unknown", "PARSE_ERROR")
 
-    plat = platform if platform in ("windows", "posix") else ("windows" if sys.platform == "win32" else "posix")
-    approved_for_plat = data.get(plat)
-    if not isinstance(approved_for_plat, dict):
-        return _res(None, None, "unknown", "PARSE_ERROR")
-
-    approved_suites: dict[str, set[str]] = {}
-    total_approved_set: set[str] = set()
-    for suite_id, suite_lines in approved_for_plat.items():
-        if not isinstance(suite_lines, list):
+    # Step 1 (manifest): validate the structure of every lane present in the
+    # manifest before any lane is selected. There is no reviewer-OS fallback.
+    lanes: dict[str, dict[str, Counter]] = {}
+    lane_counts: dict[str, int] = {}
+    for lane_name, lane_data in data.items():
+        if not isinstance(lane_data, dict):
             return _res(None, None, "unknown", "PARSE_ERROR")
-        suite_set, ok = _parse_skip_records(suite_lines)
-        if not ok or suite_set is None:
+        suites: dict[str, Counter] = {}
+        total = 0
+        for suite_id, suite_lines in lane_data.items():
+            if not isinstance(suite_lines, list):
+                return _res(None, None, "unknown", "PARSE_ERROR")
+            suite_counter, ok = _parse_skip_records(suite_lines)
+            if not ok or suite_counter is None:
+                return _res(None, None, "unknown", "PARSE_ERROR")
+            suites[suite_id] = suite_counter
+            total += sum(suite_counter.values())
+        lanes[lane_name] = suites
+        lane_counts[lane_name] = total
+
+    # Lane source: the explicit platform argument. An unmappable argument fails closed.
+    explicit_lane = None
+    if platform is not None:
+        if not isinstance(platform, str):
             return _res(None, None, "unknown", "PARSE_ERROR")
-        approved_suites[suite_id] = suite_set
-        total_approved_set.update(suite_set)
+        explicit_lane = _lane_from_platform_value(platform)
+        if explicit_lane is None:
+            return _res(None, None, "unknown", "PARSE_ERROR")
 
-    approved_count = len(total_approved_set)
+    def _count_for(lane: str | None):
+        # The determined lane's baseline count, or None when no lane is
+        # determined or a conflict leaves no lane selected.
+        return lane_counts.get(lane) if lane is not None else None
 
-    candidate_dir = observed_sidecars_dir
-    raw_skip = os.environ.get("PBZ_SKIP_OUTPUT")
-    if not candidate_dir and raw_skip:
-        p = Path(raw_skip)
-        if p.is_dir():
-            candidate_dir = p
+    def _determined(sources: set) -> str | None:
+        return sources.pop() if len(sources) == 1 else None
+
+    # A caller that already resolved the evidence directory (cmd_doctor_ci)
+    # passes evidence_dir_resolved=True, so a directory that appears later
+    # cannot be picked up here while the POSIX lane report still sees None.
+    candidate_dir = observed_sidecars_dir if evidence_dir_resolved else _resolve_evidence_dir(observed_sidecars_dir)
 
     if not candidate_dir or not candidate_dir.is_dir():
-        return _res(approved_count, None, "unknown", "NOT_RUN")
+        return _res(_count_for(explicit_lane), None, "unknown", "NOT_RUN")
 
     serial_file = candidate_dir / "serial.json"
     if serial_file.is_file():
+        # A valid serial report satisfies the provenance presence requirement
+        # itself; its lane is its identity.os. PRODUCER_PLATFORM_UNKNOWN never
+        # applies to serial evidence.
+        serial_lane = None
+        try:
+            serial_doc = json.loads(serial_file.read_text(encoding="utf-8"), object_pairs_hook=_json_object)
+        except (OSError, ValueError, UnicodeDecodeError):
+            serial_doc = None
+        if isinstance(serial_doc, dict):
+            identity = serial_doc.get("identity")
+            if isinstance(identity, dict) and isinstance(identity.get("os"), str):
+                serial_lane = _lane_from_os_string(identity["os"])
+        # A provenance file beside a serial report is still a lane source when
+        # its platform cleanly parses. The serial report itself satisfies the
+        # presence requirement, and the provenance SHA is not rechecked here.
+        prov_lane_serial = None
+        prov_file_serial = next((candidate_dir / name for name in ("provenance.json", "report.json") if (candidate_dir / name).is_file()), None)
+        if prov_file_serial is not None:
+            try:
+                prov_doc_serial = json.loads(prov_file_serial.read_text(encoding="utf-8"), object_pairs_hook=_json_object)
+            except (OSError, ValueError, UnicodeDecodeError):
+                prov_doc_serial = None
+            if isinstance(prov_doc_serial, dict) and isinstance(prov_doc_serial.get("platform"), str):
+                prov_lane_serial = _lane_from_platform_value(prov_doc_serial["platform"])
+        serial_sources = {src for src in (explicit_lane, serial_lane, prov_lane_serial) if src is not None}
+        determined = _determined(set(serial_sources))
+        # The platform the serial report is compared against: a non-serial
+        # source it disagrees with (which returns PLATFORM_MISMATCH inside
+        # _serial_skip_status, after its structural checks), else the explicit
+        # argument, else the serial lane itself.
+        compare_platform = None
+        for src in (explicit_lane, prov_lane_serial):
+            if src is not None and serial_lane is not None and src != serial_lane:
+                compare_platform = src
+                break
+        if compare_platform is None:
+            compare_platform = explicit_lane or serial_lane or prov_lane_serial
+        if len(serial_sources) <= 1 and compare_platform is not None and compare_platform not in lanes:
+            return _res(_count_for(determined), None, "unknown", "PARSE_ERROR")
         required_ids = None
         suites_path = base_skill / "tests" / "offline_suites.json"
         if suites_path.is_file():
             try:
                 listed = json.loads(suites_path.read_text(encoding="utf-8"), object_pairs_hook=_json_object)
             except (OSError, ValueError, UnicodeDecodeError):
-                return _res(approved_count, None, "unknown", "PARSE_ERROR")
+                return _res(_count_for(determined), None, "unknown", "PARSE_ERROR")
             if not isinstance(listed, list) or not listed:
-                return _res(approved_count, None, "unknown", "PARSE_ERROR")
+                return _res(_count_for(determined), None, "unknown", "PARSE_ERROR")
             required_ids = []
             for entry in listed:
                 if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"].strip():
-                    return _res(approved_count, None, "unknown", "PARSE_ERROR")
+                    return _res(_count_for(determined), None, "unknown", "PARSE_ERROR")
                 required_ids.append(entry["id"])
             if len(required_ids) != len(set(required_ids)):
-                return _res(approved_count, None, "unknown", "PARSE_ERROR")
+                return _res(_count_for(determined), None, "unknown", "PARSE_ERROR")
         return _serial_skip_status(
-            serial_file, candidate_dir, approved_for_plat, approved_count, expected_sha, plat, required_ids,
+            serial_doc, candidate_dir, data.get(compare_platform, {}), _count_for(determined), expected_sha, compare_platform, required_ids,
         )
 
-    # 1. Discover provenance and validate presence, SHA, and platform first
-    # (stale SHA / wrong OS fails closed to STALE_RUN / PLATFORM_MISMATCH before parsing sidecars)
+    # Legacy (non-serial) evidence.
+    # Step 2: provenance presence requirements (required and absent stays NOT_RUN).
     prov_file = next((candidate_dir / name for name in ("provenance.json", "report.json") if (candidate_dir / name).is_file()), None)
     if (expected_sha or require_provenance) and not prov_file:
-        return _res(approved_count, None, "unknown", "NOT_RUN")
+        return _res(_count_for(explicit_lane), None, "unknown", "NOT_RUN")
 
+    # Structural parse of the provenance file, then SHA validation. A missing
+    # or non-string platform field is a structural PARSE_ERROR; an unmappable
+    # platform string is a PARSE_ERROR with no lane. The stale-SHA verdict
+    # precedes the unmappable-platform PARSE_ERROR, as at the base.
     prov_data = None
+    prov_lane = None
     if prov_file:
         try:
             prov_data = json.loads(prov_file.read_text(encoding="utf-8"), object_pairs_hook=_json_object)
-            if not isinstance(prov_data, dict):
-                return _res(approved_count, None, "mismatch", "PARSE_ERROR")
-            p_sha = prov_data.get("sha")
-            p_plat = prov_data.get("platform")
-            if not isinstance(p_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", p_sha) or not isinstance(p_plat, str):
-                return _res(approved_count, None, "mismatch", "PARSE_ERROR")
-            if expected_sha and p_sha != expected_sha:
-                return _res(approved_count, None, "mismatch", "STALE_RUN")
-            if p_plat.strip().lower() != plat.strip().lower():
-                return _res(approved_count, None, "mismatch", "PLATFORM_MISMATCH")
         except (OSError, ValueError, UnicodeDecodeError):
-            return _res(approved_count, None, "mismatch", "PARSE_ERROR")
+            return _res(_count_for(explicit_lane), None, "mismatch", "PARSE_ERROR")
+        if not isinstance(prov_data, dict):
+            return _res(_count_for(explicit_lane), None, "mismatch", "PARSE_ERROR")
+        p_sha = prov_data.get("sha")
+        p_plat = prov_data.get("platform")
+        if not isinstance(p_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", p_sha) or not isinstance(p_plat, str):
+            return _res(_count_for(explicit_lane), None, "mismatch", "PARSE_ERROR")
+        prov_lane = _lane_from_platform_value(p_plat)
+        if expected_sha and p_sha != expected_sha:
+            stale_sources = {src for src in (explicit_lane, prov_lane) if src is not None}
+            return _res(_count_for(_determined(stale_sources)), None, "mismatch", "STALE_RUN")
+        if prov_lane is None:
+            return _res(_count_for(explicit_lane), None, "mismatch", "PARSE_ERROR")
 
-    # 2. Check known provenance execution failure before parsing sidecars
+    # Step 3: lane determination and conflicts. Any two speaking sources that
+    # disagree leave no lane selected and return PLATFORM_MISMATCH.
+    lane_sources = {src for src in (explicit_lane, prov_lane) if src is not None}
+    if len(lane_sources) > 1:
+        return _res(None, None, "mismatch", "PLATFORM_MISMATCH")
+    lane = _determined(lane_sources)
+    if lane is not None and lane not in lanes:
+        return _res(None, None, "unknown", "PARSE_ERROR")
+    approved_count = _count_for(lane)
+    approved_suites: dict[str, Counter] = lanes.get(lane, {}) if lane is not None else {}
+
+    # Provenance execution failure is checked before parsing sidecars.
     if prov_data:
         p_exit = prov_data.get("exit_code")
         p_st = prov_data.get("status")
@@ -1349,57 +1507,82 @@ def get_skips_status(
             if st_clean not in ("passed", "success", "ok"):
                 return _res(approved_count, None, "mismatch", "SUITE_FAILED")
 
-    # 3. Discover and parse sidecars
-    observed_files = list(candidate_dir.glob("*.skips.jsonl"))
+    # Step 4: no-evidence exit. A supplied directory with no sidecar files, no
+    # serial report (handled above), and no affirmative provenance is NOT_RUN.
+    # Affirmative provenance (status passed with exit_code 0) against a
+    # selected baseline with no approved suites is a match instead; when the
+    # baseline has approved suites, all of them are missing here, exactly as
+    # the step 6 comparison reports for a partially supplied directory.
+    observed_files = _list_sidecar_files(candidate_dir)
+    if observed_files is None:
+        return _res(approved_count, None, "mismatch", "PARSE_ERROR")
     if not observed_files:
+        affirmative = (
+            prov_data is not None
+            and isinstance(prov_data.get("exit_code"), int)
+            and not isinstance(prov_data.get("exit_code"), bool)
+            and prov_data.get("exit_code") == 0
+            and isinstance(prov_data.get("status"), str)
+            and prov_data.get("status").strip().lower() == "passed"
+        )
+        if affirmative and lane is not None:
+            if not approved_suites:
+                return _res(approved_count, 0, "match", None)
+            return _res(approved_count, None, "unknown", "MISSING_SKIPS", miss=[f"suite:{s}" for s in sorted(approved_suites)])
         return _res(approved_count, None, "unknown", "NOT_RUN")
 
-    observed_by_suite: dict[str, set[str]] = {}
-    total_observed_set: set[str] = set()
+    # Structural parse of the sidecar files (step 1 for legacy content).
+    observed_by_suite: dict[str, Counter] = {}
     for f in observed_files:
         suite_name = f.name.removesuffix(".skips.jsonl")
         try:
             lines = f.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError):
             return _res(approved_count, None, "mismatch", "PARSE_ERROR")
-        s_set, ok = _parse_skip_records(lines)
-        if not ok or s_set is None:
+        s_counter, ok = _parse_skip_records(lines)
+        if not ok or s_counter is None:
             return _res(approved_count, None, "mismatch", "PARSE_ERROR")
-        observed_by_suite[suite_name] = s_set
-        total_observed_set.update(s_set)
+        observed_by_suite[suite_name] = s_counter
 
-    obs_count = len(total_observed_set)
+    obs_count = sum(sum(c.values()) for c in observed_by_suite.values())
 
-    # 4. Unexpected extra suite sidecars trigger UNEXPECTED_SKIPS (exit 1)
+    # Step 5: parsed legacy evidence with no lane source fails closed.
+    if lane is None:
+        return _res(None, obs_count, "unknown", "PRODUCER_PLATFORM_UNKNOWN")
+
+    # Step 6: multiset baseline comparison for the determined lane.
+    # Unexpected extra suite sidecars trigger UNEXPECTED_SKIPS (exit 1)
     unexpected_suites = [s for s in observed_by_suite if s not in approved_suites]
     if unexpected_suites:
         return _res(approved_count, obs_count, "mismatch", "UNEXPECTED_SKIPS", unexp=[f"suite:{s}" for s in sorted(unexpected_suites)])
 
-    # 5. Unexpected skip records in observed approved suites trigger UNEXPECTED_SKIPS (exit 1)
-    all_unexpected = []
-    for s, obs_set in observed_by_suite.items():
-        app_set = approved_suites.get(s, set())
-        all_unexpected.extend(obs_set - app_set)
+    # Unexpected skip records in observed approved suites trigger UNEXPECTED_SKIPS (exit 1)
+    all_unexpected: list[str] = []
+    for s, obs_counter in observed_by_suite.items():
+        extra = obs_counter - approved_suites.get(s, Counter())
+        for record, n in sorted(extra.items()):
+            all_unexpected.extend([record] * n)
     if all_unexpected:
         return _res(approved_count, obs_count, "mismatch", "UNEXPECTED_SKIPS", unexp=sorted(all_unexpected)[:20])
 
-    # 6. Affirmative provenance execution completion required when provenance present
+    # Affirmative provenance execution completion required when provenance present
     if prov_data:
         p_exit = prov_data.get("exit_code")
         p_st = prov_data.get("status")
         if p_exit is None or p_st is None:
             return _res(approved_count, obs_count, "unknown", "NOT_RUN")
 
-    # 7. Missing suites
+    # Missing suites
     missing_suites = [s for s in approved_suites if s not in observed_by_suite]
     if missing_suites:
         return _res(approved_count, obs_count, "unknown", "MISSING_SKIPS", miss=[f"suite:{s}" for s in sorted(missing_suites)])
 
-    # 8. Missing skip records in observed approved suites
-    all_missing = []
-    for s, app_set in approved_suites.items():
-        obs_set = observed_by_suite.get(s, set())
-        all_missing.extend(app_set - obs_set)
+    # Missing skip records in observed approved suites
+    all_missing: list[str] = []
+    for s, app_counter in approved_suites.items():
+        missing_counter = app_counter - observed_by_suite.get(s, Counter())
+        for record, n in sorted(missing_counter.items()):
+            all_missing.extend([record] * n)
     if all_missing:
         return _res(approved_count, obs_count, "mismatch", "MISSING_SKIPS", miss=sorted(all_missing)[:20])
 
@@ -1711,7 +1894,8 @@ def cmd_doctor_ci(
         hosted_checks = dict(hosted_checks)
         hosted_checks["status"] = "unknown"
         hosted_checks["reason"] = "REQUIREMENTS_UNKNOWN"
-    skips = get_skips_status(skill_dir=None, observed_sidecars_dir=observed_sidecars_dir, expected_sha=sha, require_provenance=True)
+    evidence_dir = _resolve_evidence_dir(observed_sidecars_dir)
+    skips = get_skips_status(skill_dir=None, observed_sidecars_dir=evidence_dir, expected_sha=sha, require_provenance=True, evidence_dir_resolved=True)
     desktop_present, desktop_reason = get_desktop_evidence(ws_path, expected_sha=sha)
     if hook_mode == "full":
         hook_mode_reason = None
@@ -1739,7 +1923,7 @@ def cmd_doctor_ci(
         # Local files are not hosted artifacts. Retrieval is a separate design.
         "artifact_provenance": "unavailable",
         "artifact_provenance_reason": "RETRIEVAL_UNAVAILABLE",
-        "posix_lane": _posix_lane_report(observed_sidecars_dir),
+        "posix_lane": _posix_lane_report(evidence_dir),
     }
 
     return {
