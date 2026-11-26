@@ -52,7 +52,8 @@
       "PBZ_SKIP {\"test\": \"__main__.SnapshotPairPublicationTests.test_case_30_timeout_retries_child_kill_before_confirming_exit\", \"reason\": \"POSIX native cleanup faults\"}",
       "PBZ_SKIP {\"test\": \"__main__.SnapshotPairPublicationTests.test_case_30_unconfirmed_timeout_retains_prepared_journal\", \"reason\": \"POSIX child cleanup\"}",
       "PBZ_SKIP {\"test\": \"__main__.SnapshotPairPublicationTests.test_case_30_unmoved_supersede_runtime_error_leaves_flag\", \"reason\": \"POSIX native communicate fault\"}",
-      "PBZ_SKIP {\"test\": \"__main__.SnapshotPairPublicationTests.test_case_33_posix_drain_probe_excludes_contender\", \"reason\": \"POSIX shell drain probe\"}"
+      "PBZ_SKIP {\"test\": \"__main__.SnapshotPairPublicationTests.test_case_33_posix_drain_probe_excludes_contender\", \"reason\": \"POSIX shell drain probe\"}",
+      "PBZ_SKIP {\"test\": \"__main__.SnapshotPairPublicationTests.test_journal_without_read_permission_is_unreadable\", \"reason\": \"needs a non-root POSIX process so journal read permission is enforced\"}"
     ]
   },
   "posix": {}
