@@ -137,14 +137,30 @@ def find_workspace(start: str | None = None) -> Workspace:
     return Workspace(cur)
 
 
-def engine_call(verb: str, request: dict, timeout: int = 120) -> dict:
+def create_kill_on_close_job():
+    try:
+        from . import engine
+    except ImportError as error:
+        raise PbzError("ENGINE_UNAVAILABLE") from error
+    return engine.create_kill_on_close_job()
+
+
+def engine_call(verb: str, request: dict, timeout: int = 120, *,
+                pass_fds=(), inherit_handles=(), kill_on_close_job=None) -> dict:
     """Call pbz-engine through pbz/engine.py; missing engine -> ENGINE_UNAVAILABLE."""
+    options = {}
+    if pass_fds or inherit_handles or kill_on_close_job is not None:
+        options.update(pass_fds=pass_fds, inherit_handles=inherit_handles,
+                       kill_on_close_job=kill_on_close_job)
     try:
         from . import engine
     except ImportError:
-        return {"ok": False, "verb": verb, "class": "ENGINE_UNAVAILABLE"}
+        result = {"ok": False, "verb": verb, "class": "ENGINE_UNAVAILABLE"}
+        if options:
+            result["payload_state"] = "not_sent"
+        return result
     try:
-        res = engine.call(verb, request, timeout=timeout)
+        res = engine.call(verb, request, timeout=timeout, **options)
     except Exception:  # never surface engine internals
         return {"ok": False, "verb": verb, "class": "OTHER"}
     return res if isinstance(res, dict) else {"ok": False, "verb": verb, "class": "OTHER"}

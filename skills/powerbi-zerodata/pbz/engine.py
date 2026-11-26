@@ -12,6 +12,7 @@ Callers pass private_dir (and port for live verbs) in every request themselves.
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import re
@@ -190,33 +191,173 @@ def _project(verb: str, response: dict, request: dict | None = None) -> dict:
         return _fail(verb, "ENGINE_UNAVAILABLE")
 
 
-def call(verb: str, request: dict, timeout: float = 120) -> dict:
-    """Run `pbz-engine.exe <verb>` with `request` as JSON on stdin and return the parsed response."""
+_CLEANUP_WAIT = 5
+
+
+def create_kill_on_close_job():
+    from ctypes import wintypes as w
+    from .common import PbzError
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [
+            ("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
+            ("flags", w.DWORD), ("min_working_set", ctypes.c_size_t),
+            ("max_working_set", ctypes.c_size_t), ("active_processes", w.DWORD),
+            ("affinity", ctypes.c_size_t), ("priority", w.DWORD),
+            ("scheduling", w.DWORD),
+        ]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [
+            ("basic", BasicLimits), ("io_counters", ctypes.c_uint64 * 6),
+            ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+            ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateJobObjectW
+    create.argtypes = [ctypes.c_void_p, w.LPCWSTR]
+    create.restype = w.HANDLE
+    job = create(None, None)
+    if not job:
+        raise PbzError("ENGINE_UNAVAILABLE")
+    limits = ExtendedLimits()
+    limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    configure = kernel.SetInformationJobObject
+    configure.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD]
+    configure.restype = w.BOOL
+    try:
+        if not configure(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise PbzError("ENGINE_UNAVAILABLE")
+    except BaseException:
+        kernel.CloseHandle(ctypes.c_void_p(job))
+        raise
+    return job
+
+
+def _terminate_and_wait(child):
+    for _ in range(2):
+        try:
+            child.kill()
+            child.wait(timeout=_CLEANUP_WAIT)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _run_inheriting(argv, payload, timeout, options, pass_fds, handles, job):
+    child = None
+    phase = "setup"
+    try:
+        if handles or job is not None:
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        if handles:
+            startup = subprocess.STARTUPINFO()
+            startup.lpAttributeList = {"handle_list": list(handles)}
+            options.update(startupinfo=startup, close_fds=True)
+            toggle = kernel.SetHandleInformation
+            toggle.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+            toggle.restype = ctypes.c_int
+
+            def set_inheritable(enabled):
+                for handle in handles:
+                    if not toggle(handle, 1, int(enabled)):
+                        raise ctypes.WinError(ctypes.get_last_error())
+        elif pass_fds:
+            options["pass_fds"] = pass_fds
+
+        try:
+            if handles:
+                set_inheritable(True)
+            phase = "spawn"
+            child = subprocess.Popen(argv, stdin=subprocess.PIPE, **options)
+        finally:
+            if handles:
+                previous_phase = phase
+                phase = "clear"
+                set_inheritable(False)
+                phase = previous_phase
+
+        phase = "assign"
+        if job is not None:
+            assign = kernel.AssignProcessToJobObject
+            assign.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            assign.restype = ctypes.c_int
+            if not assign(job, int(child._handle)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        phase = "communicate"
+        stdout, _ = child.communicate(payload, timeout=timeout)
+        return stdout, None, "may_have_been_sent"
+    except BaseException as error:
+        confirmed = True
+        if child is not None:
+            try:
+                confirmed = _terminate_and_wait(child)
+            finally:
+                if child.stdin is not None:
+                    try:
+                        child.stdin.close()
+                    except OSError:
+                        pass
+                if phase == "clear":
+                    try:
+                        set_inheritable(False)
+                    except Exception:
+                        pass
+        if not isinstance(error, Exception):
+            raise
+        if phase in ("setup", "clear"):
+            cls = "OTHER"
+        elif isinstance(error, subprocess.TimeoutExpired):
+            cls = "TIMEOUT"
+        elif isinstance(error, OSError) or phase == "assign":
+            cls = "ENGINE_UNAVAILABLE"
+        elif confirmed:
+            raise
+        else:
+            cls = "OTHER"
+        state = "may_have_been_sent" if phase == "communicate" else "not_sent"
+        return None, cls, state if confirmed else "unconfirmed"
+
+
+def call(verb: str, request: dict, timeout: float = 120, *,
+         pass_fds=(), inherit_handles=(), kill_on_close_job=None) -> dict:
+    """Run the engine with a JSON request and project its response."""
+    inheriting = bool(pass_fds or inherit_handles or kill_on_close_job is not None)
+    state = "not_sent"
+
+    def finish(result):
+        if inheriting:
+            result["payload_state"] = state
+        return result
+
     exe = Path(ENGINE_EXE)
     if not exe.is_file():
-        return _fail(verb, "ENGINE_UNAVAILABLE")
+        return finish(_fail(verb, "ENGINE_UNAVAILABLE"))
     try:
         payload = json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (TypeError, ValueError):
-        return _fail(verb, "BAD_REQUEST")
+        return finish(_fail(verb, "BAD_REQUEST"))
+    argv = [str(exe), verb]
+    options = dict(stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                   cwd=str(exe.parent), creationflags=_CREATE_NO_WINDOW)
+    if inheriting:
+        stdout, failure, state = _run_inheriting(
+            argv, payload, timeout, options, pass_fds, inherit_handles, kill_on_close_job)
+        if failure:
+            return finish(_fail(verb, failure))
+    else:
+        try:
+            stdout = subprocess.run(argv, input=payload, timeout=timeout, **options).stdout
+        except subprocess.TimeoutExpired:
+            return _fail(verb, "TIMEOUT")
+        except OSError:
+            return _fail(verb, "ENGINE_UNAVAILABLE")
     try:
-        proc = subprocess.run(
-            [str(exe), verb],
-            input=payload,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            cwd=str(exe.parent),
-            timeout=timeout,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-    except subprocess.TimeoutExpired:
-        return _fail(verb, "TIMEOUT")
-    except OSError:
-        return _fail(verb, "ENGINE_UNAVAILABLE")
-    try:
-        response = json.loads(proc.stdout.decode("utf-8"))
+        response = json.loads(stdout.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        return _fail(verb, "ENGINE_UNAVAILABLE")
+        return finish(_fail(verb, "ENGINE_UNAVAILABLE"))
     if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
-        return _fail(verb, "ENGINE_UNAVAILABLE")
-    return _project(verb, response, request)
+        return finish(_fail(verb, "ENGINE_UNAVAILABLE"))
+    return finish(_project(verb, response, request))

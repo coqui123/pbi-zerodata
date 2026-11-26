@@ -840,10 +840,10 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             # Omitted compare spec may reuse the saved spec. An explicit empty
             # object is invalid and must not fall through to that saved spec.
             if a.spec is None:
-                spec = checks.saved_spec(ws, a.name) if a.action == "compare" else None
+                spec = None
             else:
                 spec = _spec(a.spec, ws)
-            if not spec:
+            if not spec and (a.spec is not None or a.action == "save"):
                 raise PbzError("BAD_REQUEST", "--spec required")
             out = checks.snapshot(ws, project, a.action, a.name, spec)
         elif a.cmd == "smoke":

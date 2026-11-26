@@ -3912,7 +3912,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         sk = result["ci"]["skips"]
         self.assertEqual(sk["status"], "match")
         self.assertIsNone(sk["reason"])
-        self.assertEqual(sk["approved_count"], 13)
+        self.assertEqual(sk["approved_count"], 44)
 
     def test_windows_serial_report_posix_only_match_is_content_mismatch(self):
         """Public CLI: a Windows serial report matching only the empty POSIX baseline mismatches on Windows content."""
