@@ -951,6 +951,16 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         self.assertEqual(sk_linux["status"], "match")
         self.assertEqual(sk_linux["approved_count"], 0)
 
+        # Two more shapes that contain a family name without naming the OS:
+        # a token that merely starts with the family name, and a family name
+        # that is not the leading token. Both are unmappable.
+        for plat in ("linuxish", "unknown-linux"):
+            (sidecars_dir / "provenance.json").write_text(json.dumps({"sha": "1" * 40, "platform": plat, "exit_code": 0, "status": "passed"}), encoding="utf-8")
+            sk_extra = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_dir, expected_sha="1" * 40, require_provenance=True)
+            self.assertEqual(sk_extra["status"], "mismatch")
+            self.assertEqual(sk_extra["reason"], "PARSE_ERROR")
+            self.assertIsNone(sk_extra["approved_count"])
+
     def test_doctor_ci_skip_status_matching_artifact(self):
         """When prior sidecars match approved manifest per-suite, skips report match."""
         sidecars_dir = self.test_root / "sidecars"
