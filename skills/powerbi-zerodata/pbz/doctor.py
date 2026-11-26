@@ -856,12 +856,7 @@ def _read_hosted_serial(payload: bytes) -> tuple[bytes | None, str | None]:
 
 
 def _canonical_positive_decimal(value) -> bool:
-    return (
-        isinstance(value, str)
-        and re.fullmatch(r"[0-9]+", value) is not None
-        and int(value) > 0
-        and str(int(value)) == value
-    )
+    return isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value) is not None
 
 
 def get_hosted_artifact_evidence(repo_root: Path, sha: str, slug: str, timeout: int) -> dict:

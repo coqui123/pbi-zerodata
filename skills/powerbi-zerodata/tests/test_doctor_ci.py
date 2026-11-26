@@ -3016,6 +3016,7 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         duplicate_artifact=False, report_run_id=None, report_attempt=None,
         report_workflow=None, report_run_omit=None,
         drop_identity=False, malformed_identity=False, blank_identity=False,
+        oversized_identity=False,
     ):
         # Response shapes and upload log modeled on GitHub Actions run 45782287275.
         repo_slug = "owner/repo"
@@ -3161,6 +3162,8 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
                 result = {**result, "identity": {"id": 45782287275, "attempt": "1", "workflow": "tests"}}
             elif blank_identity:
                 result = {**result, "identity": {"id": "", "attempt": "1", "workflow": "tests"}}
+            elif oversized_identity:
+                result = {**result, "identity": {"id": "0" * 5000, "attempt": "1", "workflow": "tests"}}
             return result
 
         with patch.object(doctor, "_find_repo_root", return_value=self.test_root), \
@@ -3266,6 +3269,9 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
 
     def test_hosted_artifact_reports_identity_unavailable_when_blank(self):
         self._assert_hosted_artifact_rejection("ARTIFACT_IDENTITY_UNAVAILABLE", blank_identity=True)
+
+    def test_hosted_artifact_reports_identity_unavailable_when_oversized(self):
+        self._assert_hosted_artifact_rejection("ARTIFACT_IDENTITY_UNAVAILABLE", oversized_identity=True)
 
     def test_hosted_artifact_reports_expired(self):
         self._assert_hosted_artifact_rejection("ARTIFACT_EXPIRED", expired=True)
