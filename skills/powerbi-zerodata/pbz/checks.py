@@ -1192,6 +1192,13 @@ def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
     if not res.get("ok"):
         raise PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
     if action == "save":
+        results = res.get("queries") or []
+        if not any(isinstance(q, dict) and q.get("result") == "SAVED" for q in results):
+            # No query succeeded: leave any existing spec untouched and
+            # create nothing on a first-ever all-failed save. The failed
+            # per-query verdicts and the charge already spent stand.
+            res["verb"] = verb
+            return res
         directory = os.path.dirname(spec_path)
         if _reparse_link(ws.private) or _reparse_link(directory) or _reparse_link(spec_path):
             raise PbzError("UNSAFE_PATH", "refusing to write through a link")

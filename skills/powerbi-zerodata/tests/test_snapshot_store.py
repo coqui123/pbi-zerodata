@@ -355,7 +355,7 @@ class SnapshotStoreTests(unittest.TestCase):
             shutil.rmtree(self.snaps)
         self.assertFalse(self.snaps.exists())
         with patch("pbz.desktop.require_port", return_value=1234), \
-             patch("pbz.checks.engine_call", return_value={"ok": True, "class": "OK"}), \
+             patch("pbz.checks.engine_call", return_value={"ok": True, "class": "OK", "queries": [{"id": "q1", "result": "SAVED"}]}), \
              patch("pbz.checks.spend", return_value=True):
             res = checks.snapshot(self.ws, None, "save", "fresh_snap", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
             self.assertTrue(res.get("ok"))
@@ -780,7 +780,7 @@ class SnapshotStoreTests(unittest.TestCase):
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as handle:
                 handle.write(written)
-            return {"ok": True, "class": "OK"}
+            return {"ok": True, "class": "OK", "queries": [{"id": "q1", "result": "SAVED"}]}
 
         real_replace = os.replace
 

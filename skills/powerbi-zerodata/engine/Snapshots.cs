@@ -148,6 +148,13 @@ public static class Snapshots
             }
             outArr.Add(o);
         }
+        if (stored.Count == 0)
+        {
+            // No query succeeded (stored is populated only in the SAVED
+            // branch above): leave any existing baseline result untouched
+            // and create nothing on a first-ever all-failed save.
+            return Ctx.Ok("snapshot-save", new JsonObject { ["name"] = name, ["queries"] = outArr });
+        }
         var doc = new JsonObject
         {
             ["version"] = 1,
