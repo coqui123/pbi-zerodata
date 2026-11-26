@@ -355,7 +355,7 @@ class SnapshotStoreTests(unittest.TestCase):
             shutil.rmtree(self.snaps)
         self.assertFalse(self.snaps.exists())
         with patch("pbz.desktop.require_port", return_value=1234), \
-             patch("pbz.checks.engine_call", return_value={"ok": True, "class": "OK"}), \
+             patch("pbz.checks.engine_call", return_value={"ok": True, "class": "OK", "queries": [{"id": "q1", "result": "SAVED"}]}), \
              patch("pbz.checks.spend", return_value=True):
             res = checks.snapshot(self.ws, None, "save", "fresh_snap", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
             self.assertTrue(res.get("ok"))
@@ -780,7 +780,7 @@ class SnapshotStoreTests(unittest.TestCase):
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as handle:
                 handle.write(written)
-            return {"ok": True, "class": "OK"}
+            return {"ok": True, "class": "OK", "queries": [{"id": "q1", "result": "SAVED"}]}
 
         real_replace = os.replace
 
@@ -842,6 +842,98 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(payload["outcome"]["status"], "UNAVAILABLE")
         self.assertEqual(_tree(snaps), before)
         self.assertEqual(_public_budget(private, workspace), 0)
+
+    # PR A red tests: a save where no query succeeds must not publish.
+    # The adapter half is proven here with a response-only fake engine (it
+    # returns the engine verdicts and writes nothing itself, like the other
+    # adapter tests in this file). The result-file half is proven against the
+    # real engine in tests/test_engine.py, because a fake that writes the
+    # result file cannot be turned green by any adapter change.
+
+    _GOOD_RESULT = b'{"queries":{"q1":{"rows":["good"]}},"refreshed":"2026-01-01T00:00:00"}'
+    _OLD_SPEC = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+    _NEW_SPEC = {"queries": [{"id": "q1", "dax": "EVALUATE {2}"}]}
+
+    def _seed_good_pair(self):
+        (self.snaps / "results").mkdir(exist_ok=True)
+        (self.snaps / "specs").mkdir(exist_ok=True)
+        (self.snaps / "results" / "different.json").write_bytes(self._GOOD_RESULT)
+        spec_path = self.snaps / "specs" / "different.json"
+        spec_path.write_text(json.dumps(self._OLD_SPEC), encoding="utf-8")
+        return spec_path, spec_path.read_bytes()
+
+    def test_all_failed_save_preserves_spec_and_charge(self):
+        spec_path, spec_bytes = self._seed_good_pair()
+
+        def fake_engine(verb, payload, timeout=1800):
+            return {"ok": True, "verb": "snapshot-save", "name": "different",
+                    "queries": [{"id": "q1", "result": "ERROR", "class": "OTHER"}]}
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine):
+            res = checks.snapshot(self.ws, None, "save", "different", self._NEW_SPEC)
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(res["queries"][0]["result"], "ERROR")
+        self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 1)
+        self.assertEqual(spec_path.read_bytes(), spec_bytes)
+
+    def test_all_failed_save_preserves_spec_for_several_queries(self):
+        spec_path, spec_bytes = self._seed_good_pair()
+        spec = {"queries": [{"id": f"q{i}", "dax": f"EVALUATE {{{i}}}"} for i in (1, 2, 3)]}
+
+        def fake_engine(verb, payload, timeout=1800):
+            return {"ok": True, "verb": "snapshot-save", "name": "different",
+                    "queries": [{"id": q["id"], "result": "ERROR", "class": "OTHER"}
+                                for q in payload["queries"]]}
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine):
+            res = checks.snapshot(self.ws, None, "save", "different", spec)
+        self.assertEqual([q["result"] for q in res["queries"]], ["ERROR"] * 3)
+        self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 3)
+        self.assertEqual(spec_path.read_bytes(), spec_bytes)
+
+    def test_first_all_failed_save_creates_no_spec_and_no_temp(self):
+        def fake_engine(verb, payload, timeout=1800):
+            return {"ok": True, "verb": "snapshot-save", "name": "different",
+                    "queries": [{"id": "q1", "result": "ERROR", "class": "OTHER"}]}
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine):
+            res = checks.snapshot(self.ws, None, "save", "different", self._NEW_SPEC)
+        self.assertEqual(res["queries"][0]["result"], "ERROR")
+        self.assertFalse((self.snaps / "specs" / "different.json").exists())
+        leftovers = [p for p in self.snaps.rglob("*") if "snapshot-spec." in p.name]
+        self.assertEqual(leftovers, [])
+
+    def test_save_with_no_success_signal_does_not_write_spec(self):
+        for response in ({"ok": True, "verb": "snapshot-save", "name": "different", "queries": []},
+                         {"ok": True, "verb": "snapshot-save", "name": "different"}):
+            with self.subTest(response=response):
+                # Reseed inside the subtest so each response demonstrates its
+                # own failure, independent of what the previous case wrote.
+                spec_path, spec_bytes = self._seed_good_pair()
+                with patch("pbz.desktop.require_port", return_value=1), \
+                     patch("pbz.checks.engine_call", return_value=dict(response)):
+                    checks.snapshot(self.ws, None, "save", "different", self._NEW_SPEC)
+                self.assertEqual(spec_path.read_bytes(), spec_bytes)
+
+    def test_zero_row_success_still_publishes(self):
+        # Response-only control: the fake reports SAVED for a query whose
+        # result set is empty, and the adapter must still publish the spec.
+        # Result-file publication for a zero-row success is asserted against
+        # the real engine in tests/test_engine.py.
+        spec_path, _spec_bytes = self._seed_good_pair()
+
+        def fake_engine(verb, payload, timeout=1800):
+            return {"ok": True, "verb": "snapshot-save", "name": "different",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine):
+            res = checks.snapshot(self.ws, None, "save", "different", self._NEW_SPEC)
+        self.assertEqual(res["queries"][0]["result"], "SAVED")
+        self.assertEqual(json.loads(spec_path.read_text(encoding="utf-8")), self._NEW_SPEC)
 
     def test_engine_refuses_empty_queries_in_save_and_compare(self):
         # Direct engine call with empty queries must return BAD_REQUEST
