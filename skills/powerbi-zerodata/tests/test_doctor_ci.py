@@ -961,6 +961,26 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
             self.assertEqual(sk_extra["reason"], "PARSE_ERROR")
             self.assertIsNone(sk_extra["approved_count"])
 
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0, "needs a non-root POSIX process so directory read permission is enforced")
+    def test_doctor_ci_skip_unreadable_evidence_dir_is_not_a_match(self):
+        """An evidence directory that cannot be listed fails closed instead of matching the empty baseline.
+
+        With search permission only, provenance.json stays readable by name
+        but the sidecar listing comes back empty; the existing sidecar must
+        not be hidden by that.
+        """
+        sidecars_dir = self.test_root / "sidecars_unreadable"
+        sidecars_dir.mkdir()
+        (sidecars_dir / "engine.skips.jsonl").write_text("", encoding="utf-8")
+        (sidecars_dir / "provenance.json").write_text(json.dumps({"sha": "1" * 40, "platform": "posix", "exit_code": 0, "status": "passed"}), encoding="utf-8")
+        os.chmod(sidecars_dir, 0o111)
+        try:
+            sk = doctor.get_skips_status(skill_dir=SKILL, observed_sidecars_dir=sidecars_dir, expected_sha="1" * 40, require_provenance=True)
+        finally:
+            os.chmod(sidecars_dir, 0o755)
+        self.assertEqual(sk["status"], "mismatch")
+        self.assertEqual(sk["reason"], "PARSE_ERROR")
+
     def test_doctor_ci_skip_status_matching_artifact(self):
         """When prior sidecars match approved manifest per-suite, skips report match."""
         sidecars_dir = self.test_root / "sidecars"
