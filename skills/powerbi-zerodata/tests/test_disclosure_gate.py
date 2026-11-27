@@ -15,7 +15,7 @@ from pathlib import Path
 SKILL = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL))
 
-from pbz import audit, checks, cli, common, describe, dpapi, index_store, mirror, pbir, tmdl, tokens, unused  # noqa: E402
+from pbz import audit, checks, cli, common, describe, dpapi, index_store, lexers, mirror, pbir, tmdl, tokens, unused  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 from pbz.classify import Classifier, looks_like_phone  # noqa: E402
 from _junction import make_junction  # noqa: E402
@@ -971,6 +971,648 @@ class TypedSensitivityTests(unittest.TestCase):
             self.assertEqual(
                 self._m2_values(json.loads(restored)), [("SecretFlag", "true"), ("SecretFlag", "true")],
             )
+
+
+class EmbeddedRowConstructorTests(unittest.TestCase):
+    EVENTS = [
+        ("Name", "string"), ("Amount", "double"), ("When", "dateTime"),
+        ("Kind", "string"), ("R", "string"), ("X", "double"), ("Net Amount", "double"),
+    ]
+    _m3_modes = ({}, {"literals": "strict"})
+    _m3_edit = b"/// harmless m3 edit\n"
+    _m3_rows = '{{"qz-4815 widget", 7}, {"qz-90210 gadget", 67890}}'
+    _m3_type = "type table [Name = text, Amount = number]"
+    _m3_names = '{"Name", "Amount"}'
+    _m3_context = 'List.Contains(Table.Column(Table.FromRows({{12345}}, {"Amount"}), "Amount"), [Amount])'
+    _m3_context_default = 'List.Contains(Table.FromList({1}, null, {"Amount"}, 12345), [Amount])'
+    _m3_comment = ('Table.FromRows({{/* contact a@b.co */ "qz-4815 widget", 7}, '
+                   '{Table.FromRecords({424242})}}, SomeHeader)')
+
+    def _m3_tm(self):
+        result = object.__new__(tokens.TokenMap)
+        result.data = {"version": 1, "next": {}, "tokens": {}, "keys": {}}
+        result.dirty = False
+        return result
+
+    def _m3_header(self, table, columns):
+        header = f"table {table}\n"
+        for name, dtype in columns:
+            if " " in name:
+                name = f"'{name}'"
+            header += f"\tcolumn {name}\n\t\tdataType: {dtype}\n"
+        return header
+
+    def _m3_model(self, root, spec):
+        tables = Path(root) / "tables"
+        tables.mkdir()
+        for table, columns in spec.items():
+            (tables / f"{table}.tmdl").write_text(
+                self._m3_source(table, columns, "0"), encoding="utf-8",
+            )
+        return tmdl.load_model(root)
+
+    def _m3_events(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        return self._m3_model(root, {"Events": self.EVENTS})
+
+    def _m3_source(self, table, columns, expr, kind="m"):
+        return (
+            self._m3_header(table, columns)
+            + f"\tpartition {table} = {kind}\n\t\tmode: import\n\t\tsource = {expr}\n"
+        )
+
+    def _m3_tok(self, source, model, policy=None, clf=None):
+        tm = self._m3_tm()
+        if clf is None:
+            clf = Classifier(model, None, policy or {})
+        return tokens.tokenize_tmdl(source, "tables/Events.tmdl", model, clf, tm), tm
+
+    def _m3_roundtrip(self, source, model, policy=None, clf=None):
+        output, tm = self._m3_tok(source, model, policy, clf)
+        self.assertEqual(tokens.detokenize_tmdl(output, tm), (source, []))
+        return output
+
+    def _m3_sig(self, expr):
+        return lexers.significant(lexers.lex_m(expr, 0))
+
+    def _m3_tokens_in(self, text):
+        import re
+
+        return re.findall(r"«[^»]*»", text)
+
+    def _m3_source_line(self, text):
+        return next(line for line in text.splitlines() if "source =" in line)
+
+    def _m3_line_tokens(self, line):
+        return [token.split("#", 1)[0] for token in self._m3_tokens_in(line)]
+
+    def _m3_workspace(self, root, private, tables, policy):
+        if os.name != "nt":
+            # These synthetic workspaces exercise pull and push on hosts without Windows DPAPI.
+            self.enterContext(patch.object(dpapi, "protect", side_effect=lambda data: data))
+            self.enterContext(patch.object(dpapi, "unprotect", side_effect=lambda data: data))
+        m2 = TypedSensitivityTests()
+        visual = {
+            "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.10.0/schema.json",
+            "name": "v1",
+            "visual": {"visualType": "card", "objects": {"general": [{"properties": {
+                "title": {"expr": {"Literal": {"Value": m2._m2_titles[0]}}},
+                "title2": {"expr": {"Literal": {"Value": m2._m2_titles[1]}}},
+            }}]}},
+        }
+        files = {
+            Path("Mini.pbip"): json.dumps({
+                "version": "1.0", "artifacts": [
+                    {"report": {"path": "Mini.Report"}}, {"dataset": {"path": "Mini.SemanticModel"}},
+                ],
+            }),
+            Path("Mini.SemanticModel/model.tmdl"): "database\n\n" + "".join(
+                f"ref table {table}\n" for table in tables
+            ),
+            Path("Mini.SemanticModel/definition.pbism"): json.dumps({"version": "4.0", "settings": {}}),
+            Path("Mini.Report/definition.pbir"): json.dumps({
+                "version": "4.0", "datasetReference": {"byPath": {"path": "../Mini.SemanticModel"}},
+            }),
+            m2._m2_page_path: json.dumps(m2._m2_page([]), indent=2),
+            m2._m2_visual_path: json.dumps(visual, indent=2),
+            Path(".pbz/policy.json"): json.dumps({
+                "sensitive_columns": [
+                    f"{table}[{column}]" for table, (columns, _, _) in tables.items()
+                    for column, _ in columns if column in ("Name", "Amount")
+                ],
+                **policy,
+            }),
+        }
+        for table_index, (table, (columns, kind, expr)) in enumerate(tables.items(), 1):
+            source = self._m3_source(table, columns, expr, kind)
+            for index, (column, _) in enumerate(columns, 1):
+                source = source.replace(
+                    f"\tcolumn {column}\n",
+                    f"\tcolumn {column}\n"
+                    f"\t\tlineageTag: 00000000-0000-0000-{table_index:04d}-{index:012d}\n",
+                    1,
+                )
+            files[self._m3_table_path(table)] = source
+        for relative, content in files.items():
+            path = Path(root) / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content.encode("utf-8"))
+        ws = common.Workspace(root)
+        ws.private = private
+        return ws, ws.project()
+
+    def _m3_table_path(self, table):
+        return Path(f"Mini.SemanticModel/definition/tables/{table}.tmdl")
+
+    def _m3_forms(self):
+        rows, header, names = self._m3_rows, self._m3_type, self._m3_names
+        columns = self.EVENTS[:2]
+        amount = [self.EVENTS[1]]
+        return {
+            "FDataTable": (columns, "calculated", f'DATATABLE("Name", STRING, "Amount", DOUBLE, {rows})'),
+            "FHashType": (columns, "m", f"#table({header}, {rows})"),
+            "FHashNames": (columns, "m", f"#table({names}, {rows})"),
+            "FFromRowsType": (columns, "m", f"Table.FromRows({rows}, {header})"),
+            "FFromRowsNames": (columns, "m", f"Table.FromRows({rows}, {names})"),
+            "FFromRecords": (columns, "m", 'Table.FromRecords({[Name = "qz-4815 widget", Amount = 7], '
+                             '[Name = "qz-90210 gadget", Amount = 67890]})'),
+            "FFromColumns": (columns, "m", 'Table.FromColumns({{"qz-4815 widget", "qz-90210 gadget"}, '
+                             f"{{7, 67890}}}}, {names})"),
+            "FFromList": (amount, "m", 'Table.FromList({7, 67890}, null, {"Amount"})'),
+            "FHashAmount": (amount, "m", '#table({"Amount"}, {{7}, {67890}})'),
+        }
+
+    def _m3_assert_hidden(self, authored, published, columns):
+        spellings = ("67890",)
+        if len(columns) == 2:
+            spellings = ("qz-4815 widget", "qz-90210 gadget", *spellings)
+        for spelling in spellings:
+            self.assertIn(spelling, authored)
+            self.assertNotIn(spelling, published)
+
+    def _m3_push_restored(self, root, ws, project, paths):
+        originals = {}
+        for path in paths:
+            originals[path] = (Path(root) / path).read_bytes()
+            published = Path(ws.mirror) / path
+            published.write_bytes(self._m3_edit + published.read_bytes())
+        with patch("pbz.mirror.desktop.processes", return_value=[]), patch(
+            "pbz.mirror.validate.run_stage", return_value=[],
+        ):
+            result = mirror.push(ws, project)
+        self.assertEqual(result["result"], "PUSHED", result)
+        for path, original in originals.items():
+            self.assertEqual((Path(root) / path).read_bytes(), self._m3_edit + original)
+
+    def test_public_pull_equivalence(self):
+        tables = self._m3_forms()
+        expected_labels = {
+            "FDataTable": ("Name", "Amount", "Name", "Amount"),
+            "FHashType": ("Name", "Amount", "Name", "Amount"),
+            "FHashNames": ("Name", "Amount", "Name", "Amount"),
+            "FFromRowsType": ("Name", "Amount", "Name", "Amount"),
+            "FFromRowsNames": ("Name", "Amount", "Name", "Amount"),
+            "FFromRecords": ("Name", "Amount", "Name", "Amount"),
+            "FFromColumns": ("Name", "Name", "Amount", "Amount"),
+            "FFromList": ("Amount", "Amount"),
+            "FHashAmount": ("Amount", "Amount"),
+        }
+        fragments = ("{7}", "{7,", ", 7}", ", 7,", "Amount = 7]")
+        for policy in self._m3_modes:
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+                ws, project = self._m3_workspace(root, private, tables, policy)
+                mirror.pull(ws, project)
+                paired_lines = {}
+                for table, (columns, _, _) in tables.items():
+                    with self.subTest(table=table):
+                        path = self._m3_table_path(table)
+                        authored = (Path(root) / path).read_text(encoding="utf-8")
+                        published = (Path(ws.mirror) / path).read_text(encoding="utf-8")
+                        line = self._m3_source_line(published)
+                        if table in ("FFromList", "FHashAmount"):
+                            paired_lines[table] = line
+                        self._m3_assert_hidden(authored, published, columns)
+                        for column, _ in columns:
+                            self.assertEqual(line.count(f"«{table}[{column}]#"), 2)
+                        self.assertEqual(
+                            self._m3_line_tokens(line),
+                            [f"«{table}[{column}]" for column in expected_labels[table]],
+                        )
+                        authored_line = self._m3_source_line(authored)
+                        self.assertTrue(any(fragment in authored_line for fragment in fragments))
+                        for fragment in fragments:
+                            self.assertNotIn(fragment, line)
+                self.assertEqual(
+                    [token.replace("FFromList", "T") for token in self._m3_line_tokens(paired_lines["FFromList"])],
+                    [token.replace("FHashAmount", "T") for token in self._m3_line_tokens(paired_lines["FHashAmount"])],
+                )
+
+    def test_public_pull_push_restores_each_file(self):
+        tables = self._m3_forms()
+        for policy in self._m3_modes:
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+                ws, project = self._m3_workspace(root, private, tables, policy)
+                mirror.pull(ws, project)
+                for table, (columns, _, _) in tables.items():
+                    path = self._m3_table_path(table)
+                    self._m3_assert_hidden(
+                        (Path(root) / path).read_text(encoding="utf-8"),
+                        (Path(ws.mirror) / path).read_text(encoding="utf-8"), columns,
+                    )
+                self._m3_push_restored(root, ws, project, [self._m3_table_path(table) for table in tables])
+
+    def test_public_category_text_visible(self):
+        tables = {
+            "FCatHash": ([("Kind", "string")], "m", '#table({"Kind"}, {{"Internal"}})'),
+            "FCatList": ([("Kind", "string")], "m", 'Table.FromList({"Internal"}, null, {"Kind"})'),
+        }
+        policy = {"category_columns": [f"{table}[Kind]" for table in tables]}
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+            ws, project = self._m3_workspace(root, private, tables, policy)
+            mirror.pull(ws, project)
+            for table in tables:
+                path = Path(ws.mirror) / self._m3_table_path(table)
+                self.assertIn("Internal", path.read_text(encoding="utf-8"))
+
+    def test_public_uncertain_fromrows_withheld(self):
+        columns = self.EVENTS[:2]
+        tables = {"FUncertain": (columns, "m", f"Table.FromRows({self._m3_rows})")}
+        path = self._m3_table_path("FUncertain")
+        fragments = ("{7}", "{7,", ", 7}", ", 7,")
+        for policy in self._m3_modes:
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+                ws, project = self._m3_workspace(root, private, tables, policy)
+                mirror.pull(ws, project)
+                authored = (Path(root) / path).read_text(encoding="utf-8")
+                published = (Path(ws.mirror) / path).read_text(encoding="utf-8")
+                self._m3_assert_hidden(authored, published, columns)
+                authored_line = self._m3_source_line(authored)
+                published_line = self._m3_source_line(published)
+                self.assertEqual(len(self._m3_tokens_in(published_line)), 1)
+                self.assertTrue(any(fragment in authored_line for fragment in fragments))
+                for fragment in fragments:
+                    self.assertNotIn(fragment, published_line)
+                self._m3_push_restored(root, ws, project, [path])
+
+    def test_unit_equivalence_eight_forms(self):
+        model = self._m3_events()
+        forms = self._m3_forms()
+        del forms["FHashAmount"]
+        forms["FFromList"] = (
+            [self.EVENTS[0]], "m",
+            'Table.FromList({"qz-4815 widget", "qz-90210 gadget"}, null, {"Name"})',
+        )
+        for policy in self._m3_modes:
+            for form, (_, kind, expr) in forms.items():
+                with self.subTest(policy=policy, form=form):
+                    source = self._m3_source("Events", self.EVENTS, expr, kind)
+                    line = self._m3_source_line(self._m3_roundtrip(source, model, policy))
+                    for spelling in ("qz-4815 widget", "qz-90210 gadget", "67890", "7"):
+                        self.assertNotIn(spelling, line)
+
+    def test_unit_category_pairing_states(self):
+        model = self._m3_events()
+        forms = ('#table({"Kind"}, {{"Internal"}})', 'Table.FromList({"Internal"}, null, {"Kind"})')
+        for policy in self._m3_modes:
+            for state in ("heuristic", "index"):
+                with self.subTest(policy=policy, state=state):
+                    pol = {"category_columns": ["Events[Kind]"], **policy}
+                    clf = Classifier(model, None, pol)
+                    if state == "index":
+                        clf.index = {"columns": {"Events[Kind]": {}}}
+                        clf.categories = {"Events[Kind]": ["Internal", "External"]}
+                        clf.mode = "index"
+                        clf.key = b"m3-test-key"
+                    expected = "«Events[Kind]#" if policy and state == "heuristic" else "Internal"
+                    for expr in forms:
+                        source = self._m3_source("Events", self.EVENTS, expr)
+                        self.assertIn(expected, self._m3_roundtrip(source, model, clf=clf))
+
+    def test_explicit_policy_string_hidden(self):
+        model = self._m3_events()
+        forms = (
+            '#table({"Name", "Amount"}, {{"qz-4815 widget", 7}})',
+            'Table.FromRows({{"qz-4815 widget", 7}}, {"Name", "Amount"})',
+            'Table.FromRecords({[Name = "qz-4815 widget", Amount = 7]})',
+        )
+        for policy in self._m3_modes:
+            pol = {"sensitive_columns": ["Events[Name]", "Events[Amount]"], **policy}
+            for expr in forms:
+                with self.subTest(policy=policy, expr=expr):
+                    source = self._m3_source("Events", self.EVENTS, expr)
+                    self.assertNotIn("qz-4815 widget", self._m3_roundtrip(source, model, pol))
+
+    def test_uncertain_shapes_withheld(self):
+        import re
+
+        model = self._m3_events()
+        cases = (
+            ("a", f"Table.FromRows({self._m3_rows})", ("qz-4815 widget", "qz-90210 gadget", "67890"), 1),
+            ("b", 'Table.FromRows({{"qz-4815 widget", 7}}, SomeHeader("a@b.co"))',
+             ("qz-4815 widget", "a@b.co"), 1),
+            ("c", '#table({"Name", "Amount"}, {{"qz-4815 widget", 7, 99999}})', ("99999",), 1),
+            ("d", 'Table.FromRecords({[Name = "qz-4815 widget", Amount = 7], 424242})', ("424242",), 1),
+            ("e", '#table({"Name", "Amount"}, {{"qz-4815 widget", 12345}})', ("12345",), 1),
+            ("f", 'Table.FromRows({List.Combine({{12345}, {67890}})}, {"Amount"})', ("12345", "67890"), 1),
+            ("g", '#table({"Amount"}, {{1, 2} & {3}})', (), 1),
+            ("h", '#table({"Amount"}, {{731}} & {{842}})', (), 1),
+            ("i", 'DATATABLE("Amount", "Amount2", {{731}})', ("731",), 1),
+            ("j", '#table(type table [Amount = number] extra, {{731}})', ("731",), 1),
+            ("k", '#table({"Amount"}, {{731})', ("731",), 1),
+            ("l", 'Table.FromList({731, 842}, MySplitter, {"Amount"})', ("731", "842"), 1),
+            ("m", 'Table.FromList({731}, null, {"Amount", "Name"})', ("731",), 1),
+            ("n", 'Table.FromList({731, 842}, null, {"Amount"}, 1 + 2)', ("731", "842"), 1),
+            ("o", 'Table.FromList({731}, MySplitter, {"Amount"}, 1 + 2)', ("731",), 2),
+            ("p", 'Table.FromList({}, null, {"Amount"}, Number.FromText("67890"))', ("67890",), 1),
+            ("q", 'Table.FromList({}, null, {"Amount", "Name"}, 12345)', ("12345",), 1),
+            ("r", '#table({"Amount"}, {{731}}', ("731",), 1),
+            ("s", 'DATATABLE("Amount", DOUBLE, {{731}}', ("731",), 1),
+            ("t", '#table({"Amount"}, {{[731}})', ("731",), 1),
+            ("u", '#table({"Amount"}, {{731]}})', ("731",), 1),
+            ("v", 'Table.FromRows({{731]}}, {"Amount"})', ("731",), 1),
+            ("w", '#table({"Amount"}, {{({731)}}})', ("731",), 1),
+            ("x", 'Table.FromRows({{731}}, , {"Amount"})', ("731",), 1),
+            ("y", '#table(, {{731}})', ("731",), 1),
+            ("extraValues", 'Table.FromList({731}, null, {"Amount"}, null, 5)', (), 0),
+        )
+        for shape, expr, spellings, payload_count in cases:
+            with self.subTest(shape=shape):
+                if shape == "e":
+                    source = f"expression Shared = {expr}\n"
+                    tm = self._m3_tm()
+                    empty = tmdl.Model()
+                    output = tokens.tokenize_tmdl(source, "model.tmdl", empty, Classifier(empty, None, {}), tm)
+                    line = output
+                else:
+                    kind = "calculated" if shape in ("i", "s") else "m"
+                    source = self._m3_source("Events", self.EVENTS, expr, kind)
+                    output, tm = self._m3_tok(source, model)
+                    line = self._m3_source_line(output)
+                for spelling in spellings:
+                    self.assertNotIn(spelling, output)
+                self.assertEqual(line.count("«payload:"), payload_count)
+                if shape == "b":
+                    self.assertIn("«pii#", output)
+                if shape in ("g", "h", "r", "s"):
+                    self.assertNotIn("«Events[Amount]#", line)
+                if shape == "n":
+                    self.assertEqual(line.count("«Events[Amount]#"), 2)
+                    self.assertIn('"Amount"', output)
+                    self.assertTrue(re.search(
+                        r'Table\.FromList\(\{«Events\[Amount\]#\d+», «Events\[Amount\]#\d+»\}, null, \{"Amount"\}, «payload:',
+                        line,
+                    ))
+                if shape == "o":
+                    self.assertTrue(re.search(
+                        r'Table\.FromList\(«payload:[^»]*», MySplitter, \{"Amount"\}, «payload:', line,
+                    ))
+                if shape == "p":
+                    self.assertIn("{}", output)
+                    self.assertTrue(re.search(r'Table\.FromList\(\{\}, null, \{"Amount"\}, «payload:', line))
+                if shape == "q":
+                    self.assertTrue(re.search(r'Table\.FromList\(\{\}, null, \{"Amount", "Name"\}, «payload:', line))
+                if shape == "r":
+                    self.assertTrue(re.search(r'#table\(\{"Amount"\}, «payload:', line))
+                    self.assertTrue(line.rstrip().endswith("»"))
+                if shape == "s":
+                    self.assertTrue(re.search(r'DATATABLE\("Amount", DOUBLE, «payload:', line))
+                    self.assertTrue(line.rstrip().endswith("»"))
+                if shape == "extraValues":
+                    self.assertEqual(line.count("«Events[Amount]#"), 1)
+                    self.assertIn(", null, 5)", line)
+                self.assertEqual(tokens.detokenize_tmdl(output, tm), (source, []))
+
+    def _m3_row_bindings(self, expr, model, expected):
+        sig = self._m3_sig(expr)
+        result = tokens.bind_literals(sig, "m", "Events", model)
+        self.assertIsInstance(result, tuple)
+        binding, _ = result
+        actual = [
+            (tok.value if tok.kind == "str" else tok.text, binding.get(index))
+            for index, tok in enumerate(sig)
+            if (tok.kind == "str" and tok.value in expected)
+            or (tok.kind == "num" and tok.text in expected)
+        ]
+        self.assertEqual(actual, [(value, ("Events", column, "row")) for value, column in expected.items()])
+
+    def test_attribution_correctness(self):
+        import re
+
+        model = self._m3_events()
+        with self.subTest(item="a"):
+            expr = '#table(type table [Name = text, Amount = number], {{Text.Repeat("x", 3), 67890}})'
+            output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+            self.assertEqual(
+                [token.split("#", 1)[0] for token in self._m3_tokens_in(output)],
+                ["«Events[Name]", "«Events[Name]", "«Events[Amount]"],
+            )
+        with self.subTest(item="b"):
+            expr = '#table({"Amount"}, {{Number.FromText("123.45", "en-US")}})'
+            self._m3_row_bindings(expr, model, {"123.45": "Amount", "en-US": "Amount"})
+            result = tokens.bind_literals(self._m3_sig(expr), "m", "Events", model)
+            self.assertIsInstance(result, tuple)
+            self.assertEqual(result[1], [])
+        date_rows = '{{"qz-4815 widget", #date(2024, 1, 15), 67890}}'
+        date_type = "type table [Name = text, When = date, Amount = number]"
+        date_names = '{"Name", "When", "Amount"}'
+        date_forms = (
+            ("m", f"#table({date_type}, {date_rows})"),
+            ("m", f"#table({date_names}, {date_rows})"),
+            ("m", f"Table.FromRows({date_rows}, {date_type})"),
+            ("m", f"Table.FromRows({date_rows}, {date_names})"),
+            ("m", 'Table.FromRecords({[Name = "qz-4815 widget", When = #date(2024, 1, 15), Amount = 67890]})'),
+            ("calculated", 'DATATABLE("Name", STRING, "When", DATETIME, "Amount", DOUBLE, '
+             '{{"qz-4815 widget", DATE(2024, 1, 15), 67890}})'),
+        )
+        for kind, expr in date_forms:
+            with self.subTest(item="c", expr=expr):
+                output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr, kind), model)
+                self.assertEqual(
+                    self._m3_line_tokens(output),
+                    ["«Events[Name]", "«Events[When]", "«Events[When]", "«Events[When]", "«Events[Amount]"],
+                )
+        with self.subTest(item="d"):
+            expr = 'Table.FromColumns({{Number.FromText("123.45", "en-US")}, {67890}}, {"Amount", "X"})'
+            self._m3_row_bindings(expr, model, {"123.45": "Amount", "en-US": "Amount", "67890": "X"})
+        with self.subTest(item="e"):
+            expr = '#table(type table [#"Net Amount" = number], {{12345}})'
+            output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+            self.assertNotIn("12345", output)
+            self.assertIn("«Events[Net Amount]#", output)
+        with self.subTest(item="f"):
+            expr = '#table(type table [R = [X = number], Amount = number], {{"a", 2}})'
+            output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+            self.assertNotIn("«Events[X]#", output)
+            self.assertIn("«Events[Amount]#", output)
+        with self.subTest(item="g"):
+            expr = '#table(type table [Amount = number], {{{12345}}})'
+            output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+            self.assertIn("«Events[Amount]#", output)
+        with self.subTest(item="h"):
+            expr = 'Table.FromList({731}, null, {"Amount"}, 7)'
+            output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+            self.assertEqual(output.count("«Events[Amount]#"), 2)
+        with self.subTest(item="i"):
+            expr = 'Table.FromList({}, null, {"Amount"}, 12345)'
+            output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+            self.assertNotIn("12345", output)
+            self.assertEqual(output.count("«Events[Amount]#"), 1)
+        with self.subTest(item="j"):
+            expr = 'Table.FromList({731, 842}, MySplitter, {"Amount"}, 7)'
+            output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+            self.assertEqual(output.count("«payload:"), 1)
+            self.assertEqual(output.count("«Events[Amount]#"), 1)
+            line = self._m3_source_line(output)
+            self.assertTrue(re.search(
+                r'Table\.FromList\(«payload:[^»]*», MySplitter, \{"Amount"\}, «Events\[Amount\]#\d+»\)', line))
+        with self.subTest(item="k"):
+            expr = (
+                'Table.FromRecords({[Name = "qz-4815 widget", Amount = 7]}, '
+                '{"Name", "Amount"}, {"x", "a@b.co"})'
+            )
+            output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+            self.assertIn("«Events[Name]#", output)
+            self.assertNotIn("qz-4815 widget", output)
+            self.assertNotIn("a@b.co", output)
+            self.assertIn("«pii#", output)
+            self.assertIn('"Name"', output)
+            self.assertIn('"Amount"', output)
+
+    def test_fromrecords_optional_args_binder(self):
+        model = self._m3_events()
+        expr = ('Table.FromRecords({[Name = "qz-4815 widget", Amount = 7]}, '
+                '{"Name", "Amount"}, {"x", "a@b.co"})')
+        sig = self._m3_sig(expr)
+        result = tokens.bind_literals(sig, "m", "Events", model)
+        self.assertIsInstance(result, tuple)
+        binding, spans = result
+        self.assertEqual(spans, [])
+        for index, tok in enumerate(sig):
+            if tok.kind == "str" and tok.value in ("Name", "Amount"):
+                self.assertEqual(binding.get(index), "skip", (index, tok))
+            if tok.kind == "str" and tok.value == "qz-4815 widget":
+                self.assertEqual(binding.get(index), ("Events", "Name", "row"))
+            if tok.kind == "num" and tok.text == "7":
+                self.assertEqual(binding.get(index), ("Events", "Amount", "row"))
+            if tok.kind == "str" and tok.value == "a@b.co":
+                self.assertIsNone(binding.get(index))
+
+    def test_contextual_ownership_tokenize(self):
+        model = self._m3_events()
+        for expr in (self._m3_context, self._m3_context_default):
+            with self.subTest(expr=expr):
+                source = self._m3_source("Events", self.EVENTS, expr)
+                output, _ = self._m3_tok(source, model)
+                self.assertNotIn("12345", output)
+
+    def test_bare_function_reference_binds(self):
+        model = self._m3_events()
+        expr = '#table({"Amount", "Kind"}, {{731, Table.FromRows}})'
+        output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+        line = self._m3_source_line(output)
+        self.assertNotIn("731", line)
+        self.assertNotIn("«payload:", line)
+        self.assertIn("«Events[Amount]#1»", line)
+        self.assertIn("Table.FromRows", line)
+
+    def test_contextual_ownership_binder(self):
+        model = self._m3_events()
+        for expr in (self._m3_context, self._m3_context_default):
+            with self.subTest(expr=expr):
+                self._m3_row_bindings(expr, model, {"12345": "Amount"})
+
+    def test_nested_constructor_isolation(self):
+        model = self._m3_events()
+        expr = 'Table.FromRows({{#table({"Amount"}, {{12345}})}}, {"Amount"})'
+        output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+        self.assertNotIn("12345", output)
+        self.assertEqual(self._m3_source_line(output).count("«payload:"), 1)
+
+    def test_nested_containment_comment(self):
+        model = self._m3_events()
+        source = self._m3_source("Events", self.EVENTS, self._m3_comment)
+        output, tm = self._m3_tok(source, model)
+        self.assertEqual(output.count("«payload:"), 1)
+        self.assertNotIn("a@b.co", output)
+        self.assertNotIn("qz-4815 widget", output)
+        self.assertNotIn("424242", output)
+        records = [record for record in tm.data["tokens"].values() if "a@b.co" in str(record)]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["kind"], "raw")
+        self.assertIn("424242", str(records[0]))
+        self.assertEqual(tokens.detokenize_tmdl(output, tm), (source, []))
+
+    def test_nested_containment_binder_spans(self):
+        model = self._m3_events()
+        result = tokens.bind_literals(self._m3_sig(self._m3_comment), "m", "Events", model)
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result[1]), 1)
+
+    def test_spelling_variant_limit_pin(self):
+        model = self._m3_events()
+        forms = (
+            '#table({"Amount"}, {{1.5}, {1.50}})',
+            'Table.FromRecords({[Amount = 1.5], [Amount = 1.50]})',
+        )
+        for expr in forms:
+            with self.subTest(expr=expr):
+                source = self._m3_source("Events", self.EVENTS, expr)
+                output, tm = self._m3_tok(source, model)
+                sites = self._m3_tokens_in(self._m3_source_line(output))
+                self.assertEqual(len(sites), 2)
+                self.assertEqual(sites[0], sites[1])
+                restored, unknown = tokens.detokenize_tmdl(output, tm)
+                self.assertNotEqual(restored, source)
+                self.assertEqual(restored, source.replace("1.50", "1.5"))
+                self.assertEqual(unknown, [])
+
+    def test_controls_unchanged(self):
+        model = self._m3_events()
+        with self.subTest(control="ordinary constant"):
+            source = self._m3_source("Events", self.EVENTS, "let Threshold = 12345 in Threshold")
+            output, _ = self._m3_tok(source, model)
+            self.assertIn("12345", output)
+        with self.subTest(control="empty typed table"):
+            columns = [*self.EVENTS, ("Note", "string")]
+            root = self.enterContext(tempfile.TemporaryDirectory())
+            note_model = self._m3_model(root, {"Events": columns})
+            source = self._m3_source("Events", columns, '#table(type table [Note = text], {})')
+            output, _ = self._m3_tok(source, note_model)
+            self.assertEqual(output, source)
+        with self.subTest(control="base64"):
+            base64 = "QUJD" * 60
+            expr = f'Table.FromRows(Json.Document(Binary.Decompress(Binary.FromText("{base64}"))))'
+            source = self._m3_source("Events", self.EVENTS, expr)
+            output, _ = self._m3_tok(source, model)
+            self.assertEqual(output.count("«payload:"), 1)
+            self.assertIn("«payload:Events#", output)
+            self.assertNotIn(base64, output)
+            self.assertNotIn("«Events[", output)
+        with self.subTest(control="category"):
+            source = self._m3_source("Events", self.EVENTS, '#table({"Kind"}, {{"Internal"}})')
+            output, _ = self._m3_tok(source, model, {"category_columns": ["Events[Kind]"]})
+            self.assertIn("Internal", output)
+        with self.subTest(control="rename pairs"):
+            expr = 'Table.RenameColumns(#table({"Amount"}, {{7}}), {{"Amount", "Total"}})'
+            source = self._m3_source("Events", self.EVENTS, expr)
+            output, _ = self._m3_tok(source, model)
+            self.assertIn("Total", output)
+        with self.subTest(control="empty rows"):
+            source = self._m3_source("Events", self.EVENTS, 'Table.FromRows({}, {"Amount"})')
+            output, _ = self._m3_tok(source, model)
+            self.assertEqual(output, source)
+        with self.subTest(control="literal-free nested"):
+            source = self._m3_source(
+                "Events", self.EVENTS, 'Table.FromRows({{#table(type table [Amount = number], {})}}, {"Amount"})',
+            )
+            output, _ = self._m3_tok(source, model)
+            self.assertEqual(output, source)
+        with self.subTest(control="over-width null"):
+            source = self._m3_source("Events", self.EVENTS, '#table({"Amount"}, {{731, null}})')
+            output = self._m3_roundtrip(source, model)
+            self.assertNotIn("731", output)
+            self.assertNotIn("«payload:", output)
+        with self.subTest(control="unmatched new constructor"):
+            source = self._m3_source("Events", self.EVENTS, 'Table.FromRows({{12345}}, {"Amount"}')
+            output, _ = self._m3_tok(source, model)
+            self.assertIn("12345", output)
+
+    def test_fixture_guard_zero_opaque_spans(self):
+        root = Path(__file__).resolve().parent / "fixture" / "Canary.SemanticModel"
+        model = tmdl.load_model(str(root))
+        self.assertTrue(model.tables)
+        for path in sorted(root.rglob("*.tmdl")):
+            relpath = path.relative_to(root).as_posix()
+            text = path.read_text(encoding="utf-8")
+            for region in tmdl.parse(relpath, text).regions:
+                if region.kind in ("dax", "m"):
+                    with self.subTest(path=relpath, start=region.start):
+                        segment = text[region.start:region.end]
+                        lex = lexers.lex_dax if region.kind == "dax" else lexers.lex_m
+                        sig = lexers.significant(lex(segment, region.start))
+                        result = tokens.bind_literals(sig, region.kind, tokens._table_of(region.node), model)
+                        self.assertIsInstance(result, tuple)
+                        self.assertEqual(result[1], [])
 
 
 if __name__ == "__main__":

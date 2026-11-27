@@ -341,9 +341,109 @@ def _split_args(sig, open_idx, close_idx):
     return [(a, b) for a, b in args if a < b]
 
 
-def bind_literals(sig: list, lang: str, cur_table: str | None, model) -> dict:
-    """Map index in sig -> (table, column) or 'skip' (column names in DATATABLE / #table headers)."""
+def _split_args_keep(sig, open_idx, close_idx):
+    """Top-level argument index ranges inside a call's parentheses, keeping empty arguments."""
+    args, depth, start = [], 0, open_idx + 1
+    for k in range(open_idx + 1, close_idx):
+        t = sig[k]
+        if t.kind == "op" and t.text in ("(", "{", "["):
+            depth += 1
+        elif t.kind == "op" and t.text in (")", "}", "]"):
+            depth -= 1
+        elif t.kind == "op" and t.text == "," and depth == 0:
+            args.append((start, k))
+            start = k + 1
+    args.append((start, close_idx))
+    return args
+
+
+def _match_span(sig, i, open_text, close_text):
+    depth = 0
+    for j in range(i, len(sig)):
+        t = sig[j]
+        if t.kind == "op" and t.text == open_text:
+            depth += 1
+        elif t.kind == "op" and t.text == close_text:
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+
+def _balanced(sig, a, b):
+    stack = []
+    pairs = {"{": "}", "(": ")", "[": "]"}
+    for k in range(a, b):
+        t = sig[k]
+        if t.kind != "op":
+            continue
+        if t.text in pairs:
+            stack.append(pairs[t.text])
+        elif t.text in "})]":
+            if not stack or stack.pop() != t.text:
+                return False
+    return not stack
+
+
+def _split_commas(sig, a, b):
+    depths = {"{": 0, "(": 0, "[": 0}
+    opens = {"}": "{", ")": "(", "]": "["}
+    parts, start = [], a
+    for k in range(a, b):
+        t = sig[k]
+        if t.kind != "op":
+            continue
+        if t.text in depths:
+            depths[t.text] += 1
+        elif t.text in opens:
+            depths[opens[t.text]] -= 1
+        elif t.text == "," and not any(depths.values()):
+            parts.append((start, k))
+            start = k + 1
+    parts.append((start, b))
+    return parts
+
+
+def _extract_header(sig, a, b):
+    if not _balanced(sig, a, b) or a == b:
+        return None
+    if sig[a].text == "{" and _match_span(sig, a, "{", "}") == b - 1:
+        if a + 1 == b - 1:
+            return [], []
+        indices = []
+        for start, end in _split_commas(sig, a + 1, b - 1):
+            if start == end:
+                return None
+            if end - start != 1 or sig[start].kind != "str":
+                return None
+            indices.append(start)
+        return [sig[k].value for k in indices], indices
+    if b - a >= 4 and all(sig[a + k].kind == "ident" and sig[a + k].text == name
+                          for k, name in enumerate(("type", "table"))) \
+            and sig[a + 2].kind == "op" and sig[a + 2].text == "[" \
+            and _match_span(sig, a + 2, "[", "]") == b - 1:
+        if a + 3 == b - 1:
+            return [], []
+        names = []
+        for start, end in _split_commas(sig, a + 3, b - 1):
+            if start == end:
+                return None
+            name = sig[start]
+            if end - start < 2 or name.kind not in ("ident", "qident", "bracket") \
+                    or sig[start + 1].kind != "op" or sig[start + 1].text != "=":
+                return None
+            names.append(name.value.split("=")[0].strip() if name.kind == "bracket" else name.value)
+        return names, []
+    return None
+
+
+_M_ROW_CONSTRUCTORS = ("TABLE.FROMROWS", "TABLE.FROMCOLUMNS", "TABLE.FROMRECORDS", "TABLE.FROMLIST")
+
+
+def bind_literals(sig: list, lang: str, cur_table: str | None, model) -> tuple[dict, list[tuple[int, int]]]:
+    """Return literal bindings and inclusive sig ranges to withhold as one opaque payload token each."""
     binding: dict[int, object] = {}
+    opaque_spans: list[tuple[int, int]] = []
     colref: dict[int, tuple] = {}   # index of the token that *ends* a column ref -> (table, col)
     start_of: dict[int, int] = {}   # end index -> start index of that ref
     tables = model.tables if model else {}
@@ -391,6 +491,84 @@ def bind_literals(sig: list, lang: str, cur_table: str | None, model) -> dict:
 
     lits = {i for i, t in enumerate(sig) if t.kind in ("str", "num")}
 
+    def lits_in(a, b):
+        return {k for k in range(a, b) if k in lits}
+
+    def constructor_head(m):
+        t = sig[m]
+        if t.kind == "ident" and t.text.upper() in ("DATATABLE", *_M_ROW_CONSTRUCTORS):
+            return m + 1 < len(sig) and sig[m + 1].text == "("
+        return t.text == "#" and m + 2 < len(sig) and sig[m + 1].text == "table" and sig[m + 2].text == "("
+
+    def list_span(a, b):
+        return a < b and sig[a].text == "{" and _match_span(sig, a, "{", "}") == b - 1
+
+    def assign(local, indices, name):
+        for k in indices:
+            local[k] = (cur_table, name, "row")
+
+    def _validate_rows(sig, cand_a, cand_b, names, local):
+        for a, b in _split_commas(sig, cand_a + 1, cand_b - 1):
+            if not lits_in(a, b):
+                continue
+            if not list_span(a, b):
+                return False
+            for pos, (ca, cb) in enumerate(_split_commas(sig, a + 1, b - 1)):
+                cell = lits_in(ca, cb)
+                if cell:
+                    if pos >= len(names):
+                        return False
+                    assign(local, cell, names[pos])
+        return True
+
+    def _validate_columns(sig, cand_a, cand_b, names, local):
+        for pos, (a, b) in enumerate(_split_commas(sig, cand_a + 1, cand_b - 1)):
+            column = lits_in(a, b)
+            if column:
+                if pos >= len(names) or not list_span(a, b):
+                    return False
+                assign(local, column, names[pos])
+        return True
+
+    def _validate_records(sig, cand_a, cand_b, names, local):
+        for a, b in _split_commas(sig, cand_a + 1, cand_b - 1):
+            if not lits_in(a, b):
+                continue
+            if sig[a].text != "[" or _match_span(sig, a, "[", "]") != b - 1:
+                return False
+            for fa, fb in _split_commas(sig, a + 1, b - 1):
+                if fb - fa < 2 or sig[fa].kind not in ("ident", "qident") \
+                        or sig[fa + 1].kind != "op" or sig[fa + 1].text != "=":
+                    return False
+                assign(local, lits_in(fa + 2, fb), sig[fa].value)
+        return True
+
+    def _validate_list(sig, cand_a, cand_b, names, local):
+        assign(local, lits_in(cand_a + 1, cand_b - 1), names[0])
+        return True
+
+    def process_candidate(a, b, header, validate):
+        indices = lits_in(a, b)
+        if not indices:
+            if header is not None:
+                for k in header[1]:
+                    binding[k] = "skip"
+            return
+        local = {}
+        if header is None or cur_table is None or not list_span(a, b) \
+                or not _balanced(sig, a, b) \
+                or any(constructor_head(k) for k in range(a + 1, b)) \
+                or not validate(sig, a, b, header[0], local) or indices != local.keys():
+            opaque_spans.append((a, b - 1))
+            return
+        binding.update(local)
+        for k in header[1]:
+            binding[k] = "skip"
+
+    def withhold_tail(a):
+        if lits_in(a, len(sig)):
+            opaque_spans.append((a, len(sig) - 1))
+
     for i, t in enumerate(sig):
         up = t.text.upper() if t.kind == "ident" else ""
         # VAR x = SELECTEDVALUE('T'[C])  /  VAR x = 'T'[C]
@@ -410,6 +588,22 @@ def bind_literals(sig: list, lang: str, cur_table: str | None, model) -> dict:
                         break
         # DATATABLE("A", STRING, "B", INTEGER, {{...}})
         if up == "DATATABLE" and i + 1 < len(sig) and sig[i + 1].text == "(":
+            close = _match_span(sig, i + 1, "(", ")")
+            limit = len(sig) if close is None else close
+            a = next((k for k in range(i + 2, limit) if sig[k].text == "{"), limit)
+            if close is None:
+                withhold_tail(a)
+                continue
+            if a < close:
+                indices = list(range(i + 2, a, 4))
+                valid = a > i + 2 and (a - i - 2) % 4 == 0 and all(
+                    sig[k].kind == "str" and sig[k + 1].text == ","
+                    and sig[k + 2].kind == "ident" and sig[k + 3].text == ","
+                    for k in indices
+                )
+                header = ([sig[k].value for k in indices], indices) if valid else None
+                process_candidate(a, close, header, _validate_rows)
+                continue
             close = _match_close(sig, i + 1)
             names, k = [], i + 2
             while k < close and sig[k].text != "{":
@@ -434,6 +628,16 @@ def bind_literals(sig: list, lang: str, cur_table: str | None, model) -> dict:
         # #table(type table [A = text], {...}) or #table({"A","B"}, {...})
         if lang == "m" and t.kind == "op" and t.text == "#" and i + 2 < len(sig) and sig[i + 1].text == "table" \
                 and sig[i + 2].text == "(":
+            close = _match_span(sig, i + 2, "(", ")")
+            if close is None:
+                parts = _split_commas(sig, i + 3, len(sig))
+                if len(parts) > 1:
+                    withhold_tail(parts[1][0])
+                continue
+            args = _split_args_keep(sig, i + 2, close)
+            if len(args) > 1 and args[1][0] < args[1][1] and sig[args[1][0]].text == "{":
+                process_candidate(*args[1], _extract_header(sig, *args[0]), _validate_rows)
+                continue
             close = _match_close(sig, i + 2)
             args = _split_args(sig, i + 2, close)
             names = []
@@ -462,6 +666,34 @@ def bind_literals(sig: list, lang: str, cur_table: str | None, model) -> dict:
                         pos += 1
                     elif m in lits and depth >= 2 and cur_table and pos < len(names):
                         bind(m, (cur_table, names[pos], "row"))
+        if lang == "m" and up in _M_ROW_CONSTRUCTORS and i + 1 < len(sig) and sig[i + 1].text == "(":
+            close = _match_span(sig, i + 1, "(", ")")
+            if close is None:
+                continue
+            args = _split_args_keep(sig, i + 1, close)
+            header_idx = 2 if up == "TABLE.FROMLIST" else 1
+            header = _extract_header(sig, *args[header_idx]) if len(args) > header_idx else None
+            candidate = args and args[0][0] < args[0][1] and sig[args[0][0]].text == "{"
+            if up == "TABLE.FROMLIST":
+                if header is not None and len(header[0]) != 1:
+                    header = None
+                if candidate:
+                    splitter_ok = (len(args) > 1 and args[1][1] - args[1][0] == 1
+                                   and sig[args[1][0]].kind == "ident" and sig[args[1][0]].text == "null")
+                    process_candidate(*args[0], header if splitter_ok else None, _validate_list)
+                if len(args) > 3:
+                    a, b = args[3]
+                    if lits_in(a, b):
+                        if header is not None and cur_table is not None and b - a == 1:
+                            assign(binding, (a,), header[0][0])
+                        else:
+                            opaque_spans.append((a, b - 1))
+            elif candidate:
+                if up == "TABLE.FROMRECORDS":
+                    process_candidate(*args[0], header or ([], []), _validate_records)
+                else:
+                    validate = _validate_columns if up == "TABLE.FROMCOLUMNS" else _validate_rows
+                    process_candidate(*args[0], header, validate)
         # IN { ... }
         if up == "IN" and i + 1 < len(sig) and sig[i + 1].text == "{":
             col = operand_col(i - 1)
@@ -544,7 +776,11 @@ def bind_literals(sig: list, lang: str, cur_table: str | None, model) -> dict:
             end = next((e for e, s in start_of.items() if s == j), None)
             if end is not None:
                 bind(k, colref[end])
-    return binding
+    normalized = []
+    for a, b in sorted(opaque_spans, key=lambda span: (span[0], -span[1])):
+        if not normalized or b > normalized[-1][1]:
+            normalized.append((a, b))
+    return binding, normalized
 
 
 # ---------------------------------------------------------------- TMDL
@@ -669,8 +905,17 @@ def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
             toks = (lexers.lex_dax if reg.kind == "dax" else lexers.lex_m)(seg, reg.start)
             sig = lexers.significant(toks)
             cur = _table_of(reg.node)
-            binding = bind_literals(sig, reg.kind, cur, model)
+            binding, opaque = bind_literals(sig, reg.kind, cur, model)
+            covered = set()
+            opaque_offsets = []
+            for a, b in opaque:
+                covered.update(range(a, b + 1))
+                start, end = sig[a].start, sig[b].end
+                opaque_offsets.append((start, end))
+                edits.append((start, end, tm.raw(f"payload:{cur or 'rows'}", text[start:end], "tmdl")))
             for k, t in enumerate(sig):
+                if k in covered:
+                    continue
                 b = binding.get(k)
                 if b == "skip":
                     continue
@@ -710,7 +955,7 @@ def tokenize_tmdl(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
                     if label:
                         edits.append((t.start, t.end, tm.lit(label, _num_value(t.text), "number", "tmdl", t.text)))
             for t in toks:
-                if t.kind == "comment":
+                if t.kind == "comment" and not any(s <= t.start and t.end <= e for s, e in opaque_offsets):
                     for s, e, lab in clf.free_text(t.text, numbers=True):
                         edits.append((t.start + s, t.start + e, tm.raw(lab, t.text[s:e], "tmdl")))
         elif reg.kind == "text":
