@@ -496,5 +496,208 @@ class PlanFixTests(unittest.TestCase):
         self.assertFalse(images.valid_item("folder/picture.png"))
 
 
+class PerfIncompleteActionTests(unittest.TestCase):
+    FULL = {
+        "ok": True, "timing": "BANDED", "duration_band": "100_500MS",
+        "fe_share": "HIGH", "se_queries": "1_5", "dq_events": "0",
+        "cache_hit": "SOME", "callback": False, "agg_rewrite": "MISS",
+        "trace": "CAPTURED",
+    }
+    UNAVAIL = {"ok": True, "timing": "UNAVAILABLE", "trace": "UNAVAILABLE"}
+    CLOSED_FULL = {
+        "verb": "perf", "timing": "BANDED", "duration_band": "100_500MS",
+        "fe_share": "HIGH", "se_queries": "1_5", "dq_events": "0",
+        "cache_hit": "SOME", "callback": False, "agg_rewrite": "MISS",
+        "trace": "CAPTURED",
+    }
+    CLOSED_UNAVAIL = {"verb": "perf", "timing": "UNAVAILABLE", "trace": "UNAVAILABLE"}
+    EVIDENCE = (
+        "baseline not saved: the measurement evidence was incomplete or unusable, "
+        "so nothing was written; the measurement above is informational only"
+    )
+    NOTCONF = (
+        "baseline save not confirmed: the engine reported SAVED, but the on-disk check "
+        "could not verify a baseline creation or replacement"
+    )
+    COMPARE = (
+        "comparison not completed: no verdict was produced because the saved baseline is "
+        "missing, invalid, incompatible or unreadable, or the measurement evidence was incomplete"
+    )
+
+    def setUp(self):
+        from pbz import common
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = os.path.join(self.tmp.name, "ws")
+        os.makedirs(root)
+        self.ws = Workspace(root)
+        self.ws.private = os.path.join(self.tmp.name, "private")
+        self.project = common.Project(self.ws, "One")
+        self.perf_dir = os.path.join(self.ws.private, "perf")
+
+    def _call(self, body, action=None, baseline="b1", during=None, spend=True):
+        from pbz.outcomes import envelope
+
+        def engine_stub(*args, **kwargs):
+            if during is not None:
+                during()
+            return dict(body)
+
+        kwargs = {} if action is None else {"baseline": baseline, "action": action}
+        with patch("pbz.perf.desktop.require_port", return_value=1), \
+                patch("pbz.perf.checks.spend", return_value=spend), \
+                patch("pbz.perf.engine_call", side_effect=engine_stub) as self.engine:
+            out = perf.run(self.ws, self.project, "EVALUATE {1}", **kwargs)
+        return out, envelope(out)[1]
+
+    def test_save_unusable_evidence_is_incomplete(self):
+        out, rc = self._call(self.UNAVAIL, action="save")
+        self.assertEqual(out, {**self.CLOSED_UNAVAIL, "status": "INCOMPLETE", "note": self.EVIDENCE})
+        self.assertEqual(rc, 3)
+        self.assertFalse(any(
+            name.endswith(".bin")
+            for _, _, files in os.walk(self.perf_dir)
+            for name in files
+        ))
+
+    def test_save_claimed_but_nothing_written_is_not_confirmed(self):
+        out, rc = self._call({**self.FULL, "baseline": "SAVED"}, action="save")
+        self.assertEqual(out, {**self.CLOSED_FULL, "status": "INCOMPLETE", "note": self.NOTCONF})
+        self.assertEqual(rc, 3)
+
+    def test_save_valid_when_baseline_file_written(self):
+        path = os.path.join(self.perf_dir, "abc.bin")
+
+        def during():
+            os.makedirs(self.perf_dir)
+            with open(path, "wb") as handle:
+                handle.write(b"baseline-bytes")
+
+        out, rc = self._call({**self.FULL, "baseline": "SAVED"}, action="save", during=during)
+        self.assertEqual(out, {**self.CLOSED_FULL, "baseline": "SAVED"})
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(path))
+
+    def test_save_overwrite_same_size_same_mtime_still_confirmed(self):
+        from hashlib import sha256
+
+        os.makedirs(self.perf_dir)
+        path = os.path.join(self.perf_dir, "existing.bin")
+        original = b"A" * 64
+        with open(path, "wb") as handle:
+            handle.write(original)
+        before = os.stat(path)
+
+        def during():
+            with tempfile.NamedTemporaryFile(dir=self.perf_dir, delete=False) as handle:
+                handle.write(b"B" * 64)
+            os.replace(handle.name, path)
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        out, rc = self._call({**self.FULL, "baseline": "SAVED"}, action="save", during=during)
+        after = os.stat(path)
+        self.assertEqual(after.st_size, before.st_size)
+        self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+        with open(path, "rb") as handle:
+            self.assertNotEqual(sha256(handle.read()).digest(), sha256(original).digest())
+        self.assertEqual(out, {**self.CLOSED_FULL, "baseline": "SAVED"})
+        self.assertEqual(rc, 0)
+
+    def test_compare_missing_baseline_is_incomplete(self):
+        out, rc = self._call({**self.FULL, "baseline": "MISSING"}, action="compare")
+        self.assertEqual(out, {
+            **self.CLOSED_FULL, "baseline": "MISSING",
+            "status": "INCOMPLETE", "note": self.COMPARE,
+        })
+        self.assertEqual(rc, 3)
+
+    def test_compare_unusable_evidence_is_incomplete(self):
+        out, rc = self._call({**self.UNAVAIL, "baseline": "MISSING"}, action="compare")
+        self.assertEqual(out, {
+            **self.CLOSED_UNAVAIL, "baseline": "MISSING",
+            "status": "INCOMPLETE", "note": self.COMPARE,
+        })
+        self.assertEqual(rc, 3)
+
+    def test_compare_valid_control(self):
+        body = {**self.FULL, "verdict": "SAME", "ratio_verdict": "WITHIN_LIMIT"}
+        out, rc = self._call(body, action="compare")
+        self.assertEqual(out, {**self.CLOSED_FULL, "verdict": "SAME", "ratio_verdict": "WITHIN_LIMIT"})
+        self.assertEqual(rc, 0)
+
+    def test_informational_unusable_control(self):
+        out, rc = self._call(self.UNAVAIL)
+        self.assertEqual(out, {"verb": "perf", "timing": "UNAVAILABLE", "trace": "UNAVAILABLE"})
+        self.assertEqual(rc, 0)
+
+    def test_budget_control(self):
+        out, rc = self._call(self.FULL, action="save", spend=False)
+        self.assertEqual(out, {
+            "verb": "perf", "status": "BUDGET",
+            "note": "daily probe budget reached; the user can reset it",
+        })
+        self.engine.assert_not_called()
+        self.assertEqual(rc, 3)
+
+    def test_unrelated_write_masks_save_attribution_limit(self):
+        """Document the accepted attribution limit in proposal-V1-4 section 2.
+
+        A confirmed write carries no guarantee of attribution to this save.
+        """
+        def during():
+            os.makedirs(self.perf_dir)
+            with open(os.path.join(self.perf_dir, "unrelated.bin"), "wb") as handle:
+                handle.write(b"other")
+
+        out, rc = self._call({**self.FULL, "baseline": "SAVED"}, action="save", during=during)
+        self.assertEqual(out, {**self.CLOSED_FULL, "baseline": "SAVED"})
+        self.assertEqual(rc, 0)
+
+    def test_unreadable_store_cannot_confirm_save(self):
+        # Fail closed across a readability transition. The poisoned entry makes the
+        # before snapshot incomplete. The after snapshot is complete, but the save
+        # must still be unconfirmed.
+        os.makedirs(os.path.join(self.perf_dir, "poison.bin"))
+        path = os.path.join(self.perf_dir, "real.bin")
+
+        def during():
+            os.rmdir(os.path.join(self.perf_dir, "poison.bin"))
+            with open(path, "wb") as handle:
+                handle.write(b"real")
+
+        out, rc = self._call({**self.FULL, "baseline": "SAVED"}, action="save", during=during)
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(out, {**self.CLOSED_FULL, "status": "INCOMPLETE", "note": self.NOTCONF})
+        self.assertEqual(rc, 3)
+
+    def test_timestamp_only_change_does_not_confirm_save(self):
+        os.makedirs(self.perf_dir)
+        path = os.path.join(self.perf_dir, "existing.bin")
+        with open(path, "wb") as handle:
+            handle.write(b"C" * 32)
+        before = os.stat(path)
+
+        def during():
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+        out, rc = self._call({**self.FULL, "baseline": "SAVED"}, action="save", during=during)
+        self.assertEqual(out, {**self.CLOSED_FULL, "status": "INCOMPLETE", "note": self.NOTCONF})
+        self.assertEqual(rc, 3)
+
+    def test_deletion_only_does_not_confirm_save(self):
+        os.makedirs(self.perf_dir)
+        path = os.path.join(self.perf_dir, "existing.bin")
+        with open(path, "wb") as handle:
+            handle.write(b"D" * 32)
+
+        def during():
+            os.remove(path)
+
+        out, rc = self._call({**self.FULL, "baseline": "SAVED"}, action="save", during=during)
+        self.assertEqual(out, {**self.CLOSED_FULL, "status": "INCOMPLETE", "note": self.NOTCONF})
+        self.assertEqual(rc, 3)
+
+
 if __name__ == "__main__":
     unittest.main()
