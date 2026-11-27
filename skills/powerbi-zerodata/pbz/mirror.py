@@ -109,6 +109,40 @@ def _scope(base: str, kind: str) -> list[str]:
     return sorted(out)
 
 
+def _publication_supported(rel: str) -> bool:
+    """Decide file publication eligibility by location before tokenization.
+
+    A successful round trip proves reversibility, not eligibility.
+    """
+    segments = rel.split("/")
+    if len(segments) < 2:
+        return False
+    first, rest = segments[0].lower(), segments[1:]
+    low_rest = [s.lower() for s in rest]
+    if first.endswith(".semanticmodel"):
+        return (low_rest in ([".platform"], ["definition.pbism"])
+                or (rest[0] == "definition" and len(rest) >= 2
+                    and low_rest[-1].endswith(".tmdl")))
+    if first.endswith(".report"):
+        if low_rest in ([".platform"], ["definition.pbir"]):
+            return True
+        if low_rest[0] == "definition":
+            tail = low_rest[1:]
+            return (tail in (["report.json"], ["version.json"], ["reportextensions.json"],
+                             ["pages", "pages.json"], ["bookmarks", "bookmarks.json"])
+                    or (len(tail) == 3 and tail[0] == "pages" and tail[2] == "page.json")
+                    or (len(tail) == 5 and tail[0] == "pages" and tail[2] == "visuals"
+                        and tail[4] in ("visual.json", "mobile.json"))
+                    or (len(tail) == 2 and tail[0] == "bookmarks"
+                        and tail[1].endswith(".bookmark.json")))
+        return ((len(low_rest) == 3 and low_rest[0] == "staticresources"
+                 and low_rest[1] in ("registeredresources", "sharedresources")
+                 and low_rest[2].endswith(".json"))
+                or (len(low_rest) == 4 and low_rest[:3] == ["staticresources", "sharedresources", "basethemes"]
+                    and low_rest[3].endswith(".json")))
+    return False
+
+
 def project_files(project: Project, ws: Workspace | None = None) -> list[tuple[str, str]]:
     """[(mirror-relative path, absolute real path)] for one project.
 
@@ -380,13 +414,50 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
         new_files, lossy, counts = {}, [], {}
         deleted = set(pending["deleted"]) if rebase else set()
         keep = set(pending["changed"] + pending["added"]) | deleted if rebase else set()
+        captured_paths = {rel for rel, *_ in captured}
+        if rebase:
+            pending_paths = set(pending["changed"]) | set(pending["deleted"])
+            for rel in sorted(keep):
+                if (rel in pending_paths and rel not in captured_paths
+                        and not _publication_supported(rel)):
+                    raise PbzError("REFUSED", rel)
         conflicts = []
         bdir = base_dir(ws, project)
-        # Phase 1 tokenizes that capture. Nothing is written here, so a later refusal leaves the
-        # published mirror and base untouched. A malformed report file refuses the pull; it is not
-        # published and it is not reported as PULLED.
+        # Dropping a manifest entry and its mirror copy can leave an untracked base.
+        # Sweep only unsupported locations so a later diff cannot use it as the old side.
+        orphan_bases = []
+        try:
+            base_info = os.stat(bdir)
+        except FileNotFoundError:
+            base_info = None
+        except OSError:
+            raise PbzError("REFUSED", project.name) from None
+        if base_info is not None:
+            if not stat.S_ISDIR(base_info.st_mode):
+                raise PbzError("REFUSED", project.name)
+
+            def unreadable(_err):
+                raise PbzError("REFUSED", project.name) from None
+
+            for directory, _, names in os.walk(bdir, onerror=unreadable):
+                for name in names:
+                    rel = os.path.relpath(os.path.join(directory, name), bdir)
+                    rel = rel.replace(os.sep, "/")
+                    if rel not in captured_paths and not _publication_supported(rel):
+                        orphan_bases.append(rel)
+        orphan_bases.sort()
+        # Phase 1 withholds files outside the supported inventory without tokenizing them.
+        # It tokenizes supported files in memory. A malformed supported report file refuses
+        # the pull before it writes to the mirror or base.
         prepared = []
         for rel, text, bom, real_h in captured:
+            if not _publication_supported(rel):
+                if rel in keep:
+                    raise PbzError("REFUSED", rel)
+                lossy.append(rel)
+                prepared.append({"rel": rel, "bom": bom, "real_h": real_h,
+                                 "mtext": None, "old": {}, "unsupported": True})
+                continue
             try:
                 mtext = _tokenize(rel, text, model, clf, tm)
             except PbzError as err:
@@ -424,6 +495,8 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
             if mtext is None:
                 if os.path.exists(mpath):
                     _must_stay(mpath, ws.mirror)
+                if item.get("unsupported"):
+                    _must_stay(bpath, ws.private)
                 continue
             _must_stay(mpath, ws.mirror)
             _must_stay(bpath, ws.private)
@@ -433,6 +506,10 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
             stale = os.path.join(ws.mirror, *rel.split("/"))
             if os.path.lexists(stale):
                 _must_stay(stale, ws.mirror)
+            if not _publication_supported(rel):
+                _must_stay(os.path.join(bdir, *rel.split("/")), ws.private)
+        for rel in orphan_bases:
+            _must_stay(os.path.join(bdir, *rel.split("/")), ws.private)
         tm.save()  # Persist token definitions durably before publishing any references.
     # Phase 2 reuses those strings. It does not read the same files again.
     for item in prepared:
@@ -457,6 +534,10 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
         if mtext is None:
             if os.path.exists(mpath):
                 remove_file(mpath, root=ws.mirror)
+            if item.get("unsupported"):
+                bpath = os.path.join(bdir, *rel.split("/"))
+                if os.path.lexists(bpath):
+                    remove_file(bpath, root=ws.private)
             new_files[rel] = {"real": real_h, "mirror": None, "lossy": True}
             continue
         write_text(mpath, mtext, bom, root=ws.mirror)
@@ -471,6 +552,14 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
             p = os.path.join(ws.mirror, *rel.split("/"))
             if os.path.exists(p):
                 remove_file(p, root=ws.mirror)
+            if not _publication_supported(rel):
+                bpath = os.path.join(bdir, *rel.split("/"))
+                if os.path.lexists(bpath):
+                    remove_file(bpath, root=ws.private)
+    for rel in orphan_bases:
+        bpath = os.path.join(bdir, *rel.split("/"))
+        if os.path.lexists(bpath):
+            remove_file(bpath, root=ws.private)
     man = {"version": 1, "project": project.name, "pulled": dt.datetime.now().isoformat(timespec="seconds"),
            "classification": clf.mode, "files": new_files}
     save_manifest(ws, project, man)

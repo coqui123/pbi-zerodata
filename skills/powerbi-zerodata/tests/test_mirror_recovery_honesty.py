@@ -3,6 +3,7 @@ Run: python tests/test_mirror_recovery_honesty.py
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -715,7 +716,12 @@ class MirrorEditJournalTests(unittest.TestCase):
         self.assertEqual(common.read_checked(self.path, root=self.ws.mirror), self.before)
         self.assertEqual(file_map(other.mirror_model), calls[0])
         self.assertFalse(any(mirror.mirror_changes(self.ws, other, mirror.load_manifest(self.ws, other)).values()))
-        self.assertTrue(os.path.isfile(os.path.join(other.mirror_report, "definition", "extra.json")))
+        extra_rel = "Other.Report/definition/extra.json"
+        self.assertFalse(os.path.exists(os.path.join(other.mirror_report, "definition", "extra.json")))
+        self.assertEqual(mirror.load_manifest(self.ws, other)["files"][extra_rel],
+                         {"real": hashlib.sha256(b"{}").hexdigest(), "mirror": None, "lossy": True})
+        with open(os.path.join(other.report_dir, "definition", "extra.json"), "rb") as handle:
+            self.assertEqual(handle.read(), b"{}")
 
     def test_same_path_conflict_preserves_newer_bytes(self):
         newer = b"table T\n\tmeasure M = 3\n"
