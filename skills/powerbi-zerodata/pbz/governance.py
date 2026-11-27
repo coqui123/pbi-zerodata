@@ -805,34 +805,223 @@ def role_remove(ws, project, name: str) -> dict:
 
 
 def role_filter(ws, project, name: str, table: str, dax: str | None) -> dict:
+    from bisect import bisect_left, bisect_right
+
     mdef, model = _model(project)
     rel, doc, node = _role(mdef, model, name)
+    if doc.unclosed_fence:
+        raise PbzError("REFUSED", "unclosed TMDL expression fence")
+    if node.parent is not None or sum(
+        n.kind == "role" and n.name.lower() == name.lower()
+        for other_doc in model.docs.values() for n in other_doc.nodes
+    ) != 1:
+        raise PbzError("REFUSED", "duplicate or nested role declaration")
+
     t = model.table(table)
     if t is None:
         raise PbzError("NOT_FOUND", f"table {table}")
-    tp = next((c for c in node.children if c.kind == "tablePermission" and c.name.lower() == t.name.lower()), None)
     text = doc.text
     eol = _eol(text)
-    if dax is None:  # unfilter
-        if tp is None:
-            raise PbzError("NOT_FOUND", f"no filter on {t.name} in role {node.name}")
-        text = apply_edits(text, [tmdl.block_span(doc, tp) + ("",)])
-        _write(mdef, rel, text)
-        return {"verb": "role", "action": "unfiltered", "role": node.name, "table": t.name, "next": "pbz diff, pbz push"}
-    d = deps.dax(dax, t.name, deps.Resolver(model), row_home=True)
-    if d.unresolved:
-        raise PbzError("UNKNOWN_REF", ", ".join(sorted({f"{u.table}[{u.name}]" if u.table else f"[{u.name}]" for u in d.unresolved})))
-    body = dax.strip()
-    if "\n" in body:
-        value = eol + eol.join("\t\t\t" + ln.strip() for ln in body.splitlines() if ln.strip())
-    else:
-        value = " " + body
-    line = f"\ttablePermission {_q(t.name)} ={value}"
-    if tp is not None:
-        text = apply_edits(text, [(tmdl.block_span(doc, tp)[0], tmdl.block_span(doc, tp)[1], line + eol + eol)])
-    else:
+    no_filter = f"no filter on {t.name} in role {node.name}"
+    if dax is not None:
+        d = deps.dax(dax, t.name, deps.Resolver(model), row_home=True)
+        if d.unresolved:
+            raise PbzError("UNKNOWN_REF", ", ".join(sorted({f"{u.table}[{u.name}]" if u.table else f"[{u.name}]" for u in d.unresolved})))
+        body = dax.strip()
+        if body.startswith("```") or ("\n" not in body and len(body.splitlines()) > 1):
+            raise PbzError("REFUSED", "unsupported row filter body")
+        if "\n" in body:
+            value = eol + eol.join("\t\t\t" + ln.strip() for ln in body.splitlines() if ln.strip())
+        else:
+            value = " " + body
+        line = f"\ttablePermission {_q(t.name)} ={value}"
+
+    targets = [c for c in node.children if c.kind == "tablePermission" and c.name.lower() == t.name.lower()]
+    if len(targets) > 1:
+        raise PbzError("REFUSED", "duplicate tablePermission declarations")
+
+    offsets = doc.line_offsets + [len(text)]
+    bare_flag = re.compile(r"\t*[A-Za-z]+")
+
+    def intersects(start, end, span):
+        left, right = span
+        if left == right:
+            return start <= left < end
+        return start < right and left < end
+
+    def property_syntax(content):
+        return tmdl.PROP_RE.match(content) or tmdl.PROP_EXPR_RE.match(content) or bare_flag.fullmatch(content)
+
+    def line_at(offset):
+        return bisect_right(doc.line_offsets, offset) - 1
+
+    def fenced(rest):
+        return rest is not None and rest.strip().startswith("```")
+
+    def region_fenced(region):
+        start_line = line_at(region.start)
+        if start_line <= 0 or region.start != doc.line_offsets[start_line]:
+            return False
+        creating_line = doc.lines[start_line - 1][1]
+        match = tmdl.DECL_RE.match(creating_line) or tmdl.PROP_EXPR_RE.match(creating_line)
+        return match is not None and fenced(match.group("rest"))
+
+    if not targets:
+        if dax is None:
+            raise PbzError("NOT_FOUND", no_filter)
+        for r in doc.regions:
+            if r.kind not in ("dax", "m") or r.start >= r.end or region_fenced(r):
+                continue
+            first_line = max(r.node.line + 1, line_at(r.start))
+            for _, content in doc.lines[first_line:line_at(r.end - 1) + 1]:
+                match = tmdl.DECL_RE.match(content)
+                if match and match.group("kw") == "tablePermission":
+                    declared_name = match.group("name")
+                    if declared_name and tmdl.unquote(declared_name).lower() == t.name.lower():
+                        raise PbzError("REFUSED", f"tablePermission for {t.name} inside an unfenced expression")
+        # G9: the appended permission must stay under this role and inherit no note.
+        if node.indent != 0 or any(n.parent is None and n.line > node.line for n in doc.nodes):
+            raise PbzError("REFUSED", "role is not the final top-level declaration")
+        for i, (offset, content) in enumerate(doc.lines):
+            if content.strip().startswith("///") and not any(
+                intersects(offset, offsets[i + 1], (r.start, r.end)) for r in doc.regions
+            ):
+                raise PbzError("REFUSED", "unowned TMDL description before append")
+            if i > node.line and not content.startswith("\t") and property_syntax(content):
+                raise PbzError("REFUSED", "top-level property after role declaration")
         text = text.rstrip("\r\n") + eol + eol + line + eol
+    else:
+        def is_description(region):
+            return region.kind == "text" and region.prop == "description"
+
+        def region_end(region):
+            if is_description(region) or region.kind == "member" or not region_fenced(region):
+                return region.end
+            # take_expr records the closing fence's start as the region end.
+            offset, content = doc.lines[line_at(region.end)]
+            return offset + len(content)
+
+        tp = targets[0]
+        decl_offset, declaration = doc.lines[tp.line]
+        match = tmdl.DECL_RE.match(declaration)
+        rest = match.group("rest")
+        is_fenced = fenced(rest)
+        owned_regions = doc.regions_for(tp)
+        expressions = [r for r in owned_regions if not is_description(r)]
+
+        # G1-G4: identify the declaration filter and reject ambiguous structure.
+        if any(r.prop != "expression" for r in expressions) or len(expressions) > 1:
+            raise PbzError("REFUSED", "unexpected tablePermission expression regions")
+        expression = expressions[0] if expressions else None
+        cut_lines = [tp.line]
+        if expression is not None:
+            if rest is None or not text[expression.start:expression.end].strip():
+                raise PbzError("REFUSED", "missing or empty declaration filter")
+            inline = bool(rest.strip()) and not is_fenced
+            expected_start = decl_offset + match.start("rest") if inline else offsets[tp.line + 1]
+            if expression.start != expected_start:
+                raise PbzError("REFUSED", "unexpected declaration filter offset")
+            expression_end = region_end(expression)
+            end_line = line_at(expression.end if is_fenced else expression.end - 1)
+            cut_lines.append(end_line)
+            if not is_fenced:
+                continuation = [content for _, content in doc.lines[tp.line + 1:end_line + 1]
+                                if content.strip()]
+                if not inline and (not continuation or tmdl._indent(continuation[0]) <= tp.indent + 1):
+                    raise PbzError("REFUSED", "unexpected declaration filter continuation")
+                for content in continuation:
+                    decl = tmdl.DECL_RE.match(content)
+                    if property_syntax(content) or (decl and (
+                        decl.group("kw") in tmdl.DECL_KINDS
+                        or (decl.group("name") and decl.group("rest") is not None)
+                    )):
+                        raise PbzError("REFUSED", "structural line inside unfenced row filter")
+
+        for child in tp.children:
+            if child.kind not in ("columnPermission", "annotation") or (
+                expression is not None
+                and intersects(expression.start, expression_end, tmdl.block_span(doc, child))
+            ):
+                raise PbzError("REFUSED", "unexpected child of tablePermission")
+        if rest is not None and expression is None:
+            raise PbzError("REFUSED", "assignment without a declaration filter region")
+
+        # G8: account for physical lines in each block, including descendant blocks.
+        descriptions = [r for r in doc.regions if is_description(r)]
+        block = tmdl.block_span(doc, tp)
+
+        def block_lines(span):
+            return range(bisect_left(offsets, span[0]), bisect_left(offsets, span[1]))
+
+        def accounted_lines(owner, span):
+            regions = [(r.start, region_end(r)) for r in doc.regions_for(owner)]
+            children = [(child, tmdl.block_span(doc, child)) for child in owner.children]
+            accounted = {owner.line}
+            properties = {}
+            for i in block_lines(span):
+                offset, content = doc.lines[i]
+                if not content.strip() or i == owner.line:
+                    continue
+                end = offsets[i + 1]
+                if any(intersects(offset, end, region) for region in regions):
+                    accounted.add(i)
+                elif (content.strip().startswith("///")
+                      and any(intersects(offset, end, (r.start, r.end)) for r in descriptions)):
+                    accounted.add(i)
+                elif (tmdl._indent(content) == owner.indent + 1
+                      and not any(intersects(offset, end, child_span) for _, child_span in children)):
+                    prop = tmdl.PROP_RE.match(content)
+                    if prop or bare_flag.fullmatch(content):
+                        key = prop.group("prop") if prop else content.strip()
+                        if key in owner.props:
+                            properties.setdefault(key, []).append(i)
+            accounted.update(lines[0] for lines in properties.values() if len(lines) == 1)
+            for child, child_span in children:
+                accounted.update(accounted_lines(child, child_span))
+            return accounted
+
+        accounted = accounted_lines(tp, block)
+        if any(doc.lines[i][1].strip() and i not in accounted for i in block_lines(block)):
+            raise PbzError("REFUSED", "unaccounted text in tablePermission block")
+
+        has_content = bool(tp.props or tp.children or any(is_description(r) for r in owned_regions))
+        # G10 applies to partial edits, before the removal no-filter check.
+        if has_content and any(re.search(r"[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]", doc.lines[i][1])
+                               for i in cut_lines):
+            raise PbzError("REFUSED", "unsupported line separator at filter boundary")
+        if dax is None and rest is None:
+            raise PbzError("NOT_FOUND", no_filter)
+        # G6 applies whenever the permission declaration will remain.
+        if (dax is not None or has_content) and tp.indent != 1:
+            raise PbzError("REFUSED", "unexpected tablePermission indentation")
+
+        if not has_content:
+            # G7: a whole-block edit must not erase a different node's description.
+            if any(r.node is not tp and intersects(*block, (r.start, r.end)) for r in descriptions):
+                raise PbzError("REFUSED", "foreign description inside tablePermission block")
+            start, end = block
+            replacement = "" if dax is None else line + eol + eol
+        elif dax is None:
+            start = decl_offset + match.end("name")
+            end = expression_end
+            replacement = ""
+        else:
+            end = expression_end if expression is not None else decl_offset + len(declaration)
+            # G5: the new unfenced expression must not absorb the next line.
+            suffix = next((content for _, content in doc.lines[cut_lines[-1] + 1:] if content.strip()), "")
+            if tmdl._indent(suffix) > tp.indent + 1:
+                raise PbzError("REFUSED", "row filter would absorb following text")
+            if expression is None:
+                start = end
+                replacement = " =" + value
+            else:
+                start = decl_offset + declaration.index("=", match.end("name"))
+                replacement = "=" + value
+        text = apply_edits(text, [(start, end, replacement)])
+
     _write(mdef, rel, text)
+    if dax is None:
+        return {"verb": "role", "action": "unfiltered", "role": node.name, "table": t.name, "next": "pbz diff, pbz push"}
     return {"verb": "role", "action": "filtered", "role": node.name, "table": t.name,
             "references": sorted({f"{r.table}[{r.name}]" if r.kind == "column" else f"[{r.name}]" for r in d.refs
                                   if r.kind in ("column", "measure")}),
