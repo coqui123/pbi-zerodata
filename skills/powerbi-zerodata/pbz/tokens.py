@@ -926,10 +926,16 @@ def tokenize_pbir(text: str, relpath: str, model, clf, tm: TokenMap) -> str:
                 _free_text_edits(text, site.node, value, clf, tm, edits, numbers=False, avoid=(*deneb, *uris))
                 continue
         label = None
-        if vtype in ("string", "int", "double"):
-            label = clf.literal(value, "string" if vtype == "string" else "number", site.column)
+        if vtype in ("string", "int", "double", "bool", "datetime"):
+            clf_vtype = "string" if vtype == "string" else "number" if vtype in ("int", "double") else vtype
+            label = clf.literal(value, clf_vtype, site.column)
         if label:
-            edits.append((site.node.start, site.node.end, '"' + tm.lit(label, value, vtype, "pbir_full", raw_full) + '"'))
+            record_vtype = vtype
+            if vtype == "datetime" and site.raw.startswith("datetimeoffset'"):
+                # decode maps both date spellings to "datetime"; keep the offset
+                # spelling distinct in the record so the two forms never share a token
+                record_vtype = "datetimeoffset"
+            edits.append((site.node.start, site.node.end, '"' + tm.lit(label, value, record_vtype, "pbir_full", raw_full) + '"'))
         elif vtype == "string" and isinstance(value, str):
             uris = _uri_edits(text, site.node, tm)
             edits.extend(uris)

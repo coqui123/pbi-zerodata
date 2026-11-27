@@ -15,7 +15,7 @@ from pathlib import Path
 SKILL = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SKILL))
 
-from pbz import audit, checks, cli, describe, dpapi, index_store, tmdl, tokens, unused  # noqa: E402
+from pbz import audit, checks, cli, common, describe, dpapi, index_store, mirror, pbir, tmdl, tokens, unused  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 from pbz.classify import Classifier, looks_like_phone  # noqa: E402
 from _junction import make_junction  # noqa: E402
@@ -638,6 +638,339 @@ with patch("pbz.checks.policy_mod.load", return_value={}), patch("pbz.checks.des
                 self.run_index(self.b)
         self.assertEqual(index_store.load(self.ws.private, "A"), before)
         self.assertIsNone(index_store.load(self.ws.private, "B"))
+
+
+class TypedSensitivityTests(unittest.TestCase):
+    _m2_page_path = Path("Mini.Report/definition/pages/p1/page.json")
+    _m2_visual_path = _m2_page_path.parent / "visuals/v1/visual.json"
+    _m2_definition = Path("Mini.SemanticModel/definition")
+    _m2_policy = {
+        "sensitive_columns": [
+            "Events[SecretDate]", "Events[SecretStamp]", "Events[SecretFlag]", "Events[Name]",
+        ],
+        "category_columns": ["Events[KindFlag]"],
+    }
+    _m2_sites = (
+        ("SecretDate", "datetime'2024-03-05T00:00:00'"),
+        ("SecretDate", "datetime'2024-04-01T00:00:00'", True),
+        ("SecretStamp", "datetime'2024-03-05T06:30:00'"),
+        ("SecretStamp", "datetimeoffset'2024-03-05T06:30:00'"),
+        ("SecretFlag", "true"),
+        ("SecretFlag", "false"),
+        ("Name", "'Canary Person'"),
+        ("OpenDate", "datetime'2025-01-15T00:00:00'"),
+        ("OpenFlag", "false"),
+        ("KindFlag", "true"),
+        ("OpenFlag", "datetime'2025-02-02T00:00:00'"),
+        ("OpenDate", "false"),
+    )
+    _m2_titles = ("true", "datetime'2025-06-01T00:00:00'")
+
+    def _m2_page(self, sites):
+        filters = []
+        for index, (column, value, *in_site) in enumerate(sites, 1):
+            field = {"Column": {
+                "Expression": {"SourceRef": {"Entity": "Events"}}, "Property": column,
+            }}
+            left = {"Column": {
+                "Expression": {"SourceRef": {"Source": "e"}}, "Property": column,
+            }}
+            literal = {"Literal": {"Value": value}}
+            if in_site:
+                condition = {"In": {"Expressions": [left], "Values": [[literal]]}}
+            else:
+                condition = {"Comparison": {"ComparisonKind": 0, "Left": left, "Right": literal}}
+            filters.append({
+                "name": f"f{index}", "field": field, "type": "Categorical",
+                "filter": {
+                    "Version": 2, "From": [{"Name": "e", "Entity": "Events", "Type": 0}],
+                    "Where": [{"Condition": condition}],
+                },
+            })
+        return {
+            "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/page/2.1.0/schema.json",
+            "name": "p1", "displayName": "Overview", "filterConfig": {"filters": filters},
+        }
+
+    def _m2_values(self, page):
+        sites = []
+        for entry in page["filterConfig"]["filters"]:
+            column = entry["field"]["Column"]["Property"]
+            condition = entry["filter"]["Where"][0]["Condition"]
+            if "Comparison" in condition:
+                literal = condition["Comparison"]["Right"]
+            else:
+                literal = condition["In"]["Values"][0][0]
+            sites.append((column, literal["Literal"]["Value"]))
+        return sites
+
+    def _m2_workspace(self, root, private, policy):
+        columns = {
+            "SecretDate": "dateTime", "SecretStamp": "dateTime", "SecretFlag": "boolean",
+            "Name": "string", "OpenDate": "dateTime", "OpenFlag": "boolean",
+            "KindFlag": "boolean", "Count": "int64", "Amount": "double",
+        }
+        table = "table Events\n"
+        for index, (column, dtype) in enumerate(columns.items(), 1):
+            table += (
+                f"\n\tcolumn {column}\n\t\tlineageTag: 00000000-0000-0000-0000-{index:012d}\n"
+                f"\t\tdataType: {dtype}\n\t\tsourceColumn: {column}\n"
+            )
+        visual = {
+            "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.10.0/schema.json",
+            "name": "v1",
+            "visual": {"visualType": "card", "objects": {"general": [{"properties": {
+                "title": {"expr": {"Literal": {"Value": self._m2_titles[0]}}},
+                "title2": {"expr": {"Literal": {"Value": self._m2_titles[1]}}},
+            }}]}},
+        }
+        files = {
+            Path("Mini.pbip"): json.dumps({
+                "version": "1.0", "artifacts": [
+                    {"report": {"path": "Mini.Report"}}, {"dataset": {"path": "Mini.SemanticModel"}},
+                ],
+            }),
+            Path("Mini.SemanticModel/model.tmdl"): "database\n\nref table Events\n",
+            self._m2_definition / "tables/Events.tmdl": table,
+            Path("Mini.SemanticModel/definition.pbism"): json.dumps({"version": "4.0", "settings": {}}),
+            Path("Mini.Report/definition.pbir"): json.dumps({
+                "version": "4.0", "datasetReference": {"byPath": {"path": "../Mini.SemanticModel"}},
+            }),
+            self._m2_page_path: json.dumps(self._m2_page(self._m2_sites), indent=2),
+            self._m2_visual_path: json.dumps(visual, indent=2),
+            Path(".pbz/policy.json"): json.dumps({**self._m2_policy, **policy}),
+        }
+        for relative, content in files.items():
+            path = Path(root) / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content.encode("utf-8"))
+        ws = common.Workspace(root)
+        ws.private = private
+        return ws, ws.project()
+
+    def _m2_pull(self, ws, project):
+        mirror.pull(ws, project)
+        page = Path(ws.mirror) / self._m2_page_path
+        return self._m2_values(json.loads(page.read_text(encoding="utf-8")))
+
+    def _m2_assert_token(self, column, value):
+        self.assertTrue(value.startswith("«"), (column, value))
+        self.assertIn(f"Events[{column}]", value)
+
+    def _m2_assert_edit_restored(self, root, ws, project, authored):
+        real_page = Path(root) / self._m2_page_path
+        published = Path(ws.mirror) / self._m2_page_path
+        text = published.read_bytes()
+        before, after = b'"Overview"', b'"Overview Edited"'
+        self.assertEqual(text.count(before), 1)
+        self.assertEqual(authored.count(before), 1)
+        published.write_bytes(text.replace(before, after, 1))
+        # The synthetic report lacks the metadata needed by the Desktop validators.
+        with patch("pbz.mirror.desktop.processes", return_value=[]), patch(
+            "pbz.mirror.validate.run_stage", return_value=[],
+        ):
+            result = mirror.push(ws, project)
+        self.assertEqual(result["result"], "PUSHED", result)
+        self.assertEqual(real_page.read_bytes(), authored.replace(before, after, 1))
+
+    def test_sensitive_datetime_hidden(self):
+        for policy in ({}, {"literals": "strict"}):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+                ws, project = self._m2_workspace(root, private, policy)
+                sites = self._m2_pull(ws, project)
+                for index in (0, 1):
+                    column, value = sites[index]
+                    self.assertEqual(column, "SecretDate")
+                    self._m2_assert_token(column, value)
+                    self.assertNotIn(self._m2_sites[index][1], [value for _, value in sites])
+
+    def test_sensitive_offset_hidden(self):
+        for policy in ({}, {"literals": "strict"}):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+                ws, project = self._m2_workspace(root, private, policy)
+                sites = self._m2_pull(ws, project)
+                column, value = sites[3]
+                self.assertEqual(column, "SecretStamp")
+                self._m2_assert_token(column, value)
+                self.assertNotIn(self._m2_sites[3][1], [value for _, value in sites])
+
+    def test_sensitive_bool_hidden(self):
+        for policy in ({}, {"literals": "strict"}):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+                ws, project = self._m2_workspace(root, private, policy)
+                sites = self._m2_pull(ws, project)
+                for column, value in sites[4:6]:
+                    self.assertEqual(column, "SecretFlag")
+                    self._m2_assert_token(column, value)
+                    self.assertNotIn(value, ("true", "false"))
+                self.assertNotEqual(sites[4][1], sites[5][1])
+
+    def test_controls_unchanged(self):
+        def snapshot(root, published):
+            return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
+                    if path.is_file() and not path.is_relative_to(published)}
+
+        for policy in ({}, {"literals": "strict"}):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+                ws, project = self._m2_workspace(root, private, policy)
+                before = snapshot(Path(root), Path(ws.mirror))
+                sites = self._m2_pull(ws, project)
+                self.assertEqual(sites[7:], list(self._m2_sites[7:]))
+                column, value = sites[6]
+                self.assertEqual(column, "Name")
+                self._m2_assert_token(column, value)
+                visual_path = Path(ws.mirror) / self._m2_visual_path
+                visual = json.loads(visual_path.read_text(encoding="utf-8"))
+                properties = visual["visual"]["objects"]["general"][0]["properties"]
+                self.assertEqual(
+                    tuple(properties[title]["expr"]["Literal"]["Value"] for title in ("title", "title2")),
+                    self._m2_titles,
+                )
+                self.assertEqual(mirror.push(ws, project)["result"], "NOTHING_TO_PUSH")
+                self.assertEqual(snapshot(Path(root), Path(ws.mirror)), before)
+
+    def test_restoration_after_edit(self):
+        for policy in ({}, {"literals": "strict"}):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+                ws, project = self._m2_workspace(root, private, policy)
+                authored = (Path(root) / self._m2_page_path).read_bytes()
+                sites = self._m2_pull(ws, project)
+                self.assertEqual(
+                    [column for column, _ in sites[:6]],
+                    [site[0] for site in self._m2_sites[:6]],
+                )
+                for column, value in sites[:6]:
+                    self._m2_assert_token(column, value)
+                self._m2_assert_edit_restored(root, ws, project, authored)
+
+    def test_collision_pair_distinct_tokens(self):
+        for policy in ({}, {"literals": "strict"}):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+                ws, project = self._m2_workspace(root, private, policy)
+                authored = (Path(root) / self._m2_page_path).read_bytes()
+                sites = self._m2_pull(ws, project)
+                for column, value in sites[2:4]:
+                    self.assertEqual(column, "SecretStamp")
+                    self._m2_assert_token(column, value)
+                self.assertNotEqual(sites[2][1], sites[3][1])
+                self._m2_assert_edit_restored(root, ws, project, authored)
+
+    def test_unit_pins(self):
+        stamp = "2024-03-05T06:30:00"
+        offset = "datetimeoffset'2024-03-05T06:30:00'"
+        with self.subTest(pin="encode datetimeoffset"):
+            self.assertEqual(pbir.encode_literal(stamp, "datetimeoffset"), offset)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tm = tokens.TokenMap(tmp)
+            for label, value, vtype, expected in (
+                ("Events[SecretStamp]", stamp, "datetimeoffset", offset),
+                ("Events[SecretFlag]", True, "bool", "true"),
+                ("Events[SecretFlag]", False, "bool", "false"),
+                ("Events[OpenDate]", "2025-01-15T00:00:00", "datetime", "datetime'2025-01-15T00:00:00'"),
+            ):
+                with self.subTest(pin="fallback", value=value, vtype=vtype):
+                    tok = tm.lit(label, value, vtype, "other_ctx", "ignored")
+                    self.assertEqual(tokens.detokenize_pbir(json.dumps(tok), tm), (json.dumps(expected), []))
+
+            self.assertEqual(pbir.decode_literal(offset), (stamp, "datetime"))
+            self.assertEqual(pbir.decode_literal("true"), (True, "bool"))
+            for policy in ({}, {"literals": "strict"}):
+                with self.subTest(pin="index category", policy=policy):
+                    clf = Classifier(None, None, policy)
+                    clf.mode = "index"
+                    clf.index = {"columns": {"T[Kind]": {"class": "category", "type": "string"}}}
+                    clf.categories = {"T[Kind]": ["2024-01-01T00:00:00"]}
+                    self.assertEqual(clf.literal(True, "bool", ("T", "Kind")), "T[Kind]")
+                    self.assertEqual(clf.literal("2025-05-05T00:00:00", "datetime", ("T", "Kind")), "T[Kind]")
+                    self.assertIsNone(clf.literal("2024-01-01T00:00:00", "datetime", ("T", "Kind")))
+
+            definition = Path(tmp) / "definition"
+            (definition / "tables").mkdir(parents=True)
+            (definition / "model.tmdl").write_text("model Model\n\nref table T\n", encoding="utf-8")
+            (definition / "tables/T.tmdl").write_text(
+                "table T\n\tcolumn A\n\t\tdataType: string\n", encoding="utf-8",
+            )
+            model = tmdl.load_model(str(definition))
+            clf = Classifier(model, None, {"category_columns": ["T[Gone]"]})
+            clf.index = {"columns": {}}
+            self.assertEqual(clf.column_class("T", "Gone"), "sensitive")
+
+            tm2 = tokens.TokenMap(str(Path(tmp) / "hmac"))
+            tok = tm2.lit("T[B]", True, "bool", "pbir_full", '"true"')
+            key = b"k" * 32
+            digest = dpapi.hmac_hex(key, "true")
+            self.assertEqual(tm2.find_by_hmac(key, "T[B]", digest), tok)
+            self.assertIsNone(tm2.find_by_hmac(key, "T[Other]", digest))
+
+    def test_dispatch_arguments(self):
+        class RecordingClassifier(Classifier):
+            def __init__(self, model, policy):
+                super().__init__(model, None, policy)
+                self.calls = []
+
+            def literal(self, value, vtype, column):
+                self.calls.append((value, vtype, column))
+                return super().literal(value, vtype, column)
+
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+            self._m2_workspace(root, private, {})
+            model = tmdl.load_model(str(Path(root) / self._m2_definition))
+            clf = RecordingClassifier(model, self._m2_policy)
+            tm = tokens.TokenMap(private)
+            page = (Path(root) / self._m2_page_path).read_text(encoding="utf-8")
+            relative = "definition/pages/p1/page.json"
+            tokens.tokenize_pbir(page, relative, model, clf, tm)
+            extra = self._m2_page((
+                ("Count", "5L"), ("Amount", "1.5D"), ("OpenFlag", "datetime'2025-02-02T00:00:00'"),
+            ))
+            tokens.tokenize_pbir(json.dumps(extra), relative, model, clf, tm)
+            visual = (Path(root) / self._m2_visual_path).read_text(encoding="utf-8")
+            tokens.tokenize_pbir(
+                visual, "definition/pages/p1/visuals/v1/visual.json", model, clf, tm,
+            )
+
+        for call in (
+            (True, "bool", ("Events", "SecretFlag")),
+            (False, "bool", ("Events", "SecretFlag")),
+            ("2024-03-05T00:00:00", "datetime", ("Events", "SecretDate")),
+            ("Canary Person", "string", ("Events", "Name")),
+            (5, "number", ("Events", "Count")),
+            (1.5, "number", ("Events", "Amount")),
+            (True, "bool", None),
+            ("2025-06-01T00:00:00", "datetime", None),
+            ("2025-02-02T00:00:00", "datetime", ("Events", "OpenFlag")),
+            (False, "bool", ("Events", "OpenDate")),
+        ):
+            with self.subTest(call=call):
+                self.assertIn(call, clf.calls)
+        with self.subTest(column="SecretStamp"):
+            stamp = ("2024-03-05T06:30:00", "datetime", ("Events", "SecretStamp"))
+            self.assertGreaterEqual(clf.calls.count(stamp), 2)
+        for value, vtype, column in clf.calls:
+            if isinstance(value, bool):
+                self.assertEqual(vtype, "bool")
+            if isinstance(value, str) and column in (("Events", "SecretDate"), ("Events", "SecretStamp")):
+                self.assertEqual(vtype, "datetime")
+
+    def test_raw_sharing_limit(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as private:
+            self._m2_workspace(root, private, {})
+            model = tmdl.load_model(str(Path(root) / self._m2_definition))
+            clf = Classifier(model, None, self._m2_policy)
+            tm = tokens.TokenMap(private)
+            page = self._m2_page((("SecretFlag", "true"), ("SecretFlag", "true\n")))
+            output = tokens.tokenize_pbir(
+                json.dumps(page), "definition/pages/p1/page.json", model, clf, tm,
+            )
+            sites = self._m2_values(json.loads(output))
+            self.assertTrue(sites[0][1].startswith("«"), sites)
+            self.assertEqual(sites[0][1], sites[1][1])
+            restored, unknown = tokens.detokenize_pbir(output, tm)
+            self.assertEqual(unknown, [])
+            self.assertEqual(
+                self._m2_values(json.loads(restored)), [("SecretFlag", "true"), ("SecretFlag", "true")],
+            )
 
 
 if __name__ == "__main__":
