@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import os
 
-from . import lexers, pbir, tmdl
+from . import deps, lexers, pbir, tmdl
 from .common import PbzError, commit_bytes, read_text
 from .tokens import apply_edits
 
@@ -126,6 +126,44 @@ def plan_pbir(ws, report_dir, edit_fn) -> list[tuple]:
     return plans
 
 
+def _block_dax_regions(doc, node) -> list:
+    """DAX regions of `doc` inside node's block span, in span order. A DAX region
+    crossing the block boundary refuses: its bindings cannot be delimited."""
+    s, e = tmdl.block_span(doc, node)
+    out = []
+    for reg in doc.regions:
+        if reg.kind != "dax":
+            continue
+        if s <= reg.start and reg.end <= e:
+            out.append(reg)
+        elif reg.start < e and s < reg.end:
+            raise PbzError("REFUSED", "a DAX expression crosses the moved measure's block boundary")
+    return out
+
+
+def _block_bindings(doc, regions, res) -> list:
+    """Every deps Binding in `regions`, concatenated in region order."""
+    out = []
+    for reg in regions:
+        out.extend(deps.dax_region(doc.text, reg, res).bindings)
+    return out
+
+
+def _binding_tuples(doc, regions, res) -> list:
+    """[(kind, table, name, uncertain)] for every binding in `regions`, in order."""
+    return [(b.ref.kind, b.ref.table, b.ref.name, b.uncertain)
+            for b in _block_bindings(doc, regions, res)]
+
+
+def _binding_key(binding, measure: str):
+    """Comparison key for one binding tuple: a self-measure occurrence compares by
+    (kind, name, uncertain); its owner legitimately changes with the move."""
+    kind, table, name, uncertain = binding
+    if kind == "measure" and name.lower() == measure.lower():
+        return (kind, "", name, uncertain)
+    return binding
+
+
 def move_measure(ws, project, name: str, target: str) -> dict:
     from .rename import translated_names
     mdef = os.path.join(project.mirror_model, "definition")
@@ -153,6 +191,26 @@ def move_measure(ws, project, name: str, target: str) -> dict:
         block += eol
     if not block.endswith(eol * 2):
         block += eol
+    res = deps.Resolver(model)
+    pre_bindings = _block_bindings(sdoc, _block_dax_regions(sdoc, m.node), res)
+    pre = [(b.ref.kind, b.ref.table, b.ref.name, b.uncertain) for b in pre_bindings]
+    block_edits = []
+    for b in pre_bindings:
+        if b.ref.kind != "measure" or b.ref.table != src.name or b.ref.name.lower() != m.name.lower():
+            continue
+        if b.qualifier is None:
+            continue
+        q0, q1 = b.qualifier
+        toks = lexers.significant(lexers.lex_dax(sdoc.text[q0:q1]))
+        if not toks:
+            continue
+        tok = toks[0]
+        qname = tok.value if tok.kind == "table" else tok.text if tok.kind == "ident" else None
+        if qname is None or res.table(qname) != src.name:
+            continue
+        block_edits.append((q0 - s, q1 - s, lexers.dax_table_name(dst.name)))
+    if block_edits:
+        block = apply_edits(block, sorted(set(block_edits)))
     changed = []
     texts = {rel: doc.text for rel, doc in model.docs.items()}
     edits: dict[str, list] = {}
@@ -171,11 +229,58 @@ def move_measure(ws, project, name: str, target: str) -> dict:
     planned = dict(texts)
     for rel, eds in edits.items():
         planned[rel] = apply_edits(texts[rel], sorted(eds))
+    if pre:
+        bare_pre = sum(1 for b in pre_bindings if b.qualifier is None)
+        insertions = 0
+        while insertions < bare_pre:
+            pdoc = tmdl.parse(dst.file, planned[dst.file])
+            pnode = None
+            for node in pdoc.nodes:
+                if node.kind != "measure" or node.name.lower() != m.name.lower():
+                    continue
+                t = node
+                while t is not None and t.kind != "table":
+                    t = t.parent
+                if t is not None and t.name.lower() == dst.name.lower():
+                    pnode = node
+                    break
+            if pnode is None:
+                break
+            cur_bindings = _block_bindings(pdoc, _block_dax_regions(pdoc, pnode), res)
+            if len(cur_bindings) != len(pre_bindings):
+                break
+            target = None
+            for i, (pb, cb) in enumerate(zip(pre_bindings, cur_bindings)):
+                pid = (pb.ref.kind, "" if pb.ref.kind == "measure" and pb.ref.name.lower() == m.name.lower() else pb.ref.table, pb.ref.name)
+                cid = (cb.ref.kind, "" if cb.ref.kind == "measure" and cb.ref.name.lower() == m.name.lower() else cb.ref.table, cb.ref.name)
+                if cid == pid:
+                    continue
+                if pb.ref.kind == "column" and not pb.uncertain and pb.qualifier is None and cb.qualifier is None:
+                    target = (i, cb)
+                    break
+            if target is None:
+                break
+            i, cb = target
+            at = cb.start
+            planned[dst.file] = (planned[dst.file][:at]
+                                 + lexers.dax_table_name(pre_bindings[i].ref.table)
+                                 + planned[dst.file][at:])
+            insertions += 1
     pbir_plans = plan_pbir(ws, project.mirror_report,
                            lambda root, _text: pbir_move_edits(root, m.name, src.name, dst.name))
     from .governance import culture_move_texts, perspective_move_texts
     cultures = culture_move_texts(mdef, src.name, dst.name, m.name)
     perspectives = perspective_move_texts(mdef, src.name, dst.name, m.name, planned)
+    if pre:
+        effective = {rel: perspectives.get(rel, planned[rel]) for rel in planned}
+        check = tmdl.load_model(mdef, texts=effective, root=os.path.dirname(project.mirror_model))
+        m2 = check.measure(m.name)
+        if m2 is None or m2.node is None or m2.table != dst.name:
+            raise PbzError("REFUSED", "the moved measure cannot be verified in its new table")
+        cdoc = check.docs[m2.node.file]
+        got = _binding_tuples(cdoc, _block_dax_regions(cdoc, m2.node), deps.Resolver(check))
+        if [_binding_key(t, m.name) for t in got] != [_binding_key(t, m.name) for t in pre]:
+            raise PbzError("REFUSED", "moving this measure would change what its references bind to")
     ops = []
     for rel, text in planned.items():
         final = perspectives.get(rel, text)

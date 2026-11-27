@@ -19,7 +19,7 @@ from unittest.mock import patch
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 
-from pbz import common, move, rename, tmdl  # noqa: E402
+from pbz import common, deps, move, rename, tmdl  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 
 SALES = "table Sales\n\n\tmeasure Amount = 1\n\n"
@@ -254,6 +254,383 @@ class AtomicRefactorTests(unittest.TestCase):
         self.assertEqual(_bytes(ws.mirror), before)
         leftovers = list(Path(ws.mirror).rglob("*.pbz-tmp"))
         self.assertEqual(leftovers, [])
+
+
+class MoveBindingTests(unittest.TestCase):
+    def _project(self, tables, visual_entity, visual_measure):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        ws = common.Workspace(root)
+        ws.private = os.path.join(root, "private")
+        os.makedirs(ws.private)
+        _write(os.path.join(root, "Mini.pbip"), "{}")
+        project = common.Project(ws, "Mini")
+        mdef = os.path.join(project.mirror_model, "definition")
+        for fname, text in tables.items():
+            _write(os.path.join(mdef, "tables", fname), text)
+        page = os.path.join(project.mirror_report, "definition", "pages", "p1", "visuals")
+        visual = {"query": {"queryState": {"Y": {"projections": [
+            {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": visual_entity}},
+                                   "Property": visual_measure}}}]}}}}
+        _write(os.path.join(page, "v_ok", "visual.json"), json.dumps(visual))
+        os.makedirs(project.model_dir, exist_ok=True)
+        return ws, project, mdef
+
+    @staticmethod
+    def _block_bindings(mdef, measure_name):
+        """(bindings, block_text) for the measure in a freshly loaded model.
+
+        bindings: [(kind, table, name, uncertain)] over every dax region inside the
+        measure's block span, in span order, resolved with deps.dax_region.
+        """
+        model = tmdl.load_model(mdef, root=os.path.dirname(mdef))
+        m = model.measure(measure_name)
+        doc = model.docs[m.node.file]
+        s, e = tmdl.block_span(doc, m.node)
+        res = deps.Resolver(model)
+        out = []
+        for reg in doc.regions:
+            if reg.kind == "dax" and s <= reg.start and reg.end <= e:
+                d = deps.dax_region(doc.text, reg, res)
+                out.extend((b.ref.kind, b.ref.table, b.ref.name, b.uncertain) for b in d.bindings)
+        return out, doc.text[s:e]
+
+    @staticmethod
+    def _normalized(bindings, measure_name):
+        """Self-measure owner normalization: (measure, any table, own name) compares
+        by (kind, name, uncertain)."""
+        return [(k, "" if (k == "measure" and n.lower() == measure_name.lower()) else t, n, u)
+                for (k, t, n, u) in bindings]
+
+    def test_same_named_columns_keep_the_home_binding(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": "table Sales\n\n\tcolumn Amount\n\n\tmeasure Total = SUM([Amount])\n",
+            "Metrics.tmdl": "table Metrics\n\n\tcolumn Amount\n\n\tmeasure Other = 1\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [("column", "Sales", "Amount", False)])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("'Sales'[Amount]", block)
+        self.assertEqual(fresh, pre)
+
+    def test_three_owner_columns_qualify_the_source(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": "table Sales\n\n\tcolumn Amount\n\n\tmeasure Total = SUM([Amount])\n",
+            "Metrics.tmdl": "table Metrics\n\n\tcolumn Amount\n\n\tmeasure Other = 1\n",
+            "Alpha.tmdl": "table Alpha\n\n\tcolumn Amount\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [("column", "Sales", "Amount", False)])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("'Sales'[Amount]", block)
+        self.assertEqual(fresh, pre)
+
+    def test_unresolved_reference_that_would_capture_refuses(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": "table Sales\n\n\tmeasure Total = SUM([Rate])\n",
+            "Metrics.tmdl": "table Metrics\n\n\tcolumn Rate\n\n\tmeasure Other = 1\n",
+            "Tax.tmdl": "table Tax\n\n\tcolumn Rate\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [("unresolved", "", "Rate", True)])
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            move.move_measure(ws, project, "Total", "Metrics")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_home_only_column_is_qualified_not_refused(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": "table Sales\n\n\tcolumn Qty\n\n\tmeasure Total = SUM([Qty])\n",
+            "Metrics.tmdl": "table Metrics\n\n\tmeasure Other = 1\n",
+            "Alpha.tmdl": "table Alpha\n\n\tcolumn Qty\n",
+            "Beta.tmdl": "table Beta\n\n\tcolumn Qty\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [("column", "Sales", "Qty", False)])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("SUM('Sales'[Qty])", block)
+        self.assertEqual(fresh, pre)
+
+    def test_iterator_teaching_cascade_heals(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Qty\n\n"
+                "\tmeasure Margin = 1\n\n"
+                "\tmeasure Total = SUMX(VALUES([Qty]), [Margin])\n"
+            ),
+            "Metrics.tmdl": "table Metrics\n\n\tmeasure Other = 1\n",
+            "Alpha.tmdl": "table Alpha\n\n\tcolumn Qty\n",
+            "Beta.tmdl": "table Beta\n\n\tcolumn Qty\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [
+            ("column", "Sales", "Qty", False),
+            ("measure", "Sales", "Margin", False),
+        ])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("VALUES('Sales'[Qty])", block)
+        self.assertIn("SUMX(VALUES('Sales'[Qty]), [Margin])", block)
+        self.assertNotIn("'Sales'[Margin]", block)
+        self.assertEqual(fresh, pre)
+
+    def test_self_reference_qualifier_moves_with_the_block(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Total = SUM([Amount]) + 'Sales'[Total] * 0 + [Total] * 0\n"
+            ),
+            "Metrics.tmdl": "table Metrics\n\n\tcolumn Amount\n\n\tmeasure Other = 1\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [
+            ("column", "Sales", "Amount", False),
+            ("measure", "Sales", "Total", False),
+            ("measure", "Sales", "Total", False),
+        ])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("'Metrics'[Total]", block)
+        self.assertNotIn("'Sales'[Total]", block)
+        self.assertIn("SUM('Sales'[Amount]) + 'Metrics'[Total] * 0 + [Total] * 0", block)
+        self.assertEqual(self._normalized(fresh, "Total"), self._normalized(pre, "Total"))
+
+    def test_clean_move_inserts_no_qualifier(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Other = 1\n\n"
+                "\tmeasure Total = SUM([Amount]) + 'Sales'[Amount] + [Other]\n"
+            ),
+            "Metrics.tmdl": "table Metrics\n\n\tmeasure Reserve = 1\n",
+        }, "Sales", "Total")
+        pre, source_block = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [
+            ("column", "Sales", "Amount", False),
+            ("column", "Sales", "Amount", False),
+            ("measure", "Sales", "Other", False),
+        ])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertEqual(block.rstrip("\n"), source_block.rstrip("\n"))
+        destination = Path(mdef, "tables", "Metrics.tmdl").read_text(encoding="utf-8")
+        self.assertNotIn("'Metrics'", destination)
+        self.assertEqual(fresh, pre)
+
+    def test_unrelated_measure_text_is_left_alone(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Keeper = SUM([Amount]) * 2\n\n"
+                "\tmeasure Total = SUM([Amount])\n"
+            ),
+            "Metrics.tmdl": "table Metrics\n\n\tcolumn Amount\n\n\tmeasure Other = 1\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [("column", "Sales", "Amount", False)])
+        keeper_pre, keeper_block = self._block_bindings(mdef, "Keeper")
+        self.assertEqual(keeper_pre, [("column", "Sales", "Amount", False)])
+        move.move_measure(ws, project, "Total", "Metrics")
+        keeper_fresh, fresh_block = self._block_bindings(mdef, "Keeper")
+        self.assertEqual(fresh_block, keeper_block)
+        self.assertEqual(keeper_fresh, [("column", "Sales", "Amount", False)])
+
+    def test_move_within_one_file_keeps_bindings(self):
+        ws, project, mdef = self._project({
+            "Model.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Total = SUM([Amount])\n\n"
+                "table Metrics\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Other = 1\n"
+            ),
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [("column", "Sales", "Amount", False)])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("'Sales'[Amount]", block)
+        self.assertEqual(fresh, pre)
+
+    def test_qualification_quotes_a_spaced_table_name(self):
+        ws, project, mdef = self._project({
+            "Sales Data.tmdl": (
+                "table 'Sales Data'\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Total = SUM([Amount])\n"
+            ),
+            "Metrics.tmdl": "table Metrics\n\n\tcolumn Amount\n\n\tmeasure Other = 1\n",
+        }, "Sales Data", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [("column", "Sales Data", "Amount", False)])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("'Sales Data'[Amount]", block)
+        self.assertEqual(fresh, pre)
+
+    def test_flag_only_difference_heals_without_an_edit(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Qty\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Total = SUMX(VALUES([Qty]), [Amount])\n"
+            ),
+            "Metrics.tmdl": "table Metrics\n\n\tmeasure Other = 1\n",
+            "Alpha.tmdl": "table Alpha\n\n\tcolumn Qty\n",
+            "Beta.tmdl": "table Beta\n\n\tcolumn Qty\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [
+            ("column", "Sales", "Qty", False),
+            ("column", "Sales", "Amount", False),
+        ])
+        model = tmdl.load_model(mdef, root=os.path.dirname(mdef))
+        total = model.measure("Total")
+        doc = model.docs[total.node.file]
+        region = next(reg for reg in doc.regions_for(total.node) if reg.kind == "dax")
+        expr_text = doc.text[region.start:region.end]
+        destination = deps.dax_bindings(expr_text, "Metrics", deps.Resolver(model))
+        self.assertEqual(
+            [(b.ref.kind, b.ref.table, b.ref.name, b.uncertain) for b in destination.bindings],
+            [("unresolved", "", "Qty", True), ("column", "Sales", "Amount", True)],
+        )
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("VALUES('Sales'[Qty])", block)
+        self.assertIn("SUMX(VALUES('Sales'[Qty]), [Amount])", block)
+        self.assertNotIn("'Sales'[Amount]", block)
+        self.assertEqual(fresh, pre)
+
+    def test_column_to_measure_cascade_leaves_the_victim_bare(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Qty\n\n"
+                "\tcolumn Margin\n\n"
+                "\tmeasure Total = SUMX(VALUES([Qty]), [Margin])\n"
+            ),
+            "Metrics.tmdl": "table Metrics\n\n\tcolumn Qty\n\n\tmeasure Margin = 1\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [
+            ("column", "Sales", "Qty", False),
+            ("column", "Sales", "Margin", False),
+        ])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("VALUES('Sales'[Qty])", block)
+        self.assertIn("SUMX(VALUES('Sales'[Qty]), [Margin])", block)
+        self.assertNotIn("'Sales'[Margin]", block)
+        self.assertEqual(fresh, pre)
+
+    def test_kpi_target_expression_keeps_its_binding(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Total = SUM([Amount])\n\n"
+                "\t\tkpi\n"
+                "\t\t\ttargetExpression = SUM([Amount])\n"
+            ),
+            "Metrics.tmdl": "table Metrics\n\n\tcolumn Amount\n\n\tmeasure Other = 1\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [
+            ("column", "Sales", "Amount", False),
+            ("column", "Sales", "Amount", False),
+        ])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertGreaterEqual(block.count("'Sales'[Amount]"), 2)
+        self.assertEqual(fresh, pre)
+
+    def test_stray_quote_expression_refuses_without_writes(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Qty\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Total = SUM([Qty]) ' + [Amount]\n"
+            ),
+            "Metrics.tmdl": (
+                "table Metrics\n\n"
+                "\tcolumn Qty\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Other = 1\n"
+            ),
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [
+            ("column", "Sales", "Qty", False),
+            ("column", "Sales", "Amount", False),
+        ])
+        before = _bytes(ws.mirror)
+        with self.assertRaises(PbzError) as caught:
+            move.move_measure(ws, project, "Total", "Metrics")
+        self.assertEqual(caught.exception.code, "REFUSED")
+        self.assertEqual(_bytes(ws.mirror), before)
+
+    def test_foreign_qualifier_on_a_self_reference_is_left_alone(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Total = SUM([Amount]) + 'Alpha'[Total] * 0\n"
+            ),
+            "Metrics.tmdl": "table Metrics\n\n\tmeasure Other = 1\n",
+            "Alpha.tmdl": "table Alpha\n\n\tcolumn Qty\n",
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [
+            ("column", "Sales", "Amount", False),
+            ("measure", "Sales", "Total", False),
+        ])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("'Alpha'[Total]", block)
+        self.assertEqual(self._normalized(fresh, "Total"), self._normalized(pre, "Total"))
+
+    def test_two_insertions_in_one_region(self):
+        ws, project, mdef = self._project({
+            "Sales.tmdl": (
+                "table Sales\n\n"
+                "\tcolumn Qty\n\n"
+                "\tcolumn Margin\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Total = SUMX(VALUES([Qty]), [Margin]) + SUM([Amount])\n"
+            ),
+            "Metrics.tmdl": (
+                "table Metrics\n\n"
+                "\tcolumn Qty\n\n"
+                "\tcolumn Amount\n\n"
+                "\tmeasure Margin = 1\n"
+            ),
+        }, "Sales", "Total")
+        pre, _ = self._block_bindings(mdef, "Total")
+        self.assertEqual(pre, [
+            ("column", "Sales", "Qty", False),
+            ("column", "Sales", "Margin", False),
+            ("column", "Sales", "Amount", False),
+        ])
+        move.move_measure(ws, project, "Total", "Metrics")
+        fresh, block = self._block_bindings(mdef, "Total")
+        self.assertIn("VALUES('Sales'[Qty])", block)
+        self.assertIn("SUM('Sales'[Amount])", block)
+        self.assertNotIn("'Sales'[Margin]", block)
+        self.assertIn("SUMX(VALUES('Sales'[Qty]), [Margin]) + SUM('Sales'[Amount])", block)
+        self.assertEqual(block.count("'Sales'"), 2)
+        self.assertEqual(fresh, pre)
 
 
 if __name__ == "__main__":
