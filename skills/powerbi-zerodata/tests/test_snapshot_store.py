@@ -5,19 +5,21 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest.mock import patch
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pbz import checks, evidence, guard, tokens
+from pbz import checks, evidence, guard, identity, tokens
 from pbz.common import PbzError
-from mirror_helpers import make_workspace
+from mirror_helpers import make_project, make_workspace
 from test_mirror_writers_root import _tiny
 
 CLI = os.path.join(SKILL, "pbz", "cli.py")
@@ -45,6 +47,11 @@ def _tree(root: Path) -> tuple:
 def _tree_with_pending_lock(before, name):
     lock = (f"pending/{name}.lock", "file", hashlib.sha256(b"").hexdigest())
     return tuple(sorted((*before, ("pending", "dir", ""), lock)))
+
+
+def _tree_after_first_use(before, name):
+    return tuple(sorted((*_tree_with_pending_lock(before, name),
+                         ("results", "dir", ""), ("specs", "dir", ""))))
 
 
 def _public_cli(workspace: str, private_root: str, args: list):
@@ -80,8 +87,28 @@ class SnapshotStoreTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.ws = make_workspace(tmp.name)
-        self.snaps = Path(self.ws.private) / "snapshots"
+        self.project = make_project(self.ws)
+        self.project_id = identity.resolve(self.ws, self.project, apply=True).project_id
+        self.flat_snaps = Path(self.ws.private) / "snapshots"
+        self.snaps = self.flat_snaps / "projects" / self.project_id
         self.snaps.mkdir(parents=True, exist_ok=True)
+
+    def _stamped_result(self, raw):
+        doc = json.loads(raw)
+        doc["project_id"] = self.project_id
+        return json.dumps(doc).encode()
+
+    def _stamped_spec(self, spec):
+        return {**spec, "project_id": self.project_id}
+
+    def _ping(self):
+        return {"ok": True, "snapshot_layout": "project-v1"}
+
+    def _echo(self, payload, response):
+        if isinstance(response, dict) and response.get("ok"):
+            return {**response, "project_id": payload.get("project_id"),
+                    "snapshot_layout": "project-v1"}
+        return response
 
     def test_old_layout_fixture_migration_and_sha256_identity(self):
         res_data = {"queries": {"q1": {"rows": ["abc123def456"]}}, "refreshed": "2026-01-01T00:00:00"}
@@ -90,8 +117,8 @@ class SnapshotStoreTests(unittest.TestCase):
         res_bytes = json.dumps(res_data, indent=2).encode("utf-8")
         spec_bytes = json.dumps(spec_data, indent=2).encode("utf-8")
 
-        res_file = self.snaps / "monthly.json"
-        spec_file = self.snaps / "monthly.spec.json"
+        res_file = self.flat_snaps / "monthly.json"
+        spec_file = self.flat_snaps / "monthly.spec.json"
 
         res_file.write_bytes(res_bytes)
         spec_file.write_bytes(spec_bytes)
@@ -107,8 +134,8 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertFalse(res_file.exists())
         self.assertFalse(spec_file.exists())
 
-        new_res = self.snaps / "results" / "monthly.json"
-        new_spec = self.snaps / "specs" / "monthly.json"
+        new_res = self.flat_snaps / "results" / "monthly.json"
+        new_spec = self.flat_snaps / "specs" / "monthly.json"
         self.assertTrue(new_res.is_file())
         self.assertTrue(new_spec.is_file())
 
@@ -118,7 +145,7 @@ class SnapshotStoreTests(unittest.TestCase):
     def test_migration_results_shaped_monthly_spec_file(self):
         # A legacy file named monthly.spec.json that holds results (from baseline named monthly.spec)
         res_data = {"queries": {"q1": {"rows": ["111222"]}}, "refreshed": "2026-02-01T00:00:00"}
-        legacy_file = self.snaps / "monthly.spec.json"
+        legacy_file = self.flat_snaps / "monthly.spec.json"
         legacy_file.write_text(json.dumps(res_data), encoding="utf-8")
 
         res = checks.migrate_snapshot_layout(self.ws)
@@ -127,14 +154,14 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(res["specs"], [])
 
         self.assertFalse(legacy_file.exists())
-        migrated = self.snaps / "results" / "monthly.spec.json"
+        migrated = self.flat_snaps / "results" / "monthly.spec.json"
         self.assertTrue(migrated.is_file())
         loaded = json.loads(migrated.read_text("utf-8"))
         self.assertEqual(loaded["refreshed"], "2026-02-01T00:00:00")
 
     def test_migration_corrupt_legacy_file_fail_closed(self):
         # Corrupt / unrecognized shape legacy file
-        corrupt_file = self.snaps / "bad.json"
+        corrupt_file = self.flat_snaps / "bad.json"
         corrupt_file.write_text('{"random_key": 123}', encoding="utf-8")
 
         with self.assertRaises(PbzError) as ctx:
@@ -146,49 +173,49 @@ class SnapshotStoreTests(unittest.TestCase):
 
     def test_migration_two_pass_late_conflict_prevents_partial_migration(self):
         # Setup: candidate a is valid, candidate b conflicts with existing results/b.json
-        (self.snaps / "results").mkdir(parents=True, exist_ok=True)
-        (self.snaps / "results" / "b.json").write_text('{"queries": {}, "refreshed": "new"}', encoding="utf-8")
+        (self.flat_snaps / "results").mkdir(parents=True, exist_ok=True)
+        (self.flat_snaps / "results" / "b.json").write_text('{"queries": {}, "refreshed": "new"}', encoding="utf-8")
 
         a_data = {"queries": {"q1": {}}, "refreshed": "a"}
         b_data = {"queries": {"q1": {}}, "refreshed": "old_conflicting"}
-        (self.snaps / "a.json").write_text(json.dumps(a_data), encoding="utf-8")
-        (self.snaps / "b.json").write_text(json.dumps(b_data), encoding="utf-8")
+        (self.flat_snaps / "a.json").write_text(json.dumps(a_data), encoding="utf-8")
+        (self.flat_snaps / "b.json").write_text(json.dumps(b_data), encoding="utf-8")
 
         with self.assertRaises(PbzError) as ctx:
             checks.migrate_snapshot_layout(self.ws)
         self.assertEqual(ctx.exception.code, "CONFLICT")
 
         # Zero partial mutation: a.json must NOT have been migrated or removed!
-        self.assertTrue((self.snaps / "a.json").is_file())
-        self.assertFalse((self.snaps / "results" / "a.json").exists())
+        self.assertTrue((self.flat_snaps / "a.json").is_file())
+        self.assertFalse((self.flat_snaps / "results" / "a.json").exists())
 
     def test_migration_crash_recovery_identical_both_exist(self):
         # Both results/c.json and snapshots/c.json exist with identical content
         c_data = {"queries": {"q1": {}}, "refreshed": "identical"}
         c_text = json.dumps(c_data)
-        (self.snaps / "results").mkdir(parents=True, exist_ok=True)
-        (self.snaps / "results" / "c.json").write_text(c_text, encoding="utf-8")
-        (self.snaps / "c.json").write_text(c_text, encoding="utf-8")
+        (self.flat_snaps / "results").mkdir(parents=True, exist_ok=True)
+        (self.flat_snaps / "results" / "c.json").write_text(c_text, encoding="utf-8")
+        (self.flat_snaps / "c.json").write_text(c_text, encoding="utf-8")
 
         res = checks.migrate_snapshot_layout(self.ws)
         self.assertTrue(res["migrated"])
         self.assertEqual(res["results"], ["c"])
-        self.assertFalse((self.snaps / "c.json").exists())
-        self.assertTrue((self.snaps / "results" / "c.json").is_file())
+        self.assertFalse((self.flat_snaps / "c.json").exists())
+        self.assertTrue((self.flat_snaps / "results" / "c.json").is_file())
 
     def test_migration_idempotency(self):
-        (self.snaps / "results").mkdir(parents=True, exist_ok=True)
-        (self.snaps / "specs").mkdir(parents=True, exist_ok=True)
-        (self.snaps / "results" / "foo.json").write_text('{"queries": {}, "refreshed": "1"}', encoding="utf-8")
-        (self.snaps / "specs" / "foo.json").write_text('{"queries": []}', encoding="utf-8")
+        (self.flat_snaps / "results").mkdir(parents=True, exist_ok=True)
+        (self.flat_snaps / "specs").mkdir(parents=True, exist_ok=True)
+        (self.flat_snaps / "results" / "foo.json").write_text('{"queries": {}, "refreshed": "1"}', encoding="utf-8")
+        (self.flat_snaps / "specs" / "foo.json").write_text('{"queries": []}', encoding="utf-8")
 
         res = checks.migrate_snapshot_layout(self.ws)
         self.assertFalse(res["migrated"])
         self.assertEqual(res["results"], [])
         self.assertEqual(res["specs"], [])
 
-        self.assertTrue((self.snaps / "results" / "foo.json").is_file())
-        self.assertTrue((self.snaps / "specs" / "foo.json").is_file())
+        self.assertTrue((self.flat_snaps / "results" / "foo.json").is_file())
+        self.assertTrue((self.flat_snaps / "specs" / "foo.json").is_file())
 
     def test_migration_under_workspace_lock(self):
         lock_acquired = []
@@ -206,7 +233,7 @@ class SnapshotStoreTests(unittest.TestCase):
     def test_migration_refuses_unsafe_link_paths_before_makedirs(self):
         # A reparse point on snapshots/results or snapshots/specs fails closed with UNSAFE_PATH
         with patch("pbz.checks._reparse_link", side_effect=lambda p: "results" in str(p)):
-            (self.snaps / "results").mkdir(parents=True, exist_ok=True)
+            (self.flat_snaps / "results").mkdir(parents=True, exist_ok=True)
             with self.assertRaises(PbzError) as ctx:
                 checks.migrate_snapshot_layout(self.ws)
             self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
@@ -233,23 +260,23 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertTrue(spec_monthly_spec.endswith(os.path.join("snapshots", "specs", "monthly.spec.json")))
 
     def test_saved_spec_legacy_read_only_fallback(self):
-        legacy_path = self.snaps / "old.spec.json"
+        legacy_path = self.flat_snaps / "old.spec.json"
         legacy_data = {"queries": [{"id": "q1", "dax": "EVALUATE {10}"}]}
         legacy_path.write_text(json.dumps(legacy_data), encoding="utf-8")
 
         spec = checks.saved_spec(self.ws, "old")
         self.assertEqual(spec, legacy_data)
 
-        (self.snaps / "specs").mkdir(parents=True, exist_ok=True)
+        (self.flat_snaps / "specs").mkdir(parents=True, exist_ok=True)
         new_data = {"queries": [{"id": "q1", "dax": "EVALUATE {20}"}]}
-        (self.snaps / "specs" / "old.json").write_text(json.dumps(new_data), encoding="utf-8")
+        (self.flat_snaps / "specs" / "old.json").write_text(json.dumps(new_data), encoding="utf-8")
 
         spec = checks.saved_spec(self.ws, "old")
         self.assertEqual(spec, new_data)
 
     def test_saved_spec_legacy_fallback_refuses_result_shaped_file(self):
         # A legacy result-shaped file at monthly.spec.json must not be misread as a spec for monthly
-        legacy_path = self.snaps / "monthly.spec.json"
+        legacy_path = self.flat_snaps / "monthly.spec.json"
         res_data = {"queries": {"q1": {"rows": []}}, "refreshed": "2026-01-01T00:00:00"}
         legacy_path.write_text(json.dumps(res_data), encoding="utf-8")
 
@@ -258,9 +285,9 @@ class SnapshotStoreTests(unittest.TestCase):
 
     def test_saved_spec_primary_precedence_invalid_primary_does_not_fall_back(self):
         # When primary specs/foo.json exists but is invalid (queries not a list), do NOT fall back to legacy!
-        (self.snaps / "specs").mkdir(parents=True, exist_ok=True)
-        (self.snaps / "specs" / "foo.json").write_text('{"queries": {}}', encoding="utf-8")
-        legacy_path = self.snaps / "foo.spec.json"
+        (self.flat_snaps / "specs").mkdir(parents=True, exist_ok=True)
+        (self.flat_snaps / "specs" / "foo.json").write_text('{"queries": {}}', encoding="utf-8")
+        legacy_path = self.flat_snaps / "foo.spec.json"
         legacy_path.write_text('{"queries": [{"id": "q1"}]}', encoding="utf-8")
 
         spec = checks.saved_spec(self.ws, "foo")
@@ -269,18 +296,18 @@ class SnapshotStoreTests(unittest.TestCase):
     def test_migration_dot_spec_result_baseline(self):
         # A legacy result baseline named .spec (file name .spec.json)
         res_data = {"queries": {"q1": {}}, "refreshed": "2026-01-01T00:00:00"}
-        legacy_file = self.snaps / ".spec.json"
+        legacy_file = self.flat_snaps / ".spec.json"
         legacy_file.write_text(json.dumps(res_data), encoding="utf-8")
 
         res = checks.migrate_snapshot_layout(self.ws)
         self.assertTrue(res["migrated"])
         self.assertEqual(res["results"], [".spec"])
-        self.assertTrue((self.snaps / "results" / ".spec.json").is_file())
+        self.assertTrue((self.flat_snaps / "results" / ".spec.json").is_file())
         self.assertFalse(legacy_file.exists())
 
     def test_migration_invalid_refreshed_type_fails_closed(self):
         # A legacy result file with numeric refreshed (e.g. 123 instead of string/null)
-        bad_file = self.snaps / "bad_refresh.json"
+        bad_file = self.flat_snaps / "bad_refresh.json"
         bad_file.write_text('{"queries": {}, "refreshed": 123}', encoding="utf-8")
 
         with self.assertRaises(PbzError) as ctx:
@@ -288,20 +315,20 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "CORRUPT_STATE")
         self.assertTrue(bad_file.exists())
         # Destination directories must not have been created on Pass 1 failure
-        self.assertFalse((self.snaps / "results").exists())
-        self.assertFalse((self.snaps / "specs").exists())
+        self.assertFalse((self.flat_snaps / "results").exists())
+        self.assertFalse((self.flat_snaps / "specs").exists())
 
     def test_migration_anomalous_spec_file_fails_closed(self):
         # A spec-shaped file without .spec.json suffix is refused as CORRUPT_STATE
-        anomalous = self.snaps / "anomalous.json"
+        anomalous = self.flat_snaps / "anomalous.json"
         anomalous.write_text(json.dumps({"queries": [{"id": "q1"}]}), encoding="utf-8")
 
         with self.assertRaises(PbzError) as ctx:
             checks.migrate_snapshot_layout(self.ws)
         self.assertEqual(ctx.exception.code, "CORRUPT_STATE")
         self.assertTrue(anomalous.exists())
-        self.assertFalse((self.snaps / "results").exists())
-        self.assertFalse((self.snaps / "specs").exists())
+        self.assertFalse((self.flat_snaps / "results").exists())
+        self.assertFalse((self.flat_snaps / "specs").exists())
 
     def test_evidence_state_names_refuses_intermediate_reparse_link(self):
         # If snapshots itself is flagged as a reparse link, looking up snapshots/results must fail closed
@@ -312,27 +339,27 @@ class SnapshotStoreTests(unittest.TestCase):
 
     def test_evidence_suggested_tests_includes_results_monthly_spec_and_unions_legacy(self):
         # In ws.private/snapshots/results/: q1.json
-        (self.snaps / "results").mkdir(parents=True, exist_ok=True)
-        (self.snaps / "results" / "q1.json").write_text("{}", encoding="utf-8")
+        (self.flat_snaps / "results").mkdir(parents=True, exist_ok=True)
+        (self.flat_snaps / "results" / "q1.json").write_text("{}", encoding="utf-8")
 
         # In legacy ws.private/snapshots/:
         # 1. monthly.spec.json (result-shaped) -> should be suggested as monthly.spec
-        (self.snaps / "monthly.spec.json").write_text('{"queries": {}, "refreshed": "2026-01-01"}', encoding="utf-8")
+        (self.flat_snaps / "monthly.spec.json").write_text('{"queries": {}, "refreshed": "2026-01-01"}', encoding="utf-8")
         # 2. legacy.json (result-shaped) -> should be suggested as legacy
-        (self.snaps / "legacy.json").write_text('{"queries": {}, "refreshed": "2026-01-01"}', encoding="utf-8")
+        (self.flat_snaps / "legacy.json").write_text('{"queries": {}, "refreshed": "2026-01-01"}', encoding="utf-8")
         # 3. pure_spec.spec.json (spec-shaped) -> should be omitted
-        (self.snaps / "pure_spec.spec.json").write_text('{"queries": [{"id": "q1"}]}', encoding="utf-8")
+        (self.flat_snaps / "pure_spec.spec.json").write_text('{"queries": [{"id": "q1"}]}', encoding="utf-8")
 
         suggested = evidence._suggested_tests(self.ws, None, [])
-        # Must include q1 from results
-        self.assertIn("pbz snapshot compare q1", suggested)
-        # Must include monthly.spec from result-shaped legacy file
-        self.assertIn("pbz snapshot compare monthly.spec", suggested)
-        # Must include legacy from legacy result file
-        self.assertIn("pbz snapshot compare legacy", suggested)
-        # Must NOT include pure_spec.spec (since that was a spec file in the legacy directory)
-        self.assertNotIn("pbz snapshot compare pure_spec.spec", suggested)
-        self.assertNotIn("pbz snapshot compare pure_spec", suggested)
+        # Re-pointed under S1: with no project selected there are no
+        # per-project compare suggestions at all; flat names are reported
+        # only in the legacy-labeled form naming the adopt-legacy remedy.
+        self.assertFalse(any("snapshot compare" in line for line in suggested))
+        self.assertTrue(any(line.startswith("legacy snapshot q1 ") and "adopt-legacy" in line for line in suggested))
+        self.assertTrue(any(line.startswith("legacy snapshot monthly.spec ") and "adopt-legacy" in line for line in suggested))
+        self.assertTrue(any(line.startswith("legacy snapshot legacy ") and "adopt-legacy" in line for line in suggested))
+        # pure_spec.spec was a spec file in the legacy directory: omitted everywhere
+        self.assertFalse(any("pure_spec" in line for line in suggested))
 
     def test_evidence_suggested_tests_pbz_state_b_dir_none(self):
         # Under .pbz/snapshots/ (b_dir=None path):
@@ -340,13 +367,14 @@ class SnapshotStoreTests(unittest.TestCase):
         pbz_snaps.mkdir(parents=True, exist_ok=True)
         (pbz_snaps / "shared_res.spec.json").write_text('{"queries": {}, "refreshed": "2026-01-01"}', encoding="utf-8")
         suggested = evidence._suggested_tests(self.ws, None, [])
-        self.assertIn("pbz snapshot compare shared_res.spec", suggested)
+        self.assertFalse(any("snapshot compare" in line for line in suggested))
+        self.assertTrue(any(line.startswith("legacy snapshot shared_res.spec ") and "adopt-legacy" in line for line in suggested))
 
     def test_evidence_suggested_tests_omits_invalid_refreshed_type(self):
         # Ambiguous legacy file with non-string/non-null refreshed is omitted from suggestions
-        (self.snaps / "bad_num_ref.spec.json").write_text('{"queries": {}, "refreshed": 123}', encoding="utf-8")
+        (self.flat_snaps / "bad_num_ref.spec.json").write_text('{"queries": {}, "refreshed": 123}', encoding="utf-8")
         suggested = evidence._suggested_tests(self.ws, None, [])
-        self.assertNotIn("pbz snapshot compare bad_num_ref.spec", suggested)
+        self.assertFalse(any("bad_num_ref" in line for line in suggested))
 
     def test_evidence_state_names_refuses_dot_dot_traversal(self):
         with self.assertRaises(PbzError) as ctx:
@@ -354,24 +382,37 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "UNSAFE_PATH")
 
     def test_first_save_creates_specs_directory_on_fresh_workspace(self):
-        # Fresh workspace with no pre-existing snapshots directory
-        if self.snaps.exists():
-            import shutil
-            shutil.rmtree(self.snaps)
-        self.assertFalse(self.snaps.exists())
+        # Cold start: an unbound project in a workspace whose private store
+        # has no snapshots directory at all. The first save must create the
+        # whole chain (identity, namespace, specs directory) itself.
+        ws = make_workspace(tempfile.mkdtemp(prefix="pbz-snap-cold-"))
+        self.addCleanup(shutil.rmtree, ws.root, True)
+        project = make_project(ws)
+        snaps_root = Path(ws.private) / "snapshots"
+        self.assertFalse(snaps_root.exists())
+
         def fake_engine(verb, payload, timeout=1800, **kwargs):
-            results = self.snaps / "results"
-            results.mkdir()
-            (results / (payload["name"] + ".json")).write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+            if verb == "ping":
+                return {"ok": True, "snapshot_layout": "project-v1"}
+            results = (Path(payload["private_dir"]) / "snapshots" / "projects"
+                       / payload["project_id"] / "results")
+            results.mkdir(parents=True, exist_ok=True)
+            doc = {**LEGACY_RESULT, "project_id": payload["project_id"]}
+            (results / (payload["name"] + ".json")).write_text(json.dumps(doc), encoding="utf-8")
             return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": payload["project_id"], "snapshot_layout": "project-v1",
                     "queries": [{"id": "q1", "result": "SAVED"}]}
 
         with patch("pbz.desktop.require_port", return_value=1234), \
              patch("pbz.checks.engine_call", side_effect=fake_engine), \
              patch("pbz.checks.spend", return_value=True):
-            res = checks.snapshot(self.ws, None, "save", "fresh_snap", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
-            self.assertTrue(res.get("ok"))
-            self.assertTrue((self.snaps / "specs" / "fresh_snap.json").is_file())
+            res = checks.snapshot(ws, project, "save", "fresh_snap", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
+        self.assertTrue(res.get("ok"))
+        registry = identity.load_registry(ws)
+        self.assertEqual(len(registry), 1)
+        project_id = next(iter(registry))
+        self.assertTrue(
+            (snaps_root / "projects" / project_id / "specs" / "fresh_snap.json").is_file())
 
     def test_snapshot_refuses_empty_queries_in_checks(self):
         # snapshot() must fail closed with BAD_REQUEST when queries list is empty
@@ -394,6 +435,8 @@ class SnapshotStoreTests(unittest.TestCase):
             self.assertFalse((self.snaps / "results" / "empty_snap.json").exists())
 
     def _seed_public_tree(self):
+        import pbz.common as _common
+
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name) / "ws"
@@ -406,6 +449,12 @@ class SnapshotStoreTests(unittest.TestCase):
         snaps.mkdir(parents=True)
         (snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
         (snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        with patch.dict(os.environ, {"PBZ_PRIVATE_ROOT": str(private)}):
+            pub_ws = _common.Workspace(str(root))
+            pub_ws.private = str(snaps.parent)
+            project = pub_ws.project(None)
+            self.public_project_id = identity.resolve(pub_ws, project, apply=True).project_id
+            checks._ensure_project_namespace(pub_ws, self.public_project_id)
         return str(root), str(private), snaps
 
     def test_public_cli_empty_query_leaves_snapshot_tree(self):
@@ -433,7 +482,13 @@ class SnapshotStoreTests(unittest.TestCase):
                 self.assertEqual(payload.get("error"), "ENGINE_UNAVAILABLE")
                 self.assertEqual(payload["outcome"]["status"], "UNAVAILABLE")
                 self.assertEqual(payload["outcome"]["exit_code"], 4)
-                self.assertEqual(_tree(snaps), _tree_with_pending_lock(before, "different"))
+                # The namespace structure is pre-created by the fixture. On a
+                # host whose engine answers the capability ping, the pair lock
+                # is also created before the Desktop port probe fails; on a
+                # host without a runnable engine the ping itself fails first.
+                lock_row = (f"projects/{self.public_project_id}/pending/different.lock",
+                            "file", hashlib.sha256(b"").hexdigest())
+                self.assertIn(_tree(snaps), (before, tuple(sorted((*before, lock_row)))))
 
     def test_public_cli_cold_snapshot_dir_stays_absent(self):
         tmp = tempfile.TemporaryDirectory()
@@ -463,19 +518,40 @@ class SnapshotStoreTests(unittest.TestCase):
             engine.assert_not_called()
 
     def test_unrelated_malformed_legacy_does_not_reject_another_name(self):
-        (self.snaps / "bad.json").write_text("{not-json", encoding="utf-8")
-        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
-        before = _tree(self.snaps)
-        with patch("pbz.desktop.require_port", side_effect=PbzError("ENGINE_UNAVAILABLE", "desktop down")):
-            with self.assertRaises(PbzError) as ctx:
-                checks.snapshot(self.ws, None, "save", "different", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
-            self.assertEqual(ctx.exception.code, "ENGINE_UNAVAILABLE")
-        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "different"))
+        (self.flat_snaps / "bad.json").write_text("{not-json", encoding="utf-8")
+        (self.flat_snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        files = [self.flat_snaps / name for name in ("bad.json", "notes.txt")]
+        before = [path.read_bytes() for path in files]
+        before_flat = [row for row in _tree(self.flat_snaps) if not row[0].startswith("projects/")]
+
+        def fake_engine(verb, payload, **kwargs):
+            if verb == "ping":
+                return self._ping()
+            result = self.snaps / "results" / "different.json"
+            result.write_bytes(self._stamped_result(json.dumps(LEGACY_RESULT).encode()))
+            return self._echo(payload, {"ok": True, "payload_state": "may_have_been_sent",
+                                       "queries": [{"id": "q1", "result": "SAVED"}]})
+
+        with patch("pbz.desktop.require_port", return_value=1), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine):
+            res = checks.snapshot(self.ws, None, "save", "different", json.loads(VALID_SPEC))
+        self.assertTrue(res.get("ok"))
+        self.assertEqual([path.read_bytes() for path in files], before)
+        # The flat store gains nothing, and the namespace holds exactly the
+        # published pair and its lock: no journal or staged file remains.
+        self.assertEqual(
+            [row for row in _tree(self.flat_snaps) if not row[0].startswith("projects/")],
+            before_flat)
+        self.assertEqual(
+            {(row[0], row[1]) for row in _tree(self.snaps)},
+            {("results", "dir"), ("specs", "dir"), ("pending", "dir"),
+             ("results/different.json", "file"), ("specs/different.json", "file"),
+             ("pending/different.lock", "file")})
 
     def test_malformed_requested_baseline_fails_before_port(self):
-        (self.snaps / "different.json").write_text("{not-json", encoding="utf-8")
-        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
-        before = _tree(self.snaps)
+        (self.flat_snaps / "different.json").write_text("{not-json", encoding="utf-8")
+        (self.flat_snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        before = _tree(self.flat_snaps)
         with patch("pbz.desktop.require_port") as port, \
              patch("pbz.checks.engine_call") as engine, \
              patch("pbz.checks.spend") as spend:
@@ -485,13 +561,40 @@ class SnapshotStoreTests(unittest.TestCase):
             port.assert_not_called()
             engine.assert_not_called()
             spend.assert_not_called()
-        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "different"))
+        self.assertEqual(_tree(self.flat_snaps), before)
+        self.assertFalse((self.snaps / "pending" / "different.lock").exists())
+
+    def test_flat_candidate_json_null_is_corrupt_before_engine(self):
+        candidates = (
+            Path(self.ws.private, "snapshots", "results", "nullcase.json"),
+            Path(self.ws.private, "snapshots", "nullcase.json"),
+            Path(self.ws.private, "snapshots", "specs", "nullcase.json"),
+            Path(self.ws.private, "snapshots", "nullcase.spec.json"),
+        )
+        for path in candidates:
+            with self.subTest(candidate=str(path)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("null", encoding="utf-8")
+                try:
+                    with patch("pbz.desktop.require_port") as port, \
+                         patch("pbz.checks.engine_call") as engine, \
+                         patch("pbz.checks.spend") as spend:
+                        with self.assertRaises(PbzError) as raised:
+                            checks.snapshot(self.ws, None, "compare", "nullcase", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
+                        self.assertEqual(raised.exception.code, "CORRUPT_STATE")
+                        port.assert_not_called()
+                        engine.assert_not_called()
+                        spend.assert_not_called()
+                finally:
+                    path.unlink()
+                self.assertFalse((self.snaps / "results" / "nullcase.json").exists())
 
     def test_malformed_namespaced_result_does_not_fall_back_to_legacy(self):
         (self.snaps / "results").mkdir()
         (self.snaps / "results" / "different.json").write_text("{not-json", encoding="utf-8")
-        (self.snaps / "different.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
-        before = _tree(self.snaps)
+        (self.flat_snaps / "different.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        before_flat = _tree(self.flat_snaps)
+        before_ns = _tree(self.snaps)
         with patch("pbz.desktop.require_port") as port, \
              patch("pbz.checks.engine_call") as engine, \
              patch("pbz.checks.spend") as spend:
@@ -503,44 +606,59 @@ class SnapshotStoreTests(unittest.TestCase):
             port.assert_not_called()
             engine.assert_not_called()
             spend.assert_not_called()
-        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "different"))
+        self.assertEqual(_tree(self.snaps), before_ns)
+        self.assertEqual(_tree(self.flat_snaps), before_flat)
+        self.assertFalse((self.snaps / "pending" / "different.lock").exists())
 
     def test_namespaced_result_wins_and_legacy_bytes_stay(self):
         (self.snaps / "results").mkdir()
         namespaced = {"queries": {"q1": {"rows": ["aa"]}}, "refreshed": "2026-02-01T00:00:00"}
+        namespaced["project_id"] = self.project_id
         legacy = {"queries": {"q1": {"rows": ["bb"]}}, "refreshed": "2026-01-01T00:00:00"}
         (self.snaps / "results" / "different.json").write_text(json.dumps(namespaced), encoding="utf-8")
-        (self.snaps / "different.json").write_text(json.dumps(legacy), encoding="utf-8")
-        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
-        legacy_bytes = (self.snaps / "different.json").read_bytes()
-        notes_bytes = (self.snaps / "notes.txt").read_bytes()
+        (self.flat_snaps / "different.json").write_text(json.dumps(legacy), encoding="utf-8")
+        (self.flat_snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        legacy_bytes = (self.flat_snaps / "different.json").read_bytes()
+        notes_bytes = (self.flat_snaps / "notes.txt").read_bytes()
+        def fake_engine(verb, payload, **kwargs):
+            if verb == "ping":
+                return self._ping()
+            self.assertEqual(verb, "snapshot-compare")
+            self.assertEqual(payload["project_id"], self.project_id)
+            baseline = self.snaps / "results" / (payload["name"] + ".json")
+            self.assertEqual(json.loads(baseline.read_bytes()), namespaced)
+            return self._echo(payload, {"ok": True, "queries": [{"id": "q1", "result": "SAME"}]})
+
         with patch("pbz.desktop.require_port", return_value=1), \
-             patch("pbz.checks.engine_call", return_value={"ok": True, "queries": [{"id": "q1", "result": "SAME"}]}) as engine, \
+             patch("pbz.checks.engine_call", side_effect=fake_engine) as engine, \
              patch("pbz.checks.spend", return_value=True):
             res = checks.snapshot(self.ws, None, "compare", "different", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]})
         self.assertTrue(res.get("ok"))
-        engine.assert_called_once()
-        self.assertEqual((self.snaps / "different.json").read_bytes(), legacy_bytes)
-        self.assertEqual((self.snaps / "notes.txt").read_bytes(), notes_bytes)
+        self.assertEqual(engine.call_count, 2)
+        self.assertEqual(engine.call_args_list[0].args, ("ping", {}))
+        self.assertEqual((self.flat_snaps / "different.json").read_bytes(), legacy_bytes)
+        self.assertEqual((self.flat_snaps / "notes.txt").read_bytes(), notes_bytes)
         self.assertEqual(json.loads((self.snaps / "results" / "different.json").read_text("utf-8")), namespaced)
 
     def test_adapter_save_writes_only_the_named_snapshot(self):
         # Adapter, not a live engine run. The stand-in writes only the namespaced result.
-        (self.snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
-        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
-        earlier_bytes = (self.snaps / "earlier.json").read_bytes()
-        notes_bytes = (self.snaps / "notes.txt").read_bytes()
+        (self.flat_snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        (self.flat_snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        earlier_bytes = (self.flat_snaps / "earlier.json").read_bytes()
+        notes_bytes = (self.flat_snaps / "notes.txt").read_bytes()
 
         def fake_engine(verb, payload, timeout=1800, **kwargs):
+            if verb == "ping":
+                return self._ping()
             self.assertEqual(verb, "snapshot-save")
             self.assertEqual(payload["name"], "different")
             results = self.snaps / "results"
             results.mkdir(parents=True, exist_ok=True)
             (results / "different.json").write_text(
-                json.dumps({"queries": {"q1": {}}, "refreshed": "2026-03-01T00:00:00"}),
+                json.dumps({"project_id": payload["project_id"], "queries": {"q1": {}}, "refreshed": "2026-03-01T00:00:00"}),
                 encoding="utf-8",
             )
-            return {"ok": True, "payload_state": "may_have_been_sent", "queries": [{"id": "q1", "result": "SAVED"}]}
+            return self._echo(payload, {"ok": True, "payload_state": "may_have_been_sent", "queries": [{"id": "q1", "result": "SAVED"}]})
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine), \
@@ -549,43 +667,65 @@ class SnapshotStoreTests(unittest.TestCase):
                 self.ws, None, "save", "different", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
             )
         self.assertTrue(res.get("ok"))
-        self.assertEqual((self.snaps / "earlier.json").read_bytes(), earlier_bytes)
-        self.assertEqual((self.snaps / "notes.txt").read_bytes(), notes_bytes)
+        self.assertEqual((self.flat_snaps / "earlier.json").read_bytes(), earlier_bytes)
+        self.assertEqual((self.flat_snaps / "notes.txt").read_bytes(), notes_bytes)
         self.assertTrue((self.snaps / "results" / "different.json").is_file())
         self.assertTrue((self.snaps / "specs" / "different.json").is_file())
         self.assertFalse((self.snaps / "results" / "earlier.json").exists())
 
     def test_adapter_compare_reads_legacy_result_in_place(self):
-        # Adapter, not a live engine run. Legacy result and spec stay at their original paths.
-        (self.snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        # Re-pointed under S1: the flat pair is unadopted legacy state. The
+        # compare refuses while it is unadopted and leaves the flat bytes
+        # untouched; after adopt-legacy the same compare succeeds against
+        # the project's namespace, with the flat originals removed by the
+        # adoption itself and the adopted copies carrying the stamp.
+        (self.flat_snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
         spec = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
-        (self.snaps / "earlier.spec.json").write_text(json.dumps(spec), encoding="utf-8")
-        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
-        before = _tree(self.snaps)
+        (self.flat_snaps / "earlier.spec.json").write_text(json.dumps(spec), encoding="utf-8")
+        (self.flat_snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        before = _tree(self.flat_snaps)
+        project_id = identity.read_anchor(self.ws, self.project)
 
         def fake_engine(verb, payload, timeout=1800, **kwargs):
+            if verb == "ping":
+                return {"ok": True, "snapshot_layout": "project-v1"}
             self.assertEqual(verb, "snapshot-compare")
-            self.assertTrue((self.snaps / "earlier.json").is_file())
-            self.assertFalse((self.snaps / "results" / "earlier.json").exists())
-            return {"ok": True, "payload_state": "may_have_been_sent", "queries": [{"id": "q1", "result": "SAME"}]}
+            self.assertEqual(payload["project_id"], project_id)
+            return {"ok": True, "project_id": project_id, "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAME"}]}
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine), \
              patch("pbz.checks.spend", return_value=True):
+            with self.assertRaises(PbzError) as raised:
+                checks.snapshot(self.ws, None, "compare", "earlier", spec)
+            self.assertEqual(raised.exception.code, "LEGACY_BASELINE_UNADOPTED")
+            self.assertEqual(_tree(self.flat_snaps), before)
+            report = checks.adopt_legacy(self.ws, self.project, confirm_fn=lambda plan: True)
+            self.assertTrue(report["ok"])
+            self.assertIn("earlier", report["adopted"])
             res = checks.snapshot(self.ws, None, "compare", "earlier", spec)
         self.assertTrue(res.get("ok"))
-        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "earlier"))
+        self.assertFalse((self.flat_snaps / "earlier.json").exists())
+        self.assertFalse((self.flat_snaps / "earlier.spec.json").exists())
+        self.assertTrue((self.flat_snaps / "notes.txt").exists())
+        adopted_result = json.loads((self.snaps / "results" / "earlier.json").read_text(encoding="utf-8"))
+        self.assertEqual(adopted_result["project_id"], project_id)
+        adopted_spec = json.loads((self.snaps / "specs" / "earlier.json").read_text(encoding="utf-8"))
+        self.assertEqual(adopted_spec["project_id"], project_id)
 
     def test_adapter_monthly_names_do_not_share_files(self):
         # Adapter, not a live engine run. monthly and monthly.spec stay distinct.
         def fake_engine(verb, payload, timeout=1800, **kwargs):
+            if verb == "ping":
+                return self._ping()
             results = self.snaps / "results"
             results.mkdir(parents=True, exist_ok=True)
             (results / (payload["name"] + ".json")).write_text(
-                json.dumps({"queries": {"q1": {"name": payload["name"]}}, "refreshed": "2026-01-01T00:00:00"}),
+                json.dumps({"project_id": payload["project_id"], "queries": {"q1": {"name": payload["name"]}}, "refreshed": "2026-01-01T00:00:00"}),
                 encoding="utf-8",
             )
-            return {"ok": True, "payload_state": "may_have_been_sent", "queries": [{"id": "q1", "result": "SAVED"}]}
+            return self._echo(payload, {"ok": True, "payload_state": "may_have_been_sent", "queries": [{"id": "q1", "result": "SAVED"}]})
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine), \
@@ -607,16 +747,29 @@ class SnapshotStoreTests(unittest.TestCase):
         # Adapter. A spec-shaped legacy file is not deleted or moved. The live engine
         # case that reports NEW for this file is unchanged and is not run here.
         doc = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
-        (self.snaps / "unmigrated.spec.json").write_text(json.dumps(doc), encoding="utf-8")
-        before = _tree(self.snaps)
+        (self.flat_snaps / "unmigrated.spec.json").write_text(json.dumps(doc), encoding="utf-8")
+        before = [row for row in _tree(self.flat_snaps) if not row[0].startswith("projects/")]
+        def fake_engine(verb, payload, **kwargs):
+            if verb == "ping":
+                return self._ping()
+            return self._echo(payload, {"ok": True, "queries": [{"id": "q1", "result": "NEW"}]})
+
         with patch("pbz.desktop.require_port", return_value=1), \
-             patch("pbz.checks.engine_call", return_value={"ok": True, "queries": [{"id": "q1", "result": "NEW"}]}), \
+             patch("pbz.checks.engine_call", side_effect=fake_engine), \
              patch("pbz.checks.spend", return_value=True):
             res = checks.snapshot(
                 self.ws, None, "compare", "unmigrated.spec", {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
             )
         self.assertTrue(res.get("ok"))
-        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "unmigrated.spec"))
+        flat_rows = [row for row in _tree(self.flat_snaps) if not row[0].startswith("projects/")]
+        self.assertEqual(flat_rows, before)
+        # The compare touches nothing in the namespace beyond the first-use
+        # directories and the pair lock: no result, spec or journal appears.
+        expected_ns = tuple(sorted((
+            ("pending", "dir", ""), ("results", "dir", ""), ("specs", "dir", ""),
+            ("pending/unmigrated.spec.lock", "file", hashlib.sha256(b"").hexdigest()),
+        )))
+        self.assertEqual(_tree(self.snaps), expected_ns)
 
     def _state_bytes(self):
         path = checks._state_path(self.ws)
@@ -641,15 +794,15 @@ class SnapshotStoreTests(unittest.TestCase):
     def _reaches_port(self, spec, *, creates_lock=False):
         before = _tree(self.snaps)
         if creates_lock:
-            before = _tree_with_pending_lock(before, "different")
+            before = _tree_after_first_use(before, "different")
         state = self._state_bytes()
         with patch("pbz.desktop.require_port", side_effect=PbzError("ENGINE_UNAVAILABLE", "desktop down")) as port, \
-             patch("pbz.checks.engine_call") as engine:
+             patch("pbz.checks.engine_call", return_value=self._ping()) as engine:
             with self.assertRaises(PbzError) as ctx:
                 checks.snapshot(self.ws, None, "save", "different", spec)
             self.assertEqual(ctx.exception.code, "ENGINE_UNAVAILABLE")
             port.assert_called_once()
-            engine.assert_not_called()
+            engine.assert_called_once_with("ping", {})
         self.assertEqual(_tree(self.snaps), before)
         self.assertEqual(self._state_bytes(), state)
 
@@ -702,10 +855,12 @@ class SnapshotStoreTests(unittest.TestCase):
         (self.snaps / "results").mkdir()
         result = self.snaps / "results" / "different.json"
         original = b'{"queries":{"q1":{"rows":["kept"]}},"refreshed":"2026-01-01T00:00:00"}'
+        original = self._stamped_result(original)
         result.write_bytes(original)
         (self.snaps / "specs").write_bytes(b"not-a-directory")
-        (self.snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        (self.flat_snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
         before = _tree(self.snaps)
+        before_flat = _tree(self.flat_snaps)
         state = self._state_bytes()
 
         def overwrite(verb, payload, timeout=1800, **kwargs):
@@ -725,6 +880,7 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(result.read_bytes(), original)
         self.assertTrue((self.snaps / "specs").is_file())
         self.assertEqual(_tree(self.snaps), before)
+        self.assertEqual(_tree(self.flat_snaps), before_flat)
         self.assertEqual(self._state_bytes(), state)
 
     def test_result_directory_file_and_result_path_directory_are_corrupt(self):
@@ -793,12 +949,16 @@ class SnapshotStoreTests(unittest.TestCase):
         # Recovery is required. The engine write is not rolled back and the query stays spent.
         written = b'{"queries":{"q1":{"rows":["engine"]}},"refreshed":"2026-01-01T00:00:00"}'
 
+        written = self._stamped_result(written)
+
         def fake_engine(verb, payload, timeout=1800, **kwargs):
-            dest = os.path.join(payload["private_dir"], "snapshots", "results", payload["name"] + ".json")
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "wb") as handle:
-                handle.write(written)
-            return {"ok": True, "payload_state": "may_have_been_sent", "class": "OK", "queries": [{"id": "q1", "result": "SAVED"}]}
+            if verb == "ping":
+                return self._ping()
+            dest = (Path(payload["private_dir"]) / "snapshots" / "projects"
+                    / payload["project_id"] / "results" / (payload["name"] + ".json"))
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(written)
+            return self._echo(payload, {"ok": True, "payload_state": "may_have_been_sent", "class": "OK", "queries": [{"id": "q1", "result": "SAVED"}]})
 
         real_replace = os.replace
 
@@ -824,12 +984,15 @@ class SnapshotStoreTests(unittest.TestCase):
 
     def test_public_cli_specs_file_leaves_tree_and_budget(self):
         workspace, private, snaps = self._seed_public_tree()
-        (snaps / "results").mkdir()
-        (snaps / "results" / "different.json").write_bytes(
-            b'{"queries":{"q1":{"rows":["kept"]}},"refreshed":"2026-01-01T00:00:00"}'
-        )
-        (snaps / "specs").write_bytes(b"not-a-directory")
-        before = _tree(snaps)
+        ns = snaps / "projects" / self.public_project_id
+        (ns / "results").mkdir(parents=True, exist_ok=True)
+        result = json.loads(b'{"queries":{"q1":{"rows":["kept"]}},"refreshed":"2026-01-01T00:00:00"}')
+        result["project_id"] = self.public_project_id
+        (ns / "results" / "different.json").write_bytes(json.dumps(result).encode())
+        (ns / "specs").rmdir()
+        (ns / "specs").write_bytes(b"not-a-directory")
+        before = _tree(ns)
+        before_flat = _tree(snaps)
         self.assertEqual(_public_budget(private, workspace), 0)
         proc = _public_snapshot(workspace, private, "save", "different", VALID_SPEC)
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
@@ -837,14 +1000,19 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(payload.get("error"), "CORRUPT_STATE")
         self.assertEqual(payload["outcome"]["status"], "FAILED")
         self.assertEqual(payload["outcome"]["exit_code"], 2)
-        self.assertEqual(_tree(snaps), before)
+        self.assertEqual(_tree(ns), before)
+        self.assertEqual(_tree(snaps), before_flat)
         self.assertEqual(_public_budget(private, workspace), 0)
 
     def test_public_cli_explicit_empty_spec_does_not_use_saved_spec(self):
         workspace, private, snaps = self._seed_public_tree()
-        (snaps / "specs").mkdir()
-        (snaps / "specs" / "different.json").write_text(VALID_SPEC, encoding="utf-8")
-        before = _tree(snaps)
+        ns = snaps / "projects" / self.public_project_id
+        (ns / "specs").mkdir(parents=True, exist_ok=True)
+        (ns / "specs" / "different.json").write_text(
+            json.dumps({**json.loads(VALID_SPEC), "project_id": self.public_project_id}), encoding="utf-8"
+        )
+        before = _tree(ns)
+        before_flat = _tree(snaps)
         for spec in ("{}", "null", '{"queries":[]}'):
             with self.subTest(spec=spec):
                 proc = _public_snapshot(workspace, private, "compare", "different", spec)
@@ -852,14 +1020,22 @@ class SnapshotStoreTests(unittest.TestCase):
                 payload = json.loads(proc.stdout)
                 self.assertEqual(payload.get("error"), "BAD_REQUEST")
                 self.assertEqual(payload["outcome"]["status"], "INVALID")
-                self.assertEqual(_tree(snaps), before)
+                self.assertEqual(_tree(ns), before)
+                self.assertEqual(_tree(snaps), before_flat)
                 self.assertEqual(_public_budget(private, workspace), 0)
         omitted = _public_cli(workspace, private, ["snapshot", "compare", "different"])
         self.assertEqual(omitted.returncode, 4, omitted.stdout + omitted.stderr)
         payload = json.loads(omitted.stdout)
         self.assertEqual(payload.get("error"), "ENGINE_UNAVAILABLE")
         self.assertEqual(payload["outcome"]["status"], "UNAVAILABLE")
-        self.assertEqual(_tree(snaps), _tree_with_pending_lock(before, "different"))
+        # On a host whose engine answers the capability ping, the pair lock is
+        # created before the Desktop port probe fails; without a runnable
+        # engine the ping itself fails first and the tree is unchanged.
+        ns_lock_row = ("pending/different.lock", "file", hashlib.sha256(b"").hexdigest())
+        self.assertIn(_tree(ns), (before, tuple(sorted((*before, ns_lock_row)))))
+        lock_row = (f"projects/{self.public_project_id}/pending/different.lock",
+                    "file", hashlib.sha256(b"").hexdigest())
+        self.assertIn(_tree(snaps), (before_flat, tuple(sorted((*before_flat, lock_row)))))
         self.assertEqual(_public_budget(private, workspace), 0)
 
     # PR A red tests: a save where no query succeeds must not publish.
@@ -876,17 +1052,19 @@ class SnapshotStoreTests(unittest.TestCase):
     def _seed_good_pair(self):
         (self.snaps / "results").mkdir(exist_ok=True)
         (self.snaps / "specs").mkdir(exist_ok=True)
-        (self.snaps / "results" / "different.json").write_bytes(self._GOOD_RESULT)
+        (self.snaps / "results" / "different.json").write_bytes(self._stamped_result(self._GOOD_RESULT))
         spec_path = self.snaps / "specs" / "different.json"
-        spec_path.write_text(json.dumps(self._OLD_SPEC), encoding="utf-8")
+        spec_path.write_text(json.dumps(self._stamped_spec(self._OLD_SPEC)), encoding="utf-8")
         return spec_path, spec_path.read_bytes()
 
     def test_all_failed_save_preserves_spec_and_charge(self):
         spec_path, spec_bytes = self._seed_good_pair()
 
         def fake_engine(verb, payload, timeout=1800, **kwargs):
-            return {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
-                    "queries": [{"id": "q1", "result": "ERROR", "class": "OTHER"}]}
+            if verb == "ping":
+                return self._ping()
+            return self._echo(payload, {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
+                    "queries": [{"id": "q1", "result": "ERROR", "class": "OTHER"}]})
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine):
@@ -901,9 +1079,11 @@ class SnapshotStoreTests(unittest.TestCase):
         spec = {"queries": [{"id": f"q{i}", "dax": f"EVALUATE {{{i}}}"} for i in (1, 2, 3)]}
 
         def fake_engine(verb, payload, timeout=1800, **kwargs):
-            return {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
+            if verb == "ping":
+                return self._ping()
+            return self._echo(payload, {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
                     "queries": [{"id": q["id"], "result": "ERROR", "class": "OTHER"}
-                                for q in payload["queries"]]}
+                                for q in payload["queries"]]})
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine):
@@ -914,8 +1094,10 @@ class SnapshotStoreTests(unittest.TestCase):
 
     def test_first_all_failed_save_creates_no_spec_and_no_temp(self):
         def fake_engine(verb, payload, timeout=1800, **kwargs):
-            return {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
-                    "queries": [{"id": "q1", "result": "ERROR", "class": "OTHER"}]}
+            if verb == "ping":
+                return self._ping()
+            return self._echo(payload, {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
+                    "queries": [{"id": "q1", "result": "ERROR", "class": "OTHER"}]})
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine):
@@ -932,8 +1114,14 @@ class SnapshotStoreTests(unittest.TestCase):
                 # Reseed inside the subtest so each response demonstrates its
                 # own failure, independent of what the previous case wrote.
                 spec_path, spec_bytes = self._seed_good_pair()
+
+                def fake_engine(verb, payload, **kwargs):
+                    if verb == "ping":
+                        return self._ping()
+                    return self._echo(payload, dict(response, payload_state="may_have_been_sent"))
+
                 with patch("pbz.desktop.require_port", return_value=1), \
-                     patch("pbz.checks.engine_call", return_value=dict(response, payload_state="may_have_been_sent")):
+                     patch("pbz.checks.engine_call", side_effect=fake_engine):
                     checks.snapshot(self.ws, None, "save", "different", self._NEW_SPEC)
                 self.assertEqual(spec_path.read_bytes(), spec_bytes)
 
@@ -945,20 +1133,23 @@ class SnapshotStoreTests(unittest.TestCase):
         spec_path, _spec_bytes = self._seed_good_pair()
 
         def fake_engine(verb, payload, timeout=1800, **kwargs):
-            return {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
-                    "queries": [{"id": "q1", "result": "SAVED"}]}
+            if verb == "ping":
+                return self._ping()
+            return self._echo(payload, {"ok": True, "payload_state": "may_have_been_sent", "verb": "snapshot-save", "name": "different",
+                    "queries": [{"id": "q1", "result": "SAVED"}]})
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine):
             res = checks.snapshot(self.ws, None, "save", "different", self._NEW_SPEC)
         self.assertEqual(res["queries"][0]["result"], "SAVED")
-        self.assertEqual(json.loads(spec_path.read_text(encoding="utf-8")), self._NEW_SPEC)
+        self.assertEqual(json.loads(spec_path.read_text(encoding="utf-8")), self._stamped_spec(self._NEW_SPEC))
 
     def test_engine_refuses_empty_queries_in_save_and_compare(self):
         # Direct engine call with empty queries must return BAD_REQUEST
         for verb in ("snapshot-save", "snapshot-compare"):
             res = checks.engine_call(verb, {
                 "private_dir": self.ws.private,
+                "project_id": str(uuid.uuid4()),
                 "port": 9999,
                 "name": "empty_queries",
                 "queries": [],
@@ -982,35 +1173,52 @@ class SnapshotPairPublicationTests(unittest.TestCase):
         wid = hashlib.sha256(guard.norm(os.path.abspath(self.ws.root)).encode()).hexdigest()[:16]
         self.ws.private = str(self.private_root / wid)
         Path(self.ws.private).mkdir()
-        self.snaps = Path(self.ws.private) / "snapshots"
+        self.project = self.ws.project(None)
+        self.project_id = identity.resolve(self.ws, self.project, apply=True).project_id
+        self.flat_snaps = Path(self.ws.private) / "snapshots"
+        self.snaps = self.flat_snaps / "projects" / self.project_id
         self.result = self.snaps / "results" / "different.json"
         self.spec = self.snaps / "specs" / "different.json"
         self.pending = self.snaps / "pending"
         self.journal = self.pending / "different.journal.json"
         self.staged = self.pending / "different.spec.next"
-        self.old_spec_bytes = json.dumps(self._OLD_SPEC).encode()
-        self.new_spec_bytes = json.dumps(self._NEW_SPEC).encode()
+        self.old_result_bytes = json.dumps({**json.loads(self._OLD_RESULT), "project_id": self.project_id}).encode()
+        self.new_result_bytes = json.dumps({**json.loads(self._NEW_RESULT), "project_id": self.project_id}).encode()
+        self.old_spec_bytes = json.dumps({**self._OLD_SPEC, "project_id": self.project_id}).encode()
+        self.new_spec_bytes = json.dumps({**self._NEW_SPEC, "project_id": self.project_id}).encode()
         self.port = self.enterContext(patch("pbz.desktop.require_port", return_value=1))
         self.engine = self.enterContext(patch("pbz.checks.engine_call", side_effect=self._engine))
 
     def _seed_pair(self):
-        for path, data in ((self.result, self._OLD_RESULT), (self.spec, self.old_spec_bytes)):
+        for path, data in ((self.result, self.old_result_bytes), (self.spec, self.old_spec_bytes)):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
 
     def _engine(self, verb, payload, timeout=1800, **kwargs):
+        if verb == "ping":
+            return {"ok": True, "snapshot_layout": "project-v1"}
         if verb == "snapshot-save":
             self.result.parent.mkdir(parents=True, exist_ok=True)
-            self.result.write_bytes(self._NEW_RESULT)
+            self.result.write_bytes(self.new_result_bytes)
             verdict = "SAVED"
         else:
             dax = payload["queries"][0]["dax"]
-            expected = "EVALUATE {2}" if self.result.read_bytes() == self._NEW_RESULT else "EVALUATE {1}"
+            expected = "EVALUATE {2}" if self.result.read_bytes() == self.new_result_bytes else "EVALUATE {1}"
             verdict = "MATCH" if dax == expected else "DRIFT"
         response = {"ok": True, "class": "OK", "queries": [{"id": "q1", "result": verdict}]}
         if verb == "snapshot-save":
             response["payload_state"] = "may_have_been_sent"
-        return response
+        return self._dispatch(response)(verb, payload)
+
+    def _dispatch(self, response):
+        def fake(verb, payload, timeout=1800, **kwargs):
+            if verb == "ping":
+                return {"ok": True, "snapshot_layout": "project-v1"}
+            if isinstance(response, dict) and response.get("ok"):
+                return {**response, "project_id": payload.get("project_id"),
+                        "snapshot_layout": "project-v1"}
+            return response
+        return fake
 
     def _save(self):
         return checks.snapshot(self.ws, None, "save", "different", self._NEW_SPEC)
@@ -1027,6 +1235,7 @@ class SnapshotPairPublicationTests(unittest.TestCase):
     def _public_child_command(self, action, interruption=None, *, explicit=False,
                               engine_failure=None, spec=None, result=None):
         script = """
+import json
 import os
 from contextlib import ExitStack
 from pathlib import Path
@@ -1079,34 +1288,44 @@ def watching_isfile(path):
             os._exit(72)
     return real_isfile(path)
 
-def announcing_open_lock(path, readonly=False):
+def announcing_open_lock(path, readonly=False, **kwargs):
     print("at-lock-wait", file=sys.stderr, flush=True)
-    return real_open_lock(path, readonly)
+    return real_open_lock(path, readonly, **kwargs)
 
 def fake_engine(verb, payload, timeout=1800, **kwargs):
+    if verb == "ping":
+        return {"ok": True, "snapshot_layout": "project-v1"}
+
+    def stamped(raw):
+        doc = json.loads(raw)
+        doc["project_id"] = payload["project_id"]
+        return json.dumps(doc).encode() + raw[len(raw.rstrip()):]
+
     if interruption == "hold-at-engine":
         print("ready", file=sys.stderr, flush=True)
         if not sys.stdin.readline():
             os._exit(72)
     if interruption == "watch-lock":
         print("dispatched", file=sys.stderr, flush=True)
-    baseline = Path(payload["private_dir"]) / "snapshots" / "results" / (payload["name"] + ".json")
+    baseline = (Path(payload["private_dir"]) / "snapshots" / "projects"
+                / payload["project_id"] / "results" / (payload["name"] + ".json"))
     if engine_failure:
         return {"ok": False, "class": engine_failure, "payload_state": "may_have_been_sent"}
     if verb == "snapshot-save":
         if interruption == "before-engine-write":
             os._exit(71)
         baseline.parent.mkdir(parents=True, exist_ok=True)
-        baseline.write_bytes(result.encode() if result else Suite._NEW_RESULT)
+        baseline.write_bytes(stamped(result.encode() if result else Suite._NEW_RESULT))
         if interruption == "inside-engine":
             os._exit(71)
         verdict = "SAVED"
     else:
         if not baseline.is_file():
             baseline = baseline.parent.parent / baseline.name
-        expected = "EVALUATE {2}" if baseline.read_bytes() == Suite._NEW_RESULT else "EVALUATE {1}"
+        expected = "EVALUATE {2}" if baseline.read_bytes() == stamped(Suite._NEW_RESULT) else "EVALUATE {1}"
         verdict = "MATCH" if payload["queries"][0]["dax"] == expected else "DRIFT"
     return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+            "project_id": payload["project_id"], "snapshot_layout": "project-v1",
             "queries": [{"id": "q1", "result": verdict}]}
 
 args = ["snapshot", action, "different"]
@@ -1168,7 +1387,7 @@ with ExitStack() as stack:
         return ctx.exception
 
     def _assert_completed(self):
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
         self.assertTrue(self.spec.is_file(), "recovery did not publish a spec")
         self.assertEqual(self.spec.read_bytes(), self.new_spec_bytes)
         self.assertFalse(self.journal.exists())
@@ -1179,14 +1398,16 @@ with ExitStack() as stack:
         (self.pending / "different.lock").touch()
         self.staged.write_bytes(self.new_spec_bytes)
         doc = {
-            "version": 1,
+            "version": 2,
             "state": state,
-            "before_result": hashlib.sha256(self._OLD_RESULT).hexdigest(),
+            "before_result": hashlib.sha256(self.old_result_bytes).hexdigest(),
             "before_spec": hashlib.sha256(self.old_spec_bytes).hexdigest(),
             "before_coherent": True,
             "staged_spec": hashlib.sha256(self.new_spec_bytes).hexdigest(),
-            "new_result": hashlib.sha256(self._NEW_RESULT).hexdigest()
+            "new_result": hashlib.sha256(self.new_result_bytes).hexdigest()
             if state == "RESULT_PUBLISHED" else None,
+            "project_id": self.project_id,
+            "name": "different",
         }
         doc.update(fields)
         data = json.dumps(doc).encode()
@@ -1221,7 +1442,7 @@ with ExitStack() as stack:
         self._seed_pair()
         child = self._public_child("save", "before-spec")
         self.assertEqual(child.returncode, 71, child.stdout + child.stderr)
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
         self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
         self._assert_public_compare("MATCH")
         self._assert_completed()
@@ -1238,13 +1459,13 @@ with ExitStack() as stack:
 
     def test_case_04_all_failed_supersede_preserves_prepared(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         journal = self._write_journal("PREPARED")
         pair = (self.result.read_bytes(), self.spec.read_bytes())
-        with patch("pbz.checks.engine_call", return_value={
+        with patch("pbz.checks.engine_call", side_effect=self._dispatch({
             "ok": True, "class": "OK", "payload_state": "may_have_been_sent",
             "queries": [{"id": "q1", "result": "ERROR", "class": "OTHER"}],
-        }):
+        })):
             response = self._save()
         self.assertEqual(response["queries"][0]["result"], "ERROR")
         self._assert_public_block()
@@ -1261,14 +1482,14 @@ with ExitStack() as stack:
         ):
             with self.subTest(state=state, interruption=interruption):
                 self._seed_pair()
-                self.result.write_bytes(self._NEW_RESULT)
+                self.result.write_bytes(self.new_result_bytes)
                 original = self._write_journal(state)
                 self.staged.unlink()
-                newest = self._NEW_RESULT + b" "
+                newest = self.new_result_bytes + b" "
                 proc = self._public_child("save", interruption, result=newest)
                 self.assertEqual(proc.returncode, 71, proc.stdout + proc.stderr)
                 self._assert_public_block()
-                expected = self._NEW_RESULT if interruption == "before-engine-write" else newest
+                expected = self.new_result_bytes if interruption == "before-engine-write" else newest
                 self.assertEqual(self.result.read_bytes(), expected)
                 self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
                 if state == "RESULT_PUBLISHED":
@@ -1284,14 +1505,14 @@ with ExitStack() as stack:
         for staging, publication in (("different", "same"), ("same", "same"), ("same", "different")):
             with self.subTest(staging=staging, publication=publication):
                 self._seed_pair()
-                self.result.write_bytes(self._NEW_RESULT)
+                self.result.write_bytes(self.new_result_bytes)
                 # Keep the original journal blocking until the supersede stages.
                 original = self._write_journal()
                 self.staged.unlink()
                 next_spec = self._NEW_SPEC if staging == "same" else {
                     "queries": [{"id": "q1", "dax": "EVALUATE {3}"}],
                 }
-                next_result = self._NEW_RESULT if publication == "same" else self._NEW_RESULT + b" "
+                next_result = self.new_result_bytes if publication == "same" else self.new_result_bytes + b" "
                 proc = self._public_child("save", "after-stage", spec=next_spec, result=next_result)
                 # The base completes and changes the live spec because it never stages.
                 self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
@@ -1310,19 +1531,20 @@ with ExitStack() as stack:
     def test_case_05_engine_and_port_refusals_preserve_pair(self):
         self._seed_pair()
         before = _tree(self.snaps)
-        self.engine.side_effect = None
-        self.engine.return_value = {"ok": False, "class": "ENGINE_UNAVAILABLE", "payload_state": "not_sent"}
+        self.engine.side_effect = self._dispatch(
+            {"ok": False, "class": "ENGINE_UNAVAILABLE", "payload_state": "not_sent"}
+        )
         self._assert_class("ENGINE_UNAVAILABLE", self._save)
         self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 1)
         self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
-        self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
         self.assertFalse(self.journal.exists())
         self.assertFalse(self.staged.exists())
 
         self.engine.reset_mock()
         self.port.side_effect = PbzError("ENGINE_UNAVAILABLE")
         self._assert_class("ENGINE_UNAVAILABLE", self._save)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
         self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 1)
         self.assertEqual(tuple(row for row in _tree(self.snaps) if not row[0].startswith("pending")), before)
         self.assertFalse(self.journal.exists())
@@ -1334,9 +1556,9 @@ with ExitStack() as stack:
         self.pending.mkdir()
         with patch("pbz.checks.create_kill_on_close_job", side_effect=PbzError("ENGINE_UNAVAILABLE")):
             self._assert_class("ENGINE_UNAVAILABLE", self._save)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
         self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 0)
-        self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
         self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
         self.assertFalse(self.journal.exists())
         self.assertFalse(self.staged.exists())
@@ -1353,7 +1575,7 @@ with ExitStack() as stack:
     def test_case_07_first_save_recovers_missing_spec(self):
         child = self._public_child("save", "before-spec")
         self.assertEqual(child.returncode, 71, child.stdout + child.stderr)
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
         self.assertFalse(self.spec.exists())
         self._assert_public_compare("MATCH")
         self._assert_completed()
@@ -1362,9 +1584,9 @@ with ExitStack() as stack:
         for edited in (self.spec, self.result, self.staged):
             with self.subTest(path=edited.name, directory=edited.parent.name):
                 self._seed_pair()
-                self.result.write_bytes(self._NEW_RESULT)
+                self.result.write_bytes(self.new_result_bytes)
                 self._write_journal()
-                data = self.new_spec_bytes + b" " if edited != self.result else self._NEW_RESULT + b" "
+                data = self.new_spec_bytes + b" " if edited != self.result else self.new_result_bytes + b" "
                 edited.write_bytes(data)
                 before = _tree(self.snaps)
                 self._assert_class("RECOVERY_REQUIRED", self._compare)
@@ -1377,6 +1599,8 @@ with ExitStack() as stack:
         foreign = self.old_spec_bytes + b" "
 
         def engine(*args, **kwargs):
+            if args[0] == "ping":
+                return self._engine(*args, **kwargs)
             response = self._engine(*args, **kwargs)
             self.spec.write_bytes(foreign)
             return response
@@ -1388,9 +1612,11 @@ with ExitStack() as stack:
 
     def test_case_08_readback_records_foreign_result_as_generation(self):
         self._seed_pair()
-        foreign = self._NEW_RESULT + b" "
+        foreign = self.new_result_bytes + b" "
 
         def engine(*args, **kwargs):
+            if args[0] == "ping":
+                return self._engine(*args, **kwargs)
             response = self._engine(*args, **kwargs)
             self.result.write_bytes(foreign)
             return response
@@ -1410,7 +1636,7 @@ with ExitStack() as stack:
     def test_case_08_result_edited_immediately_after_spec_replace(self):
         self._seed_pair()
         replace = os.replace
-        foreign = self._NEW_RESULT + b" "
+        foreign = self.new_result_bytes + b" "
 
         def edit_after_replace(src, dst):
             replace(src, dst)
@@ -1425,7 +1651,7 @@ with ExitStack() as stack:
         self._assert_public_block()
 
     def test_case_08_pair_moved_during_failed_dispatch(self):
-        for path, original in ((self.result, self._OLD_RESULT), (self.spec, self.old_spec_bytes)):
+        for path, original in ((self.result, self.old_result_bytes), (self.spec, self.old_spec_bytes)):
             with self.subTest(path=path.parent.name):
                 self.journal.unlink(missing_ok=True)
                 self.staged.unlink(missing_ok=True)
@@ -1433,6 +1659,8 @@ with ExitStack() as stack:
                 foreign = original + b" "
 
                 def engine(*args, **kwargs):
+                    if args[0] == "ping":
+                        return self._engine(*args, **kwargs)
                     path.write_bytes(foreign)
                     return {"ok": False, "class": "ENGINE_UNAVAILABLE", "payload_state": "may_have_been_sent"}
 
@@ -1460,19 +1688,35 @@ with ExitStack() as stack:
 
     def test_case_12_public_compare_with_explicit_spec_and_no_saved_spec(self):
         self.result.parent.mkdir(parents=True)
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         proc = self._public_child("compare", explicit=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["queries"][0]["result"], "MATCH")
         self.assertFalse(self.spec.exists())
 
     def test_case_12_public_compare_with_only_legacy_result(self):
-        self.snaps.mkdir()
-        (self.snaps / self.result.name).write_bytes(self._NEW_RESULT)
+        # Re-pointed under S1: a result held only in the flat store is
+        # unadopted legacy state. The public compare refuses and leaves the
+        # flat bytes untouched; after adopt-legacy the same compare
+        # succeeds against the project's namespace.
+        self.flat_snaps.mkdir(parents=True, exist_ok=True)
+        flat_result = self.flat_snaps / self.result.name
+        flat_result.write_bytes(self._NEW_RESULT)
+        proc = self._public_child("compare", explicit=True)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("LEGACY_BASELINE_UNADOPTED", proc.stdout + proc.stderr)
+        self.assertEqual(flat_result.read_bytes(), self._NEW_RESULT)
+        self.assertFalse(self.result.exists())
+        report = checks.adopt_legacy(self.ws, self.project, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        self.assertIn("different", report["adopted"])
+        self.assertFalse(flat_result.exists())
+        self.assertTrue(self.result.exists())
+        adopted = json.loads(self.result.read_text(encoding="utf-8"))
+        self.assertEqual(adopted["project_id"], self.project_id)
         proc = self._public_child("compare", explicit=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["queries"][0]["result"], "MATCH")
-        self.assertFalse(self.result.exists())
 
     def test_case_12_public_save_does_not_expose_payload_state(self):
         for failure in (None, "TIMEOUT"):
@@ -1487,7 +1731,7 @@ with ExitStack() as stack:
 
     def test_case_14_supersede_revalidates_pair_after_port(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         journal = self._write_journal("PREPARED")
         foreign = self.old_spec_bytes + b" "
 
@@ -1497,7 +1741,7 @@ with ExitStack() as stack:
 
         with patch("pbz.desktop.require_port", side_effect=edit_at_port):
             self._assert_class("RECOVERY_REQUIRED", self._save)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
         self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 0)
         self.assertEqual(self.spec.read_bytes(), foreign)
         self.assertEqual(self.journal.read_bytes(), journal)
@@ -1507,7 +1751,7 @@ with ExitStack() as stack:
             for refusal in ("port", "budget", "engine"):
                 with self.subTest(state=state, refusal=refusal):
                     self._seed_pair()
-                    self.result.write_bytes(self._NEW_RESULT)
+                    self.result.write_bytes(self.new_result_bytes)
                     journal = self._write_journal(state)
                     self.staged.unlink()
                     before = _tree(self.snaps)
@@ -1518,9 +1762,9 @@ with ExitStack() as stack:
                         with patch("pbz.desktop.require_port", side_effect=PbzError("ENGINE_UNAVAILABLE")):
                             self._assert_class("ENGINE_UNAVAILABLE", self._save)
                     else:
-                        with patch("pbz.checks.engine_call", return_value={
+                        with patch("pbz.checks.engine_call", side_effect=self._dispatch({
                             "ok": False, "class": "ENGINE_UNAVAILABLE", "payload_state": "not_sent",
-                        }):
+                        })):
                             self._assert_class("ENGINE_UNAVAILABLE", self._save)
                     self._assert_public_block()
                     self.assertEqual(_tree(self.snaps), before)
@@ -1548,33 +1792,38 @@ with ExitStack() as stack:
         before = _tree(self.snaps)
         self._assert_class("RECOVERY_REQUIRED", self._save)
         self.assertEqual(_tree(self.snaps), before)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
 
     def test_case_16_absent_pair_directories_allow_cleanup(self):
         with patch("pbz.checks.spend", return_value=False):
             self.assertEqual(self._save()["status"], "BUDGET")
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
         self.assertFalse(self.journal.exists())
         self.assertFalse(self.staged.exists())
 
+        self.result.parent.rmdir()
+        self.spec.parent.rmdir()
         interrupted = self._start_snapshot_script(
             '    stack.enter_context(patch("pbz.checks.spend", side_effect=lambda *args: os._exit(71)))'
         )
         _, stderr = interrupted.communicate(timeout=10)
         self.assertEqual(interrupted.returncode, 71, stderr)
         self.assertTrue(self.journal.exists())
+        # Remove the empty directories again to exercise recovery of an absent pair.
+        self.result.parent.rmdir()
+        self.spec.parent.rmdir()
         completed = self._public_child("compare")
         self.assertEqual(json.loads(completed.stdout)["error"], "BAD_REQUEST")
         self.assertFalse(self.journal.exists())
         self.assertFalse(self.staged.exists())
-        self.assertFalse(self.result.parent.exists())
-        self.assertFalse(self.spec.parent.exists())
+        self.assertEqual(_tree(self.result.parent), ())
+        self.assertEqual(_tree(self.spec.parent), ())
 
     def test_case_18_supersede_prepared_foreign_result(self):
         self._seed_pair()
         child = self._public_child("save", "inside-engine")
         self.assertEqual(child.returncode, 71, child.stdout + child.stderr)
-        self.result.write_bytes(self._OLD_RESULT + b" ")
+        self.result.write_bytes(self.old_result_bytes + b" ")
         proc = self._public_child("compare")
         with self.subTest("governing journal"):
             self.assertTrue(self.journal.is_file())
@@ -1585,12 +1834,14 @@ with ExitStack() as stack:
 
     def _overwrite_during_dispatch(self, expected_state):
         def engine(*args, **kwargs):
+            if args[0] == "ping":
+                return self._engine(*args, **kwargs)
             self.assertTrue(self.journal.is_file(), "no journal at engine dispatch")
             journal = json.loads(self.journal.read_bytes())
             self.assertEqual(journal["state"], expected_state)
             if expected_state == "RESULT_PUBLISHED":
                 self.assertTrue(journal.get("superseding"))
-            self.result.write_bytes(self._OLD_RESULT + b" ")
+            self.result.write_bytes(self.old_result_bytes + b" ")
             return self._engine(*args, **kwargs)
 
         self.engine.side_effect = engine
@@ -1603,14 +1854,14 @@ with ExitStack() as stack:
 
     def test_case_20_supersede_overwrites_edit_inside_dispatch(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         self._write_journal()
         self.staged.unlink()
         self._overwrite_during_dispatch("RESULT_PUBLISHED")
 
     def test_case_21_compare_preflight_rejects_malformed_specs(self):
         self.result.parent.mkdir(parents=True)
-        self.result.write_bytes(self._OLD_RESULT)
+        self.result.write_bytes(self.old_result_bytes)
         self.spec.parent.write_bytes(b"not a directory")
         before = _tree(self.snaps)
         self._assert_class("CORRUPT_STATE", lambda: checks.snapshot(
@@ -1620,16 +1871,8 @@ with ExitStack() as stack:
         self.port.assert_not_called()
         self.engine.assert_not_called()
 
-    def _assert_pending_refused(self, code, *, lock_file=False, detail=None):
+    def _assert_pending_refused(self, code, *, detail=None):
         before = _tree(self.snaps)
-        if lock_file:
-            expected = list(before)
-            for row in _tree_with_pending_lock((), "different"):
-                if row not in expected:
-                    expected.append(row)
-            expected = tuple(sorted(expected))
-        else:
-            expected = before
         for operation in (self._save, self._compare):
             with self.subTest(action=operation.__name__):
                 self.engine.reset_mock()
@@ -1638,7 +1881,7 @@ with ExitStack() as stack:
                     self.assertEqual(exc.detail, detail)
                 self.engine.assert_not_called()
                 self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 0)
-                self.assertEqual(_tree(self.snaps), expected)
+                self.assertEqual(_tree(self.snaps), before)
 
     def test_case_23_pending_directory_is_a_file(self):
         self._seed_pair()
@@ -1648,7 +1891,7 @@ with ExitStack() as stack:
     def test_case_23_pending_journal_is_a_directory(self):
         self._seed_pair()
         self.journal.mkdir(parents=True)
-        self._assert_pending_refused("CORRUPT_STATE", lock_file=True,
+        self._assert_pending_refused("CORRUPT_STATE",
                                      detail="snapshot path is not a file")
 
     def test_case_23_pending_directory_link(self):
@@ -1674,13 +1917,13 @@ with ExitStack() as stack:
             if os.name != "nt":
                 raise
             self.skipTest(f"creating a file symlink is unavailable: {exc}")
-        self._assert_pending_refused("UNSAFE_PATH", lock_file=True,
+        self._assert_pending_refused("UNSAFE_PATH",
                                      detail="refusing to write through a link")
         self.assertEqual(outside.read_bytes(), b"target survives")
 
     def test_case_29_interrupt_at_port_preserves_annotations(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT + b" ")
+        self.result.write_bytes(self.new_result_bytes + b" ")
         journal = self._write_journal(superseding=True)
         with patch("pbz.desktop.require_port", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
@@ -1716,11 +1959,11 @@ with ExitStack() as stack:
                     out_c, err_c = compare.communicate("\n", timeout=10)
                 else:
                     out_c, err_c = compare.communicate(timeout=10)
-                self.assertEqual(self.result.read_bytes(), self._NEW_RESULT,
+                self.assertEqual(self.result.read_bytes(), self.new_result_bytes,
                                  "schedule-signal: " + signal)
                 self.assertEqual(
                     hashlib.sha256(self.result.read_bytes()).hexdigest(),
-                    hashlib.sha256(self._NEW_RESULT).hexdigest(),
+                    hashlib.sha256(self.new_result_bytes).hexdigest(),
                     "schedule-signal: " + signal)
                 self.assertEqual(self.spec.read_bytes(), self.new_spec_bytes,
                                  "schedule-signal: " + signal)
@@ -1757,12 +2000,12 @@ with ExitStack() as stack:
                 first_process = self._start_public_child(first, "hold-at-engine")
                 try:
                     self.assertEqual(self._child_signal(first_process), "ready")
-                    newest = self._NEW_RESULT + b" "
+                    newest = self.new_result_bytes + b" "
                     second = self._start_public_child("save", "watch-lock", result=newest)
                     try:
                         signal = self._child_signal(second)
                         self.assertEqual(signal, "contended")
-                        self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+                        self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
                         self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
                         out, err = first_process.communicate("\n", timeout=10)
                         self.assertEqual(first_process.returncode, 0, out + err)
@@ -1823,7 +2066,7 @@ with ExitStack() as stack:
                 with patch("builtins.open", side_effect=lambda *a, **kw: deny(open_file, *a, **kw)), \
                      patch("os.open", side_effect=lambda *a, **kw: deny(open_fd, *a, **kw)):
                     self._assert_class(expected, self._compare)
-                self.engine.assert_not_called()
+                self.engine.assert_called_once_with("ping", {})
 
     @unittest.skipUnless(os.name == "posix", "POSIX flock failure")
     def test_case_10_flock_enolck_falls_through_both_open_modes(self):
@@ -1845,7 +2088,7 @@ with ExitStack() as stack:
         with patch("fcntl.flock", side_effect=fail_lock):
             self._assert_class("RECOVERY_REQUIRED", self._compare)
         self.assertEqual(len(attempts), 2)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
 
     @unittest.skipUnless(os.name == "posix", "POSIX file descriptor inheritance")
     def test_case_11_posix_timed_out_child_is_reaped(self):
@@ -1892,7 +2135,7 @@ with ExitStack() as stack:
     @unittest.skipUnless(os.name == "posix", "POSIX directory fsync")
     def test_case_13_failed_specs_sync_retains_journal(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         journal = self._write_journal()
         sync = os.fsync
         specs_stat = self.spec.parent.stat()
@@ -1913,7 +2156,7 @@ with ExitStack() as stack:
     @unittest.skipUnless(os.name == "posix", "POSIX journal durability")
     def test_case_13_staged_unlink_failure_leaves_ignored_orphan(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         self._write_journal()
         unlink = os.unlink
         replace = os.replace
@@ -1941,12 +2184,12 @@ with ExitStack() as stack:
             self.assertFalse(self.journal.exists())
             self._compare()
         self.assertEqual(spec_replaces, [self.spec])
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
         self.assertEqual(self.staged.read_bytes(), self.new_spec_bytes)
 
     def test_case_10_denied_journal_unlink_does_not_republish_spec(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         journal = self._write_journal()
         unlink = os.unlink
         replace = os.replace
@@ -1965,7 +2208,7 @@ with ExitStack() as stack:
         with patch("os.replace", side_effect=record_replace):
             with patch("os.unlink", side_effect=deny_unlink):
                 self._assert_class("RECOVERY_REQUIRED", self._compare)
-            self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+            self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
             self.assertEqual(self.spec.read_bytes(), self.new_spec_bytes)
             self.assertEqual(self.journal.read_bytes(), journal)
             self._compare()
@@ -1982,6 +2225,8 @@ with ExitStack() as stack:
         post_publication_syncs = []
 
         def engine(*args, **kwargs):
+            if args[0] == "ping":
+                return self._engine(*args, **kwargs)
             nonlocal engine_returned
             response = self._engine(*args, **kwargs)
             engine_returned = True
@@ -2028,7 +2273,7 @@ with ExitStack() as stack:
                     with patch("pbz.checks.spend", side_effect=edit_after_spend), \
                          patch("os.replace", side_effect=edit_after_prepare):
                         self._assert_class("RECOVERY_REQUIRED", self._save)
-                    self.engine.assert_not_called()
+                    self.engine.assert_called_once_with("ping", {})
                     self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], spent + int(after_spend))
                     self.assertEqual(changed.read_bytes(), foreign)
                     journal = json.loads(self.journal.read_bytes())
@@ -2044,16 +2289,16 @@ with ExitStack() as stack:
 
     def test_case_24_known_result_clears_flag_even_with_unknown_spec(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         cleared = self._write_journal()
         self._write_journal(superseding=True)
         self.spec.write_bytes(self.old_spec_bytes + b" ")
         self._assert_public_block()
         self.assertEqual(self.journal.read_bytes(), cleared)
         self.spec.write_bytes(self.old_spec_bytes)
-        self.result.write_bytes(self._NEW_RESULT + b" ")
+        self.result.write_bytes(self.new_result_bytes + b" ")
         self._assert_class("RECOVERY_REQUIRED", self._save)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
 
     def test_case_25_moved_result_refuses_two_superseding_saves(self):
         for state, flagged, after_spend in (
@@ -2065,12 +2310,12 @@ with ExitStack() as stack:
         ):
             with self.subTest(state=state, flagged=flagged, after_spend=after_spend):
                 self._seed_pair()
-                initial = self._NEW_RESULT + b" " if flagged else self._NEW_RESULT
+                initial = self.new_result_bytes + b" " if flagged else self.new_result_bytes
                 self.result.write_bytes(initial)
                 annotations = {"superseding": True} if flagged else {}
                 original = json.loads(self._write_journal(state, **annotations))
                 self.staged.unlink()
-                foreign = self._NEW_RESULT + b"  "
+                foreign = self.new_result_bytes + b"  "
                 self.engine.reset_mock()
                 spend = checks.spend
 
@@ -2092,8 +2337,9 @@ with ExitStack() as stack:
                 marked = json.loads(journal)
                 self.assertTrue(marked.pop("result_foreign"))
                 self.assertEqual(marked, original)
+                self.engine.reset_mock()
                 self._assert_class("RECOVERY_REQUIRED", self._save)
-                self.engine.assert_not_called()
+                self.engine.assert_called_once_with("ping", {})
                 self.assertEqual(self.result.read_bytes(), foreign)
                 self.assertEqual(self.journal.read_bytes(), journal)
 
@@ -2101,12 +2347,14 @@ with ExitStack() as stack:
         for delivery in ("not_sent", "may_have_been_sent"):
             with self.subTest(delivery=delivery):
                 self._seed_pair()
-                self.result.write_bytes(self._NEW_RESULT)
+                self.result.write_bytes(self.new_result_bytes)
                 journal = self._write_journal()
                 self.staged.unlink()
-                foreign = self._NEW_RESULT + b" "
+                foreign = self.new_result_bytes + b" "
 
                 def fail_engine(*args, **kwargs):
+                    if args[0] == "ping":
+                        return self._engine(*args, **kwargs)
                     self.result.write_bytes(foreign)
                     return {"ok": False, "class": "ENGINE_UNAVAILABLE" if delivery == "not_sent" else "TIMEOUT",
                             "payload_state": delivery}
@@ -2117,7 +2365,7 @@ with ExitStack() as stack:
                     self.assertEqual(self.journal.read_bytes(), journal)
                     self.engine.reset_mock()
                     self._assert_class("RECOVERY_REQUIRED", self._save)
-                    self.engine.assert_not_called()
+                    self.engine.assert_called_once_with("ping", {})
                 else:
                     self._assert_class("TIMEOUT", self._save)
                     self.assertTrue(json.loads(self.journal.read_bytes()).get("superseding"))
@@ -2126,13 +2374,13 @@ with ExitStack() as stack:
 
     def test_case_27_restored_result_clears_marker_before_supersede(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         journal = self._write_journal()
         self._write_journal(result_foreign=True)
         self.staged.unlink()
         self._assert_public_block()
         self.assertEqual(self.journal.read_bytes(), journal)
-        child = self._public_child("save", "inside-engine", result=self._NEW_RESULT + b" ")
+        child = self._public_child("save", "inside-engine", result=self.new_result_bytes + b" ")
         self.assertEqual(child.returncode, 71, child.stdout + child.stderr)
         self._assert_public_block()
         self._save()
@@ -2142,9 +2390,9 @@ with ExitStack() as stack:
         for refusal in ("port", "budget"):
             with self.subTest(refusal=refusal):
                 self._seed_pair()
-                self.result.write_bytes(self._NEW_RESULT)
+                self.result.write_bytes(self.new_result_bytes)
                 self._write_journal("PREPARED")
-                foreign = self._NEW_RESULT + b" "
+                foreign = self.new_result_bytes + b" "
 
                 def edit_and_refuse(*args):
                     self.result.write_bytes(foreign)
@@ -2156,8 +2404,9 @@ with ExitStack() as stack:
                 with patch(target, side_effect=edit_and_refuse):
                     self._assert_class("RECOVERY_REQUIRED", self._save)
                 self.assertTrue(json.loads(self.journal.read_bytes()).get("result_foreign"))
+                self.engine.reset_mock()
                 self._assert_class("RECOVERY_REQUIRED", self._save)
-                self.engine.assert_not_called()
+                self.engine.assert_called_once_with("ping", {})
                 self.assertEqual(self.result.read_bytes(), foreign)
 
     @unittest.skipUnless(os.name == "posix", "POSIX child cleanup")
@@ -2175,6 +2424,8 @@ with ExitStack() as stack:
              patch.object(engine.subprocess, "Popen", return_value=child) as start:
             for queries in ([{"id": "q1", "result": "SAVED"}], []):
                 raw = {"ok": True, "verb": verb, "name": "different", "queries": queries,
+                       "project_id": "12345678-1234-4234-9234-123456789012",
+                       "snapshot_layout": "project-v1",
                        "payload_state": "spoofed"}
                 child.communicate.return_value = json.dumps(raw).encode(), None
                 response = engine.call(verb, {}, **options)
@@ -2228,18 +2479,18 @@ with ExitStack() as stack:
                 proc = self._public_child("save", interruption)
                 self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
                 self.assertEqual(proc.returncode, 71, proc.stdout + proc.stderr)
-                self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+                self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
                 self.assertFalse(self.journal.exists())
                 if interruption == "after-stage":
                     self.assertFalse(os.path.samefile(self.spec, self.staged))
 
     def test_case_32_supersede_stage_replaces_hard_link_without_rewriting_spec(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         journal = self._write_journal("PREPARED")
         self.staged.unlink()
         os.link(self.spec, self.staged)
-        newest = self._NEW_RESULT + b" "
+        newest = self.new_result_bytes + b" "
         proc = self._public_child("save", "after-stage", result=newest)
         self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
         self.assertEqual(proc.returncode, 71, proc.stdout + proc.stderr)
@@ -2249,8 +2500,8 @@ with ExitStack() as stack:
 
     def test_case_33_recovery_of_a_preserves_a_journal_files(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
-        self._write_journal()
+        self.result.write_bytes(self.new_result_bytes)
+        self._write_journal(name="a")
         for path in (self.result, self.spec, self.journal, self.staged, self.pending / "different.lock"):
             path.rename(path.with_name(path.name.replace("different", "a", 1)))
         other = self.pending / "a.journal.journal.json"
@@ -2262,7 +2513,7 @@ with ExitStack() as stack:
         leftover = self.pending / "a.journal.leftover"
         leftover.write_bytes(b"ignored")
         before = {path: path.read_bytes() for path in (other, other_staged, other_lock, leftover)}
-        with patch("pbz.checks.engine_call", return_value={"ok": True, "class": "OK", "queries": []}):
+        with patch("pbz.checks.engine_call", side_effect=self._dispatch({"ok": True, "class": "OK", "queries": []})):
             checks.snapshot(self.ws, None, "compare", "a", self._NEW_SPEC)
         self.assertEqual((self.spec.parent / "a.json").read_bytes(), self.new_spec_bytes)
         self.assertFalse((self.pending / "a.journal.json").exists())
@@ -2312,12 +2563,14 @@ with ExitStack() as stack:
         ):
             with self.subTest(state=state, fault=fault, identical=identical):
                 self._seed_pair()
-                self.result.write_bytes(self._NEW_RESULT)
+                self.result.write_bytes(self.new_result_bytes)
                 journal = self._write_journal(state)
                 self.staged.unlink()
-                newest = self._NEW_RESULT if identical else self._NEW_RESULT + b" "
+                newest = self.new_result_bytes if identical else self.new_result_bytes + b" "
 
                 def engine(*args, **kwargs):
+                    if args[0] == "ping":
+                        return self._engine(*args, **kwargs)
                     response = self._engine(*args, **kwargs)
                     self.result.write_bytes(newest)
                     return response
@@ -2353,7 +2606,7 @@ with ExitStack() as stack:
 
     def _blocked_publication(self, state="RESULT_PUBLISHED", **annotations):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         journal = self._write_journal(state, **annotations)
         self.staged.unlink()
         return journal
@@ -2373,6 +2626,8 @@ with ExitStack() as stack:
                 other_bytes = other.read_bytes()
 
                 def timeout(*args, **kwargs):
+                    if args[0] == "ping":
+                        return self._engine(*args, **kwargs)
                     moved.write_bytes(foreign)
                     return {"ok": False, "class": "TIMEOUT", "payload_state": "may_have_been_sent"}
 
@@ -2403,7 +2658,7 @@ with ExitStack() as stack:
 
     def test_case_08_edit_after_recovery_reads_staged_spec(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         journal = self._write_journal()
         foreign = self.old_spec_bytes + b" "
         read_bytes = Path.read_bytes
@@ -2420,9 +2675,9 @@ with ExitStack() as stack:
             self._assert_class("RECOVERY_REQUIRED", self._compare)
         self.assertEqual(reads, [self.staged])
         self.assertEqual(self.spec.read_bytes(), foreign)
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
         self.assertEqual(self.journal.read_bytes(), journal)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
 
     @staticmethod
     def _external_snapshot_edit(path, data):
@@ -2463,30 +2718,30 @@ with ExitStack() as stack:
     @unittest.skipUnless(os.name == "posix", "POSIX recovery fsync")
     def test_case_13_live_sync_failure_blocks_cleanup(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         self.spec.write_bytes(self.new_spec_bytes)
         journal = self._write_journal()
         with self._record_snapshot_syncs(self.result, self._fail_snapshot_sync):
             self._assert_class("RECOVERY_REQUIRED", self._compare)
         self.assertEqual(self.journal.read_bytes(), journal)
         self.assertEqual(self.spec.read_bytes(), self.new_spec_bytes)
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
         self._assert_public_compare("MATCH")
         self._assert_completed()
 
     @unittest.skipUnless(os.name == "posix", "POSIX recovery fsync")
     def test_case_13_cleanup_rechecks_live_spec_after_sync(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         self.spec.write_bytes(self.new_spec_bytes)
         journal = self._write_journal()
         foreign = self.new_spec_bytes + b" "
         with self._record_snapshot_syncs(self.spec.parent, lambda: self._external_snapshot_edit(self.spec, foreign)):
             self._assert_class("RECOVERY_REQUIRED", self._compare)
         self.assertEqual(self.spec.read_bytes(), foreign)
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
         self.assertEqual(self.journal.read_bytes(), journal)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
 
     @unittest.skipUnless(os.name == "posix", "POSIX recovery fsync")
     def test_case_13_clear_requires_successful_result_sync(self):
@@ -2494,7 +2749,7 @@ with ExitStack() as stack:
         with self._record_snapshot_syncs(self.result, self._fail_snapshot_sync):
             self._assert_class("RECOVERY_REQUIRED", self._compare)
         self.assertEqual(self.journal.read_bytes(), journal)
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
         self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
 
     def test_case_14_budget_refusal_then_edit_and_operator_restoration(self):
@@ -2512,13 +2767,14 @@ with ExitStack() as stack:
         self.assertEqual(journal_writes, [])
         self.assertEqual(self.journal.read_bytes(), journal)
         self._assert_public_block()
-        foreign = self._NEW_RESULT + b" "
+        foreign = self.new_result_bytes + b" "
         self.result.write_bytes(foreign)
+        self.engine.reset_mock()
         self._assert_class("RECOVERY_REQUIRED", self._save)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
         self.assertEqual(self.result.read_bytes(), foreign)
         self.assertEqual(self.journal.read_bytes(), journal)
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         self.staged.write_bytes(self.new_spec_bytes)
         self._assert_public_compare("MATCH")
         self._assert_completed()
@@ -2553,10 +2809,10 @@ with ExitStack() as stack:
         self._assert_annotations(journal, superseding=True)
         self._assert_public_block()
         self.assertEqual(self.journal.read_bytes(), journal)
-        foreign = self._NEW_RESULT + b" "
+        foreign = self.new_result_bytes + b" "
         self.result.write_bytes(foreign)
         self._assert_class("RECOVERY_REQUIRED", self._save)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
         self.assertEqual(self.result.read_bytes(), foreign)
 
     def test_case_24_clearing_replace_failure_retains_annotations(self):
@@ -2571,7 +2827,7 @@ with ExitStack() as stack:
         with patch("os.replace", side_effect=deny_journal_replace):
             self._assert_class("RECOVERY_REQUIRED", self._compare)
         self.assertEqual(self.journal.read_bytes(), journal)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
 
     @unittest.skipUnless(os.name == "posix", "POSIX journal directory fsync")
     def test_case_24_clearing_post_replace_sync_failure_uses_installed_bytes(self):
@@ -2585,26 +2841,29 @@ with ExitStack() as stack:
         with self._record_snapshot_syncs(self.pending, fail_cleared_sync):
             self._assert_class("RECOVERY_REQUIRED", self._compare)
         self.assertEqual(self.journal.read_bytes(), cleared)
-        foreign = self._NEW_RESULT + b" "
+        foreign = self.new_result_bytes + b" "
         self.result.write_bytes(foreign)
         self._assert_class("RECOVERY_REQUIRED", self._save)
-        self.engine.assert_not_called()
+        # S1: each operation pings once at the capability gate; neither
+        # operation reaches a snapshot dispatch.
+        self.assertEqual([c.args for c in self.engine.call_args_list],
+                         [("ping", {}), ("ping", {})])
         self.assertEqual(self.result.read_bytes(), foreign)
 
     @unittest.skipUnless(os.name == "posix", "POSIX annotation prerequisite fsync")
     def test_case_24_clearing_rechecks_result_after_sync(self):
         journal = self._blocked_publication(superseding=True, result_foreign=True)
-        foreign = self._NEW_RESULT + b" "
+        foreign = self.new_result_bytes + b" "
         with self._record_snapshot_syncs(self.result, lambda: self._external_snapshot_edit(self.result, foreign)):
             self._assert_class("RECOVERY_REQUIRED", self._compare)
         self.assertEqual(self.journal.read_bytes(), journal)
         self.assertEqual(self.result.read_bytes(), foreign)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
 
     def test_case_32_published_original_survives_superseding_stage_replace(self):
         journal = self._blocked_publication()
         os.link(self.spec, self.staged)
-        newest = self._NEW_RESULT + b" "
+        newest = self.new_result_bytes + b" "
         child = self._public_child("save", "after-stage", result=newest)
         self.assertEqual(child.returncode, 71, child.stdout + child.stderr)
         self.assertEqual(self.result.read_bytes(), newest)
@@ -2615,7 +2874,7 @@ with ExitStack() as stack:
 
     def test_case_33_equals_before_cleanup_isolates_dotted_name(self):
         self._seed_pair()
-        self._write_journal("PREPARED")
+        self._write_journal("PREPARED", name="a")
         for path in (self.result, self.spec, self.journal, self.staged, self.pending / "different.lock"):
             path.rename(path.with_name(path.name.replace("different", "a", 1)))
         other_journal = self.pending / "a.journal.journal.json"
@@ -2627,12 +2886,11 @@ with ExitStack() as stack:
         orphan = self.pending / "a.journal.leftover"
         orphan.write_bytes(b"ignored")
         before = {path: path.read_bytes() for path in (other_journal, other_stage, other_lock, orphan)}
-        self.engine.return_value = {"ok": True, "class": "OK", "queries": []}
-        self.engine.side_effect = None
+        self.engine.side_effect = self._dispatch({"ok": True, "class": "OK", "queries": []})
         checks.snapshot(self.ws, None, "compare", "a", self._OLD_SPEC)
         self.assertFalse((self.pending / "a.journal.json").exists())
         self.assertFalse((self.pending / "a.spec.next").exists())
-        self.assertEqual((self.result.parent / "a.json").read_bytes(), self._OLD_RESULT)
+        self.assertEqual((self.result.parent / "a.json").read_bytes(), self.old_result_bytes)
         self.assertEqual((self.spec.parent / "a.json").read_bytes(), self.old_spec_bytes)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
 
@@ -2660,10 +2918,11 @@ with ExitStack() as stack:
 
     def _assert_case_27_results_directory(self, *, replaced):
         self.result.parent.mkdir(parents=True)
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         fields = {"before_result": None, "before_spec": None}
         journal = self._write_journal("PREPARED", result_foreign=True, **fields)
         if replaced:
+            self.spec.parent.mkdir()
             aside = self.snaps / "results-aside"
             self.result.parent.rename(aside)
             self.result.parent.mkdir()
@@ -2679,8 +2938,8 @@ with ExitStack() as stack:
             with self._record_snapshot_syncs(self.snaps, fail_if_marked):
                 self._assert_class("RECOVERY_REQUIRED", self._save)
             self.assertEqual(self.journal.read_bytes(), journal)
-            self.engine.assert_not_called()
-            self.assertEqual((aside / self.result.name).read_bytes(), self._NEW_RESULT)
+            self.engine.assert_called_once_with("ping", {})
+            self.assertEqual((aside / self.result.name).read_bytes(), self.new_result_bytes)
 
         syncs = []
         clears = []
@@ -2726,13 +2985,14 @@ with ExitStack() as stack:
                 self.assertIn(refusal.lower(), str(error).lower() + str(error.__cause__).lower())
                 self.assertEqual(self.journal.read_bytes(), journal)
                 self._assert_public_block()
+                self.engine.reset_mock()
                 self._assert_class("RECOVERY_REQUIRED", self._save)
-                self.engine.assert_not_called()
+                self.engine.assert_called_once_with("ping", {})
                 self.assertEqual(self.spec.read_bytes(), foreign)
 
     def test_case_28_journal_known_spec_edit_blocks_only_current_attempt(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         journal = self._write_journal("PREPARED")
 
         def edit_and_refuse(*args):
@@ -2741,7 +3001,7 @@ with ExitStack() as stack:
 
         with patch("pbz.desktop.require_port", side_effect=edit_and_refuse):
             self._assert_class("RECOVERY_REQUIRED", self._save)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
         self.assertEqual(self.spec.read_bytes(), self.new_spec_bytes)
         self.assertEqual(self.journal.read_bytes(), journal)
         self._save()
@@ -2749,9 +3009,9 @@ with ExitStack() as stack:
 
     def test_case_28_inherited_flag_marker_failure_preserves_supersede_permission(self):
         self._blocked_publication(superseding=True)
-        self.result.write_bytes(self._NEW_RESULT + b" ")
+        self.result.write_bytes(self.new_result_bytes + b" ")
         original = self.journal.read_bytes()
-        foreign = self._NEW_RESULT + b"  "
+        foreign = self.new_result_bytes + b"  "
         replace = os.replace
         denied = []
 
@@ -2771,7 +3031,7 @@ with ExitStack() as stack:
         ):
             self._assert_class("RECOVERY_REQUIRED", self._save)
         self.assertEqual(denied, [self.journal])
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
         self.assertEqual(self.journal.read_bytes(), original)
         self.assertEqual(self.result.read_bytes(), foreign)
         self._save()
@@ -2786,6 +3046,8 @@ with ExitStack() as stack:
         replace = os.replace
 
         def engine(*args, **kwargs):
+            if args[0] == "ping":
+                return self._engine(*args, **kwargs)
             response = self._engine(*args, **kwargs)
             events.append("engine-published")
             return response
@@ -2818,11 +3080,13 @@ with ExitStack() as stack:
         for state in ("PREPARED", "RESULT_PUBLISHED"):
             with self.subTest(state=state):
                 journal = self._blocked_publication(state)
-                newest = self._NEW_RESULT + b" "
+                newest = self.new_result_bytes + b" "
                 events = []
                 replace = os.replace
 
                 def engine(*args, **kwargs):
+                    if args[0] == "ping":
+                        return self._engine(*args, **kwargs)
                     response = self._engine(*args, **kwargs)
                     self.result.write_bytes(newest)
                     events.append("engine-published")
@@ -2861,20 +3125,24 @@ with ExitStack() as stack:
                 self._seed_pair()
                 if state == "inherited":
                     original = self._blocked_publication(superseding=True)
-                    self.result.write_bytes(self._NEW_RESULT + b" ")
+                    self.result.write_bytes(self.new_result_bytes + b" ")
                 elif state:
                     original = self._blocked_publication(state)
-                foreign = self._NEW_RESULT + b"  "
+                foreign = self.new_result_bytes + b"  "
 
                 def fail_all(*args, **kwargs):
+                    if args[0] == "ping":
+                        return self._engine(*args, **kwargs)
                     self.result.write_bytes(foreign)
-                    return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
-                            "queries": [{"id": "q1", "result": "FAILED"}]}
+                    return self._dispatch({"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                            "queries": [{"id": "q1", "result": "FAILED"}]})(*args, **kwargs)
 
                 self.engine.side_effect = fail_all
                 self.engine.reset_mock()
                 self._assert_class("RECOVERY_REQUIRED", self._save)
-                self.engine.assert_called_once()
+                self.assertEqual(self.engine.call_count, 2)
+                self.assertEqual(self.engine.call_args_list[0].args, ("ping", {}))
+                self.assertEqual(self.engine.call_args.args[0], "snapshot-save")
                 if state == "RESULT_PUBLISHED":
                     self.assertEqual(self.journal.read_bytes(), original)
                 elif state is None:
@@ -2885,7 +3153,7 @@ with ExitStack() as stack:
                     self._assert_annotations(original, result_foreign=True)
                 self.engine.reset_mock()
                 self._assert_class("RECOVERY_REQUIRED", self._save)
-                self.engine.assert_not_called()
+                self.engine.assert_called_once_with("ping", {})
                 self.assertEqual(self.result.read_bytes(), foreign)
 
     def test_case_26_clear_failure_falls_back_to_marker_or_retains_flag(self):
@@ -2894,11 +3162,13 @@ with ExitStack() as stack:
         for fault in ("clear", "both", "after-marker-replace"):
             with self.subTest(fault=fault):
                 original = self._blocked_publication()
-                foreign = self._NEW_RESULT + b" "
+                foreign = self.new_result_bytes + b" "
                 replace = os.replace
                 writes = []
 
                 def fail_dispatch(*args, **kwargs):
+                    if args[0] == "ping":
+                        return self._engine(*args, **kwargs)
                     self.result.write_bytes(foreign)
                     return {"ok": False, "class": "ENGINE_UNAVAILABLE", "payload_state": "not_sent"}
 
@@ -2937,17 +3207,19 @@ with ExitStack() as stack:
                     self._assert_annotations(original, superseding=True, result_foreign=True)
                     self.engine.reset_mock()
                     self._assert_class("RECOVERY_REQUIRED", self._save)
-                    self.engine.assert_not_called()
+                    self.engine.assert_called_once_with("ping", {})
                     self.assertEqual(self.result.read_bytes(), foreign)
 
     def _native_engine_patch(self, popen, responses):
         from contextlib import ExitStack
         from pbz import common, engine
 
-        def observe(*args, **kwargs):
-            response = common.engine_call(*args, **kwargs)
+        def observe(verb, payload, **kwargs):
+            if verb == "ping":
+                return self._engine(verb, payload, **kwargs)
+            response = common.engine_call(verb, payload, **kwargs)
             responses.append(response)
-            return response
+            return self._dispatch(response)(verb, payload)
 
         stack = ExitStack()
         self.addCleanup(stack.close)
@@ -2971,7 +3243,7 @@ with ExitStack() as stack:
         for spawn_failure in (True, False):
             with self.subTest(spawn_failure=spawn_failure):
                 original = self._blocked_publication()
-                foreign = self._NEW_RESULT + b" "
+                foreign = self.new_result_bytes + b" "
                 responses = []
                 children = []
 
@@ -2995,7 +3267,7 @@ with ExitStack() as stack:
                     self.assertEqual(error.__cause__.code, "ENGINE_UNAVAILABLE")
                     self.assertEqual(self.journal.read_bytes(), original)
                     self._assert_class("RECOVERY_REQUIRED", self._save)
-                    self.engine.assert_not_called()
+                    self.engine.assert_called_once_with("ping", {})
                 else:
                     self.assertEqual(len(children), 1)
                     self.assertIsNotNone(children[0].returncode, "timeout must reap the child")
@@ -3015,7 +3287,7 @@ with ExitStack() as stack:
 
     def _assert_native_communicate_exception(self, fault, *, moved):
         original = self._blocked_publication()
-        foreign = self._NEW_RESULT + b" " if moved else self._NEW_RESULT
+        foreign = self.new_result_bytes + b" " if moved else self.new_result_bytes
         responses = []
         children = []
         popen = subprocess.Popen
@@ -3131,10 +3403,10 @@ result.write_bytes(bytes.fromhex(release.read_text()))
         else:
             self.assertEqual(json.loads(self.journal.read_bytes())["state"], "PREPARED")
         release_tmp = release.with_suffix(".tmp")
-        release_tmp.write_text((self._NEW_RESULT + b" ").hex(), encoding="ascii")
+        release_tmp.write_text((self.new_result_bytes + b" ").hex(), encoding="ascii")
         os.replace(release_tmp, release)
         self.assertEqual(child.wait(timeout=10), 0)
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT + b" ")
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes + b" ")
         self._assert_public_block()
 
 
@@ -3199,6 +3471,7 @@ result.write_bytes(bytes.fromhex(release.read_text()))
         for pending in (False, True):
             with self.subTest(pending=pending):
                 self._seed_pair()
+                self.engine.reset_mock()
                 child = self._start_writer_for_denied_reader(pending=pending)
                 try:
                     self.assertEqual(self._child_signal(child), "ready")
@@ -3208,7 +3481,7 @@ result.write_bytes(bytes.fromhex(release.read_text()))
                             stack.enter_context(patch.object(owner, name, side_effect=deny_lock(getattr(owner, name))))
                         self._assert_class("RECOVERY_REQUIRED" if pending else "LOCAL_STATE_UNAVAILABLE",
                                            self._compare)
-                    self.engine.assert_not_called()
+                    self.engine.assert_called_once_with("ping", {})
                     self.assertEqual(_tree(self.snaps), before)
                     self.assertEqual(self.journal.exists(), pending)
                 finally:
@@ -3252,21 +3525,22 @@ result.write_bytes(bytes.fromhex(release.read_text()))
             try:
                 self.assertEqual(progress.get(timeout=10), "contended")
                 self.assertEqual(attempts, ["write-denied", "read-open"])
-                self.engine.assert_not_called()
+                self.engine.assert_called_once_with("ping", {})
             finally:
                 out, err = child.communicate("\n", timeout=10)
                 reader.join(timeout=10)
         self.assertEqual(child.returncode, 0, out + err)
         self.assertFalse(reader.is_alive())
         self.assertEqual(progress.get(timeout=10), "compared")
-        self.engine.assert_called_once()
+        self.assertEqual(self.engine.call_count, 2)
+        self.assertEqual(self.engine.call_args.args[0], "snapshot-compare")
 
     @unittest.skipUnless(os.name == "posix", "POSIX read-only flock")
     def test_case_10_read_only_recovery_write_failure_preserves_tree(self):
         import errno
 
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         self._write_journal()
         open_patch, attempts = self._posix_read_only_lock_open()
         before = _tree(self.snaps)
@@ -3284,11 +3558,11 @@ result.write_bytes(bytes.fromhex(release.read_text()))
         self.assertEqual(attempts, ["write-denied", "read-open"])
         self.assertTrue(denied)
         self.assertEqual(_tree(self.snaps), before)
-        self.engine.assert_not_called()
+        self.engine.assert_called_once_with("ping", {})
 
     def test_case_10_flag_clear_survives_later_spec_replace_denial(self):
         self._seed_pair()
-        self.result.write_bytes(self._NEW_RESULT)
+        self.result.write_bytes(self.new_result_bytes)
         cleared = self._write_journal()
         self._write_journal(superseding=True)
         replace = os.replace
@@ -3304,7 +3578,7 @@ result.write_bytes(bytes.fromhex(release.read_text()))
             self._assert_class("RECOVERY_REQUIRED", self._compare)
         self.assertEqual(denied, [cleared])
         self.assertEqual(self.journal.read_bytes(), cleared)
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
         self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
         self._assert_public_compare("MATCH")
         self._assert_completed()
@@ -3317,7 +3591,7 @@ result.write_bytes(bytes.fromhex(release.read_text()))
             with self.subTest(directory=directory.name):
                 shutil.rmtree(self.snaps, ignore_errors=True)
                 if directory == self.pending:
-                    self.snaps.mkdir()
+                    self.snaps.mkdir(parents=True)
                 script = f"""
     mkdir = os.mkdir
     target = Path({str(directory)!r})
@@ -3333,24 +3607,36 @@ result.write_bytes(bytes.fromhex(release.read_text()))
                 try:
                     self.assertEqual(self._child_signal(child), "created")
                     self.assertTrue(directory.is_dir())
+                    # S1: the child paused inside the identity lock (namespace
+                    # creation is step 5). Release it and wait until it is
+                    # inside its own dispatch, holding only the pair lock for
+                    # "different", before running the parent save for "other".
+                    child.stdin.write("\n")
+                    child.stdin.flush()
+                    self.assertEqual(self._child_signal(child), "dispatched")
                     recorded = []
                     parent = directory.parent
                     parent_synced_at_dispatch = False
 
                     def dispatch(verb, payload, **kwargs):
+                        if verb == "ping":
+                            return self._engine(verb, payload, **kwargs)
                         nonlocal parent_synced_at_dispatch
                         parent_synced_at_dispatch = parent in recorded
                         other = self.result.with_name("other.json")
                         other.parent.mkdir(exist_ok=True)
-                        other.write_bytes(self._NEW_RESULT)
-                        return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
-                                "queries": [{"id": "q1", "result": "SAVED"}]}
+                        other.write_bytes(self.new_result_bytes)
+                        return self._dispatch({
+                            "ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                            "queries": [{"id": "q1", "result": "SAVED"}],
+                        })(verb, payload)
 
                     self.engine.reset_mock()
                     self.engine.side_effect = dispatch
                     with self._record_snapshot_syncs(parent, lambda: recorded.append(parent)):
                         result = checks.snapshot(self.ws, None, "save", "other", self._NEW_SPEC)
-                    self.engine.assert_called_once()
+                    self.assertEqual(self.engine.call_count, 2)
+                    self.assertEqual(self.engine.call_args_list[0].args, ("ping", {}))
                     self.assertEqual(self.engine.call_args.args[1]["name"], "other")
                     self.assertTrue(parent_synced_at_dispatch, "observing an existing directory still requires syncing its parent")
                     self.assertEqual(result["queries"], [{"id": "q1", "result": "SAVED"}])
@@ -3379,12 +3665,13 @@ ready.write_text(str(os.getpid()))
 try:
     request = sys.stdin.buffer.read()
     if request:
-        json.loads(request)
+        doc = json.loads(request)
         done.with_name("engine-received").touch()
         while not release.exists():
             time.sleep(0.01)
         if mode != "default-path":
-            result.write_bytes(b'{"queries": {"q1": {"rows": ["engine-child"]}}}')
+            result.write_bytes(json.dumps({"queries": {"q1": {"rows": ["engine-child"]}},
+                                           "project_id": doc["project_id"]}).encode())
 finally:
     done.touch()
 """
@@ -3418,7 +3705,14 @@ finally:
         return child
     stack.enter_context(patch.object(engine, "ENGINE_EXE", sys.executable))
     stack.enter_context(patch.object(engine.subprocess, "Popen", side_effect=start))
-    stack.enter_context(patch.object(checks, "engine_call", side_effect=common.engine_call))
+    def dispatch(verb, payload, **kwargs):
+        if verb == "ping":
+            return {{"ok": True, "snapshot_layout": "project-v1"}}
+        response = common.engine_call(verb, payload, **kwargs)
+        if response.get("ok"):
+            return {{**response, "project_id": payload["project_id"], "snapshot_layout": "project-v1"}}
+        return response
+    stack.enter_context(patch.object(checks, "engine_call", side_effect=dispatch))
     if mode == "default-path":
         def launch_default(project):
             engine.call("snapshot-compare", {{}})
@@ -3454,13 +3748,13 @@ finally:
         contender = self._start_public_child("compare", "watch-lock")
         self.addCleanup(self._stop_child, contender)
         self.assertEqual(self._child_signal(contender), "contended")
-        self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
         self.assertEqual(json.loads(self.journal.read_bytes())["state"], "PREPARED")
         release.touch()
         out, err = contender.communicate(timeout=10)
         self.assertEqual(json.loads(out).get("error"), "RECOVERY_REQUIRED", out + err)
         self.assertTrue(self._wait_for_snapshot_path(done))
-        self.assertNotEqual(self.result.read_bytes(), self._OLD_RESULT)
+        self.assertNotEqual(self.result.read_bytes(), self.old_result_bytes)
 
     @unittest.skipUnless(os.name == "posix", "POSIX timeout cleanup")
     def test_case_11_timeout_names_class_after_kill_and_wait(self):
@@ -3567,7 +3861,7 @@ def bind(dll, name):
         if kill_on_close:
             self._assert_windows_process_exited(pid)
             self._assert_public_compare("MATCH")
-            self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+            self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
             self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
             self.assertFalse(self.journal.exists())
         else:
@@ -3578,7 +3872,7 @@ def bind(dll, name):
             out, err = contender.communicate(timeout=10)
             self.assertEqual(json.loads(out).get("error"), "RECOVERY_REQUIRED", out + err)
             self._assert_windows_process_exited(pid)
-            self.assertNotEqual(self.result.read_bytes(), self._OLD_RESULT)
+            self.assertNotEqual(self.result.read_bytes(), self.old_result_bytes)
             self.assertEqual(json.loads(self.journal.read_bytes())["state"], "PREPARED")
 
     def _assert_windows_process_exited(self, pid):
@@ -3604,7 +3898,7 @@ def bind(dll, name):
         self.assertTrue(self._wait_for_snapshot_path(done), "child must see stdin EOF")
         self._assert_windows_process_exited(int(ready.read_text()))
         self.assertFalse(done.with_name("engine-received").exists())
-        self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
         self.assertEqual(json.loads(self.journal.read_bytes())["state"], "PREPARED")
         self._assert_public_compare("MATCH")
         self.assertFalse(self.journal.exists())
@@ -3669,7 +3963,7 @@ hooks = {{"CreateFileW": create_file}}
                     self.assertEqual(err.count("write-denied"), 2, err)
                     self.assertEqual(json.loads(out).get("error"),
                                      "RECOVERY_REQUIRED" if pending else "LOCAL_STATE_UNAVAILABLE", out + err)
-                    self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+                    self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
                     self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
                 finally:
                     out, err = holder.communicate("\n", timeout=10)
@@ -3684,7 +3978,7 @@ hooks = {{"CreateFileW": create_file}}
         if step_two:
             self.assertEqual(self._child_signal(contender), "write-denied")
         self.assertEqual(self._child_signal(contender), "share-retry")
-        self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
         out, err = holder.communicate("\n", timeout=10)
         self.assertEqual(holder.returncode, 0, out + err)
         out, err = contender.communicate(timeout=10)
@@ -3764,7 +4058,7 @@ def toggle(fn, handle, mask, flags):
     inheritable = bool(flags)
     toggles.append(inheritable)
     if mode == "toggle-before" and inheritable:
-        Path({str(self.result)!r}).write_bytes({self._NEW_RESULT + b" "!r})
+        Path({str(self.result)!r}).write_bytes({self.new_result_bytes + b" "!r})
         ctypes.set_last_error(5)
         return 0
     if not inheritable and mode.startswith("toggle-clear"):
@@ -3785,7 +4079,7 @@ def assign(fn, *args):
     assignments.append("attempt")
     if mode.startswith("assignment"):
         if {moved!r}:
-            Path({str(self.result)!r}).write_bytes({self._NEW_RESULT + b" "!r})
+            Path({str(self.result)!r}).write_bytes({self.new_result_bytes + b" "!r})
         ctypes.set_last_error(5)
         return 0
     return fn(*args)
@@ -3814,9 +4108,13 @@ hooks = {{"SetHandleInformation": toggle, "AssignProcessToJobObject": assign}}
         child.kill = child.terminate = kill_child
         child.communicate = send
         return child
-    def observe(*args, **kwargs):
-        response = common.engine_call(*args, **kwargs)
+    def observe(verb, payload, **kwargs):
+        if verb == "ping":
+            return {{"ok": True, "snapshot_layout": "project-v1"}}
+        response = common.engine_call(verb, payload, **kwargs)
         responses.append(response)
+        if response.get("ok"):
+            return {{**response, "project_id": payload["project_id"], "snapshot_layout": "project-v1"}}
         return response
     stack.enter_context(patch.object(engine, "ENGINE_EXE", sys.executable))
     stack.enter_context(patch.object(engine.subprocess, "Popen", side_effect=start))
@@ -3850,7 +4148,7 @@ hooks = {{"SetHandleInformation": toggle, "AssignProcessToJobObject": assign}}
         self.assertEqual(len(report["assignments"]), 1)
         self.assertIsNotNone(report["returncodes"][0])
         self.assertEqual(checks._load_state(self.ws)["snapshot_queries"], 1)
-        self.assertEqual(self.result.read_bytes(), self._OLD_RESULT)
+        self.assertEqual(self.result.read_bytes(), self.old_result_bytes)
         self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
         self.assertFalse(self.journal.exists())
         self.assertFalse(self.staged.exists())
@@ -3867,8 +4165,8 @@ hooks = {{"SetHandleInformation": toggle, "AssignProcessToJobObject": assign}}
         self.assertEqual(self.journal.read_bytes(), original)
         holder.communicate("\n", timeout=10)
         self._assert_class("RECOVERY_REQUIRED", self._save)
-        self.engine.assert_not_called()
-        self.assertEqual(self.result.read_bytes(), self._NEW_RESULT + b" ")
+        self.engine.assert_called_once_with("ping", {})
+        self.assertEqual(self.result.read_bytes(), self.new_result_bytes + b" ")
 
     @unittest.skipUnless(os.name == "nt", "Windows SetHandleInformation faults")
     def test_case_26_windows_inherit_toggle_failures(self):
@@ -3897,13 +4195,20 @@ hooks = {{"SetHandleInformation": toggle, "AssignProcessToJobObject": assign}}
             if mode == "toggle-before":
                 self.assertEqual(report["outcome"], ["RECOVERY_REQUIRED", "OTHER"])
                 self.assertEqual(report["children"], [])
-                self.assertEqual(self.result.read_bytes(), self._NEW_RESULT + b" ")
+                self.assertEqual(self.result.read_bytes(), self.new_result_bytes + b" ")
             else:
                 self.assertEqual(report["outcome"][0], "OTHER")
-                self.assertEqual(report["toggles"], [True, False, False])
+                # S1: the save inherits two handles (pair lock and project
+                # guard), so each inheritability pass toggles both. The
+                # clear-once fault lets the cleanup retry clear both handles;
+                # the clear-twice fault stops it on the first handle again.
+                expected_toggles = ([True, True, False, False, False]
+                                    if mode == "toggle-clear-once"
+                                    else [True, True, False, False])
+                self.assertEqual(report["toggles"], expected_toggles)
                 self.assertEqual(len(report["children"]), 1)
                 self.assertIsNotNone(report["returncodes"][0])
-                self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+                self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
                 out, err = reader.communicate(timeout=10)
                 self.assertEqual(json.loads(out).get("error"), "RECOVERY_REQUIRED", out + err)
         finally:
@@ -3911,8 +4216,8 @@ hooks = {{"SetHandleInformation": toggle, "AssignProcessToJobObject": assign}}
             holder.communicate("\n", timeout=10)
         if mode == "toggle-before":
             self._assert_class("RECOVERY_REQUIRED", self._save)
-            self.engine.assert_not_called()
-            self.assertEqual(self.result.read_bytes(), self._NEW_RESULT + b" ")
+            self.engine.assert_called_once_with("ping", {})
+            self.assertEqual(self.result.read_bytes(), self.new_result_bytes + b" ")
         else:
             self.assertEqual(self._windows_probe().returncode, 0)
 
@@ -3954,13 +4259,870 @@ hooks = {{"SetHandleInformation": toggle, "AssignProcessToJobObject": assign}}
                 out, err = reader.communicate(timeout=10)
                 self.assertEqual(json.loads(out).get("error"), "RECOVERY_REQUIRED", out + err)
             self.assertEqual(self.journal.read_bytes(), retained if assigned else original)
-            self.assertEqual(self.result.read_bytes(), self._NEW_RESULT)
+            self.assertEqual(self.result.read_bytes(), self.new_result_bytes)
             self.assertEqual(self.spec.read_bytes(), self.old_spec_bytes)
             self.assertEqual(self._windows_probe().returncode, 0)
         finally:
             release.touch()
             holder.communicate("\n", timeout=10)
 
+
+
+def _named_project(root, name):
+    model = os.path.join(root, f"{name}.SemanticModel", "definition")
+    os.makedirs(os.path.join(model, "tables"))
+    open(os.path.join(root, f"{name}.pbip"), "w", encoding="utf-8").close()
+    with open(os.path.join(root, f"{name}.SemanticModel", "definition.pbism"), "w", encoding="utf-8") as handle:
+        handle.write("{}\n")
+    with open(os.path.join(model, "database.tmdl"), "w", encoding="utf-8") as handle:
+        handle.write("database\n\tcompatibilityLevel: 1600\n")
+    with open(os.path.join(model, "model.tmdl"), "w", encoding="utf-8") as handle:
+        handle.write("model Model\n\tculture: en-US\n\nref table T\n")
+    with open(os.path.join(model, "tables", "T.tmdl"), "w", encoding="utf-8") as handle:
+        handle.write("table T\n\tmeasure M = 1\n")
+    report = os.path.join(root, f"{name}.Report", "definition")
+    os.makedirs(report)
+    with open(os.path.join(report, "definition.pbir"), "w", encoding="utf-8") as handle:
+        handle.write("{}\n")
+    with open(os.path.join(report, "report.json"), "w", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+
+class SnapshotProjectIdentityTests(unittest.TestCase):
+    """S1 acceptance: snapshot baselines are bound to the selected project, not the name."""
+
+    SPEC_A = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+    SPEC_B = {"queries": [{"id": "q1", "dax": "EVALUATE {2}"}]}
+    PORTS = {"Alpha": 41001, "Beta": 41002}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+        self.calls = []
+        self.enterContext(patch(
+            "pbz.desktop.require_port",
+            side_effect=lambda project: self.PORTS[project.name]))
+        self.enterContext(patch("pbz.checks.engine_call", side_effect=self._engine))
+
+    @staticmethod
+    def _fingerprint(dax):
+        return hashlib.sha256(dax.encode("utf-8")).hexdigest()[:12]
+
+    def _engine(self, verb, payload, timeout=1800, **kwargs):
+        # A faithful double of the S1 engine: one namespaced store per project_id.
+        self.calls.append((verb, dict(payload)))
+        if verb == "ping":
+            return {"ok": True, "snapshot_layout": "project-v1"}
+        snaps = (Path(payload["private_dir"]) / "snapshots" / "projects"
+                 / payload["project_id"])
+        if verb == "snapshot-save":
+            dax = payload["queries"][0]["dax"]
+            doc = {"version": 1, "name": payload["name"],
+                   "project_id": payload["project_id"],
+                   "refreshed": "2026-01-01T00:00:00",
+                   "queries": {"q1": {"rows": [self._fingerprint(dax)]}}}
+            result = snaps / "results" / (payload["name"] + ".json")
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_bytes(json.dumps(doc).encode("utf-8"))
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+        if verb == "snapshot-compare":
+            result = snaps / "results" / (payload["name"] + ".json")
+            doc = json.loads(result.read_text(encoding="utf-8"))
+            saved = doc["queries"]["q1"]["rows"][0]
+            want = self._fingerprint(payload["queries"][0]["dax"])
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAME" if saved == want else "DIFF"}]}
+        raise AssertionError(f"unexpected verb {verb}")
+
+    def _compare_calls(self):
+        return [p for verb, p in self.calls if verb == "snapshot-compare"]
+
+    def test_compare_in_second_project_does_not_consume_first_projects_baseline(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC_A)
+        with self.assertRaises(PbzError) as ctx:
+            checks.snapshot(self.ws, self.beta, "compare", "monthly", None)
+        self.assertEqual(ctx.exception.code, "BAD_REQUEST")
+        self.assertEqual(self._compare_calls(), [])
+
+    def test_same_name_pairs_are_isolated_per_project(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC_A)
+        checks.snapshot(self.ws, self.beta, "save", "monthly", self.SPEC_B)
+
+        res_a = checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        res_b = checks.snapshot(self.ws, self.beta, "compare", "monthly", None)
+        self.assertEqual(res_a["queries"][0]["result"], "SAME")
+        self.assertEqual(res_b["queries"][0]["result"], "SAME")
+
+        calls = self._compare_calls()
+        self.assertEqual(len(calls), 2)
+        by_port = {c["port"]: c for c in calls}
+        self.assertEqual(by_port[self.PORTS["Alpha"]]["queries"][0]["dax"], "EVALUATE {1}")
+        self.assertEqual(by_port[self.PORTS["Beta"]]["queries"][0]["dax"], "EVALUATE {2}")
+
+        registry = json.loads(
+            (Path(self.ws.root) / ".pbz" / "project-identity.json").read_text(encoding="utf-8"))
+        ids = {}
+        for project in (self.alpha, self.beta):
+            anchor = json.loads(
+                (Path(project.model_dir) / "pbz-project-id.json").read_text(encoding="utf-8"))
+            ids[project.name] = anchor["id"]
+            self.assertIn(anchor["id"], registry)
+            pair = (Path(self.ws.private) / "snapshots" / "projects" / anchor["id"]
+                    / "results" / "monthly.json")
+            self.assertTrue(pair.is_file(), f"no namespaced pair for {project.name}")
+        self.assertNotEqual(ids["Alpha"], ids["Beta"])
+        bytes_a = (Path(self.ws.private) / "snapshots" / "projects" / ids["Alpha"]
+                   / "results" / "monthly.json").read_bytes()
+        bytes_b = (Path(self.ws.private) / "snapshots" / "projects" / ids["Beta"]
+                   / "results" / "monthly.json").read_bytes()
+        self.assertNotEqual(bytes_a, bytes_b)
+
+    def test_anchor_survives_mirror_round_trip_and_tmdl_parse(self):
+        from pbz import mirror
+        anchor = Path(self.alpha.model_dir) / "pbz-project-id.json"
+        anchor_bytes = b'{"id": "3f6d2f52-1c8b-4f3a-9c2d-7a1b5e0d84f6", "version": 1}\n'
+        anchor.write_bytes(anchor_bytes)
+        with patch("pbz.desktop.processes", return_value=[]):
+            mirror.pull(self.ws, self.alpha)
+            self.assertEqual(anchor.read_bytes(), anchor_bytes)
+            table = next(Path(self.ws.mirror).rglob("T.tmdl"))
+            table.write_text(
+                table.read_text(encoding="utf-8").replace("measure M = 1", "measure M = 2"),
+                encoding="utf-8")
+            try:
+                mirror.push(self.ws, self.alpha)
+            except PbzError:
+                # The engine-backed staged validation cannot run in every
+                # environment; the witness is that neither a completed push
+                # nor a refused one ever touches the anchor.
+                pass
+            self.assertEqual(anchor.read_bytes(), anchor_bytes)
+        self.assertIsNotNone(mirror.real_model(self.alpha))
+
+
+class SnapshotIdentityStateTests(unittest.TestCase):
+    """S1 C5: identity state table witnesses (repair commands, registry
+    loss, duplicates, rename refresh, malformed anchors)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+
+    def _mint(self, project):
+        return identity.resolve(self.ws, project, apply=True).project_id
+
+    def test_registry_loss_refuses_then_rebind_restores(self):
+        pid = self._mint(self.alpha)
+        os.remove(identity.registry_path(self.ws))
+        with self.assertRaises(PbzError) as raised:
+            identity.resolve(self.ws, self.alpha, apply=False)
+        self.assertEqual(raised.exception.code, "REGISTRY_MISSING")
+        report = identity.rebind_registry(self.ws, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[pid]["name"], "Alpha")
+        self.assertEqual(registry[pid]["status"], "bound")
+        self.assertEqual(identity.resolve(self.ws, self.alpha, apply=False).project_id, pid)
+
+    def test_anchor_loss_and_bind_restores_the_same_identity(self):
+        pid = self._mint(self.alpha)
+        os.remove(identity.anchor_path(self.alpha))
+        report = identity.bind_project(self.ws, self.alpha, pid, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        self.assertEqual(identity.read_anchor(self.ws, self.alpha), pid)
+        self.assertEqual(identity.resolve(self.ws, self.alpha, apply=False).project_id, pid)
+
+    def test_same_name_replacement_refused_then_mint_fresh(self):
+        pid = self._mint(self.alpha)
+        # The project is replaced under the same name: anchor gone, the old
+        # record orphaned, a genuinely new project directory in place.
+        os.remove(identity.anchor_path(self.alpha))
+        registry = identity.load_registry(self.ws)
+        registry[pid]["status"] = "orphan"
+        identity.write_registry(self.ws, registry)
+        with self.assertRaises(PbzError) as raised:
+            identity.resolve(self.ws, self.alpha, apply=True)
+        self.assertEqual(raised.exception.code, "PROJECT_IDENTITY_UNBOUND")
+        report = identity.mint_fresh(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        self.assertNotEqual(report["identity"], pid)
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[pid]["status"], "orphan")
+        self.assertEqual(registry[report["identity"]]["status"], "bound")
+        self.assertEqual(identity.resolve(self.ws, self.alpha, apply=False).project_id, report["identity"])
+
+    def test_malformed_anchor_is_refused_and_never_minted_over(self):
+        path = identity.anchor_path(self.alpha)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"not json at all")
+        before = open(path, "rb").read()
+        with self.assertRaises(PbzError) as raised:
+            identity.resolve(self.ws, self.alpha, apply=True)
+        self.assertEqual(raised.exception.code, "CORRUPT_STATE")
+        self.assertEqual(open(path, "rb").read(), before)
+        self.assertFalse(os.path.exists(identity.registry_path(self.ws)))
+
+    def test_duplicate_anchor_keeper_selection(self):
+        pid = self._mint(self.alpha)
+        identity.write_anchor(self.ws, self.beta, pid)
+        # Beta is not the recorded holder: it reidentifies freely.
+        report = identity.reidentify(self.ws, self.beta, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        self.assertNotEqual(report["identity"], pid)
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[pid]["name"], "Alpha")
+
+    def test_duplicate_anchor_recorded_holder_needs_keeper(self):
+        pid = self._mint(self.alpha)
+        identity.write_anchor(self.ws, self.beta, pid)
+        # Alpha is the holder the record names: a keeper is required, and
+        # the same write repoints the record to the keeper.
+        with self.assertRaises(PbzError) as raised:
+            identity.reidentify(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertEqual(raised.exception.code, "BAD_REQUEST")
+        report = identity.reidentify(self.ws, self.alpha, keeper="Beta", confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[pid]["name"], "Beta")
+        self.assertEqual(registry[report["identity"]]["name"], "Alpha")
+
+    def test_rename_refresh_reports_and_marks_displaced_orphan(self):
+        alpha_id = self._mint(self.alpha)
+        beta_id = self._mint(self.beta)
+        # Alpha's project files disappear entirely: its record stays
+        # bound under the name Alpha, anchored nowhere.
+        shutil.rmtree(os.path.join(self.ws.root, "Alpha.SemanticModel"))
+        os.remove(os.path.join(self.ws.root, "Alpha.pbip"))
+        shutil.rmtree(os.path.join(self.ws.root, "Alpha.Report"))
+        # Beta is renamed to Alpha on disk: directory, pbip and report
+        # move, and Beta's anchor now answers to the name Alpha.
+        for old, new in (("Beta.pbip", "Alpha.pbip"),
+                         ("Beta.SemanticModel", "Alpha.SemanticModel"),
+                         ("Beta.Report", "Alpha.Report")):
+            os.rename(os.path.join(self.ws.root, old), os.path.join(self.ws.root, new))
+        renamed = self.ws.project("Alpha")
+        resolution = identity.resolve(self.ws, renamed, apply=True)
+        # One resolution, one registry write: the rename is refreshed
+        # and reported, and the displaced anchorless record is marked
+        # orphan in the same write.
+        self.assertEqual(resolution.project_id, beta_id)
+        self.assertEqual(resolution.action, "refresh")
+        self.assertEqual(resolution.renamed_from, "Beta")
+        self.assertEqual(resolution.orphan_marked, (alpha_id, "Alpha"))
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[beta_id]["name"], "Alpha")
+        self.assertEqual(registry[beta_id]["status"], "bound")
+        self.assertIn("Beta", registry[beta_id]["previous_names"])
+        self.assertEqual(registry[alpha_id]["status"], "orphan")
+
+    def test_concurrent_first_use_under_different_private_roots(self):
+        import threading
+        from pbz.common import Workspace
+        other_private = os.path.join(self.ws.root, "other-private")
+        os.makedirs(other_private, exist_ok=True)
+        ws_b = Workspace(self.ws.root)
+        ws_b.private = other_private
+        errors = []
+
+        def mint(ws, project):
+            try:
+                identity.resolve(ws, project, apply=True)
+            except Exception as error:  # noqa: BLE001 - collected and asserted below
+                errors.append(error)
+
+        # Force the lost-update interleaving at the contested boundary:
+        # each worker's first registry load captures its value BEFORE
+        # waiting at a barrier, so without the identity lock both
+        # workers necessarily proceed from the same empty registry and
+        # one record is lost. With the lock, the second worker's first
+        # load happens only after the first worker finished, so it
+        # captures the first record and adds its own.
+        barrier = threading.Barrier(2)
+        seen = set()
+        seen_lock = threading.Lock()
+        real_load = identity.load_registry
+
+        def gated_load(ws):
+            ident = threading.get_ident()
+            with seen_lock:
+                first = ident not in seen
+                seen.add(ident)
+            if not first:
+                return real_load(ws)
+            captured = real_load(ws)
+            try:
+                barrier.wait(timeout=5)
+            except threading.BrokenBarrierError:
+                pass
+            return captured
+
+        threads = [threading.Thread(target=mint, args=(self.ws, self.alpha)),
+                   threading.Thread(target=mint, args=(ws_b, ws_b.project("Beta")))]
+        with patch.object(identity, "load_registry", gated_load):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+        self.assertFalse(any(thread.is_alive() for thread in threads),
+                         "a first-use worker did not terminate")
+        self.assertEqual(errors, [])
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(len(registry), 2)
+        self.assertEqual({record["name"] for record in registry.values()}, {"Alpha", "Beta"})
+        self.assertTrue(all(record["status"] == "bound" for record in registry.values()))
+
+
+class SnapshotSkewTransplantTests(unittest.TestCase):
+    """S1 C5: mixed-version skew refusals, journal transplant refusals,
+    and the project guard excluding a first-use save during a repair."""
+
+    SPEC = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+    PORTS = {"Alpha": 41001, "Beta": 41002}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+        self.alpha_id = identity.resolve(self.ws, self.alpha, apply=True).project_id
+        self.beta_id = identity.resolve(self.ws, self.beta, apply=True).project_id
+        self.mode = "good"
+        self.enterContext(patch(
+            "pbz.desktop.require_port",
+            side_effect=lambda project: self.PORTS[project.name]))
+        self.enterContext(patch("pbz.checks.engine_call", side_effect=self._engine))
+        self.enterContext(patch("pbz.checks.spend", return_value=True))
+
+    def _namespace(self, project_id):
+        return Path(self.ws.private) / "snapshots" / "projects" / project_id
+
+    def _engine(self, verb, payload, timeout=1800, **kwargs):
+        if verb == "ping":
+            if self.mode == "ping-wrong-layout":
+                return {"ok": True, "snapshot_layout": "flat-v0"}
+            return {"ok": True, "snapshot_layout": "project-v1"}
+        snaps = Path(payload["private_dir"]) / "snapshots" / "projects" / payload["project_id"]
+        if verb == "snapshot-save":
+            doc = {"version": 1, "name": payload["name"], "project_id": payload["project_id"],
+                   "refreshed": "2026-01-01T00:00:00",
+                   "queries": {"q1": {"rows": ["x"]}}}
+            result = snaps / "results" / (payload["name"] + ".json")
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_bytes(json.dumps(doc).encode("utf-8"))
+            echo = str(uuid.uuid4()) if self.mode == "save-wrong-echo" else payload["project_id"]
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": echo, "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+        if verb == "snapshot-compare":
+            echo = str(uuid.uuid4()) if self.mode == "compare-wrong-echo" else payload["project_id"]
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": echo, "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAME"}]}
+        raise AssertionError(f"unexpected verb {verb}")
+
+    def _pair(self, project_id, name):
+        return checks._SnapshotPair(self.ws, name, project_id=project_id)
+
+    def _prepared_journal(self, pair, spec_bytes):
+        before = pair.hashes()
+        pair.stage(spec_bytes)
+        pair.write_journal({
+            "state": "PREPARED", "before_result": before[0], "before_spec": before[1],
+            "before_coherent": True,
+            "staged_spec": hashlib.sha256(spec_bytes).hexdigest(), "new_result": None,
+        })
+
+    def test_ping_with_wrong_layout_is_engine_version(self):
+        self.mode = "ping-wrong-layout"
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.assertEqual(raised.exception.code, "ENGINE_VERSION")
+        self.assertFalse((self._namespace(self.alpha_id) / "results" / "monthly.json").exists())
+
+    def test_save_with_wrong_project_echo_over_existing_pair_is_engine_unavailable(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.mode = "save-wrong-echo"
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.assertEqual(raised.exception.code, "ENGINE_UNAVAILABLE")
+        self.assertIn("does not match", raised.exception.detail)
+
+    def test_save_with_wrong_project_echo_on_first_save_needs_recovery(self):
+        # The engine already published a result, so the refusal cannot
+        # un-publish it: finish_refusal leaves the pair to recovery.
+        self.mode = "save-wrong-echo"
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+        journal = self._namespace(self.alpha_id) / "pending" / "monthly.journal.json"
+        self.assertTrue(journal.is_file())
+        self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["state"], "PREPARED")
+
+    def test_compare_with_wrong_project_echo_is_engine_unavailable(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.mode = "compare-wrong-echo"
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        self.assertEqual(raised.exception.code, "ENGINE_UNAVAILABLE")
+        self.assertIn("does not match", raised.exception.detail)
+
+    def test_v1_journal_transplant_refused_without_mutation(self):
+        checks.snapshot(self.ws, self.beta, "save", "monthly", self.SPEC)
+        pair = self._pair(self.beta_id, "monthly")
+        spec_bytes = Path(pair.spec).read_bytes()
+        pair.stage(spec_bytes)
+        before_hashes = pair.hashes()
+        v1 = {"version": 1, "state": "PREPARED", "before_result": before_hashes[0],
+              "before_spec": before_hashes[1], "before_coherent": True,
+              "staged_spec": hashlib.sha256(spec_bytes).hexdigest(), "new_result": None}
+        Path(pair.journal).write_text(json.dumps(v1), encoding="utf-8")
+        before = _tree(self._namespace(self.beta_id))
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.beta, "compare", "monthly", None)
+        self.assertEqual(raised.exception.code, "CORRUPT_STATE")
+        self.assertEqual(_tree(self._namespace(self.beta_id)), before)
+
+    def test_v2_journal_transplant_from_other_project_refused(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        checks.snapshot(self.ws, self.beta, "save", "monthly", self.SPEC)
+        alpha_pair = self._pair(self.alpha_id, "monthly")
+        self._prepared_journal(alpha_pair, Path(alpha_pair.spec).read_bytes())
+        beta_pair = self._pair(self.beta_id, "monthly")
+        Path(beta_pair.journal).write_bytes(Path(alpha_pair.journal).read_bytes())
+        before = _tree(self._namespace(self.beta_id))
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.beta, "compare", "monthly", None)
+        self.assertEqual(raised.exception.code, "CORRUPT_STATE")
+        self.assertEqual(_tree(self._namespace(self.beta_id)), before)
+
+    def test_v2_journal_transplant_to_other_name_refused(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        checks.snapshot(self.ws, self.alpha, "save", "other", self.SPEC)
+        pair = self._pair(self.alpha_id, "monthly")
+        self._prepared_journal(pair, Path(pair.spec).read_bytes())
+        other_journal = self._namespace(self.alpha_id) / "pending" / "other.journal.json"
+        other_journal.write_bytes(Path(pair.journal).read_bytes())
+        before = _tree(self._namespace(self.alpha_id))
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "compare", "other", None)
+        self.assertEqual(raised.exception.code, "CORRUPT_STATE")
+        self.assertEqual(_tree(self._namespace(self.alpha_id)), before)
+
+    def test_project_guard_excludes_save_during_repair(self):
+        import threading
+        checks.snapshot(self.ws, self.beta, "save", "existing", self.SPEC)
+        attempted = threading.Event()
+        reached_engine = threading.Event()
+        done = threading.Event()
+        errors = []
+        real_acquire = checks._acquire_project_guard
+        real_engine = self._engine
+
+        def spying_acquire(ws, project_id, mode="shared"):
+            if project_id == self.beta_id and mode == "shared":
+                attempted.set()
+            return real_acquire(ws, project_id, mode)
+
+        def spying_engine(verb, payload, timeout=1800, **kwargs):
+            if verb == "snapshot-save":
+                reached_engine.set()
+            return real_engine(verb, payload, timeout=timeout, **kwargs)
+
+        def save():
+            try:
+                checks.snapshot(self.ws, self.beta, "save", "brand-new", self.SPEC)
+            except Exception as error:  # noqa: BLE001 - collected and asserted below
+                errors.append(error)
+            finally:
+                done.set()
+
+        with patch.object(checks, "_acquire_project_guard", spying_acquire), \
+                patch.object(checks, "engine_call", spying_engine):
+            with identity._exclusive_guards(self.ws, [self.beta_id]):
+                worker = threading.Thread(target=save)
+                worker.start()
+                # The worker is proven to be at the guard-acquisition
+                # boundary while the repair holds the guard exclusively.
+                self.assertTrue(attempted.wait(timeout=30), "save never reached the project guard")
+                # Dispatch happens only after the guard is acquired, and
+                # every step between acquisition and dispatch is local:
+                # an excluded worker can never set this while held.
+                self.assertFalse(reached_engine.wait(timeout=3.0),
+                                 "save dispatched while a repair held the project guard")
+                self.assertFalse(done.is_set(), "save completed while a repair held the project guard")
+                self.assertFalse((self._namespace(self.beta_id) / "results" / "brand-new.json").exists())
+            worker.join(timeout=30)
+        self.assertTrue(done.is_set())
+        self.assertEqual(errors, [])
+        self.assertTrue((self._namespace(self.beta_id) / "results" / "brand-new.json").exists())
+
+
+class SnapshotAdoptionWitnessTests(unittest.TestCase):
+    """S1 C5: adoption crash idempotency, competing targets, conflicts,
+    blocked recovery, normalization-first adoption, and claim rules."""
+
+    SPEC = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+        self.alpha_id = identity.resolve(self.ws, self.alpha, apply=True).project_id
+        self.beta_id = identity.resolve(self.ws, self.beta, apply=True).project_id
+        self.flat = Path(self.ws.private) / "snapshots"
+        self.enterContext(patch("pbz.desktop.require_port", return_value=1))
+        self.enterContext(patch("pbz.checks.engine_call", side_effect=self._engine))
+        self.enterContext(patch("pbz.checks.spend", return_value=True))
+
+    def _engine(self, verb, payload, timeout=1800, **kwargs):
+        if verb == "ping":
+            return {"ok": True, "snapshot_layout": "project-v1"}
+        snaps = Path(payload["private_dir"]) / "snapshots" / "projects" / payload["project_id"]
+        if verb == "snapshot-save":
+            doc = {"version": 1, "name": payload["name"], "project_id": payload["project_id"],
+                   "refreshed": "2026-01-01T00:00:00", "queries": {"q1": {"rows": ["saved"]}}}
+            result = snaps / "results" / (payload["name"] + ".json")
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_bytes(json.dumps(doc).encode("utf-8"))
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+        return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                "queries": [{"id": "q1", "result": "SAME"}]}
+
+    def _flat_pair(self, name, result_doc=None, spec_doc=None):
+        (self.flat / "results").mkdir(parents=True, exist_ok=True)
+        (self.flat / "specs").mkdir(parents=True, exist_ok=True)
+        (self.flat / "pending").mkdir(parents=True, exist_ok=True)
+        result_doc = LEGACY_RESULT if result_doc is None else result_doc
+        spec_doc = self.SPEC if spec_doc is None else spec_doc
+        (self.flat / "results" / f"{name}.json").write_text(json.dumps(result_doc), encoding="utf-8")
+        (self.flat / "specs" / f"{name}.json").write_text(json.dumps(spec_doc), encoding="utf-8")
+        return (json.dumps(result_doc).encode(), json.dumps(spec_doc).encode())
+
+    def _namespace(self, project_id):
+        return Path(self.ws.private) / "snapshots" / "projects" / project_id
+
+    def test_adoption_crash_between_names_resumes_to_same_end_state(self):
+        self._flat_pair("one")
+        self._flat_pair("two")
+        original = checks._adopt_one_name
+        calls = []
+
+        def crashing(ws, target_id, adoption_id, entry):
+            calls.append(entry["name"])
+            if len(calls) > 1:
+                raise RuntimeError("simulated crash")
+            return original(ws, target_id, adoption_id, entry)
+
+        with patch.object(checks, "_adopt_one_name", crashing):
+            with self.assertRaises(RuntimeError):
+                checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        status, _claim = checks._read_adopt_claim(self.ws)
+        self.assertEqual(status, "ok")
+        report = checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertTrue(report["claim_released"])
+        # "one" completed during the crashed run; the resume adopts "two".
+        self.assertEqual(report["adopted"], ["two"])
+        for name in ("one", "two"):
+            adopted = json.loads((self._namespace(self.alpha_id) / "results" / f"{name}.json").read_text(encoding="utf-8"))
+            self.assertEqual(adopted["project_id"], self.alpha_id)
+            self.assertFalse((self.flat / "results" / f"{name}.json").exists())
+        self.assertEqual(checks._list_adopt_journals(self.ws, self.alpha_id), [])
+
+    def test_competing_adoption_target_refused_by_surviving_claim(self):
+        self._flat_pair("monthly")
+
+        def crashing(ws, target_id, adoption_id, entry):
+            raise RuntimeError("simulated crash")
+
+        with patch.object(checks, "_adopt_one_name", crashing):
+            with self.assertRaises(RuntimeError):
+                checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        before = _tree(Path(self.ws.private))
+        with self.assertRaises(PbzError) as raised:
+            checks.adopt_legacy(self.ws, self.beta, confirm_fn=lambda plan: True)
+        self.assertEqual(raised.exception.code, "ADOPTION_CLAIMED")
+        self.assertEqual(_tree(Path(self.ws.private)), before)
+
+    def test_adoption_destination_conflict_skips_only_that_name(self):
+        self._flat_pair("monthly")
+        self._flat_pair("other")
+        ns_results = self._namespace(self.alpha_id) / "results"
+        ns_results.mkdir(parents=True, exist_ok=True)
+        foreign = {**LEGACY_RESULT, "project_id": self.alpha_id, "queries": {"q1": {"rows": ["different"]}}}
+        (ns_results / "monthly.json").write_bytes(json.dumps(foreign).encode())
+        flat_before = (self.flat / "results" / "monthly.json").read_bytes()
+        report = checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertEqual(report["conflicts"], ["monthly"])
+        self.assertEqual(report["adopted"], ["other"])
+        self.assertEqual((self.flat / "results" / "monthly.json").read_bytes(), flat_before)
+        self.assertEqual((ns_results / "monthly.json").read_bytes(), json.dumps(foreign).encode())
+
+    def test_adoption_changed_destination_during_recovery_blocks(self):
+        self._flat_pair("crashy")
+        pid = self.alpha_id
+        checks._ensure_project_namespace(self.ws, pid)
+        dest = self._namespace(pid) / "results" / "crashy.json"
+        stamped = json.dumps({**LEGACY_RESULT, "project_id": pid}).encode()
+        dest.write_bytes(stamped)
+        journal = {"version": 1, "name": "crashy", "adoption_id": "witness-1", "target_id": pid,
+                   "state": "COPIES_WRITTEN", "unit": ["result", "spec"],
+                   "source_hashes": {"result": checks._hash_bytes(json.dumps(LEGACY_RESULT).encode()),
+                                     "spec": checks._hash_bytes(json.dumps(self.SPEC).encode())},
+                   "expected_hashes": {"result": checks._hash_bytes(stamped),
+                                       "spec": checks._hash_bytes(json.dumps({**self.SPEC, "project_id": pid}).encode())},
+                   "dest_pre": {"result": "absent", "spec": "absent"},
+                   "dest_pre_satisfied": {"result": True, "spec": False}}
+        spec_dest = self._namespace(pid) / "specs" / "crashy.json"
+        spec_dest.write_bytes(json.dumps({**self.SPEC, "project_id": pid}).encode())
+        checks._write_adopt_journal(self.ws, pid, journal)
+        checks._write_adopt_claim(self.ws, {"version": 1, "target_name": self.alpha.name,
+                                            "target_id": pid, "adoption_id": "witness-1"})
+        dest.write_bytes(b"{}")  # the published copy no longer verifies
+        report = checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertTrue(any(entry["name"] == "crashy" for entry in report["blocked"]))
+        self.assertTrue((self.flat / "results" / "crashy.json").exists())
+        self.assertIsNotNone(checks._read_adopt_journal(self.ws, pid, "crashy"))
+
+    def test_recover_legacy_blocked_state_reports_and_leaves_bytes(self):
+        self._flat_pair("monthly")
+        pair = checks._SnapshotPair(self.ws, "monthly")
+        before = pair.hashes()
+        pair.stage(json.dumps(self.SPEC).encode())
+        pair.write_journal({"version": 1, "state": "PREPARED", "before_result": before[0],
+                            "before_spec": before[1], "before_coherent": True,
+                            "staged_spec": hashlib.sha256(json.dumps(self.SPEC).encode()).hexdigest(),
+                            "new_result": None})
+        # The result is replaced after the journal was prepared: compare
+        # recovery cannot resolve this state.
+        (self.flat / "results" / "monthly.json").write_bytes(b"{}")
+        pair_files = ("results/monthly.json", "specs/monthly.json", "pending/monthly.journal.json")
+        snapshot = {rel: (self.flat / rel).read_bytes() for rel in pair_files}
+        with self.assertRaises(PbzError) as raised:
+            checks.recover_legacy(self.ws, "monthly")
+        self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+        self.assertEqual({rel: (self.flat / rel).read_bytes() for rel in pair_files}, snapshot)
+
+    def test_pre_layout_files_adopted_through_normalization(self):
+        self.flat.mkdir(parents=True, exist_ok=True)
+        (self.flat / "monthly.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        (self.flat / "monthly.spec.json").write_text(json.dumps(self.SPEC), encoding="utf-8")
+        report = checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertEqual(report["adopted"], ["monthly"])
+        adopted = json.loads((self._namespace(self.alpha_id) / "results" / "monthly.json").read_text(encoding="utf-8"))
+        self.assertEqual(adopted["project_id"], self.alpha_id)
+        self.assertFalse((self.flat / "monthly.json").exists())
+        self.assertFalse((self.flat / "monthly.spec.json").exists())
+
+    def test_save_landing_in_target_between_plan_and_move_conflicts(self):
+        self._flat_pair("monthly")
+        plan, _layout = checks._plan_adoption(self.ws, self.alpha, self.alpha_id, frozenset())
+        entry = next(item for item in plan["names"] if item["name"] == "monthly")
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        outcome = checks._adopt_one_name(self.ws, self.alpha_id, "witness-2", entry)
+        self.assertEqual(outcome, "conflict")
+        self.assertTrue((self.flat / "results" / "monthly.json").exists())
+
+    def test_cancel_claim_refused_while_journal_unresolved(self):
+        self._flat_pair("monthly")
+        pid = self.alpha_id
+        checks._ensure_project_namespace(self.ws, pid)
+        journal = {"version": 1, "name": "monthly", "adoption_id": "witness-3", "target_id": pid,
+                   "state": "PLANNED", "unit": ["result"],
+                   "source_hashes": {"result": checks._hash_bytes(b"{}")},
+                   "expected_hashes": {"result": checks._hash_bytes(b"{}")},
+                   "dest_pre": {"result": "absent"}, "dest_pre_satisfied": {"result": False}}
+        checks._write_adopt_journal(self.ws, pid, journal)
+        checks._write_adopt_claim(self.ws, {"version": 1, "target_name": self.alpha.name,
+                                            "target_id": pid, "adoption_id": "witness-3"})
+        with self.assertRaises(PbzError) as raised:
+            checks.cancel_adoption_claim(self.ws)
+        self.assertEqual(raised.exception.code, "ADOPTION_CLAIMED")
+        status, _claim = checks._read_adopt_claim(self.ws)
+        self.assertEqual(status, "ok")
+
+
+class SnapshotInterruptionWindowTests(unittest.TestCase):
+    """S1 C5 and the brief acceptance: interrupt project Alpha in each
+    publication window; project Beta's pair bytes and pending state are
+    asserted unchanged in every window."""
+
+    SPEC_A = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+    SPEC_A2 = {"queries": [{"id": "q1", "dax": "EVALUATE {2}"}]}
+    SPEC_B = {"queries": [{"id": "q1", "dax": "EVALUATE {7}"}]}
+    PORTS = {"Alpha": 41001, "Beta": 41002}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+        self.enterContext(patch(
+            "pbz.desktop.require_port",
+            side_effect=lambda project: self.PORTS[project.name]))
+        self.enterContext(patch("pbz.checks.engine_call", side_effect=self._engine))
+        self.enterContext(patch("pbz.checks.spend", return_value=True))
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC_A)
+        checks.snapshot(self.ws, self.beta, "save", "monthly", self.SPEC_B)
+        self.alpha_id = identity.resolve(self.ws, self.alpha, apply=False).project_id
+        self.beta_id = identity.resolve(self.ws, self.beta, apply=False).project_id
+
+    def _fingerprint(self, dax):
+        return {"EVALUATE {1}": "a", "EVALUATE {2}": "a2", "EVALUATE {7}": "b"}[dax]
+
+    def _engine(self, verb, payload, timeout=1800, **kwargs):
+        if verb == "ping":
+            return {"ok": True, "snapshot_layout": "project-v1"}
+        snaps = (Path(payload["private_dir"]) / "snapshots" / "projects"
+                 / payload["project_id"])
+        if verb == "snapshot-save":
+            dax = payload["queries"][0]["dax"]
+            doc = {"version": 1, "name": payload["name"],
+                   "project_id": payload["project_id"],
+                   "refreshed": "2026-01-01T00:00:00",
+                   "queries": {"q1": {"rows": [self._fingerprint(dax)]}}}
+            result = snaps / "results" / (payload["name"] + ".json")
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_bytes(json.dumps(doc).encode("utf-8"))
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+        if verb == "snapshot-compare":
+            result = snaps / "results" / (payload["name"] + ".json")
+            doc = json.loads(result.read_text(encoding="utf-8"))
+            saved = doc["queries"]["q1"]["rows"][0]
+            want = self._fingerprint(payload["queries"][0]["dax"])
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAME" if saved == want else "DIFF"}]}
+        raise AssertionError(f"unexpected verb {verb}")
+
+    def _pair(self, project_id, name="monthly"):
+        return checks._SnapshotPair(self.ws, name, project_id=project_id)
+
+    def _beta_tree(self):
+        return _tree(Path(self.ws.private) / "snapshots" / "projects" / self.beta_id)
+
+    def _prepare_journal(self, pair, spec_bytes, *, state="PREPARED", new_result=None):
+        before = pair.hashes()
+        pair.stage(spec_bytes)
+        pair.write_journal({
+            "state": state, "before_result": before[0], "before_spec": before[1],
+            "before_coherent": True,
+            "staged_spec": hashlib.sha256(spec_bytes).hexdigest(),
+            "new_result": new_result,
+        })
+        return before
+
+    def test_window_prepared_over_coherent_pair_clears_on_next_operation(self):
+        pair = self._pair(self.alpha_id)
+        self._prepare_journal(pair, Path(pair.spec).read_bytes())
+        beta_before = self._beta_tree()
+        out = checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        self.assertTrue(out["ok"])
+        self.assertIsNone(pair.read_journal())
+        self.assertEqual(self._beta_tree(), beta_before)
+
+    def test_window_prepared_with_result_written_blocks_then_save_supersedes(self):
+        pair = self._pair(self.alpha_id)
+        self._prepare_journal(pair, Path(pair.spec).read_bytes())
+        new_result = {"version": 1, "name": "monthly", "project_id": self.alpha_id,
+                      "refreshed": "2026-01-02T00:00:00", "queries": {"q1": {"rows": ["a2"]}}}
+        Path(pair.result).write_bytes(json.dumps(new_result).encode())
+        result_bytes = Path(pair.result).read_bytes()
+        spec_bytes = Path(pair.spec).read_bytes()
+        staged_bytes = Path(pair.staged).read_bytes()
+        beta_before = self._beta_tree()
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+        self.assertEqual(Path(pair.result).read_bytes(), result_bytes)
+        self.assertEqual(Path(pair.spec).read_bytes(), spec_bytes)
+        self.assertEqual(Path(pair.staged).read_bytes(), staged_bytes)
+        self.assertEqual(self._beta_tree(), beta_before)
+        with self.assertRaises(PbzError) as raised:
+            checks.recover_pair(self.ws, self.alpha, "monthly")
+        self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+        self.assertEqual(Path(pair.result).read_bytes(), result_bytes)
+        self.assertEqual(Path(pair.spec).read_bytes(), spec_bytes)
+        self.assertEqual(Path(pair.staged).read_bytes(), staged_bytes)
+        self.assertEqual(self._beta_tree(), beta_before)
+        out = checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC_A2)
+        self.assertTrue(out["ok"])
+        self.assertEqual(self._beta_tree(), beta_before)
+
+    def test_window_result_published_recovers_from_staged_spec(self):
+        pair = self._pair(self.alpha_id)
+        staged_spec = json.dumps({**self.SPEC_A2, "project_id": self.alpha_id}).encode()
+        new_result = {"version": 1, "name": "monthly", "project_id": self.alpha_id,
+                      "refreshed": "2026-01-02T00:00:00", "queries": {"q1": {"rows": ["a2"]}}}
+        new_bytes = json.dumps(new_result).encode()
+        self._prepare_journal(pair, staged_spec, state="RESULT_PUBLISHED",
+                              new_result=hashlib.sha256(new_bytes).hexdigest())
+        Path(pair.result).write_bytes(new_bytes)
+        beta_before = self._beta_tree()
+        out = checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        self.assertTrue(out["ok"])
+        self.assertIsNone(pair.read_journal())
+        self.assertEqual(Path(pair.spec).read_bytes(), staged_spec)
+        self.assertEqual(self._beta_tree(), beta_before)
+
+
+class SnapshotBoundEvidenceTests(unittest.TestCase):
+    """S1 C5: with a bound project, evidence suggestions name that
+    project's namespace compares; legacy names stay legacy-labeled."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _tiny(self.ws.root)
+        self.project = self.ws.project(None)
+        self.project_id = identity.resolve(self.ws, self.project, apply=True).project_id
+        self.namespace = Path(self.ws.private) / "snapshots" / "projects" / self.project_id
+        (self.namespace / "results").mkdir(parents=True, exist_ok=True)
+        stamped = {"version": 1, "name": "monthly", "project_id": self.project_id,
+                   "refreshed": "2026-01-01T00:00:00", "queries": {"q1": {"rows": []}}}
+        (self.namespace / "results" / "monthly.json").write_text(json.dumps(stamped), encoding="utf-8")
+        flat = Path(self.ws.private) / "snapshots" / "results"
+        flat.mkdir(parents=True, exist_ok=True)
+        (flat / "legacy.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+
+    def test_bound_project_suggestions(self):
+        from pbz import evidence
+        bound = "\n".join(evidence._suggested_tests(self.ws, self.project, []))
+        self.assertIn('pbz --project "Canary" snapshot compare monthly', bound)
+        self.assertIn("adopt-legacy", bound)
+        self.assertIn("legacy", bound)
+        unbound = "\n".join(evidence._suggested_tests(self.ws, None, []))
+        self.assertNotIn("snapshot compare monthly", unbound)
+        self.assertIn("adopt-legacy", unbound)
 
 if __name__ == "__main__":
     unittest.main()

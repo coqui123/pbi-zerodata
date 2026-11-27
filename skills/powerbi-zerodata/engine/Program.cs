@@ -50,7 +50,7 @@ public static class Program
 
     static JsonObject Dispatch(string verb, Req req, Ctx ctx) => verb switch
     {
-        "ping" => Ctx.Ok("ping", new JsonObject { ["version"] = ContractVersion }),
+        "ping" => Ctx.Ok("ping", new JsonObject { ["version"] = ContractVersion, ["snapshot_layout"] = "project-v1" }),
         "connect" => ConnectVerb.Run(req, ctx),
         "health" => Health.Run(req, ctx),
         "provenance" => Provenance.Run(req, ctx),

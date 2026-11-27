@@ -59,6 +59,14 @@ class CliMcpParityTests(unittest.TestCase):
             for token in verb[1:]:
                 self.assertTrue(any(token in a.choices for a in choice_actions), f"{tool.name} argv {verb}")
             flags = {opt for action in parser._actions for opt in action.option_strings}
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    # Only the subparser the verb selects contributes its
+                    # flags; a sibling subcommand's flags must not mask a
+                    # flag missing from the selected verb.
+                    selected = action.choices.get(verb[1]) if len(verb) > 1 else None
+                    if selected is not None:
+                        flags |= {opt for sub_action in selected._actions for opt in sub_action.option_strings}
             for _arg, (flag, _schema, _mode) in tool.opts.items():
                 self.assertIn(flag, flags, f"{tool.name} {flag}")
 

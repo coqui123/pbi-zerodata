@@ -83,6 +83,15 @@ class Workspace:
 
     def project(self, name: str | None = None) -> "Project":
         projects = self.projects
+        seen: dict[str, Project] = {}
+        for candidate in projects:
+            key = candidate.name.lower()
+            if key in seen:
+                raise PbzError(
+                    "AMBIGUOUS_PROJECT",
+                    f"two project files differ only by name case: {seen[key].name} and {candidate.name}",
+                )
+            seen[key] = candidate
         if not projects:
             raise PbzError("NO_PROJECT", "no *.pbip in workspace root")
         if name is None:
