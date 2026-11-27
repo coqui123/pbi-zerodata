@@ -64,11 +64,22 @@ jobs:
       - name: Deps boundary tests
         if: ${{ !cancelled() }}
         run: dotnet run --project engine/boundary-tests -c Release
+
+  tmdl-boundary:
+    if: vars.PBZ_OFFLINE_MODE != 'sharded'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: skills/powerbi-zerodata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
       - name: Tmdl boundary tests
-        if: ${{ !cancelled() }}
         run: dotnet run --project engine/boundary-tests/tmdl -c Release
-
-
 
   rollout-gate:
     if: vars.PBZ_OFFLINE_MODE == 'sharded'
@@ -122,7 +133,7 @@ jobs:
         run: dotnet run --project engine/boundary-tests/tmdl -c Release
   offline:
     if: always()
-    needs: [serial, rollout-gate, shard]
+    needs: [serial, rollout-gate, shard, tmdl-boundary]
     runs-on: windows-latest
     timeout-minutes: 5
     steps:
@@ -147,7 +158,7 @@ jobs:
         run: |
           if ('${{ vars.PBZ_OFFLINE_MODE }}' -eq 'sharded') {
             if ('${{ needs.rollout-gate.result }}' -ne 'success' -or '${{ needs.shard.result }}' -ne 'success') { throw 'shards failed or incomplete' }
-          } elseif ('${{ needs.serial.result }}' -ne 'success') { throw 'serial failed or incomplete' }
+          } elseif ('${{ needs.serial.result }}' -ne 'success' -or '${{ needs.tmdl-boundary.result }}' -ne 'success') { throw 'serial failed or incomplete' }
 
   vendor-validator:
     # Required on every PR/push. Configure this job as a required branch check.
