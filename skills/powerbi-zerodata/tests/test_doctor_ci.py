@@ -4352,6 +4352,138 @@ exec "$root/scripts/git-hooks/pre-push" "$@"
         live_stale, _stale_reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
         self.assertIsNot(live_stale, True)
 
+    @staticmethod
+    def _rec(sha, case, result):
+        return {"revision": sha, "case": case, "result": result}
+
+    def _evidence_log(self, records):
+        log_dir = self.test_root / ".pbz" / "private"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        text = "".join(json.dumps(r) + "\n" for r in records)
+        (log_dir / "evidence.log").write_text(text, encoding="utf-8")
+        return text
+
+    def test_live_evidence_mixed_pass_and_skip_is_inconclusive(self):
+        sha = "d" * 40
+        for records in (
+            [self._rec(sha, "case-a", "PASS"), self._rec(sha, "case-a", "SKIP")],
+            [self._rec(sha, "case-a", "SKIP"), self._rec(sha, "case-a", "PASS")],
+        ):
+            text = self._evidence_log(records)
+            self.assertEqual(doctor._live_acceptance(text, sha), "inconclusive")
+            for platform in ("win32", "linux"):
+                with patch.object(sys, "platform", platform):
+                    live, reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+                self.assertIs(live, False)
+                self.assertEqual(reason, "INCONCLUSIVE_EVIDENCE")
+        text = self._evidence_log([
+            self._rec(sha, "case-a", "PASS"),
+            self._rec(sha, "case-a", "FAIL"),
+            self._rec(sha, "case-a", "SKIP"),
+        ])
+        self.assertEqual(doctor._live_acceptance(text, sha), "conflict")
+        live, reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+        self.assertIs(live, False)
+        self.assertEqual(reason, "CONFLICTING_EVIDENCE")
+        text = self._evidence_log([
+            self._rec(sha, "case-a", "PASS"),
+            self._rec(sha, "case-a", "FAIL"),
+            self._rec(sha, "case-b", "PASS"),
+        ])
+        self.assertEqual(doctor._live_acceptance(text, sha), "conflict")
+        live, reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+        self.assertIs(live, False)
+        self.assertEqual(reason, "CONFLICTING_EVIDENCE")
+        self.assertIn("INCONCLUSIVE_EVIDENCE", doctor.CLOSED_REASONS)
+
+    def test_live_evidence_skip_does_not_taint_other_cases(self):
+        sha = "d" * 40
+        text = self._evidence_log([
+            self._rec(sha, "case-a", "PASS"),
+            self._rec(sha, "case-b", "SKIP"),
+        ])
+        self.assertEqual(doctor._live_acceptance(text, sha), "verified")
+        live, reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+        self.assertIs(live, True)
+        self.assertIsNone(reason)
+        text = self._evidence_log([
+            self._rec(sha, "case-a", "PASS"),
+            self._rec(sha, "case-a", "SKIP"),
+            self._rec(sha, "case-b", "PASS"),
+        ])
+        self.assertEqual(doctor._live_acceptance(text, sha), "verified")
+        live, reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+        self.assertIs(live, True)
+        self.assertIsNone(reason)
+        for spelling in ("SKIPPED", "FAILED"):
+            text = self._evidence_log([
+                self._rec(sha, "case-a", "PASS"),
+                self._rec(sha, "case-a", spelling),
+            ])
+            self.assertEqual(doctor._live_acceptance(text, sha), "verified")
+            live, reason = doctor.get_desktop_evidence(self.test_root, expected_sha=sha)
+            self.assertIs(live, True)
+            self.assertIsNone(reason)
+
+    def test_live_evidence_absent_outcomes_are_exact(self):
+        sha = "d" * 40
+        stale = "e" * 40
+        cases = [
+            [self._rec(sha, "case-a", "FAIL")],
+            [self._rec(sha, "case-a", "SKIP")],
+            [self._rec(sha, "case-a", "FAIL"), self._rec(sha, "case-a", "SKIP")],
+            [self._rec(stale, "case-a", "PASS"), self._rec(stale, "case-a", "SKIP")],
+        ]
+        for records in cases:
+            text = self._evidence_log(records)
+            self.assertEqual(doctor._live_acceptance(text, sha), "absent")
+            with patch.object(sys, "platform", "win32"):
+                self.assertEqual(
+                    doctor.get_desktop_evidence(self.test_root, expected_sha=sha),
+                    (False, "NOT_RUN"),
+                )
+            with patch.object(sys, "platform", "linux"):
+                self.assertEqual(
+                    doctor.get_desktop_evidence(self.test_root, expected_sha=sha),
+                    (None, "UNAVAILABLE"),
+                )
+        text = self._evidence_log([
+            self._rec(sha, "case-a", "PASS"),
+            self._rec(sha, "case-a", "SKIP"),
+        ])
+        self.assertEqual(doctor._live_acceptance(text, None), "absent")
+        self.assertEqual(doctor._live_acceptance(text, "not-a-sha"), "absent")
+        for bad in (None, "not-a-sha"):
+            with patch.object(sys, "platform", "win32"):
+                self.assertEqual(
+                    doctor.get_desktop_evidence(self.test_root, expected_sha=bad),
+                    (False, "NOT_RUN"),
+                )
+            with patch.object(sys, "platform", "linux"):
+                self.assertEqual(
+                    doctor.get_desktop_evidence(self.test_root, expected_sha=bad),
+                    (None, "UNAVAILABLE"),
+                )
+
+    def test_live_evidence_controls_are_exact(self):
+        sha = "d" * 40
+        text = self._evidence_log([self._rec(sha, "case-a", "PASS")])
+        self.assertEqual(doctor._live_acceptance(text, sha), "verified")
+        self.assertEqual(
+            doctor.get_desktop_evidence(self.test_root, expected_sha=sha),
+            (True, None),
+        )
+        for records in (
+            [self._rec(sha, "case-a", "PASS"), self._rec(sha, "case-a", "FAIL")],
+            [self._rec(sha, "case-a", "FAIL"), self._rec(sha, "case-a", "PASS")],
+        ):
+            text = self._evidence_log(records)
+            self.assertEqual(doctor._live_acceptance(text, sha), "conflict")
+            self.assertEqual(
+                doctor.get_desktop_evidence(self.test_root, expected_sha=sha),
+                (False, "CONFLICTING_EVIDENCE"),
+            )
+
     def test_public_launcher_writes_no_bytecode(self):
         repo = self.test_root / "launcher"
         repo.mkdir()
