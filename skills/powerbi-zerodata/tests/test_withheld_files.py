@@ -442,6 +442,59 @@ class WithholdUnknownTests(unittest.TestCase):
         self.assertNotIn(self.STR_A, rendered)
         self.assertNotIn(self.NUM, rendered)
 
+    def test_upstream_drift_refreshes_withheld_entry(self):
+        original = self._plant(self.PATH_A, self._rows(self.STR_A))
+        mirror.pull(self.ws, self.project)
+        self._assert_withheld(self.PATH_A, original)
+
+        upstream = self._rows(self.STR_A + "-V2").encode("utf-8")
+        (self.root / self.PATH_A).write_bytes(upstream)
+        self.assertEqual(mirror.pull(self.ws, self.project)["result"], "PULLED")
+        self._assert_withheld(self.PATH_A, upstream)
+
+        third = self._rows(self.STR_A + "-V3").encode("utf-8")
+        (self.root / self.PATH_A).write_bytes(third)
+        self.assertEqual(mirror.pull(self.ws, self.project, rebase=True)["result"], "PULLED")
+        self._assert_withheld(self.PATH_A, third)
+
+    def test_orphan_sweep_refuses_when_base_tree_unreadable(self):
+        self.assertEqual(mirror.pull(self.ws, self.project)["result"], "PULLED")
+        orphan = self._rows(self.STR_A).encode("utf-8")
+        base = Path(mirror.base_dir(self.ws, self.project), self.PATH_A)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_bytes(orphan)
+        agent = b'{"agent": "SYNTH-AGENT-LINE-2W7Q"}\n'
+        mine = Path(self.ws.mirror, self.PATH_A)
+        mine.parent.mkdir(parents=True, exist_ok=True)
+        mine.write_bytes(agent)
+        manifest_before = self.manifest_path.read_bytes()
+
+        target = str(base.parent)
+        real_scandir = os.scandir
+
+        def failing_scandir(path):
+            if os.fspath(path) == target:
+                raise PermissionError("inert enumeration failure")
+            return real_scandir(path)
+
+        with patch.object(os, "scandir", failing_scandir):
+            with self.assertRaises(PbzError) as raised:
+                mirror.pull(self.ws, self.project, rebase=True)
+            self.assertEqual(raised.exception.code, "REFUSED")
+            self.assertEqual(raised.exception.detail, self.project.name)
+            self.assertNotIn(self.STR_A, str(raised.exception))
+            self.assertEqual(mine.read_bytes(), agent)
+            self.assertEqual(base.read_bytes(), orphan)
+            self.assertEqual(self.manifest_path.read_bytes(), manifest_before)
+
+        self.assertEqual(mirror.pull(self.ws, self.project, rebase=True)["result"], "PULLED")
+        self.assertFalse(base.exists())
+        self.assertEqual(mine.read_bytes(), agent)
+        rendered = json.dumps(mirror.diff(self.ws, self.project, patch=True))
+        self.assertIn("SYNTH-AGENT-LINE-2W7Q", rendered)
+        self.assertNotIn(self.STR_A, rendered)
+        self.assertNotIn(self.NUM, rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
