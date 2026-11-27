@@ -169,6 +169,44 @@ freely, use `pbz synth` instead of the real model.
 | `FORMAT_STRING_CONFLICT` | a measure has both a static and a dynamic format string; Desktop shows "Issues were found" and does not open the model (TOM accepts it) | `pbz repair` drops the static one; `format-expr` already replaces it |
 | guard deny `[pbz guard] ...` | you tried a blocked path or command | follow the hint; never retry variants |
 
+## Snapshot project identity
+
+Snapshot baselines belong to a project identity, not to a snapshot name. Each project carries a
+minted UUID in an anchor file, `<name>.SemanticModel/pbz-project-id.json`, which travels with the
+project, and the workspace registry at `.pbz/project-identity.json` records each identity's name,
+previous names, and status (bound, orphan, quarantined). Snapshot pairs live in the project's own
+namespace, `snapshots/projects/<id>/` (results, specs, pending), guarded by
+`snapshots/projects/<id>.guard`. Two projects may save different specs under the same snapshot
+name; each compare reads only its own project's pair. The identity is minted on first qualifying
+use; an anchor-proven rename is refreshed automatically and reported. Flat snapshot files written
+before project identity existed are unadopted legacy state: a bound project's operation never
+reads or writes them as a baseline or spec, and they move only through the explicit, human-only
+`pbz snapshot adopt-legacy --project <project>` (with `--exclude <name>` to skip a name, and
+`--cancel-claim` to release a claim once no adoption journal is unresolved).
+
+Identity repair is human-only, never available through MCP, and every command prints its plan
+plus the quiescence precondition (no other pbz process of any version using this workspace under
+any PBZ_PRIVATE_ROOT) and requires a typed confirmation: `pbz snapshot bind --project <project>`
+(`--identity <id>` for an unaccounted namespace or a quarantine restore),
+`pbz snapshot mint-fresh --project <project>`, `pbz snapshot reidentify --project <project>`
+(`--keeper <project>` when the record names the target), `pbz snapshot resolve-identity
+--project <project>`, `pbz snapshot rebind-registry`, `pbz snapshot quarantine-namespace
+--identity <id>`, `pbz snapshot recover-legacy --name <name>`, and
+`pbz snapshot recover-pair --project <project> <name>`. `pbz snapshot rollback-check` is
+read-only and not human-gated; it reports unsettled pair journals, adoption claims and journals
+for the private store the invocation resolved.
+
+Operating contract: never use a pre-identity adapter or engine against a workspace that has
+project namespaces; the older layout logic cannot see the namespaces and would read the flat
+store as if it were complete. Replace the engine only while the workspace is quiescent.
+
+Rollback: run `pbz snapshot rollback-check` and settle or explicitly accept every unsettled
+item it lists; repeat for every private root in use (each PBZ_PRIVATE_ROOT variant). Then stop
+all pbz processes, rerun `pbz snapshot rollback-check` for every private root as the final
+checks, and keep writers stopped from those final checks through the binary revert.
+After reverting, stop multi-project snapshot use, or use workspace-unique snapshot names per
+project, because the reverted build keys baselines by name alone.
+
 ## Refactor and author (edits the mirror; then `pbz diff`, `pbz validate`, `pbz push`)
 
 Prefer these over hand edits: they keep every cross-file reference consistent. Details:

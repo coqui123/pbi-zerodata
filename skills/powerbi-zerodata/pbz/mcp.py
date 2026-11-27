@@ -594,7 +594,7 @@ TOOLS = [
     Tool("snapshot", "Save or compare HMAC snapshots of queries (SAME / DIFF / NEW / MISSING / STALE_DATA).",
          ["snapshot"], pos=[("action", E("save", "compare"), True), ("name", S, True)],
          opts={"spec": ("--spec", D(O, "queries spec (compare reuses the saved one when omitted)"), "json")},
-         timeout=1800),
+         timeout=1800, read_only=False),
     Tool("smoke", "Run each visual's query. Status is OK, EMPTY, ERROR with a class, UNSUPPORTED, N/A, BUDGET, or PROTOCOL_ERROR. Coverage is FULL, PARTIAL, or NONE.", ["smoke"],
          opts={"page": ("--page", S, "value")}, timeout=1800),
     Tool("perf", "Performance bands for a DAX query (duration band, shares, compare verdict). No durations.", ["perf"],

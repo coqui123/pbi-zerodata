@@ -50,6 +50,81 @@ def _is_human() -> bool:
     return consent._human_terminal()
 
 
+_QUIESCENCE = ("Precondition: no other pbz process of any version is using this workspace "
+               "concurrently, under any PBZ_PRIVATE_ROOT.")
+
+
+def _require_human() -> None:
+    if not _is_human():
+        raise PbzError("HUMAN_ONLY", "run this snapshot command yourself in a terminal")
+
+
+def _typed_confirmation(lines) -> bool:
+    for line in lines:
+        print(line)
+    print(_QUIESCENCE)
+    try:
+        answer = input("Type confirm to proceed: ")
+    except EOFError:
+        return False
+    return answer.strip() == "confirm"
+
+
+def _snapshot_confirm(title):
+    def confirm(plan):
+        lines = [title]
+        for key, value in plan.items():
+            lines.append(f"  {key}: {value}")
+        return _typed_confirmation(lines)
+    return confirm
+
+
+def _dispatch_snapshot_command(ws, a):
+    """The S1 snapshot subcommands other than save and compare. These are
+    dispatched through this explicit bypass, before the caller's project
+    resolution runs: each carries its own --project (or none), and every
+    identity-mutating or state-settling command is human-only."""
+    from pbz import identity
+
+    command = a.snapshot_cmd
+    if command == "rollback-check":
+        return checks.rollback_check(ws)
+    _require_human()
+    if command == "rebind-registry":
+        return identity.rebind_registry(ws, confirm_fn=_snapshot_confirm("Rebind the project identity registry:"))
+    if command == "quarantine-namespace":
+        return identity.quarantine_namespace(ws, a.identity, confirm_fn=_snapshot_confirm("Quarantine one snapshot namespace:"))
+    if command == "recover-legacy":
+        if not _typed_confirmation([f"Settle the flat snapshot pair journal for {a.name} (compare-mode recovery, no engine contact)."]):
+            return {"ok": False, "confirmed": False, "command": "recover-legacy"}
+        return checks.recover_legacy(ws, a.name)
+    if command == "adopt-legacy" and a.cancel_claim:
+        # Cancellation is workspace-wide: it resolves no project, so it
+        # stays reachable even when the claimed target no longer exists
+        # in the workspace configuration.
+        if not _typed_confirmation(["Release the adoption claim (the target project stays bound)."]):
+            return {"ok": False, "confirmed": False, "command": "adopt-legacy --cancel-claim"}
+        return checks.cancel_adoption_claim(ws)
+    if command == "adopt-legacy" and a.snapshot_project is None:
+        raise PbzError("BAD_REQUEST", "adopt-legacy requires --project (only --cancel-claim is workspace-wide)")
+    project = ws.project(a.snapshot_project)
+    if command == "bind":
+        return identity.bind_project(ws, project, a.identity, confirm_fn=_snapshot_confirm("Bind a project identity:"))
+    if command == "mint-fresh":
+        return identity.mint_fresh(ws, project, confirm_fn=_snapshot_confirm("Mint a fresh project identity:"))
+    if command == "reidentify":
+        return identity.reidentify(ws, project, a.keeper, confirm_fn=_snapshot_confirm("Reidentify a duplicated project:"))
+    if command == "resolve-identity":
+        return identity.resolve_identity(ws, project, confirm_fn=_snapshot_confirm("Resolve a project identity disagreement:"))
+    if command == "adopt-legacy":
+        return checks.adopt_legacy(ws, project, exclude=frozenset(a.exclude), confirm_fn=_snapshot_confirm("Adopt the flat legacy snapshots into the target project:"))
+    if command == "recover-pair":
+        if not _typed_confirmation([f"Recover the snapshot pair {a.name} in project {project.name} (no engine contact)."]):
+            return {"ok": False, "confirmed": False, "command": "recover-pair"}
+        return checks.recover_pair(ws, project, a.name)
+    raise PbzError("BAD_REQUEST", f"unknown snapshot command {command}")
+
+
 def _workspace_path(ws, path: str) -> str:
     """Resolve a filesystem path under the workspace. Relative paths start at the workspace root."""
     if not isinstance(path, str) or not path.strip():
@@ -313,9 +388,40 @@ def main(argv=None, *, parser_only: bool = False) -> int:
     p.add_argument("table")
     p.add_argument("--columns", nargs="*")
     p = sub.add_parser("snapshot")
-    p.add_argument("action", choices=["save", "compare"])
-    p.add_argument("name")
-    p.add_argument("--spec", help="queries JSON file (compare reuses the saved spec when omitted)")
+    snap_sub = p.add_subparsers(dest="snapshot_cmd", required=True)
+    # --spec also lives on the parent parser: the pre-S1 spelling
+    # `pbz snapshot --spec f compare name` must keep parsing. The verb
+    # subparsers register it with a SUPPRESS default so the post-verb
+    # spelling wins when given and never overwrites the parent's value.
+    p.add_argument("--spec", default=None, help="queries JSON file (compare reuses the saved spec when omitted)")
+    for verb in ("save", "compare"):
+        sp = snap_sub.add_parser(verb)
+        sp.add_argument("name")
+        sp.add_argument("--spec", default=argparse.SUPPRESS, help="queries JSON file (compare reuses the saved spec when omitted)")
+    sp = snap_sub.add_parser("bind")
+    sp.add_argument("--project", dest="snapshot_project", required=True)
+    sp.add_argument("--identity", help="project identity UUID to bind (required for an unaccounted namespace)")
+    sp = snap_sub.add_parser("mint-fresh")
+    sp.add_argument("--project", dest="snapshot_project", required=True)
+    sp = snap_sub.add_parser("reidentify")
+    sp.add_argument("--project", dest="snapshot_project", required=True)
+    sp.add_argument("--keeper", help="project that keeps the duplicated identity when the target is the recorded holder")
+    sp = snap_sub.add_parser("resolve-identity")
+    sp.add_argument("--project", dest="snapshot_project", required=True)
+    snap_sub.add_parser("rebind-registry")
+    sp = snap_sub.add_parser("adopt-legacy")
+    sp.add_argument("--project", dest="snapshot_project", required=False,
+                    help="project to adopt into (not needed for --cancel-claim, which is workspace-wide)")
+    sp.add_argument("--exclude", action="append", default=[], help="snapshot name to leave unadopted (repeatable)")
+    sp.add_argument("--cancel-claim", action="store_true", help="release the adoption claim when no adoption journal is unresolved")
+    sp = snap_sub.add_parser("recover-legacy")
+    sp.add_argument("--name", required=True)
+    sp = snap_sub.add_parser("recover-pair")
+    sp.add_argument("--project", dest="snapshot_project", required=True)
+    sp.add_argument("name")
+    sp = snap_sub.add_parser("quarantine-namespace")
+    sp.add_argument("--identity", required=True, help="project identity UUID whose namespace to quarantine")
+    snap_sub.add_parser("rollback-check")
     p = sub.add_parser("smoke", help="approximate per-visual query: OK, EMPTY, ERROR, UNSUPPORTED, N/A, BUDGET, or PROTOCOL_ERROR")
     p.add_argument("--page")
     p = sub.add_parser("review", help="review packet: pending changes by release class, impact, revision-bound evidence, "
@@ -741,6 +847,11 @@ def main(argv=None, *, parser_only: bool = False) -> int:
             emit(out)
             return rc
         ws = find_workspace(a.workspace)
+        if a.cmd == "snapshot" and a.snapshot_cmd not in ("save", "compare"):
+            out = _dispatch_snapshot_command(ws, a)
+            out, rc = envelope(out)
+            emit(out)
+            return rc
         project = ws.project(a.project) if a.cmd not in ("scan", "admin", "memscrub") or ws.projects else None
         if a.cmd == "status":
             out = cmd_status(ws, project, a)
@@ -843,9 +954,9 @@ def main(argv=None, *, parser_only: bool = False) -> int:
                 spec = None
             else:
                 spec = _spec(a.spec, ws)
-            if not spec and (a.spec is not None or a.action == "save"):
+            if not spec and (a.spec is not None or a.snapshot_cmd == "save"):
                 raise PbzError("BAD_REQUEST", "--spec required")
-            out = checks.snapshot(ws, project, a.action, a.name, spec)
+            out = checks.snapshot(ws, project, a.snapshot_cmd, a.name, spec)
         elif a.cmd == "smoke":
             out = smoke.run(ws, project, a.page)
         elif a.cmd == "handoff":

@@ -68,7 +68,7 @@ errors, TMDL parse errors). Before output it is scrubbed:
 ## Verbs
 
 ### `ping`
-Request `{"private_dir": "..."}` -> `{"ok": true, "verb": "ping", "version": "1"}`. No connection.
+Request `{}` or `{"private_dir": "..."}` -> `{"ok": true, "verb": "ping", "version": "1", "snapshot_layout": "project-v1"}`. No connection. `private_dir` is optional for `ping` only; every other verb requires it.
 
 ### `connect`
 Request `{"private_dir": "...", "port": 52341}`
@@ -186,13 +186,17 @@ Response `{"table": "T", "rows_bucket": "...", "columns": [{"column": "C", "type
 There is no calendar year field.
 
 ### `snapshot-save` / `snapshot-compare`
-Request `{"private_dir", "port", "name": "before-refactor", "queries": [{"id": "q1",
+Request `{"private_dir", "port", "name": "before-refactor", "project_id": "<uuid>", "queries": [{"id": "q1",
 "dax": "EVALUATE SUMMARIZECOLUMNS(DimDate[Year], \"m\", [Total Hours])", "keys": ["DimDate[Year]"]}]}`
 `queries` must be a non-empty array of query objects; an empty `queries` array produces `BAD_REQUEST`.
-- Save: run each query, store in `private_dir\snapshots\results\<name>.json` per query: map
+`project_id` is required on both verbs and must be a canonical lowercase UUID; a missing or malformed `project_id` produces `BAD_REQUEST`.
+Save stores in `private_dir\snapshots\projects\<project_id>\results\<name>.json` and stamps the stored document with `project_id`.
+Compare reads exactly that path (there is no legacy fallback inside a project namespace) and refuses with `BAD_REQUEST` when the stored document's `project_id` is missing or differs from the request's.
+Both responses echo `project_id` and carry `"snapshot_layout": "project-v1"`.
+- Save: run each query, store in `private_dir\snapshots\projects\<project_id>\results\<name>.json` per query: map
   `hmac(key tuple)` -> list of per-column `hmac(cell)`; no keys -> multiset of row hmacs. Also
   store `refreshed`: max `RefreshedTime` over TMSCHEMA_PARTITIONS (stored only, never printed).
-- Compare: rerun, read from `private_dir\snapshots\results\<name>.json` (with shape-validated legacy read-only fallback to `private_dir\snapshots\<name>.json`), respond per query `{"id": "q1", "result": "SAME"}` or
+- Compare: rerun, read from `private_dir\snapshots\projects\<project_id>\results\<name>.json`, respond per query `{"id": "q1", "result": "SAME"}` or
   `{"id": "q1", "result": "DIFF", "columns": ["m"], "mismatch": "ONE"}`; `NEW` (no saved query),
   `MISSING` (saved query not in request), `STALE_DATA` (model refreshed since save).
 
