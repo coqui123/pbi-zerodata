@@ -82,6 +82,14 @@ class ContractVerbTests(unittest.TestCase):
         response = {"ok": True, "verb": "synth-query", "verified": True, "columns": ["X"], "rows": [["synthetic"]], "truncated": False}
         self.assertEqual(engine._project("synth-query", response), response)
 
+    def test_deps_truncated_projection(self):
+        base = {"ok": True, "verb": "deps", "edges": [["MEASURE", "Sales", "Total", "COLUMN", "Sales", "Amount"]]}
+        self.assertEqual(engine._project("deps", base), base)
+        with_flag = {**base, "truncated": True}
+        self.assertEqual(engine._project("deps", with_flag), with_flag)
+        self.assertEqual(engine._project("deps", {**base, "truncated": "yes"}),
+                         {"ok": False, "verb": "deps", "class": "ENGINE_UNAVAILABLE"})
+
     def test_group_key_single_shapes_and_mixed_union(self):
         def response(key):
             return {"ok": True, "verb": "check", "checks": [
