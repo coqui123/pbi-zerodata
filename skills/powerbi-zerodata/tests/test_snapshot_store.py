@@ -4407,5 +4407,722 @@ class SnapshotProjectIdentityTests(unittest.TestCase):
             self.assertEqual(anchor.read_bytes(), anchor_bytes)
         self.assertIsNotNone(mirror.real_model(self.alpha))
 
+
+class SnapshotIdentityStateTests(unittest.TestCase):
+    """S1 C5: identity state table witnesses (repair commands, registry
+    loss, duplicates, rename refresh, malformed anchors)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+
+    def _mint(self, project):
+        return identity.resolve(self.ws, project, apply=True).project_id
+
+    def test_registry_loss_refuses_then_rebind_restores(self):
+        pid = self._mint(self.alpha)
+        os.remove(identity.registry_path(self.ws))
+        with self.assertRaises(PbzError) as raised:
+            identity.resolve(self.ws, self.alpha, apply=False)
+        self.assertEqual(raised.exception.code, "REGISTRY_MISSING")
+        report = identity.rebind_registry(self.ws, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[pid]["name"], "Alpha")
+        self.assertEqual(registry[pid]["status"], "bound")
+        self.assertEqual(identity.resolve(self.ws, self.alpha, apply=False).project_id, pid)
+
+    def test_anchor_loss_and_bind_restores_the_same_identity(self):
+        pid = self._mint(self.alpha)
+        os.remove(identity.anchor_path(self.alpha))
+        report = identity.bind_project(self.ws, self.alpha, pid, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        self.assertEqual(identity.read_anchor(self.ws, self.alpha), pid)
+        self.assertEqual(identity.resolve(self.ws, self.alpha, apply=False).project_id, pid)
+
+    def test_same_name_replacement_refused_then_mint_fresh(self):
+        pid = self._mint(self.alpha)
+        # The project is replaced under the same name: anchor gone, the old
+        # record orphaned, a genuinely new project directory in place.
+        os.remove(identity.anchor_path(self.alpha))
+        registry = identity.load_registry(self.ws)
+        registry[pid]["status"] = "orphan"
+        identity.write_registry(self.ws, registry)
+        with self.assertRaises(PbzError) as raised:
+            identity.resolve(self.ws, self.alpha, apply=True)
+        self.assertEqual(raised.exception.code, "PROJECT_IDENTITY_UNBOUND")
+        report = identity.mint_fresh(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        self.assertNotEqual(report["identity"], pid)
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[pid]["status"], "orphan")
+        self.assertEqual(registry[report["identity"]]["status"], "bound")
+        self.assertEqual(identity.resolve(self.ws, self.alpha, apply=False).project_id, report["identity"])
+
+    def test_malformed_anchor_is_refused_and_never_minted_over(self):
+        path = identity.anchor_path(self.alpha)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"not json at all")
+        before = open(path, "rb").read()
+        with self.assertRaises(PbzError) as raised:
+            identity.resolve(self.ws, self.alpha, apply=True)
+        self.assertEqual(raised.exception.code, "CORRUPT_STATE")
+        self.assertEqual(open(path, "rb").read(), before)
+        self.assertFalse(os.path.exists(identity.registry_path(self.ws)))
+
+    def test_duplicate_anchor_keeper_selection(self):
+        pid = self._mint(self.alpha)
+        identity.write_anchor(self.ws, self.beta, pid)
+        # Beta is not the recorded holder: it reidentifies freely.
+        report = identity.reidentify(self.ws, self.beta, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        self.assertNotEqual(report["identity"], pid)
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[pid]["name"], "Alpha")
+
+    def test_duplicate_anchor_recorded_holder_needs_keeper(self):
+        pid = self._mint(self.alpha)
+        identity.write_anchor(self.ws, self.beta, pid)
+        # Alpha is the holder the record names: a keeper is required, and
+        # the same write repoints the record to the keeper.
+        with self.assertRaises(PbzError) as raised:
+            identity.reidentify(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertEqual(raised.exception.code, "BAD_REQUEST")
+        report = identity.reidentify(self.ws, self.alpha, keeper="Beta", confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[pid]["name"], "Beta")
+        self.assertEqual(registry[report["identity"]]["name"], "Alpha")
+
+    def test_rename_refresh_reports_and_marks_displaced_orphan(self):
+        alpha_id = self._mint(self.alpha)
+        beta_id = self._mint(self.beta)
+        # Alpha's project files disappear entirely: its record stays
+        # bound under the name Alpha, anchored nowhere.
+        shutil.rmtree(os.path.join(self.ws.root, "Alpha.SemanticModel"))
+        os.remove(os.path.join(self.ws.root, "Alpha.pbip"))
+        shutil.rmtree(os.path.join(self.ws.root, "Alpha.Report"))
+        # Beta is renamed to Alpha on disk: directory, pbip and report
+        # move, and Beta's anchor now answers to the name Alpha.
+        for old, new in (("Beta.pbip", "Alpha.pbip"),
+                         ("Beta.SemanticModel", "Alpha.SemanticModel"),
+                         ("Beta.Report", "Alpha.Report")):
+            os.rename(os.path.join(self.ws.root, old), os.path.join(self.ws.root, new))
+        renamed = self.ws.project("Alpha")
+        resolution = identity.resolve(self.ws, renamed, apply=True)
+        # One resolution, one registry write: the rename is refreshed
+        # and reported, and the displaced anchorless record is marked
+        # orphan in the same write.
+        self.assertEqual(resolution.project_id, beta_id)
+        self.assertEqual(resolution.action, "refresh")
+        self.assertEqual(resolution.renamed_from, "Beta")
+        self.assertEqual(resolution.orphan_marked, (alpha_id, "Alpha"))
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(registry[beta_id]["name"], "Alpha")
+        self.assertEqual(registry[beta_id]["status"], "bound")
+        self.assertIn("Beta", registry[beta_id]["previous_names"])
+        self.assertEqual(registry[alpha_id]["status"], "orphan")
+
+    def test_concurrent_first_use_under_different_private_roots(self):
+        import threading
+        from pbz.common import Workspace
+        other_private = os.path.join(self.ws.root, "other-private")
+        os.makedirs(other_private, exist_ok=True)
+        ws_b = Workspace(self.ws.root)
+        ws_b.private = other_private
+        errors = []
+
+        def mint(ws, project):
+            try:
+                identity.resolve(ws, project, apply=True)
+            except Exception as error:  # noqa: BLE001 - collected and asserted below
+                errors.append(error)
+
+        # Force the lost-update interleaving at the contested boundary:
+        # each worker's first registry load captures its value BEFORE
+        # waiting at a barrier, so without the identity lock both
+        # workers necessarily proceed from the same empty registry and
+        # one record is lost. With the lock, the second worker's first
+        # load happens only after the first worker finished, so it
+        # captures the first record and adds its own.
+        barrier = threading.Barrier(2)
+        seen = set()
+        seen_lock = threading.Lock()
+        real_load = identity.load_registry
+
+        def gated_load(ws):
+            ident = threading.get_ident()
+            with seen_lock:
+                first = ident not in seen
+                seen.add(ident)
+            if not first:
+                return real_load(ws)
+            captured = real_load(ws)
+            try:
+                barrier.wait(timeout=5)
+            except threading.BrokenBarrierError:
+                pass
+            return captured
+
+        threads = [threading.Thread(target=mint, args=(self.ws, self.alpha)),
+                   threading.Thread(target=mint, args=(ws_b, ws_b.project("Beta")))]
+        with patch.object(identity, "load_registry", gated_load):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+        self.assertFalse(any(thread.is_alive() for thread in threads),
+                         "a first-use worker did not terminate")
+        self.assertEqual(errors, [])
+        registry = identity.load_registry(self.ws)
+        self.assertEqual(len(registry), 2)
+        self.assertEqual({record["name"] for record in registry.values()}, {"Alpha", "Beta"})
+        self.assertTrue(all(record["status"] == "bound" for record in registry.values()))
+
+
+class SnapshotSkewTransplantTests(unittest.TestCase):
+    """S1 C5: mixed-version skew refusals, journal transplant refusals,
+    and the project guard excluding a first-use save during a repair."""
+
+    SPEC = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+    PORTS = {"Alpha": 41001, "Beta": 41002}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+        self.alpha_id = identity.resolve(self.ws, self.alpha, apply=True).project_id
+        self.beta_id = identity.resolve(self.ws, self.beta, apply=True).project_id
+        self.mode = "good"
+        self.enterContext(patch(
+            "pbz.desktop.require_port",
+            side_effect=lambda project: self.PORTS[project.name]))
+        self.enterContext(patch("pbz.checks.engine_call", side_effect=self._engine))
+        self.enterContext(patch("pbz.checks.spend", return_value=True))
+
+    def _namespace(self, project_id):
+        return Path(self.ws.private) / "snapshots" / "projects" / project_id
+
+    def _engine(self, verb, payload, timeout=1800, **kwargs):
+        if verb == "ping":
+            if self.mode == "ping-wrong-layout":
+                return {"ok": True, "snapshot_layout": "flat-v0"}
+            return {"ok": True, "snapshot_layout": "project-v1"}
+        snaps = Path(payload["private_dir"]) / "snapshots" / "projects" / payload["project_id"]
+        if verb == "snapshot-save":
+            doc = {"version": 1, "name": payload["name"], "project_id": payload["project_id"],
+                   "refreshed": "2026-01-01T00:00:00",
+                   "queries": {"q1": {"rows": ["x"]}}}
+            result = snaps / "results" / (payload["name"] + ".json")
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_bytes(json.dumps(doc).encode("utf-8"))
+            echo = str(uuid.uuid4()) if self.mode == "save-wrong-echo" else payload["project_id"]
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": echo, "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+        if verb == "snapshot-compare":
+            echo = str(uuid.uuid4()) if self.mode == "compare-wrong-echo" else payload["project_id"]
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": echo, "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAME"}]}
+        raise AssertionError(f"unexpected verb {verb}")
+
+    def _pair(self, project_id, name):
+        return checks._SnapshotPair(self.ws, name, project_id=project_id)
+
+    def _prepared_journal(self, pair, spec_bytes):
+        before = pair.hashes()
+        pair.stage(spec_bytes)
+        pair.write_journal({
+            "state": "PREPARED", "before_result": before[0], "before_spec": before[1],
+            "before_coherent": True,
+            "staged_spec": hashlib.sha256(spec_bytes).hexdigest(), "new_result": None,
+        })
+
+    def test_ping_with_wrong_layout_is_engine_version(self):
+        self.mode = "ping-wrong-layout"
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.assertEqual(raised.exception.code, "ENGINE_VERSION")
+        self.assertFalse((self._namespace(self.alpha_id) / "results" / "monthly.json").exists())
+
+    def test_save_with_wrong_project_echo_over_existing_pair_is_engine_unavailable(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.mode = "save-wrong-echo"
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.assertEqual(raised.exception.code, "ENGINE_UNAVAILABLE")
+        self.assertIn("does not match", raised.exception.detail)
+
+    def test_save_with_wrong_project_echo_on_first_save_needs_recovery(self):
+        # The engine already published a result, so the refusal cannot
+        # un-publish it: finish_refusal leaves the pair to recovery.
+        self.mode = "save-wrong-echo"
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+        journal = self._namespace(self.alpha_id) / "pending" / "monthly.journal.json"
+        self.assertTrue(journal.is_file())
+        self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["state"], "PREPARED")
+
+    def test_compare_with_wrong_project_echo_is_engine_unavailable(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        self.mode = "compare-wrong-echo"
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        self.assertEqual(raised.exception.code, "ENGINE_UNAVAILABLE")
+        self.assertIn("does not match", raised.exception.detail)
+
+    def test_v1_journal_transplant_refused_without_mutation(self):
+        checks.snapshot(self.ws, self.beta, "save", "monthly", self.SPEC)
+        pair = self._pair(self.beta_id, "monthly")
+        spec_bytes = Path(pair.spec).read_bytes()
+        pair.stage(spec_bytes)
+        before_hashes = pair.hashes()
+        v1 = {"version": 1, "state": "PREPARED", "before_result": before_hashes[0],
+              "before_spec": before_hashes[1], "before_coherent": True,
+              "staged_spec": hashlib.sha256(spec_bytes).hexdigest(), "new_result": None}
+        Path(pair.journal).write_text(json.dumps(v1), encoding="utf-8")
+        before = _tree(self._namespace(self.beta_id))
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.beta, "compare", "monthly", None)
+        self.assertEqual(raised.exception.code, "CORRUPT_STATE")
+        self.assertEqual(_tree(self._namespace(self.beta_id)), before)
+
+    def test_v2_journal_transplant_from_other_project_refused(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        checks.snapshot(self.ws, self.beta, "save", "monthly", self.SPEC)
+        alpha_pair = self._pair(self.alpha_id, "monthly")
+        self._prepared_journal(alpha_pair, Path(alpha_pair.spec).read_bytes())
+        beta_pair = self._pair(self.beta_id, "monthly")
+        Path(beta_pair.journal).write_bytes(Path(alpha_pair.journal).read_bytes())
+        before = _tree(self._namespace(self.beta_id))
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.beta, "compare", "monthly", None)
+        self.assertEqual(raised.exception.code, "CORRUPT_STATE")
+        self.assertEqual(_tree(self._namespace(self.beta_id)), before)
+
+    def test_v2_journal_transplant_to_other_name_refused(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        checks.snapshot(self.ws, self.alpha, "save", "other", self.SPEC)
+        pair = self._pair(self.alpha_id, "monthly")
+        self._prepared_journal(pair, Path(pair.spec).read_bytes())
+        other_journal = self._namespace(self.alpha_id) / "pending" / "other.journal.json"
+        other_journal.write_bytes(Path(pair.journal).read_bytes())
+        before = _tree(self._namespace(self.alpha_id))
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "compare", "other", None)
+        self.assertEqual(raised.exception.code, "CORRUPT_STATE")
+        self.assertEqual(_tree(self._namespace(self.alpha_id)), before)
+
+    def test_project_guard_excludes_save_during_repair(self):
+        import threading
+        checks.snapshot(self.ws, self.beta, "save", "existing", self.SPEC)
+        attempted = threading.Event()
+        reached_engine = threading.Event()
+        done = threading.Event()
+        errors = []
+        real_acquire = checks._acquire_project_guard
+        real_engine = self._engine
+
+        def spying_acquire(ws, project_id, mode="shared"):
+            if project_id == self.beta_id and mode == "shared":
+                attempted.set()
+            return real_acquire(ws, project_id, mode)
+
+        def spying_engine(verb, payload, timeout=1800, **kwargs):
+            if verb == "snapshot-save":
+                reached_engine.set()
+            return real_engine(verb, payload, timeout=timeout, **kwargs)
+
+        def save():
+            try:
+                checks.snapshot(self.ws, self.beta, "save", "brand-new", self.SPEC)
+            except Exception as error:  # noqa: BLE001 - collected and asserted below
+                errors.append(error)
+            finally:
+                done.set()
+
+        with patch.object(checks, "_acquire_project_guard", spying_acquire), \
+                patch.object(checks, "engine_call", spying_engine):
+            with identity._exclusive_guards(self.ws, [self.beta_id]):
+                worker = threading.Thread(target=save)
+                worker.start()
+                # The worker is proven to be at the guard-acquisition
+                # boundary while the repair holds the guard exclusively.
+                self.assertTrue(attempted.wait(timeout=30), "save never reached the project guard")
+                # Dispatch happens only after the guard is acquired, and
+                # every step between acquisition and dispatch is local:
+                # an excluded worker can never set this while held.
+                self.assertFalse(reached_engine.wait(timeout=3.0),
+                                 "save dispatched while a repair held the project guard")
+                self.assertFalse(done.is_set(), "save completed while a repair held the project guard")
+                self.assertFalse((self._namespace(self.beta_id) / "results" / "brand-new.json").exists())
+            worker.join(timeout=30)
+        self.assertTrue(done.is_set())
+        self.assertEqual(errors, [])
+        self.assertTrue((self._namespace(self.beta_id) / "results" / "brand-new.json").exists())
+
+
+class SnapshotAdoptionWitnessTests(unittest.TestCase):
+    """S1 C5: adoption crash idempotency, competing targets, conflicts,
+    blocked recovery, normalization-first adoption, and claim rules."""
+
+    SPEC = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+        self.alpha_id = identity.resolve(self.ws, self.alpha, apply=True).project_id
+        self.beta_id = identity.resolve(self.ws, self.beta, apply=True).project_id
+        self.flat = Path(self.ws.private) / "snapshots"
+        self.enterContext(patch("pbz.desktop.require_port", return_value=1))
+        self.enterContext(patch("pbz.checks.engine_call", side_effect=self._engine))
+        self.enterContext(patch("pbz.checks.spend", return_value=True))
+
+    def _engine(self, verb, payload, timeout=1800, **kwargs):
+        if verb == "ping":
+            return {"ok": True, "snapshot_layout": "project-v1"}
+        snaps = Path(payload["private_dir"]) / "snapshots" / "projects" / payload["project_id"]
+        if verb == "snapshot-save":
+            doc = {"version": 1, "name": payload["name"], "project_id": payload["project_id"],
+                   "refreshed": "2026-01-01T00:00:00", "queries": {"q1": {"rows": ["saved"]}}}
+            result = snaps / "results" / (payload["name"] + ".json")
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_bytes(json.dumps(doc).encode("utf-8"))
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+        return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                "queries": [{"id": "q1", "result": "SAME"}]}
+
+    def _flat_pair(self, name, result_doc=None, spec_doc=None):
+        (self.flat / "results").mkdir(parents=True, exist_ok=True)
+        (self.flat / "specs").mkdir(parents=True, exist_ok=True)
+        (self.flat / "pending").mkdir(parents=True, exist_ok=True)
+        result_doc = LEGACY_RESULT if result_doc is None else result_doc
+        spec_doc = self.SPEC if spec_doc is None else spec_doc
+        (self.flat / "results" / f"{name}.json").write_text(json.dumps(result_doc), encoding="utf-8")
+        (self.flat / "specs" / f"{name}.json").write_text(json.dumps(spec_doc), encoding="utf-8")
+        return (json.dumps(result_doc).encode(), json.dumps(spec_doc).encode())
+
+    def _namespace(self, project_id):
+        return Path(self.ws.private) / "snapshots" / "projects" / project_id
+
+    def test_adoption_crash_between_names_resumes_to_same_end_state(self):
+        self._flat_pair("one")
+        self._flat_pair("two")
+        original = checks._adopt_one_name
+        calls = []
+
+        def crashing(ws, target_id, adoption_id, entry):
+            calls.append(entry["name"])
+            if len(calls) > 1:
+                raise RuntimeError("simulated crash")
+            return original(ws, target_id, adoption_id, entry)
+
+        with patch.object(checks, "_adopt_one_name", crashing):
+            with self.assertRaises(RuntimeError):
+                checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        status, _claim = checks._read_adopt_claim(self.ws)
+        self.assertEqual(status, "ok")
+        report = checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertTrue(report["claim_released"])
+        # "one" completed during the crashed run; the resume adopts "two".
+        self.assertEqual(report["adopted"], ["two"])
+        for name in ("one", "two"):
+            adopted = json.loads((self._namespace(self.alpha_id) / "results" / f"{name}.json").read_text(encoding="utf-8"))
+            self.assertEqual(adopted["project_id"], self.alpha_id)
+            self.assertFalse((self.flat / "results" / f"{name}.json").exists())
+        self.assertEqual(checks._list_adopt_journals(self.ws, self.alpha_id), [])
+
+    def test_competing_adoption_target_refused_by_surviving_claim(self):
+        self._flat_pair("monthly")
+
+        def crashing(ws, target_id, adoption_id, entry):
+            raise RuntimeError("simulated crash")
+
+        with patch.object(checks, "_adopt_one_name", crashing):
+            with self.assertRaises(RuntimeError):
+                checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        before = _tree(Path(self.ws.private))
+        with self.assertRaises(PbzError) as raised:
+            checks.adopt_legacy(self.ws, self.beta, confirm_fn=lambda plan: True)
+        self.assertEqual(raised.exception.code, "ADOPTION_CLAIMED")
+        self.assertEqual(_tree(Path(self.ws.private)), before)
+
+    def test_adoption_destination_conflict_skips_only_that_name(self):
+        self._flat_pair("monthly")
+        self._flat_pair("other")
+        ns_results = self._namespace(self.alpha_id) / "results"
+        ns_results.mkdir(parents=True, exist_ok=True)
+        foreign = {**LEGACY_RESULT, "project_id": self.alpha_id, "queries": {"q1": {"rows": ["different"]}}}
+        (ns_results / "monthly.json").write_bytes(json.dumps(foreign).encode())
+        flat_before = (self.flat / "results" / "monthly.json").read_bytes()
+        report = checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertEqual(report["conflicts"], ["monthly"])
+        self.assertEqual(report["adopted"], ["other"])
+        self.assertEqual((self.flat / "results" / "monthly.json").read_bytes(), flat_before)
+        self.assertEqual((ns_results / "monthly.json").read_bytes(), json.dumps(foreign).encode())
+
+    def test_adoption_changed_destination_during_recovery_blocks(self):
+        self._flat_pair("crashy")
+        pid = self.alpha_id
+        checks._ensure_project_namespace(self.ws, pid)
+        dest = self._namespace(pid) / "results" / "crashy.json"
+        stamped = json.dumps({**LEGACY_RESULT, "project_id": pid}).encode()
+        dest.write_bytes(stamped)
+        journal = {"version": 1, "name": "crashy", "adoption_id": "witness-1", "target_id": pid,
+                   "state": "COPIES_WRITTEN", "unit": ["result", "spec"],
+                   "source_hashes": {"result": checks._hash_bytes(json.dumps(LEGACY_RESULT).encode()),
+                                     "spec": checks._hash_bytes(json.dumps(self.SPEC).encode())},
+                   "expected_hashes": {"result": checks._hash_bytes(stamped),
+                                       "spec": checks._hash_bytes(json.dumps({**self.SPEC, "project_id": pid}).encode())},
+                   "dest_pre": {"result": "absent", "spec": "absent"},
+                   "dest_pre_satisfied": {"result": True, "spec": False}}
+        spec_dest = self._namespace(pid) / "specs" / "crashy.json"
+        spec_dest.write_bytes(json.dumps({**self.SPEC, "project_id": pid}).encode())
+        checks._write_adopt_journal(self.ws, pid, journal)
+        checks._write_adopt_claim(self.ws, {"version": 1, "target_name": self.alpha.name,
+                                            "target_id": pid, "adoption_id": "witness-1"})
+        dest.write_bytes(b"{}")  # the published copy no longer verifies
+        report = checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertTrue(any(entry["name"] == "crashy" for entry in report["blocked"]))
+        self.assertTrue((self.flat / "results" / "crashy.json").exists())
+        self.assertIsNotNone(checks._read_adopt_journal(self.ws, pid, "crashy"))
+
+    def test_recover_legacy_blocked_state_reports_and_leaves_bytes(self):
+        self._flat_pair("monthly")
+        pair = checks._SnapshotPair(self.ws, "monthly")
+        before = pair.hashes()
+        pair.stage(json.dumps(self.SPEC).encode())
+        pair.write_journal({"version": 1, "state": "PREPARED", "before_result": before[0],
+                            "before_spec": before[1], "before_coherent": True,
+                            "staged_spec": hashlib.sha256(json.dumps(self.SPEC).encode()).hexdigest(),
+                            "new_result": None})
+        # The result is replaced after the journal was prepared: compare
+        # recovery cannot resolve this state.
+        (self.flat / "results" / "monthly.json").write_bytes(b"{}")
+        pair_files = ("results/monthly.json", "specs/monthly.json", "pending/monthly.journal.json")
+        snapshot = {rel: (self.flat / rel).read_bytes() for rel in pair_files}
+        with self.assertRaises(PbzError) as raised:
+            checks.recover_legacy(self.ws, "monthly")
+        self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+        self.assertEqual({rel: (self.flat / rel).read_bytes() for rel in pair_files}, snapshot)
+
+    def test_pre_layout_files_adopted_through_normalization(self):
+        self.flat.mkdir(parents=True, exist_ok=True)
+        (self.flat / "monthly.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        (self.flat / "monthly.spec.json").write_text(json.dumps(self.SPEC), encoding="utf-8")
+        report = checks.adopt_legacy(self.ws, self.alpha, confirm_fn=lambda plan: True)
+        self.assertEqual(report["adopted"], ["monthly"])
+        adopted = json.loads((self._namespace(self.alpha_id) / "results" / "monthly.json").read_text(encoding="utf-8"))
+        self.assertEqual(adopted["project_id"], self.alpha_id)
+        self.assertFalse((self.flat / "monthly.json").exists())
+        self.assertFalse((self.flat / "monthly.spec.json").exists())
+
+    def test_save_landing_in_target_between_plan_and_move_conflicts(self):
+        self._flat_pair("monthly")
+        plan, _layout = checks._plan_adoption(self.ws, self.alpha, self.alpha_id, frozenset())
+        entry = next(item for item in plan["names"] if item["name"] == "monthly")
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC)
+        outcome = checks._adopt_one_name(self.ws, self.alpha_id, "witness-2", entry)
+        self.assertEqual(outcome, "conflict")
+        self.assertTrue((self.flat / "results" / "monthly.json").exists())
+
+    def test_cancel_claim_refused_while_journal_unresolved(self):
+        self._flat_pair("monthly")
+        pid = self.alpha_id
+        checks._ensure_project_namespace(self.ws, pid)
+        journal = {"version": 1, "name": "monthly", "adoption_id": "witness-3", "target_id": pid,
+                   "state": "PLANNED", "unit": ["result"],
+                   "source_hashes": {"result": checks._hash_bytes(b"{}")},
+                   "expected_hashes": {"result": checks._hash_bytes(b"{}")},
+                   "dest_pre": {"result": "absent"}, "dest_pre_satisfied": {"result": False}}
+        checks._write_adopt_journal(self.ws, pid, journal)
+        checks._write_adopt_claim(self.ws, {"version": 1, "target_name": self.alpha.name,
+                                            "target_id": pid, "adoption_id": "witness-3"})
+        with self.assertRaises(PbzError) as raised:
+            checks.cancel_adoption_claim(self.ws)
+        self.assertEqual(raised.exception.code, "ADOPTION_CLAIMED")
+        status, _claim = checks._read_adopt_claim(self.ws)
+        self.assertEqual(status, "ok")
+
+
+class SnapshotInterruptionWindowTests(unittest.TestCase):
+    """S1 C5 and the brief acceptance: interrupt project Alpha in each
+    publication window; project Beta's pair bytes and pending state are
+    asserted unchanged in every window."""
+
+    SPEC_A = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+    SPEC_A2 = {"queries": [{"id": "q1", "dax": "EVALUATE {2}"}]}
+    SPEC_B = {"queries": [{"id": "q1", "dax": "EVALUATE {7}"}]}
+    PORTS = {"Alpha": 41001, "Beta": 41002}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+        self.enterContext(patch(
+            "pbz.desktop.require_port",
+            side_effect=lambda project: self.PORTS[project.name]))
+        self.enterContext(patch("pbz.checks.engine_call", side_effect=self._engine))
+        self.enterContext(patch("pbz.checks.spend", return_value=True))
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC_A)
+        checks.snapshot(self.ws, self.beta, "save", "monthly", self.SPEC_B)
+        self.alpha_id = identity.resolve(self.ws, self.alpha, apply=False).project_id
+        self.beta_id = identity.resolve(self.ws, self.beta, apply=False).project_id
+
+    def _fingerprint(self, dax):
+        return {"EVALUATE {1}": "a", "EVALUATE {2}": "a2", "EVALUATE {7}": "b"}[dax]
+
+    def _engine(self, verb, payload, timeout=1800, **kwargs):
+        if verb == "ping":
+            return {"ok": True, "snapshot_layout": "project-v1"}
+        snaps = (Path(payload["private_dir"]) / "snapshots" / "projects"
+                 / payload["project_id"])
+        if verb == "snapshot-save":
+            dax = payload["queries"][0]["dax"]
+            doc = {"version": 1, "name": payload["name"],
+                   "project_id": payload["project_id"],
+                   "refreshed": "2026-01-01T00:00:00",
+                   "queries": {"q1": {"rows": [self._fingerprint(dax)]}}}
+            result = snaps / "results" / (payload["name"] + ".json")
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_bytes(json.dumps(doc).encode("utf-8"))
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+        if verb == "snapshot-compare":
+            result = snaps / "results" / (payload["name"] + ".json")
+            doc = json.loads(result.read_text(encoding="utf-8"))
+            saved = doc["queries"]["q1"]["rows"][0]
+            want = self._fingerprint(payload["queries"][0]["dax"])
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "project_id": payload["project_id"], "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAME" if saved == want else "DIFF"}]}
+        raise AssertionError(f"unexpected verb {verb}")
+
+    def _pair(self, project_id, name="monthly"):
+        return checks._SnapshotPair(self.ws, name, project_id=project_id)
+
+    def _beta_tree(self):
+        return _tree(Path(self.ws.private) / "snapshots" / "projects" / self.beta_id)
+
+    def _prepare_journal(self, pair, spec_bytes, *, state="PREPARED", new_result=None):
+        before = pair.hashes()
+        pair.stage(spec_bytes)
+        pair.write_journal({
+            "state": state, "before_result": before[0], "before_spec": before[1],
+            "before_coherent": True,
+            "staged_spec": hashlib.sha256(spec_bytes).hexdigest(),
+            "new_result": new_result,
+        })
+        return before
+
+    def test_window_prepared_over_coherent_pair_clears_on_next_operation(self):
+        pair = self._pair(self.alpha_id)
+        self._prepare_journal(pair, Path(pair.spec).read_bytes())
+        beta_before = self._beta_tree()
+        out = checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        self.assertTrue(out["ok"])
+        self.assertIsNone(pair.read_journal())
+        self.assertEqual(self._beta_tree(), beta_before)
+
+    def test_window_prepared_with_result_written_blocks_then_save_supersedes(self):
+        pair = self._pair(self.alpha_id)
+        self._prepare_journal(pair, Path(pair.spec).read_bytes())
+        new_result = {"version": 1, "name": "monthly", "project_id": self.alpha_id,
+                      "refreshed": "2026-01-02T00:00:00", "queries": {"q1": {"rows": ["a2"]}}}
+        Path(pair.result).write_bytes(json.dumps(new_result).encode())
+        result_bytes = Path(pair.result).read_bytes()
+        spec_bytes = Path(pair.spec).read_bytes()
+        staged_bytes = Path(pair.staged).read_bytes()
+        beta_before = self._beta_tree()
+        with self.assertRaises(PbzError) as raised:
+            checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+        self.assertEqual(Path(pair.result).read_bytes(), result_bytes)
+        self.assertEqual(Path(pair.spec).read_bytes(), spec_bytes)
+        self.assertEqual(Path(pair.staged).read_bytes(), staged_bytes)
+        self.assertEqual(self._beta_tree(), beta_before)
+        with self.assertRaises(PbzError) as raised:
+            checks.recover_pair(self.ws, self.alpha, "monthly")
+        self.assertEqual(raised.exception.code, "RECOVERY_REQUIRED")
+        self.assertEqual(Path(pair.result).read_bytes(), result_bytes)
+        self.assertEqual(Path(pair.spec).read_bytes(), spec_bytes)
+        self.assertEqual(Path(pair.staged).read_bytes(), staged_bytes)
+        self.assertEqual(self._beta_tree(), beta_before)
+        out = checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC_A2)
+        self.assertTrue(out["ok"])
+        self.assertEqual(self._beta_tree(), beta_before)
+
+    def test_window_result_published_recovers_from_staged_spec(self):
+        pair = self._pair(self.alpha_id)
+        staged_spec = json.dumps({**self.SPEC_A2, "project_id": self.alpha_id}).encode()
+        new_result = {"version": 1, "name": "monthly", "project_id": self.alpha_id,
+                      "refreshed": "2026-01-02T00:00:00", "queries": {"q1": {"rows": ["a2"]}}}
+        new_bytes = json.dumps(new_result).encode()
+        self._prepare_journal(pair, staged_spec, state="RESULT_PUBLISHED",
+                              new_result=hashlib.sha256(new_bytes).hexdigest())
+        Path(pair.result).write_bytes(new_bytes)
+        beta_before = self._beta_tree()
+        out = checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        self.assertTrue(out["ok"])
+        self.assertIsNone(pair.read_journal())
+        self.assertEqual(Path(pair.spec).read_bytes(), staged_spec)
+        self.assertEqual(self._beta_tree(), beta_before)
+
+
+class SnapshotBoundEvidenceTests(unittest.TestCase):
+    """S1 C5: with a bound project, evidence suggestions name that
+    project's namespace compares; legacy names stay legacy-labeled."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _tiny(self.ws.root)
+        self.project = self.ws.project(None)
+        self.project_id = identity.resolve(self.ws, self.project, apply=True).project_id
+        self.namespace = Path(self.ws.private) / "snapshots" / "projects" / self.project_id
+        (self.namespace / "results").mkdir(parents=True, exist_ok=True)
+        stamped = {"version": 1, "name": "monthly", "project_id": self.project_id,
+                   "refreshed": "2026-01-01T00:00:00", "queries": {"q1": {"rows": []}}}
+        (self.namespace / "results" / "monthly.json").write_text(json.dumps(stamped), encoding="utf-8")
+        flat = Path(self.ws.private) / "snapshots" / "results"
+        flat.mkdir(parents=True, exist_ok=True)
+        (flat / "legacy.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+
+    def test_bound_project_suggestions(self):
+        from pbz import evidence
+        bound = "\n".join(evidence._suggested_tests(self.ws, self.project, []))
+        self.assertIn('pbz --project "Canary" snapshot compare monthly', bound)
+        self.assertIn("adopt-legacy", bound)
+        self.assertIn("legacy", bound)
+        unbound = "\n".join(evidence._suggested_tests(self.ws, None, []))
+        self.assertNotIn("snapshot compare monthly", unbound)
+        self.assertIn("adopt-legacy", unbound)
+
 if __name__ == "__main__":
     unittest.main()
