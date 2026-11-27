@@ -3962,5 +3962,141 @@ hooks = {{"SetHandleInformation": toggle, "AssignProcessToJobObject": assign}}
             holder.communicate("\n", timeout=10)
 
 
+
+def _named_project(root, name):
+    model = os.path.join(root, f"{name}.SemanticModel", "definition")
+    os.makedirs(os.path.join(model, "tables"))
+    open(os.path.join(root, f"{name}.pbip"), "w", encoding="utf-8").close()
+    with open(os.path.join(root, f"{name}.SemanticModel", "definition.pbism"), "w", encoding="utf-8") as handle:
+        handle.write("{}\n")
+    with open(os.path.join(model, "database.tmdl"), "w", encoding="utf-8") as handle:
+        handle.write("database\n\tcompatibilityLevel: 1600\n")
+    with open(os.path.join(model, "model.tmdl"), "w", encoding="utf-8") as handle:
+        handle.write("model Model\n\tculture: en-US\n\nref table T\n")
+    with open(os.path.join(model, "tables", "T.tmdl"), "w", encoding="utf-8") as handle:
+        handle.write("table T\n\tmeasure M = 1\n")
+    report = os.path.join(root, f"{name}.Report", "definition")
+    os.makedirs(report)
+    with open(os.path.join(report, "definition.pbir"), "w", encoding="utf-8") as handle:
+        handle.write("{}\n")
+    with open(os.path.join(report, "report.json"), "w", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+
+class SnapshotProjectIdentityTests(unittest.TestCase):
+    """S1 acceptance: snapshot baselines are bound to the selected project, not the name."""
+
+    SPEC_A = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
+    SPEC_B = {"queries": [{"id": "q1", "dax": "EVALUATE {2}"}]}
+    PORTS = {"Alpha": 41001, "Beta": 41002}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = make_workspace(tmp.name)
+        _named_project(self.ws.root, "Alpha")
+        _named_project(self.ws.root, "Beta")
+        self.alpha = self.ws.project("Alpha")
+        self.beta = self.ws.project("Beta")
+        self.calls = []
+        self.enterContext(patch(
+            "pbz.desktop.require_port",
+            side_effect=lambda project: self.PORTS[project.name]))
+        self.enterContext(patch("pbz.checks.engine_call", side_effect=self._engine))
+
+    @staticmethod
+    def _fingerprint(dax):
+        return hashlib.sha256(dax.encode("utf-8")).hexdigest()[:12]
+
+    def _engine(self, verb, payload, timeout=1800, **kwargs):
+        # A faithful double of the base engine: one flat store keyed by name only.
+        self.calls.append((verb, dict(payload)))
+        snaps = Path(payload["private_dir"]) / "snapshots"
+        if verb == "snapshot-save":
+            dax = payload["queries"][0]["dax"]
+            doc = {"version": 1, "name": payload["name"],
+                   "refreshed": "2026-01-01T00:00:00",
+                   "queries": {"q1": {"rows": [self._fingerprint(dax)]}}}
+            result = snaps / "results" / (payload["name"] + ".json")
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_bytes(json.dumps(doc).encode("utf-8"))
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "queries": [{"id": "q1", "result": "SAVED"}]}
+        if verb == "snapshot-compare":
+            result = snaps / "results" / (payload["name"] + ".json")
+            if not result.is_file():
+                result = snaps / (payload["name"] + ".json")
+            doc = json.loads(result.read_text(encoding="utf-8"))
+            saved = doc["queries"]["q1"]["rows"][0]
+            want = self._fingerprint(payload["queries"][0]["dax"])
+            return {"ok": True, "class": "OK", "payload_state": "may_have_been_sent",
+                    "queries": [{"id": "q1", "result": "SAME" if saved == want else "DIFF"}]}
+        raise AssertionError(f"unexpected verb {verb}")
+
+    def _compare_calls(self):
+        return [p for verb, p in self.calls if verb == "snapshot-compare"]
+
+    def test_compare_in_second_project_does_not_consume_first_projects_baseline(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC_A)
+        with self.assertRaises(PbzError) as ctx:
+            checks.snapshot(self.ws, self.beta, "compare", "monthly", None)
+        self.assertEqual(ctx.exception.code, "BAD_REQUEST")
+        self.assertEqual(self._compare_calls(), [])
+
+    def test_same_name_pairs_are_isolated_per_project(self):
+        checks.snapshot(self.ws, self.alpha, "save", "monthly", self.SPEC_A)
+        checks.snapshot(self.ws, self.beta, "save", "monthly", self.SPEC_B)
+
+        res_a = checks.snapshot(self.ws, self.alpha, "compare", "monthly", None)
+        res_b = checks.snapshot(self.ws, self.beta, "compare", "monthly", None)
+        self.assertEqual(res_a["queries"][0]["result"], "SAME")
+        self.assertEqual(res_b["queries"][0]["result"], "SAME")
+
+        calls = self._compare_calls()
+        self.assertEqual(len(calls), 2)
+        by_port = {c["port"]: c for c in calls}
+        self.assertEqual(by_port[self.PORTS["Alpha"]]["queries"][0]["dax"], "EVALUATE {1}")
+        self.assertEqual(by_port[self.PORTS["Beta"]]["queries"][0]["dax"], "EVALUATE {2}")
+
+        registry = json.loads(
+            (Path(self.ws.root) / ".pbz" / "project-identity.json").read_text(encoding="utf-8"))
+        ids = {}
+        for project in (self.alpha, self.beta):
+            anchor = json.loads(
+                (Path(project.model_dir) / "pbz-project-id.json").read_text(encoding="utf-8"))
+            ids[project.name] = anchor["id"]
+            self.assertIn(anchor["id"], registry)
+            pair = (Path(self.ws.private) / "snapshots" / "projects" / anchor["id"]
+                    / "results" / "monthly.json")
+            self.assertTrue(pair.is_file(), f"no namespaced pair for {project.name}")
+        self.assertNotEqual(ids["Alpha"], ids["Beta"])
+        bytes_a = (Path(self.ws.private) / "snapshots" / "projects" / ids["Alpha"]
+                   / "results" / "monthly.json").read_bytes()
+        bytes_b = (Path(self.ws.private) / "snapshots" / "projects" / ids["Beta"]
+                   / "results" / "monthly.json").read_bytes()
+        self.assertNotEqual(bytes_a, bytes_b)
+
+    def test_anchor_survives_mirror_round_trip_and_tmdl_parse(self):
+        from pbz import mirror
+        anchor = Path(self.alpha.model_dir) / "pbz-project-id.json"
+        anchor_bytes = b'{"id": "3f6d2f52-1c8b-4f3a-9c2d-7a1b5e0d84f6", "version": 1}\n'
+        anchor.write_bytes(anchor_bytes)
+        with patch("pbz.desktop.processes", return_value=[]):
+            mirror.pull(self.ws, self.alpha)
+            self.assertEqual(anchor.read_bytes(), anchor_bytes)
+            table = next(Path(self.ws.mirror).rglob("T.tmdl"))
+            table.write_text(
+                table.read_text(encoding="utf-8").replace("measure M = 1", "measure M = 2"),
+                encoding="utf-8")
+            try:
+                mirror.push(self.ws, self.alpha)
+            except PbzError:
+                # The engine-backed staged validation cannot run in every
+                # environment; the witness is that neither a completed push
+                # nor a refused one ever touches the anchor.
+                pass
+            self.assertEqual(anchor.read_bytes(), anchor_bytes)
+        self.assertIsNotNone(mirror.real_model(self.alpha))
+
 if __name__ == "__main__":
     unittest.main()
