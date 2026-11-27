@@ -36,6 +36,7 @@
     },
     "logId": { "type": "string", "pattern": "^e-[0-9]{8}-[0-9]{4,}$" },
     "id": { "type": "string", "pattern": "^[A-Za-z0-9_.:/\\- ]{1,128}$" },
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "minLength": 36, "maxLength": 36 },
     "name": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000-\\u001f]*$" },
     "relPath": { "type": "string", "maxLength": 260, "pattern": "^[^\\u0000-\\u001f]*$" },
     "hmac": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
@@ -73,7 +74,8 @@
       "properties": {
         "ok": { "const": true },
         "verb": { "const": "ping" },
-        "version": { "const": "1" }
+        "version": { "const": "1" },
+        "snapshot_layout": { "enum": ["project-v1"] }
       }
     },
 
@@ -342,11 +344,13 @@
     "snapshotSave": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["ok", "verb", "name", "queries"],
+      "required": ["ok", "verb", "name", "project_id", "snapshot_layout", "queries"],
       "properties": {
         "ok": { "const": true },
         "verb": { "const": "snapshot-save" },
         "name": { "$ref": "#/$defs/snapshotName" },
+        "project_id": { "$ref": "#/$defs/uuid" },
+        "snapshot_layout": { "const": "project-v1" },
         "queries": {
           "type": "array",
           "items": {
@@ -367,11 +371,13 @@
     "snapshotCompare": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["ok", "verb", "name", "queries"],
+      "required": ["ok", "verb", "name", "project_id", "snapshot_layout", "queries"],
       "properties": {
         "ok": { "const": true },
         "verb": { "const": "snapshot-compare" },
         "name": { "$ref": "#/$defs/snapshotName" },
+        "project_id": { "$ref": "#/$defs/uuid" },
+        "snapshot_layout": { "const": "project-v1" },
         "queries": {
           "type": "array",
           "items": {

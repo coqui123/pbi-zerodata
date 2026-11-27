@@ -13,6 +13,7 @@ namespace PbzEngine;
 public static class Snapshots
 {
     static readonly Regex NameRx = new(@"^[A-Za-z0-9._\-]{1,64}$", RegexOptions.Compiled);
+    static readonly Regex ProjectIdRx = new(@"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z", RegexOptions.Compiled);
 
     sealed class Result
     {
@@ -24,14 +25,21 @@ public static class Snapshots
         public List<string> ValueColumns => Columns.Where((_, i) => !KeyIdx.Contains(i)).ToList();
     }
 
-    static string FilePath(string pd, string name) => Path.Combine(pd, "snapshots", "results", name + ".json");
-    static string LegacyFilePath(string pd, string name) => Path.Combine(pd, "snapshots", name + ".json");
+    static string FilePath(string pd, string name, string projectId) => Path.Combine(pd, "snapshots", "projects", projectId, "results", name + ".json");
 
     static string Name(Req req)
     {
         string name = J.ReqStr(req.Obj, "name");
         if (!NameRx.IsMatch(name)) throw new BadRequestException("snapshot name must match [A-Za-z0-9._-]{1,64}");
         return name;
+    }
+
+    static string ProjectId(Req req)
+    {
+        string? id = req.Str("project_id");
+        if (id == null) throw new BadRequestException("project_id is required");
+        if (!ProjectIdRx.IsMatch(id)) throw new BadRequestException("project_id must be a canonical UUID");
+        return id;
     }
 
     static List<(string Id, string Dax, List<string> Keys)> Queries(Req req)
@@ -123,6 +131,7 @@ public static class Snapshots
     {
         int port = req.Port();
         string name = Name(req);
+        string projectId = ProjectId(req);
         var queries = Queries(req);
         string pd = ctx.RequirePrivateDir();
         var vault = Vault.Open(pd);
@@ -153,53 +162,53 @@ public static class Snapshots
             // No query succeeded (stored is populated only in the SAVED
             // branch above): leave any existing baseline result untouched
             // and create nothing on a first-ever all-failed save.
-            return Ctx.Ok("snapshot-save", new JsonObject { ["name"] = name, ["queries"] = outArr });
+            return Ctx.Ok("snapshot-save", new JsonObject { ["name"] = name, ["project_id"] = projectId, ["snapshot_layout"] = "project-v1", ["queries"] = outArr });
         }
         var doc = new JsonObject
         {
             ["version"] = 1,
             ["name"] = name,
+            ["project_id"] = projectId,
             ["refreshed"] = conn.LatestRefresh(),
             ["queries"] = stored,
         };
-        string dir = Path.Combine(pd, "snapshots", "results");
+        string projectsDir = Path.Combine(pd, "snapshots", "projects");
+        string projectDir = Path.Combine(projectsDir, projectId);
+        string dir = Path.Combine(projectDir, "results");
         LinkGuard.Refuse(Path.Combine(pd, "snapshots"));
+        LinkGuard.Refuse(projectsDir);
+        LinkGuard.Refuse(projectDir);
         LinkGuard.Refuse(dir);
         Directory.CreateDirectory(dir);
-        Vault.WriteAtomic(FilePath(pd, name), doc.ToJsonString());
-        return Ctx.Ok("snapshot-save", new JsonObject { ["name"] = name, ["queries"] = outArr });
+        Vault.WriteAtomic(FilePath(pd, name, projectId), doc.ToJsonString());
+        return Ctx.Ok("snapshot-save", new JsonObject { ["name"] = name, ["project_id"] = projectId, ["snapshot_layout"] = "project-v1", ["queries"] = outArr });
     }
 
     public static JsonObject Compare(Req req, Ctx ctx)
     {
         int port = req.Port();
         string name = Name(req);
+        string projectId = ProjectId(req);
         var queries = Queries(req);
         string pd = ctx.RequirePrivateDir();
         var vault = Vault.Open(pd);
         using var conn = Conn.Open(ctx, port);
         JsonObject? saved = null;
-        string path = FilePath(pd, name);
-        string legacyPath = LegacyFilePath(pd, name);
+        string projectsDir = Path.Combine(pd, "snapshots", "projects");
+        string projectDir = Path.Combine(projectsDir, projectId);
+        string resultsDir = Path.Combine(projectDir, "results");
+        string path = FilePath(pd, name, projectId);
         LinkGuard.Refuse(Path.Combine(pd, "snapshots"));
-        LinkGuard.Refuse(Path.Combine(pd, "snapshots", "results"));
+        LinkGuard.Refuse(projectsDir);
+        LinkGuard.Refuse(projectDir);
+        LinkGuard.Refuse(resultsDir);
         LinkGuard.Refuse(path);
         if (File.Exists(path))
         {
             saved = JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8)) as JsonObject;
-        }
-        else
-        {
-            LinkGuard.Refuse(legacyPath);
-            if (File.Exists(legacyPath))
-            {
-                var candidate = JsonNode.Parse(File.ReadAllText(legacyPath, Encoding.UTF8)) as JsonObject;
-                if (candidate != null && candidate["queries"] is JsonObject && candidate.ContainsKey("refreshed")
-                    && (candidate["refreshed"] == null || (candidate["refreshed"] is JsonValue jv && jv.TryGetValue<string>(out _))))
-                {
-                    saved = candidate;
-                }
-            }
+            string? stamp = saved?["project_id"] is JsonValue jv && jv.TryGetValue<string>(out var s) ? s : null;
+            if (!string.Equals(stamp, projectId, StringComparison.Ordinal))
+                throw new BadRequestException("snapshot baseline project_id does not match the request");
         }
         var savedQueries = saved?["queries"] as JsonObject;
         bool stale = saved != null && !string.Equals(saved["refreshed"]?.GetValue<string>(), conn.LatestRefresh(), StringComparison.Ordinal);
@@ -246,7 +255,7 @@ public static class Snapshots
             foreach (var kv in savedQueries.OrderBy(k => k.Key, StringComparer.Ordinal))
                 if (!requested.Contains(kv.Key) && J.IsSafeId(kv.Key))
                     outArr.Add(new JsonObject { ["id"] = kv.Key, ["result"] = "MISSING" });
-        return Ctx.Ok("snapshot-compare", new JsonObject { ["name"] = name, ["queries"] = outArr });
+        return Ctx.Ok("snapshot-compare", new JsonObject { ["name"] = name, ["project_id"] = projectId, ["snapshot_layout"] = "project-v1", ["queries"] = outArr });
     }
 
     /// <summary>Returns (same, differing column names, number of differing groups/rows).</summary>
