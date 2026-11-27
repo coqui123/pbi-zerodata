@@ -1094,5 +1094,372 @@ class UnusedFilterPathTests(unittest.TestCase):
         self._remove_adate(ws, project)
 
 
+class UnusedLoadedQueryTests(unittest.TestCase):
+    def _visual(self, used):
+        projections = []
+        for table, measure in used:
+            projections.append({"field": {"Measure": {
+                "Expression": {"SourceRef": {"Entity": table}},
+                "Property": measure,
+            }}})
+        return {"visual": {"visualType": "card", "query": {"queryState": {"Values": {
+            "projections": projections}}}}}
+
+    def _build(self, tables, expressions=None, used=(("Sales", "Keep"),)):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        ws = common.Workspace(root)
+        ws.private = os.path.join(root, "private")
+        os.makedirs(ws.private)
+        _write(os.path.join(root, "Mini.pbip"), "{}")
+        project = common.Project(ws, "Mini")
+        mdef = os.path.join(project.mirror_model, "definition")
+        for name, text in tables.items():
+            _write(os.path.join(mdef, "tables", f"{name}.tmdl"), text)
+        model = "model Model\n\tculture: en-US\n\n" + "".join(
+            f"ref table {name}\n" for name in tables)
+        _write(os.path.join(mdef, "model.tmdl"), model)
+        _write(os.path.join(mdef, "database.tmdl"), DATABASE)
+        if expressions is not None:
+            _write(os.path.join(mdef, "expressions.tmdl"), expressions)
+        report = project.mirror_report
+        _write(os.path.join(report, "definition.pbir"),
+               json.dumps({"datasetReference": {"byPath": {"path": "../Mini.SemanticModel"}}}))
+        page = os.path.join(report, "definition", "pages", "p1")
+        _write(os.path.join(page, "page.json"), json.dumps({"name": "p1", "displayName": "Synthetic"}))
+        _write(os.path.join(page, "visuals", "v1", "visual.json"), json.dumps(self._visual(used)))
+        return ws, project, usage.build(ws, project)
+
+    def _tk(self, name):
+        return usage.key("table", "", name)
+
+    def _qk(self, name):
+        return usage.key("m_query", "", name)
+
+    def _dsts(self, graph, src, via="m"):
+        return [e.dst for e in graph.out.get(src, []) if e.via == via]
+
+    def _main(self):
+        tables = {
+            "Sales": ("table Sales\n\n\tmeasure Keep = 1\n\n"
+                      "\tpartition ViaQuery = m\n\t\tsource = Feed\n\n"
+                      "\tpartition ViaTable = m\n\t\tsource = Staging\n\n"
+                      "\tpartition ViaShared = m\n\t\tsource = #shared[StagingShared]\n\n"
+                      "\tpartition ViaUncertain = m\n\t\tsource = try Risky otherwise Risky\n"),
+            "Staging": "table Staging\n\n\tcolumn Id\n\n\tmeasure S1 = 1\n\n",
+            "StagingShared": "table StagingShared\n\n\tcolumn Id\n\n\tmeasure S2 = 1\n\n",
+            "Staging2": "table Staging2\n\n\tcolumn Id\n\n\tmeasure S3 = 1\n\n",
+            "Risky": "table Risky\n\n\tcolumn Id\n\n\tmeasure S4 = 1\n\n",
+            "Orphan": ORPHAN,
+        }
+        expressions = ("expression Feed = Table.FirstN(Staging2, 3)\n\n"
+                       "expression Standalone = 1\n")
+        return tables, expressions
+
+    def test_s1_partition_bare_table_name(self):
+        tables, expressions = self._main()
+        ws, project, graph = self._build(tables, expressions)
+        self.assertIn(self._tk("Staging"), self._dsts(graph, self._tk("Sales")))
+        self.assertEqual(graph.state[self._tk("Staging")], "used")
+        out = unused.remove(ws, project, only=["table"])
+        self.assertEqual(out["removed"], ["table Orphan"])
+        self.assertTrue(os.path.isfile(os.path.join(project.mirror_model, "definition", "tables", "Staging.tmdl")))
+
+    def test_s2_partition_shared_selector_table(self):
+        tables, expressions = self._main()
+        ws, project, graph = self._build(tables, expressions)
+        self.assertEqual(graph.state[self._tk("StagingShared")], "used")
+        out = unused.remove(ws, project, only=["table"])
+        self.assertNotIn("table StagingShared", out["removed"])
+
+    def test_s3_retained_query_references_table(self):
+        tables, expressions = self._main()
+        ws, project, graph = self._build(tables, expressions)
+        self.assertEqual(graph.state[self._qk("Feed")], "used")
+        self.assertEqual(graph.state[self._tk("Staging2")], "used")
+        self.assertIn(self._tk("Staging2"), self._dsts(graph, self._qk("Feed")))
+        out = unused.remove(ws, project, only=["table"])
+        self.assertNotIn("table Staging2", out["removed"])
+
+    def test_s4_uncertain_table_reference_from_used_partition(self):
+        tables, expressions = self._main()
+        ws, project, graph = self._build(tables, expressions)
+        self.assertIn(self._tk("Risky"), self._dsts(graph, self._tk("Sales")))
+        self.assertEqual(graph.state[self._tk("Risky")], "used")
+        self.assertIn("uncertain M binding", " ".join(graph.locks.get(self._tk("Risky"), [])))
+        out = unused.remove(ws, project, only=["table"])
+        self.assertNotIn("table Risky", out["removed"])
+
+    def test_s5_controls_removed(self):
+        tables, expressions = self._main()
+        ws, project, graph = self._build(tables, expressions)
+        self.assertEqual(graph.state[self._qk("Standalone")], "unused")
+        self.assertEqual(graph.state[self._tk("Orphan")], "unused")
+        out = unused.remove(ws, project, only=["m_query"])
+        self.assertIn("m_query Standalone", out["removed"])
+        ws2, project2, _g2 = self._build(tables, expressions)
+        out2 = unused.remove(ws2, project2, only=["table"])
+        self.assertIn("table Orphan", out2["removed"])
+
+    def test_s6_case_mismatch_binds_nothing(self):
+        tables = {
+            "Sales": "table Sales\n\n\tmeasure Keep = 1\n\n\tpartition P1 = m\n\t\tsource = staging\n",
+            "Staging": "table Staging\n\n\tcolumn Id\n\n",
+        }
+        ws, project, graph = self._build(tables, None)
+        self.assertNotIn(self._tk("Staging"), self._dsts(graph, self._tk("Sales")))
+        self.assertEqual(graph.state[self._tk("Staging")], "unused")
+        out = unused.remove(ws, project, only=["table"])
+        self.assertIn("table Staging", out["removed"])
+
+    def test_s7_certain_self_reference_control(self):
+        tables = {
+            "Sales": "table Sales\n\n\tmeasure Keep = 1\n\n\tpartition P1 = m\n\t\tsource = Sales\n",
+            "Orphan": ORPHAN,
+        }
+        ws, project, graph = self._build(tables, None)
+        self.assertNotIn(self._tk("Sales"), self._dsts(graph, self._tk("Sales")))
+        self.assertFalse(graph.locks.get(self._tk("Sales")))
+        self.assertEqual(graph.state[self._tk("Sales")], "used")
+        out = unused.remove(ws, project, only=["table"])
+        self.assertIn("table Orphan", out["removed"])
+
+    def test_s8_dead_referrer_blocks_table(self):
+        tables = {
+            "Sales": SALES,
+            "Orphan": ORPHAN,
+            "Staging3": "table Staging3\n\n\tcolumn Id\n\n",
+        }
+        expressions = "expression DeadFeed = Staging3\n"
+        ws, project, graph = self._build(tables, expressions)
+        self.assertEqual(graph.state[self._tk("Staging3")], "used_by_unused")
+        self.assertIn(self._qk("DeadFeed"), graph.blocked_by[self._tk("Staging3")])
+        out = unused.remove(ws, project, only=["table"])
+        self.assertNotIn("table Staging3", out["removed"])
+        self.assertTrue(os.path.isfile(os.path.join(project.mirror_model, "definition", "tables", "Staging3.tmdl")))
+
+    def test_s9_dry_run_and_actual_removal_agree(self):
+        tables, expressions = self._main()
+        wsA, projectA, _graphA = self._build(tables, expressions)
+        dry = unused.remove(wsA, projectA, only=["table"], dry_run=True)
+        self.assertEqual(dry["result"], "DRY_RUN")
+        self.assertEqual(dry["removed"], ["table Orphan"])
+        wsB, projectB, _graphB = self._build(tables, expressions)
+        before = _bytes(wsB.mirror)
+        out = unused.remove(wsB, projectB, only=["table"])
+        self.assertEqual(out["removed"], ["table Orphan"])
+        dryq = unused.remove(wsB, projectB, only=["m_query"], dry_run=True)
+        self.assertEqual(dryq["removed"], ["m_query Standalone"])
+        restored = unused.restore(wsB, projectB, out["restore_point"])
+        self.assertEqual(restored["result"], "RESTORED")
+        after = {p: b for p, b in _bytes(wsB.mirror).items() if ".pbz-trash" not in p.split(os.sep)}
+        self.assertEqual(after, before)
+        wsC, projectC, _graphC = self._build(tables, expressions)
+        outq = unused.remove(wsC, projectC, only=["m_query"])
+        self.assertEqual(outq["removed"], ["m_query Standalone"])
+
+    def test_s10_uncertain_self_reference_control(self):
+        tables = {
+            "SelfRef": "table SelfRef\n\n\tcolumn Id\n\n\tpartition P1 = m\n\t\tsource = try SelfRef otherwise SelfRef\n",
+        }
+        ws, project, graph = self._build(tables, None, used=())
+        self.assertEqual(graph.state[self._tk("SelfRef")], "unused")
+        self.assertFalse(graph.locks.get(self._tk("SelfRef")))
+        out = unused.remove(ws, project, only=["table"])
+        self.assertIn("table SelfRef", out["removed"])
+
+    def test_s11_resolver_isolation(self):
+        from pbz import deps, tmdl
+        tables, expressions = self._main()
+        ws, project, _graph = self._build(tables, expressions)
+        mdef = os.path.join(project.mirror_model, "definition")
+        model = tmdl.load_model(mdef)
+        g = usage.Graph()
+        g.model = model
+        usage._model_objects(g, model)
+        res = deps.Resolver(model)
+        before = dict(res.expressions)
+        usage._model_edges(g, model, res)
+        self.assertIn(self._tk("Staging"), self._dsts(g, self._tk("Sales")))
+        self.assertEqual(res.expressions, before)
+        captured = []
+
+        def report_spy(g2, model2, res2, name, rdir):
+            captured.append(("report", set(res2.expressions)))
+            return real_report(g2, model2, res2, name, rdir)
+
+        def apply_spy(g2, ws2, project2, model2, res2):
+            captured.append(("apply", set(res2.expressions)))
+            return real_apply(g2, ws2, project2, model2, res2)
+
+        real_report = usage._report
+        real_apply = consumers.apply
+        with patch("pbz.usage._report", report_spy), patch("pbz.consumers.apply", apply_spy):
+            ws3, project3, graph3 = self._build(tables, expressions)
+        self.assertEqual({name for name, _keys in captured}, {"report", "apply"})
+        for _name, keys in captured:
+            self.assertFalse(keys & set(tables))
+        self.assertIn(self._tk("Staging"), self._dsts(graph3, self._tk("Sales")))
+
+    def test_s12_refresh_policy_names_table(self):
+        tables = {
+            "PolicyT": ("table PolicyT\n\n\tmeasure P = 1\n\n"
+                        "\tpartition P1 = m\n\t\tsource = 1\n\n"
+                        "\trefreshPolicy\n\t\tincrementalGranularity: day\n"
+                        "\t\tsourceExpression = FeedTable\n"),
+            "FeedTable": "table FeedTable\n\n\tcolumn Id\n\n",
+        }
+        _ws, _project, graph = self._build(tables, None, used=())
+        self.assertIn(self._tk("FeedTable"), self._dsts(graph, self._tk("PolicyT")))
+        self.assertIn("incremental refresh policy", graph.locks.get(self._tk("FeedTable"), []))
+        self.assertEqual(graph.state[self._tk("FeedTable")], "locked")
+
+    def test_s13_exact_name_collision_binds_expression(self):
+        tables = {
+            "Sales": "table Sales\n\n\tmeasure Keep = 1\n\n\tpartition P1 = m\n\t\tsource = #shared[Sales]\n",
+        }
+        expressions = "expression Sales = 1\n"
+        ws, project, graph = self._build(tables, expressions)
+        self.assertIn(self._qk("Sales"), self._dsts(graph, self._tk("Sales")))
+        self.assertEqual(graph.state[self._qk("Sales")], "used")
+        out = unused.remove(ws, project, only=["m_query"])
+        self.assertEqual(out["result"], "NOTHING_TO_REMOVE")
+        self.assertNotIn("m_query Sales", out.get("removed", []))
+        from pbz import tmdl
+        mdef = os.path.join(project.mirror_model, "definition")
+        self.assertIn("Sales", tmdl.load_model(mdef).expressions)
+
+    def test_s14_case_variant_pair(self):
+        tables = {
+            "Host": ("table Host\n\n\tmeasure Keep = 1\n\n"
+                     "\tpartition P1 = m\n\t\tsource = sales\n\n"
+                     "\tpartition P2 = m\n\t\tsource = Sales\n"),
+            "Sales": "table Sales\n\n\tcolumn Id\n\n",
+        }
+        expressions = "expression sales = 1\n"
+        _ws, _project, graph = self._build(tables, expressions, used=(("Host", "Keep"),))
+        dsts = self._dsts(graph, self._tk("Host"))
+        self.assertIn(self._qk("sales"), dsts)
+        self.assertIn(self._tk("Sales"), dsts)
+        self.assertEqual(graph.state[self._qk("sales")], "used")
+        self.assertEqual(graph.state[self._tk("Sales")], "used")
+
+    def test_s15_region_wide_uncertainty(self):
+        tables = {
+            "Sales": "table Sales\n\n\tmeasure Keep = 1\n\n\tpartition P1 = m\n\t\tsource = Lambda\n",
+            "Staging": "table Staging\n\n\tcolumn Id\n\n",
+        }
+        expressions = "expression Lambda = (x as Staging) => Feed\n\nexpression Feed = 1\n"
+        _ws, _project, graph = self._build(tables, expressions)
+        dsts = self._dsts(graph, self._qk("Lambda"))
+        self.assertIn(self._qk("Feed"), dsts)
+        self.assertIn(self._tk("Staging"), dsts)
+        self.assertIn("uncertain M binding", " ".join(graph.locks.get(self._qk("Feed"), [])))
+        self.assertIn("uncertain M binding", " ".join(graph.locks.get(self._tk("Staging"), [])))
+
+    def test_s16a_shadowing_certain_region(self):
+        tables = {
+            "Sales": "table Sales\n\n\tmeasure Keep = 1\n\n\tpartition P1 = m\n\t\tsource = CertainShadow\n",
+            "Staging": "table Staging\n\n\tcolumn Id\n\n",
+        }
+        expressions = "expression CertainShadow = let Staging = 1 in Staging\n"
+        _ws, _project, graph = self._build(tables, expressions)
+        self.assertNotIn(self._tk("Staging"), self._dsts(graph, self._qk("CertainShadow")))
+        self.assertFalse(graph.locks.get(self._tk("Staging")))
+        self.assertEqual(graph.state[self._tk("Staging")], "unused")
+
+    def test_s16b_shadowing_uncertain_region(self):
+        tables = {
+            "Sales": "table Sales\n\n\tmeasure Keep = 1\n\n\tpartition P1 = m\n\t\tsource = UncertainShadow\n",
+            "Staging": "table Staging\n\n\tcolumn Id\n\n",
+        }
+        expressions = "expression UncertainShadow = try (let Staging = 1 in Staging) otherwise 1\n"
+        _ws, _project, graph = self._build(tables, expressions)
+        self.assertIn(self._tk("Staging"), self._dsts(graph, self._qk("UncertainShadow")))
+        self.assertIn("uncertain M binding", " ".join(graph.locks.get(self._tk("Staging"), [])))
+        self.assertEqual(graph.state[self._tk("Staging")], "used")
+
+    def test_s17_own_table_annotation_locks_other_target(self):
+        tables = {
+            "Host2": "table Host2\n\n\tpartition P1 = m\n\t\tsource = (x as Host2) => Feed\n",
+        }
+        expressions = "expression Feed = 1\n"
+        _ws, _project, graph = self._build(tables, expressions, used=())
+        self.assertIn(self._qk("Feed"), self._dsts(graph, self._tk("Host2")))
+        self.assertIn("uncertain M binding", " ".join(graph.locks.get(self._qk("Feed"), [])))
+        self.assertEqual(graph.state[self._qk("Feed")], "locked")
+        self.assertEqual(graph.state[self._tk("Host2")], "unused")
+        self.assertFalse(graph.locks.get(self._tk("Host2")))
+
+    def test_s18_uncertain_reference_from_dead_source(self):
+        tables = {
+            "Dead2": "table Dead2\n\n\tpartition P1 = m\n\t\tsource = try Staging4 otherwise Staging4\n",
+            "Staging4": "table Staging4\n\n\tcolumn Id\n\n",
+        }
+        ws, project, graph = self._build(tables, None, used=())
+        self.assertIn(self._tk("Staging4"), self._dsts(graph, self._tk("Dead2")))
+        self.assertEqual(graph.state[self._tk("Staging4")], "locked")
+        self.assertIn("uncertain M binding", " ".join(graph.locks.get(self._tk("Staging4"), [])))
+        out = unused.remove(ws, project, only=["table"])
+        self.assertIn("table Dead2", out["removed"])
+        self.assertNotIn("table Staging4", out["removed"])
+
+    def test_s19_refresh_policy_uncertain_self_reference(self):
+        tables = {
+            "PolicySelf": ("table PolicySelf\n\n\tmeasure P = 1\n\n"
+                           "\tpartition P1 = m\n\t\tsource = 1\n\n"
+                           "\trefreshPolicy\n\t\tincrementalGranularity: day\n"
+                           "\t\tsourceExpression = try PolicySelf otherwise PolicySelf\n"),
+        }
+        _ws, _project, graph = self._build(tables, None, used=())
+        self.assertEqual(graph.locks[self._tk("PolicySelf")], ["incremental refresh policy"])
+        self.assertEqual(graph.state[self._tk("PolicySelf")], "locked")
+
+    def test_s20_translated_key_dedupe_across_partitions(self):
+        tables = {
+            "Host3": ("table Host3\n\n\tmeasure Keep = 1\n\n"
+                      "\tpartition P1 = m\n\t\tsource = Staging5\n\n"
+                      "\tpartition P2 = m\n\t\tsource = Staging5\n"),
+            "Staging5": "table Staging5\n\n\tcolumn Id\n\n",
+        }
+        _ws, _project, graph = self._build(tables, None, used=(("Host3", "Keep"),))
+        edges = [e for e in graph.out.get(self._tk("Host3"), [])
+                 if e.dst == self._tk("Staging5") and e.via == "m"]
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(graph.state[self._tk("Staging5")], "used")
+
+    def test_s21a_refresh_policy_expression_collision(self):
+        tables = {
+            "PolicyT": ("table PolicyT\n\n\tmeasure P = 1\n\n"
+                        "\tpartition P1 = m\n\t\tsource = 1\n\n"
+                        "\trefreshPolicy\n\t\tincrementalGranularity: day\n"
+                        "\t\tsourceExpression = FeedTable\n"),
+            "FeedTable": "table FeedTable\n\n\tcolumn Id\n\n",
+        }
+        expressions = "expression FeedTable = 1\n"
+        _ws, _project, graph = self._build(tables, expressions, used=())
+        self.assertIn(self._qk("FeedTable"), self._dsts(graph, self._tk("PolicyT")))
+        self.assertIn("incremental refresh policy", graph.locks.get(self._qk("FeedTable"), []))
+        self.assertNotIn(self._tk("FeedTable"), self._dsts(graph, self._tk("PolicyT")))
+        self.assertEqual(graph.state[self._tk("FeedTable")], "unused")
+
+    def test_s21b_refresh_policy_own_name_expression_collision(self):
+        tables = {
+            "PolicySelf": ("table PolicySelf\n\n\tmeasure P = 1\n\n"
+                           "\tpartition P1 = m\n\t\tsource = 1\n\n"
+                           "\trefreshPolicy\n\t\tincrementalGranularity: day\n"
+                           "\t\tsourceExpression = try PolicySelf otherwise PolicySelf\n"),
+        }
+        expressions = "expression PolicySelf = 1\n"
+        _ws, _project, graph = self._build(tables, expressions, used=())
+        self.assertIn(self._qk("PolicySelf"), self._dsts(graph, self._tk("PolicySelf")))
+        self.assertIn("uncertain M binding", " ".join(graph.locks.get(self._qk("PolicySelf"), [])))
+        self.assertIn("incremental refresh policy", graph.locks.get(self._qk("PolicySelf"), []))
+        self.assertEqual(graph.state[self._qk("PolicySelf")], "locked")
+        self.assertEqual(graph.locks[self._tk("PolicySelf")], ["incremental refresh policy"])
+        self.assertEqual(graph.state[self._tk("PolicySelf")], "locked")
+
+
 if __name__ == "__main__":
     unittest.main()

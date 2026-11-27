@@ -625,6 +625,12 @@ def _m_edges(g: Graph, src: tuple, model, res, node, own: str = "", lock_reason:
             continue
         for binding in deps.m_bindings(doc.text[reg.start:reg.end], res, own):
             k = _ref_key(binding.ref)
+            if k is not None and binding.ref.kind == "m_query" and k not in g.objects:
+                alt = key("table", "", binding.ref.name)
+                if alt in g.objects:
+                    k = alt
+            if k is None or k == src:
+                continue
             if binding.uncertain:
                 g.lock(k, "uncertain M binding: automatic removal disabled")
             if k not in seen:
@@ -635,6 +641,8 @@ def _m_edges(g: Graph, src: tuple, model, res, node, own: str = "", lock_reason:
 
 
 def _model_edges(g: Graph, model, res) -> None:
+    mres = deps.Resolver(model)
+    mres.expressions.update({name: name for name in model.tables})
     for t in model.tables.values():
         tk = key("table", "", t.name)
         tn = t.node
@@ -679,13 +687,13 @@ def _model_edges(g: Graph, model, res) -> None:
             if kind == "calculated":
                 _dax_edges(g, tk, model, res, p, t.name, "partition")
             else:
-                _m_edges(g, tk, model, res, p)
+                _m_edges(g, tk, model, mres, p)
                 src = p.prop("expressionSource")
                 if src:
                     g.edge(tk, key("m_query", "", src), "expressionSource")
         for ch in (tn.children if tn else []):
             if ch.kind == "refreshPolicy":
-                _m_edges(g, tk, model, res, ch, lock_reason="incremental refresh policy")
+                _m_edges(g, tk, model, mres, ch, lock_reason="incremental refresh policy")
                 g.lock(tk, "incremental refresh policy")
             elif ch.kind in ("calendar",):
                 for d in ch.descendants():
@@ -695,7 +703,7 @@ def _model_edges(g: Graph, model, res) -> None:
                         if col and res.column(t.name, col):
                             g.lock(key("column", t.name, col), "calendar column group")
     for name, node in model.expressions.items():
-        _m_edges(g, key("m_query", "", name), model, res, node, own=name)
+        _m_edges(g, key("m_query", "", name), model, mres, node, own=name)
     for name, node in model.functions.items():
         _dax_edges(g, key("function", "", name), model, res, node, "", "dax", function=True)
     for name, node in model.role_nodes.items():
