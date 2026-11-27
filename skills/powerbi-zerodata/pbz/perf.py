@@ -80,6 +80,39 @@ def _closed(res: dict, ws=None) -> dict:
     return out
 
 
+def _baseline_store_state(ws) -> dict | None:
+    """Content digests of the on-disk perf baseline store, or None when the
+    store cannot be observed completely. A missing store directory is a
+    complete empty observation; any listing or read failure is not."""
+    store = os.path.join(ws.private, "perf")
+    try:
+        names = os.listdir(store)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    state = {}
+    for name in names:
+        if not name.endswith(".bin"):
+            continue
+        try:
+            with open(os.path.join(store, name), "rb") as handle:
+                state[name] = hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            return None
+    return state
+
+
+def _save_confirmed(before: dict | None, after: dict | None) -> bool:
+    """A claimed save is confirmed only by a qualifying observation between two
+    complete snapshots: a created baseline file, or an existing file whose
+    contents were replaced. Deletions and metadata-only changes never qualify,
+    and an incomplete observation confirms nothing."""
+    if before is None or after is None:
+        return False
+    return any(name not in before or before[name] != digest for name, digest in after.items())
+
+
 def run(ws, project, query: str, runs: int = 1, baseline: str | None = None, action: str | None = None) -> dict:
     if not isinstance(query, str) or not query.strip():
         raise PbzError("BAD_REQUEST", "a DAX query is required")
@@ -88,6 +121,7 @@ def run(ws, project, query: str, runs: int = 1, baseline: str | None = None, act
     port = desktop.require_port(project)
     if not checks.spend(ws, "probes"):
         return {"verb": "perf", "status": "BUDGET", "note": "daily probe budget reached; the user can reset it"}
+    before = _baseline_store_state(ws) if action == "save" else None
     res = engine_call("perf", {"private_dir": ws.private, "port": port, "dax": query, "runs": int(runs),
                                "baseline": baseline, "action": action,
                                "project_identity": hashlib.sha256(os.path.normcase(os.path.abspath(os.path.join(
@@ -98,7 +132,22 @@ def run(ws, project, query: str, runs: int = 1, baseline: str | None = None, act
                          "TIMEOUT", "ENGINE_UNAVAILABLE", "BAD_REQUEST", "OTHER"}:
             klass = "ENGINE_UNAVAILABLE"
         raise PbzError(klass)
-    return _closed(res, ws)
+    out = _closed(res, ws)
+    if action == "save":
+        if out.get("baseline") != "SAVED":
+            out["status"] = "INCOMPLETE"
+            out["note"] = ("baseline not saved: the measurement evidence was incomplete or unusable, "
+                           "so nothing was written; the measurement above is informational only")
+        elif not _save_confirmed(before, _baseline_store_state(ws)):
+            out.pop("baseline", None)
+            out["status"] = "INCOMPLETE"
+            out["note"] = ("baseline save not confirmed: the engine reported SAVED, but the on-disk check "
+                           "could not verify a baseline creation or replacement")
+    elif action == "compare" and "verdict" not in out:
+        out["status"] = "INCOMPLETE"
+        out["note"] = ("comparison not completed: no verdict was produced because the saved baseline is "
+                       "missing, invalid, incompatible or unreadable, or the measurement evidence was incomplete")
+    return out
 
 
 def expect(ws, project, query: str, expect_verdict: str = "NOT_SLOWER", check_id: str = "check") -> dict:
