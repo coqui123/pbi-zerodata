@@ -498,38 +498,38 @@ print(json.dumps({{"result": out["result"], "files": out.get("files", [])}}))
         self.assertEqual(self.manifest()["files"][self.table]["real"], file_sha(str(real)))
 
     def _phantom_setup(self):
-        real, _, base = self.paths(self.report)
+        real, _, base = self.paths(self.table)
         real.unlink()
         self.assertEqual(mirror.pull(self.ws, self.project)["result"], "PULLED")
-        self.assertNotIn(self.report, self.manifest()["files"])
+        self.assertNotIn(self.table, self.manifest()["files"])
         self.assertTrue(base.exists())
         return base.read_bytes()
 
     def test_add_add_with_surviving_phantom_base_conflicts(self):
         phantom = self._phantom_setup()
-        real, mine, base = self.paths(self.report)
-        edited = b'{"layoutOptimization": 2}\n'
+        real, mine, base = self.paths(self.table)
+        edited = b"table T\n\tmeasure M = 2\n"
         mine.write_bytes(edited)
-        real.write_bytes(b'{"layoutOptimization": 3}\n')
+        real.write_bytes(b"table T\n\tmeasure M = 3\n")
 
         out = mirror.pull(self.ws, self.project, rebase=True)
-        self.assertEqual(out["conflicts"], [self.report])
-        self.assertNotIn(self.report, self.manifest()["files"])
+        self.assertEqual(out["conflicts"], [self.table])
+        self.assertNotIn(self.table, self.manifest()["files"])
         self.assertEqual(base.read_bytes(), phantom)
         self.assertEqual(mine.read_bytes(), edited)
-        self._assert_fresh_push_conflict(self.report)
+        self._assert_fresh_push_conflict(self.table)
 
     def test_add_add_with_surviving_phantom_base_adopts(self):
         phantom = self._phantom_setup()
-        real, mine, base = self.paths(self.report)
-        upstream = b'{"layoutOptimization": 2}\n'
+        real, mine, base = self.paths(self.table)
+        upstream = b"table T\n\tmeasure M = 2\n"
         self.assertNotEqual(upstream, phantom)
         mine.write_bytes(upstream)
         real.write_bytes(upstream)
 
         out = mirror.pull(self.ws, self.project, rebase=True)
         self.assertEqual(out["conflicts"], [])
-        self.assertEqual(self.manifest()["files"][self.report],
+        self.assertEqual(self.manifest()["files"][self.table],
                          {"real": file_sha(str(real)), "mirror": file_sha(str(mine))})
         self.assertEqual(base.read_bytes(), upstream)
 
