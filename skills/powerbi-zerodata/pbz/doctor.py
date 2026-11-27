@@ -43,7 +43,7 @@ CLOSED_REASONS = {
     "UNPROTECTED", "CHECKS_FAILED", "PENDING_CHECKS", "REQUIREMENTS_UNKNOWN",
     "NOT_LAUNCHED", "SCAN_FAILED", "RUN_UNBOUND", "RETRIEVAL_UNAVAILABLE",
     "RUN_ID_MISMATCH", "RUN_ATTEMPT_MISMATCH", "RUN_WORKFLOW_MISMATCH",
-    "CONFLICTING_EVIDENCE", "LANE_MISMATCH", "PRODUCER_PLATFORM_UNKNOWN",
+    "CONFLICTING_EVIDENCE", "INCONCLUSIVE_EVIDENCE", "LANE_MISMATCH", "PRODUCER_PLATFORM_UNKNOWN",
 }
 
 # Ruleset types that are not a CI gate. Every other type stays active and unproven.
@@ -1945,7 +1945,7 @@ def _desktop_process_available() -> bool | None:
 
 
 def _live_acceptance(text: str, expected_sha: str | None) -> str:
-    """verified, conflict, or absent. Line order is not a clock."""
+    """verified, conflict, inconclusive, or absent. Line order is not a clock."""
     if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
         return "absent"
     grouped: dict[str, set[str]] = {}
@@ -1961,13 +1961,15 @@ def _live_acceptance(text: str, expected_sha: str | None) -> str:
         result = doc.get("result")
         if revision != expected_sha or not isinstance(case, str) or not case.strip():
             continue
-        if result not in ("PASS", "FAIL"):
+        if result not in ("PASS", "FAIL", "SKIP"):
             continue
         grouped.setdefault(case, set()).add(result)
     if any("PASS" in results and "FAIL" in results for results in grouped.values()):
         return "conflict"
     if any(results == {"PASS"} for results in grouped.values()):
         return "verified"
+    if any("PASS" in results and "SKIP" in results for results in grouped.values()):
+        return "inconclusive"
     return "absent"
 
 
@@ -1989,6 +1991,8 @@ def get_desktop_evidence(ws_path: str | Path | None = None, expected_sha: str | 
                     return True, None
                 if acceptance == "conflict":
                     return False, "CONFLICTING_EVIDENCE"
+                if acceptance == "inconclusive":
+                    return False, "INCONCLUSIVE_EVIDENCE"
             except (OSError, UnicodeDecodeError):
                 pass
     return (False, "NOT_RUN") if sys.platform == "win32" else (None, "UNAVAILABLE")
