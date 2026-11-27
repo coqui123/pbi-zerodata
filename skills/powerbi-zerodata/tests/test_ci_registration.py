@@ -4,6 +4,7 @@ import ast
 import hashlib
 import copy
 import json
+from collections import Counter
 from pathlib import Path
 import subprocess
 import sys
@@ -717,6 +718,135 @@ class EquivalenceTests(unittest.TestCase):
             emitted = json.loads(line.removeprefix('PBZ_TIMING '))
             self.assertEqual(emitted['tom']['calls'], 1)
             self.assertEqual(emitted['discovery']['calls'], 1)
+
+
+def posix_skip_ownership_problems(windows, json_tests, json_exceptions, runner_ids):
+    """Return problems with POSIX ownership of approved Windows platform skips."""
+    problems = []
+    windows_ids = []
+    for suite, records in windows.items():
+        for record in records:
+            payload = None
+            if isinstance(record, str) and record.startswith('PBZ_SKIP '):
+                try:
+                    payload = json.loads(record[len('PBZ_SKIP '):])
+                except (ValueError, RecursionError):
+                    pass
+            test = payload.get('test') if isinstance(payload, dict) else None
+            if isinstance(test, str) and test.startswith('__main__.'):
+                remainder = test[len('__main__.'):]
+                class_name, _, method_name = remainder.partition('.')
+                if class_name and method_name:
+                    windows_ids.append(f'test_{suite}.{remainder}')
+                    continue
+            problems.append(f'malformed approved Windows skip in {suite}: {record!r}')
+
+    inventory = Counter()
+    if not isinstance(json_tests, list) or not all(isinstance(test, str) for test in json_tests):
+        problems.append('POSIX inventory tests must be a list of strings')
+    else:
+        inventory = Counter(json_tests)
+        runner = Counter(runner_ids)
+        if inventory != runner:
+            problems.append(
+                f'POSIX inventory mismatch: posix_tests.json only: {list((inventory - runner).elements())!r}, '
+                f'run_posix.py only: {list((runner - inventory).elements())!r}'
+            )
+
+    exception_ids = []
+    if not isinstance(json_exceptions, list):
+        problems.append('exceptions must be a list')
+    else:
+        for index, entry in enumerate(json_exceptions):
+            if not isinstance(entry, dict):
+                problems.append(f'exception {index} must be an object')
+                continue
+            for field in ('id', 'rationale', 'owner'):
+                value = entry.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    problems.append(f'exception {index} {field} must be a non-empty string')
+            exception_id = entry.get('id')
+            if isinstance(exception_id, str) and exception_id:
+                exception_ids.append(exception_id)
+
+    approved = Counter(windows_ids)
+    exceptions = Counter(exception_ids)
+    for exception_id, count in exceptions.items():
+        if count > 1:
+            problems.append(f'duplicate exception: {exception_id}')
+        if exception_id not in approved:
+            problems.append(f'stale exception: {exception_id}')
+        if exception_id in inventory:
+            problems.append(f'exception also in the POSIX inventory: {exception_id}')
+
+    if inventory + exceptions != approved:
+        deficit = approved - (inventory + exceptions)
+        surplus = (inventory + exceptions) - approved
+        if deficit:
+            problems.append(
+                f'approved Windows skips without an executing lane or exception: {sorted(deficit.elements())}'
+            )
+        if surplus:
+            problems.append(
+                'POSIX inventory or exceptions claim IDs that are not approved Windows skips: '
+                f'{sorted(surplus.elements())}'
+            )
+    return problems
+
+
+def _required_ids_from_runner(path):
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == 'REQUIRED_IDS' for t in node.targets
+        ):
+            return list(ast.literal_eval(node.value))
+    raise AssertionError('REQUIRED_IDS not found in run_posix.py')
+
+
+class PosixSkipOwnershipTests(unittest.TestCase):
+    def test_windows_platform_skips_have_an_executing_lane(self):
+        windows = json.loads((BASELINE.parent / 'offline_skips.json').read_text(encoding='utf-8'))['windows']
+        doc = json.loads((BASELINE.parent / 'posix_tests.json').read_text(encoding='utf-8'))
+        runner_ids = _required_ids_from_runner(BASELINE.parent / 'run_posix.py')
+        problems = posix_skip_ownership_problems(
+            windows, doc['tests'], doc['exceptions'] if 'exceptions' in doc else [], runner_ids
+        )
+        self.assertEqual(problems, [], '\n'.join(problems))
+
+    def setUp(self):
+        self.windows = {
+            'suite_a': ['PBZ_SKIP {"test": "__main__.SomeTests.test_one", "reason": "POSIX only"}'],
+        }
+        self.inventory = ['test_suite_a.SomeTests.test_one']
+        self.exception = dict(id=self.inventory[0], rationale='POSIX only', owner='CI')
+
+    def test_exceptions_must_be_a_list(self):
+        problems = posix_skip_ownership_problems(self.windows, self.inventory, {}, self.inventory)
+        self.assertIn('exceptions must be a list', problems)
+
+    def test_exceptions_null_is_not_a_list(self):
+        problems = posix_skip_ownership_problems(self.windows, self.inventory, None, self.inventory)
+        self.assertIn('exceptions must be a list', problems)
+
+    def test_exception_owner_must_not_be_empty(self):
+        exceptions = [dict(self.exception, owner='')]
+        problems = posix_skip_ownership_problems(self.windows, [], exceptions, [])
+        self.assertIn('exception 0 owner must be a non-empty string', problems)
+
+    def test_duplicate_exception_id(self):
+        exceptions = [self.exception, self.exception.copy()]
+        problems = posix_skip_ownership_problems(self.windows, [], exceptions, [])
+        self.assertIn('duplicate exception: test_suite_a.SomeTests.test_one', problems)
+
+    def test_stale_exception_id(self):
+        exceptions = [dict(self.exception, id='test_suite_a.SomeTests.test_other')]
+        problems = posix_skip_ownership_problems(self.windows, self.inventory, exceptions, self.inventory)
+        self.assertIn('stale exception: test_suite_a.SomeTests.test_other', problems)
+
+    def test_exception_id_also_in_posix_inventory(self):
+        problems = posix_skip_ownership_problems(self.windows, self.inventory, [self.exception], self.inventory)
+        self.assertIn('exception also in the POSIX inventory: test_suite_a.SomeTests.test_one', problems)
 
 
 if __name__ == '__main__':
