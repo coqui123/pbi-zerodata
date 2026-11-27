@@ -510,6 +510,17 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
                 _must_stay(os.path.join(bdir, *rel.split("/")), ws.private)
         for rel in orphan_bases:
             _must_stay(os.path.join(bdir, *rel.split("/")), ws.private)
+        for item in prepared:
+            rel, mtext = item["rel"], item["mtext"]
+            if (rel in keep and not item["old"] and mtext is not None
+                    and item.get("mine_text") == mtext):
+                _must_stay(os.path.join(bdir, *rel.split("/")), ws.private)
+        for rel in sorted(keep):
+            if rel in planned or rel not in deleted or man.get("files", {}).get(rel) is None:
+                continue
+            bpath = os.path.join(bdir, *rel.split("/"))
+            if os.path.lexists(bpath):
+                _must_stay(bpath, ws.private)
         tm.save()  # Persist token definitions durably before publishing any references.
     # Phase 2 reuses those strings. It does not read the same files again.
     for item in prepared:
@@ -525,6 +536,26 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
                 continue
             if old.get("real") == real_h:
                 new_files[rel] = old  # real unchanged; keep agent edits as they are
+                continue
+            if not old:
+                if mtext is not None and item["mine_text"] == mtext:
+                    write_text(mpath, mtext, bom, root=ws.mirror)
+                    write_text(os.path.join(bdir, *rel.split("/")), mtext, bom, root=ws.private)
+                    new_files[rel] = {"real": real_h, "mirror": file_sha(mpath)}
+                    for t in tokens.TOKEN_RE.findall(mtext):
+                        lab = t[1:-1].rsplit("#", 1)[0]
+                        kind = "column" if "[" in lab else lab.split(":")[0]
+                        counts[kind] = counts.get(kind, 0) + 1
+                else:
+                    conflicts.append(rel)
+                continue
+            if mtext is None:
+                conflicts.append(rel)
+                new_files[rel] = {"real": real_h, "mirror": old.get("mirror"), "lossy": True}
+                continue
+            if item.get("base_text") is None or old.get("lossy"):
+                conflicts.append(rel)
+                new_files[rel] = old
                 continue
             merged = _merge3(ws, project, rel, mtext, item["mine_text"], item["mine_bom"], item.get("base_text"))
             if merged is None:
@@ -547,6 +578,19 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
             lab = t[1:-1].rsplit("#", 1)[0]
             kind = "column" if "[" in lab else lab.split(":")[0]
             counts[kind] = counts.get(kind, 0) + 1
+    for rel in sorted(keep):
+        if rel in planned or rel in new_files:
+            continue
+        old = man.get("files", {}).get(rel)
+        if old is None:
+            continue
+        if rel in deleted:
+            bpath = os.path.join(bdir, *rel.split("/"))
+            if os.path.lexists(bpath):
+                remove_file(bpath, root=ws.private)
+            continue
+        conflicts.append(rel)
+        new_files[rel] = old
     for rel in man.get("files", {}):
         if rel not in new_files and rel not in keep:
             p = os.path.join(ws.mirror, *rel.split("/"))
@@ -646,9 +690,9 @@ def _merge3(ws: Workspace, project: Project, rel: str, theirs: str | None,
             except (OSError, UnicodeError, PbzError):
                 raise PbzError("REFUSED", rel) from None
         else:
-            base_text = theirs
+            raise PbzError("REFUSED", rel)
     elif base_text is None:
-        base_text = theirs
+        raise PbzError("REFUSED", rel)
     merged, clean = merge3(base_text, mine_text, theirs)
     write_text(mine, merged, mine_bom or b"", root=ws.mirror)
     write_text(base, theirs, mine_bom or b"", root=ws.private)
