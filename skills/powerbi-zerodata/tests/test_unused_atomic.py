@@ -13,12 +13,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL)
 
-from pbz import common, consumers, unused, usage  # noqa: E402
+from pbz import common, consumers, engdeps, unused, usage  # noqa: E402
 from pbz.common import PbzError  # noqa: E402
 from pbz.outcomes import envelope  # noqa: E402
 
@@ -1460,6 +1461,81 @@ class UnusedLoadedQueryTests(unittest.TestCase):
         self.assertEqual(graph.locks[self._tk("PolicySelf")], ["incremental refresh policy"])
         self.assertEqual(graph.state[self._tk("PolicySelf")], "locked")
 
+
+
+class EngdepsCompletenessTests(unittest.TestCase):
+    """`pbz unused --verify-engine` must not issue a definitive MATCH or DIFF
+    when the engine dependency inventory is truncated at the raw-row cap or
+    its completeness is unknown (older producer). Synthetic stubs only."""
+
+    NOTE = ("engine_only = edges the parser missed (report them); pbz_only = mirror edits not in Desktop "
+            "yet, or references the engine resolves differently")
+    NOTE_TRUNCATED = ("engine inventory truncated at the 200000 raw-row cap; engine_only and pbz_only are "
+                      "partial evidence only, not a definitive comparison")
+    NOTE_ABSENT = ("engine did not report inventory completeness; engine_only and pbz_only are "
+                   "partial evidence only, not a definitive comparison")
+    E1 = ["MEASURE", "Sales", "Total", "COLUMN", "Sales", "Amount"]
+    E2 = ["MEASURE", "Sales", "Other", "COLUMN", "Sales", "Amount"]
+
+    def _verify(self, engine_edges, **extra):
+        src = usage.key("measure", "Sales", "Total")
+        dst = usage.key("column", "Sales", "Amount")
+        edge = SimpleNamespace(src=src, dst=dst, via="dax")
+        graph = SimpleNamespace(edges=[edge], label=lambda k: k[2])
+        res = {"ok": True, "verb": "deps", "edges": engine_edges, **extra}
+        ws = SimpleNamespace(private="unused")
+        project = SimpleNamespace(name="Synthetic")
+        with patch.object(engdeps.desktop, "require_port", return_value=5555), \
+                patch.object(engdeps, "engine_call", return_value=res), \
+                patch.object(engdeps.usage, "build", return_value=graph):
+            return engdeps.verify(ws, project)
+
+    def _expected(self, result, engine_count, both, engine_only, pbz_only, note):
+        return {"verb": "unused-verify-engine", "project": "Synthetic", "result": result,
+                "edges": {"engine": engine_count, "pbz": 1, "both": both},
+                "engine_only": engine_only, "pbz_only": pbz_only, "note": note}
+
+    def test_complete_equal_inventory_matches(self):
+        out = self._verify([self.E1], truncated=False)
+        self.assertEqual(out, self._expected("MATCH", 1, 1, [], [], self.NOTE))
+
+    def test_complete_differing_inventory_diffs(self):
+        out = self._verify([self.E1, self.E2], truncated=False)
+        self.assertEqual(out, self._expected("DIFF", 2, 1, ["other -> amount"], [], self.NOTE))
+
+    def test_truncated_equal_inventory_is_incomplete(self):
+        out = self._verify([self.E1], truncated=True)
+        self.assertEqual(out, self._expected("INCOMPLETE", 1, 1, [], [], self.NOTE_TRUNCATED))
+
+    def test_truncated_differing_inventory_is_incomplete(self):
+        out = self._verify([self.E1, self.E2], truncated=True)
+        self.assertEqual(out, self._expected("INCOMPLETE", 2, 1, ["other -> amount"], [], self.NOTE_TRUNCATED))
+
+    def test_unreported_equal_inventory_is_incomplete(self):
+        out = self._verify([self.E1])
+        self.assertEqual(out, self._expected("INCOMPLETE", 1, 1, [], [], self.NOTE_ABSENT))
+
+    def test_unreported_differing_inventory_is_incomplete(self):
+        out = self._verify([self.E1, self.E2])
+        self.assertEqual(out, self._expected("INCOMPLETE", 2, 1, ["other -> amount"], [], self.NOTE_ABSENT))
+
+    def test_complete_duplicate_edges_still_match(self):
+        out = self._verify([self.E1, self.E1], truncated=False)
+        self.assertEqual(out, self._expected("MATCH", 1, 1, [], [], self.NOTE))
+
+    def test_truncated_duplicate_heavy_inventory_is_incomplete(self):
+        out = self._verify([self.E1, self.E1], truncated=True)
+        self.assertEqual(out, self._expected("INCOMPLETE", 1, 1, [], [], self.NOTE_TRUNCATED))
+
+    def test_outcome_mapping_for_incomplete_is_blocked(self):
+        base = {"verb": "unused-verify-engine", "project": "Synthetic",
+                "edges": {"engine": 1, "pbz": 1, "both": 1}, "engine_only": [], "pbz_only": [], "note": "fixture"}
+        out, rc = envelope({**base, "result": "INCOMPLETE"})
+        self.assertEqual((out["outcome"]["status"], out["outcome"]["code"], rc), ("BLOCKED", "INCOMPLETE", 3))
+        _out, rc = envelope({**base, "result": "MATCH"})
+        self.assertEqual(rc, 0)
+        _out, rc = envelope({**base, "result": "DIFF", "pbz_only": ["other -> amount"]})
+        self.assertEqual(rc, 1)
 
 if __name__ == "__main__":
     unittest.main()

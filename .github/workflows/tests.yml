@@ -61,6 +61,9 @@ jobs:
           name: serial
           path: skills/powerbi-zerodata/ci-results/*.json
           if-no-files-found: error
+      - name: Deps boundary tests
+        if: ${{ !cancelled() }}
+        run: dotnet run --project engine/boundary-tests -c Release
 
 
 
@@ -108,6 +111,9 @@ jobs:
           name: shard-${{ matrix.shard }}
           path: skills/powerbi-zerodata/ci-results/*.json
           if-no-files-found: error
+      - name: Deps boundary tests
+        if: ${{ !cancelled() }}
+        run: dotnet run --project engine/boundary-tests -c Release
   offline:
     if: always()
     needs: [serial, rollout-gate, shard]

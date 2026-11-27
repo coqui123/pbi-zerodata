@@ -2,7 +2,7 @@
 (DISCOVER_CALC_DEPENDENCY through pbz-engine `deps`). Needs the project open in Desktop. Names only.
 
 The engine reflects the model as loaded in Desktop, not unpushed mirror edits, and knows nothing about
-reports, so it is a cross-check of the parser, never the source of `pbz unused`."""
+reports, so it is a cross-check of the parser, never the source of `pbz unused`. The comparison is definitive only when the engine reports its inventory complete (`truncated` false); a truncated or unreported inventory yields INCOMPLETE."""
 from __future__ import annotations
 
 from . import desktop, usage
@@ -40,9 +40,20 @@ def verify(ws, project, extra_reports=()) -> dict:
     def lab(p):
         return f"{g.label(p[0])} -> {g.label(p[1])}"
 
+    if res.get("truncated") is True:
+        result = "INCOMPLETE"
+        note = ("engine inventory truncated at the 200000 raw-row cap; engine_only and pbz_only are "
+                "partial evidence only, not a definitive comparison")
+    elif res.get("truncated") is not False:
+        result = "INCOMPLETE"
+        note = ("engine did not report inventory completeness; engine_only and pbz_only are "
+                "partial evidence only, not a definitive comparison")
+    else:
+        result = "MATCH" if not engine_only and not pbz_only else "DIFF"
+        note = ("engine_only = edges the parser missed (report them); pbz_only = mirror edits not in Desktop "
+                "yet, or references the engine resolves differently")
     return {"verb": "unused-verify-engine", "project": project.name,
-            "result": "MATCH" if not engine_only and not pbz_only else "DIFF",
+            "result": result,
             "edges": {"engine": len(engine_edges), "pbz": len(ours), "both": len(engine_edges & ours)},
             "engine_only": [lab(p) for p in engine_only][:50], "pbz_only": [lab(p) for p in pbz_only][:50],
-            "note": "engine_only = edges the parser missed (report them); pbz_only = mirror edits not in Desktop "
-                    "yet, or references the engine resolves differently"}
+            "note": note}

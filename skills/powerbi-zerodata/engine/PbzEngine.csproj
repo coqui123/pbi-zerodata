@@ -27,7 +27,9 @@
 
   <ItemGroup>
     <Compile Remove="bin\**;obj\**;build\**" />
+    <Compile Remove="boundary-tests\**" />
     <None Remove="bin\**;obj\**;build\**" />
+    <None Remove="boundary-tests\**" />
   </ItemGroup>
 
 </Project>
