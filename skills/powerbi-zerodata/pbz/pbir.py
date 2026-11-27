@@ -194,6 +194,8 @@ def encode_literal(value, vtype: str) -> str:
         return "null"
     if vtype == "datetime":
         return f"datetime'{value}'"
+    if vtype == "datetimeoffset":
+        return f"datetimeoffset'{value}'"
     return str(value)
 
 
