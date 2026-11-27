@@ -426,8 +426,20 @@ def _pull_body(ws: Workspace, project: Project, force: bool = False, rebase: boo
         # Dropping a manifest entry and its mirror copy can leave an untracked base.
         # Sweep only unsupported locations so a later diff cannot use it as the old side.
         orphan_bases = []
-        if os.path.isdir(bdir):
-            for directory, _, names in os.walk(bdir):
+        try:
+            base_info = os.stat(bdir)
+        except FileNotFoundError:
+            base_info = None
+        except OSError:
+            raise PbzError("REFUSED", project.name) from None
+        if base_info is not None:
+            if not stat.S_ISDIR(base_info.st_mode):
+                raise PbzError("REFUSED", project.name)
+
+            def unreadable(_err):
+                raise PbzError("REFUSED", project.name) from None
+
+            for directory, _, names in os.walk(bdir, onerror=unreadable):
                 for name in names:
                     rel = os.path.relpath(os.path.join(directory, name), bdir)
                     rel = rel.replace(os.sep, "/")
