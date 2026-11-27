@@ -557,23 +557,39 @@ try {
     # Global settings also apply to implicit restore and referenced projects. The engine
     # sets BaseOutputPath itself, so override it along with the SDK artifacts layout.
     source_manifests = {source: _tree_manifest(source) for source in (helper, S / "engine")}
-    for attempt in range(2):
+    def expect_source_trees_unchanged(name: str) -> None:
+        source_changes = {str(source): changes for source, before in source_manifests.items()
+                          if (changes := _manifest_changes(before, _tree_manifest(source)))}
+        expect(name, not source_changes, {"paths": source_changes})
+
+    # Build the helper once, then execute the built apphost directly for both
+    # acceptance passes; the second pass no longer exercises an incremental rebuild.
+    try:
+        proc = subprocess.run(["dotnet", "build", str(helper / "Grouped.csproj"),
+                               "--artifacts-path", str(artifacts),
+                               f"-p:BaseOutputPath={artifacts / 'bin'}/"],
+                              capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        expect(label, False, {"reason": f"{type(exc).__name__}: {exc}"})
+        return
+    expect(f"{label} (build)", proc.returncode == 0,
+           {"exit": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace"),
+            "stderr": proc.stderr.decode("utf-8", "replace")})
+    expect_source_trees_unchanged("grouped streaming build: source trees unchanged")
+    executables = sorted(artifacts.rglob("Grouped.exe"))
+    for run_number in (1, 2):
         try:
-            proc = subprocess.run(["dotnet", "run", "--project", str(helper / "Grouped.csproj"),
-                                   "--artifacts-path", str(artifacts),
-                                   f"-p:BaseOutputPath={artifacts / 'bin'}/"],
-                                  capture_output=True, timeout=300)
+            if not executables:
+                raise FileNotFoundError(f"Grouped.exe not found under {artifacts}")
+            proc = subprocess.run([str(executables[0])], capture_output=True, timeout=300)
         except (OSError, subprocess.TimeoutExpired) as exc:
             expect(label, False, {"reason": f"{type(exc).__name__}: {exc}"})
             return
-        expect(f"{label} (build {attempt + 1})",
+        expect(f"{label} (run {run_number})",
                proc.returncode == 0 and b"grouped streaming acceptance passed" in proc.stdout,
                {"exit": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace"),
                 "stderr": proc.stderr.decode("utf-8", "replace")})
-        source_changes = {str(source): changes for source, before in source_manifests.items()
-                          if (changes := _manifest_changes(before, _tree_manifest(source)))}
-        expect(f"grouped streaming build {attempt + 1}: source trees unchanged",
-               not source_changes, {"paths": source_changes})
+        expect_source_trees_unchanged(f"grouped streaming run {run_number}: source trees unchanged")
 
 
 def test_offline(env: Env, tmp: Path) -> None:
@@ -1477,6 +1493,7 @@ class GroupedStreamingLauncherTests(unittest.TestCase):
             self.assertIn(type(error).__name__, detail["reason"])
             self.assertIn(str(error), detail["reason"])
             command = run.call_args.args[0]
+            self.assertEqual(command[:2], ["dotnet", "build"])
             artifacts = Path(directory) / "grouped-streaming-artifacts"
             self.assertEqual(command[command.index("--artifacts-path") + 1], str(artifacts))
             self.assertIn(f"-p:BaseOutputPath={artifacts / 'bin'}/", command)
