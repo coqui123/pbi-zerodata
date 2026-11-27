@@ -276,11 +276,16 @@ class Resolution:
 
 
 def resolve(ws, project, *, apply: bool) -> Resolution:
+    if apply:
+        # Identity writes (minting, rename refresh, ghost marking) are
+        # serialized by the workspace identity lock, so two first uses
+        # under different private roots cannot lose each other's registry
+        # records. Callers that already hold the lock re-enter it.
+        with identity_lock(ws):
+            return _resolve_inner(ws, project, apply=True)
     try:
-        return _resolve_inner(ws, project, apply=apply)
+        return _resolve_inner(ws, project, apply=False)
     except PbzError:
-        if apply:
-            raise
         # The unlocked observation can straddle a concurrent first use: the
         # anchor, the registry and the namespace set are published at
         # different moments under the identity lock, so a refusal may rest on
