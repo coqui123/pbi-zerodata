@@ -1134,6 +1134,23 @@ def _suggested_tests(ws, project, logic: list[str]) -> list[str]:
     if logic:
         out.append("pbz check with a compiles check per changed measure: " + ", ".join(logic[:10]))
     seen = set()
+    if project is not None:
+        # Per-project suggestions come only from the selected project's
+        # own namespace, resolved read-only (evidence never mints).
+        from . import identity as _identity
+        try:
+            project_id = _identity.resolve(ws, project, apply=False).project_id
+        except PbzError:
+            project_id = None
+        if project_id is not None:
+            _d, names = _state_names(ws, os.path.join("snapshots", "projects", project_id, "results"), base_dir=ws.private)
+            for name in names:
+                if name.endswith(".json"):
+                    stem = name[:-5]
+                    if stem and stem not in seen:
+                        seen.add(stem)
+                        out.append(f'pbz --project "{project.name}" snapshot compare {stem}')
+    legacy_seen = set()
     search_dirs = [
         (ws.private, os.path.join("snapshots", "results"), True),
         (ws.private, "snapshots", False),
@@ -1146,9 +1163,8 @@ def _suggested_tests(ws, project, logic: list[str]) -> list[str]:
             if is_results:
                 if name.endswith(".json"):
                     stem = name[:-5]
-                    if stem and stem not in seen:
-                        seen.add(stem)
-                        out.append(f"pbz snapshot compare {stem}")
+                    if stem:
+                        legacy_seen.add(stem)
             else:
                 if name.endswith(".json"):
                     if name.endswith(".spec.json"):
@@ -1160,18 +1176,19 @@ def _suggested_tests(ws, project, logic: list[str]) -> list[str]:
                             doc = json.loads(raw.decode("utf-8-sig"))
                             if is_snapshot_result_doc(doc):
                                 stem = name[:-5]
-                                if stem and stem not in seen:
-                                    seen.add(stem)
-                                    out.append(f"pbz snapshot compare {stem}")
+                                if stem:
+                                    legacy_seen.add(stem)
                         except PbzError:
                             raise
                         except (OSError, ValueError):
                             pass
                     else:
                         stem = name[:-5]
-                        if stem and stem not in seen:
-                            seen.add(stem)
-                            out.append(f"pbz snapshot compare {stem}")
+                        if stem:
+                            legacy_seen.add(stem)
+    for stem in sorted(legacy_seen):
+        target = f'"{project.name}"' if project is not None else "<project>"
+        out.append(f"legacy snapshot {stem} (unadopted): adopt with pbz snapshot adopt-legacy --project {target}")
     tdir, test_names = _state_names(ws, "synth-tests")
     names = {n.lower().strip("[]") for n in logic}
     for name in test_names:

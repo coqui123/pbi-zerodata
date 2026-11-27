@@ -351,15 +351,15 @@ class SnapshotStoreTests(unittest.TestCase):
         (self.flat_snaps / "pure_spec.spec.json").write_text('{"queries": [{"id": "q1"}]}', encoding="utf-8")
 
         suggested = evidence._suggested_tests(self.ws, None, [])
-        # Must include q1 from results
-        self.assertIn("pbz snapshot compare q1", suggested)
-        # Must include monthly.spec from result-shaped legacy file
-        self.assertIn("pbz snapshot compare monthly.spec", suggested)
-        # Must include legacy from legacy result file
-        self.assertIn("pbz snapshot compare legacy", suggested)
-        # Must NOT include pure_spec.spec (since that was a spec file in the legacy directory)
-        self.assertNotIn("pbz snapshot compare pure_spec.spec", suggested)
-        self.assertNotIn("pbz snapshot compare pure_spec", suggested)
+        # Re-pointed under S1: with no project selected there are no
+        # per-project compare suggestions at all; flat names are reported
+        # only in the legacy-labeled form naming the adopt-legacy remedy.
+        self.assertFalse(any("snapshot compare" in line for line in suggested))
+        self.assertTrue(any(line.startswith("legacy snapshot q1 ") and "adopt-legacy" in line for line in suggested))
+        self.assertTrue(any(line.startswith("legacy snapshot monthly.spec ") and "adopt-legacy" in line for line in suggested))
+        self.assertTrue(any(line.startswith("legacy snapshot legacy ") and "adopt-legacy" in line for line in suggested))
+        # pure_spec.spec was a spec file in the legacy directory: omitted everywhere
+        self.assertFalse(any("pure_spec" in line for line in suggested))
 
     def test_evidence_suggested_tests_pbz_state_b_dir_none(self):
         # Under .pbz/snapshots/ (b_dir=None path):
@@ -367,13 +367,14 @@ class SnapshotStoreTests(unittest.TestCase):
         pbz_snaps.mkdir(parents=True, exist_ok=True)
         (pbz_snaps / "shared_res.spec.json").write_text('{"queries": {}, "refreshed": "2026-01-01"}', encoding="utf-8")
         suggested = evidence._suggested_tests(self.ws, None, [])
-        self.assertIn("pbz snapshot compare shared_res.spec", suggested)
+        self.assertFalse(any("snapshot compare" in line for line in suggested))
+        self.assertTrue(any(line.startswith("legacy snapshot shared_res.spec ") and "adopt-legacy" in line for line in suggested))
 
     def test_evidence_suggested_tests_omits_invalid_refreshed_type(self):
         # Ambiguous legacy file with non-string/non-null refreshed is omitted from suggestions
         (self.flat_snaps / "bad_num_ref.spec.json").write_text('{"queries": {}, "refreshed": 123}', encoding="utf-8")
         suggested = evidence._suggested_tests(self.ws, None, [])
-        self.assertNotIn("pbz snapshot compare bad_num_ref.spec", suggested)
+        self.assertFalse(any("bad_num_ref" in line for line in suggested))
 
     def test_evidence_state_names_refuses_dot_dot_traversal(self):
         with self.assertRaises(PbzError) as ctx:
