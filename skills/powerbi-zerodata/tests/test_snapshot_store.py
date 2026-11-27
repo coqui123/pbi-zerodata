@@ -673,25 +673,45 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertFalse((self.snaps / "results" / "earlier.json").exists())
 
     def test_adapter_compare_reads_legacy_result_in_place(self):
-        # Adapter, not a live engine run. Legacy result and spec stay at their original paths.
-        (self.snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
+        # Re-pointed under S1: the flat pair is unadopted legacy state. The
+        # compare refuses while it is unadopted and leaves the flat bytes
+        # untouched; after adopt-legacy the same compare succeeds against
+        # the project's namespace, with the flat originals removed by the
+        # adoption itself and the adopted copies carrying the stamp.
+        (self.flat_snaps / "earlier.json").write_text(json.dumps(LEGACY_RESULT), encoding="utf-8")
         spec = {"queries": [{"id": "q1", "dax": "EVALUATE {1}"}]}
-        (self.snaps / "earlier.spec.json").write_text(json.dumps(spec), encoding="utf-8")
-        (self.snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
-        before = _tree(self.snaps)
+        (self.flat_snaps / "earlier.spec.json").write_text(json.dumps(spec), encoding="utf-8")
+        (self.flat_snaps / "notes.txt").write_text("keep\n", encoding="utf-8")
+        before = _tree(self.flat_snaps)
+        project_id = identity.read_anchor(self.ws, self.project)
 
         def fake_engine(verb, payload, timeout=1800, **kwargs):
+            if verb == "ping":
+                return {"ok": True, "snapshot_layout": "project-v1"}
             self.assertEqual(verb, "snapshot-compare")
-            self.assertTrue((self.snaps / "earlier.json").is_file())
-            self.assertFalse((self.snaps / "results" / "earlier.json").exists())
-            return {"ok": True, "payload_state": "may_have_been_sent", "queries": [{"id": "q1", "result": "SAME"}]}
+            self.assertEqual(payload["project_id"], project_id)
+            return {"ok": True, "project_id": project_id, "snapshot_layout": "project-v1",
+                    "queries": [{"id": "q1", "result": "SAME"}]}
 
         with patch("pbz.desktop.require_port", return_value=1), \
              patch("pbz.checks.engine_call", side_effect=fake_engine), \
              patch("pbz.checks.spend", return_value=True):
+            with self.assertRaises(PbzError) as raised:
+                checks.snapshot(self.ws, None, "compare", "earlier", spec)
+            self.assertEqual(raised.exception.code, "LEGACY_BASELINE_UNADOPTED")
+            self.assertEqual(_tree(self.flat_snaps), before)
+            report = checks.adopt_legacy(self.ws, self.project, confirm_fn=lambda plan: True)
+            self.assertTrue(report["ok"])
+            self.assertIn("earlier", report["adopted"])
             res = checks.snapshot(self.ws, None, "compare", "earlier", spec)
         self.assertTrue(res.get("ok"))
-        self.assertEqual(_tree(self.snaps), _tree_with_pending_lock(before, "earlier"))
+        self.assertFalse((self.flat_snaps / "earlier.json").exists())
+        self.assertFalse((self.flat_snaps / "earlier.spec.json").exists())
+        self.assertTrue((self.flat_snaps / "notes.txt").exists())
+        adopted_result = json.loads((self.snaps / "results" / "earlier.json").read_text(encoding="utf-8"))
+        self.assertEqual(adopted_result["project_id"], project_id)
+        adopted_spec = json.loads((self.snaps / "specs" / "earlier.json").read_text(encoding="utf-8"))
+        self.assertEqual(adopted_spec["project_id"], project_id)
 
     def test_adapter_monthly_names_do_not_share_files(self):
         # Adapter, not a live engine run. monthly and monthly.spec stay distinct.
@@ -1674,12 +1694,28 @@ with ExitStack() as stack:
         self.assertFalse(self.spec.exists())
 
     def test_case_12_public_compare_with_only_legacy_result(self):
-        self.snaps.mkdir()
-        (self.snaps / self.result.name).write_bytes(self._NEW_RESULT)
+        # Re-pointed under S1: a result held only in the flat store is
+        # unadopted legacy state. The public compare refuses and leaves the
+        # flat bytes untouched; after adopt-legacy the same compare
+        # succeeds against the project's namespace.
+        self.flat_snaps.mkdir(parents=True, exist_ok=True)
+        flat_result = self.flat_snaps / self.result.name
+        flat_result.write_bytes(self._NEW_RESULT)
+        proc = self._public_child("compare", explicit=True)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("LEGACY_BASELINE_UNADOPTED", proc.stdout + proc.stderr)
+        self.assertEqual(flat_result.read_bytes(), self._NEW_RESULT)
+        self.assertFalse(self.result.exists())
+        report = checks.adopt_legacy(self.ws, self.project, confirm_fn=lambda plan: True)
+        self.assertTrue(report["ok"])
+        self.assertIn("different", report["adopted"])
+        self.assertFalse(flat_result.exists())
+        self.assertTrue(self.result.exists())
+        adopted = json.loads(self.result.read_text(encoding="utf-8"))
+        self.assertEqual(adopted["project_id"], self.project_id)
         proc = self._public_child("compare", explicit=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["queries"][0]["result"], "MATCH")
-        self.assertFalse(self.result.exists())
 
     def test_case_12_public_save_does_not_expose_payload_state(self):
         for failure in (None, "TIMEOUT"):

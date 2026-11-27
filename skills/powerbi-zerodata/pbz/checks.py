@@ -11,6 +11,7 @@ import stat
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -968,116 +969,182 @@ def _legacy_snapshot_spec_path(ws, name: str) -> str:
     return path
 
 
+def _plan_snapshot_layout(ws) -> list:
+    """Read-only planning half of the layout migration.
+
+    Returns plan entries (old_path, target, kind, base, content,
+    already_exists). Raises the same refusals the combined function raised
+    in its first pass. Takes no lock and writes nothing.
+    """
+    if _reparse_link(ws.private):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    snaps = os.path.abspath(os.path.join(ws.private, "snapshots"))
+    if os.path.lexists(snaps):
+        if _reparse_link(snaps) or not os.path.isdir(snaps):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+    results_dir = os.path.join(snaps, "results")
+    specs_dir = os.path.join(snaps, "specs")
+
+    # Refuse pre-existing reparse points or non-directories before planning
+    for d in (results_dir, specs_dir):
+        if os.path.lexists(d) and (_reparse_link(d) or not os.path.isdir(d)):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+    if not os.path.lexists(snaps):
+        return []
+
+    plan = []
+    planned_targets: dict[str, bytes] = {}
+    for name in sorted(list_names(snaps)):
+        if name in ("results", "specs"):
+            continue
+        old_path = os.path.join(snaps, name)
+        if _reparse_link(old_path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        if os.path.isdir(old_path):
+            continue
+        if not name.endswith(".json"):
+            continue
+
+        content = read_checked(old_path, root=ws.private)
+        try:
+            doc = json.loads(content.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} has unparseable JSON")
+        if not isinstance(doc, dict):
+            raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} is not a JSON object")
+
+        # Content shape inspection:
+        # Query specs have "queries" as a list and must carry the .spec.json suffix.
+        # Results have "queries" as a dict and "refreshed" as str or null.
+        if is_snapshot_spec_doc(doc):
+            if not name.endswith(".spec.json"):
+                raise PbzError("CORRUPT_STATE", f"spec-shaped legacy file {name} lacks .spec.json suffix")
+            base = name[:-10]
+            kind = "spec"
+            target = os.path.join(specs_dir, base + ".json")
+        elif is_snapshot_result_doc(doc):
+            kind = "result"
+            base = name[:-5]
+            target = os.path.join(results_dir, base + ".json")
+        else:
+            raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} has unrecognized shape")
+
+        try:
+            _validate_snapshot_name(base)
+        except PbzError:
+            raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} resolves to invalid name {base}")
+
+        if _reparse_link(target):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+        # Intra-plan and on-disk collision detection
+        if target in planned_targets:
+            if planned_targets[target] != content:
+                raise PbzError("CONFLICT", f"snapshot migration conflict for target {os.path.basename(target)}")
+            plan.append((old_path, target, kind, base, content, True))
+        else:
+            planned_targets[target] = content
+            if os.path.lexists(target):
+                existing = read_checked(target, root=ws.private)
+                if existing != content:
+                    raise PbzError("CONFLICT", f"snapshot migration conflict for {name}")
+                plan.append((old_path, target, kind, base, content, True))
+            else:
+                plan.append((old_path, target, kind, base, content, False))
+    return plan
+
+
+def _execute_snapshot_layout(ws, plan, *, revalidate: bool, progress: list | None = None) -> dict:
+    """Executing half of the layout migration.
+
+    With revalidate=False this is the combined function's original second
+    pass exactly. With revalidate=True (the adoption executor), each entry
+    is re-read before it executes and refuses on any byte change, the
+    destination is checked before publication, the published copy is
+    re-read and hash-verified before the source is unlinked, and completed
+    entries are appended to progress before any refusal propagates.
+    """
+    snaps = os.path.abspath(os.path.join(ws.private, "snapshots"))
+    results_dir = os.path.join(snaps, "results")
+    specs_dir = os.path.join(snaps, "specs")
+    if not plan:
+        return {"migrated": False, "results": [], "specs": []}
+
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(specs_dir, exist_ok=True)
+    if _reparse_link(results_dir) or _reparse_link(specs_dir):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+
+    migrated_results = []
+    migrated_specs = []
+    for old_path, target, kind, base, content, already_exists in plan:
+        if revalidate:
+            current = read_checked(old_path, root=ws.private)
+            if current != content:
+                raise PbzError("CONFLICT", f"legacy snapshot file {os.path.basename(old_path)} changed after the plan was approved")
+            dest_raw = _read_bytes_or_none(target, ws.private)
+            if dest_raw is None:
+                _durable_replace_bytes(target, content, root=ws.private)
+                written = read_checked(target, root=ws.private)
+                if hashlib.sha256(written).digest() != hashlib.sha256(content).digest():
+                    raise PbzError("CORRUPT_STATE", f"legacy snapshot file {os.path.basename(old_path)} did not verify after publication")
+            elif dest_raw != content:
+                raise PbzError("CONFLICT", f"snapshot migration conflict for {os.path.basename(old_path)}")
+            remove_file(old_path, root=ws.private)
+        else:
+            if not already_exists:
+                replace_bytes(target, content, root=ws.private)
+            remove_file(old_path, root=ws.private)
+        if progress is not None:
+            progress.append((old_path, target, kind, base))
+        if kind == "result":
+            migrated_results.append(base)
+        else:
+            migrated_specs.append(base)
+
+    return {
+        "migrated": bool(migrated_results or migrated_specs),
+        "results": sorted(migrated_results),
+        "specs": sorted(migrated_specs),
+    }
+
+
+def _durable_replace_bytes(path, content: bytes, *, root) -> None:
+    """Atomic replace with the section 1 durability discipline: file fsync
+    on every platform, containing-directory fsync on POSIX. The resolved
+    containing directory must stay inside root, so a linked directory
+    cannot redirect the write outside the store."""
+    directory = os.path.dirname(path)
+    resolved_root = os.path.realpath(root)
+    resolved_dir = os.path.realpath(directory)
+    if resolved_dir != resolved_root and not resolved_dir.startswith(resolved_root + os.sep):
+        raise PbzError("UNSAFE_PATH", f"refusing to write outside the private store: {path}")
+    fd, temp = tempfile.mkstemp(dir=directory, prefix=".pbz-durable-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+    _snapshot_sync_dir(directory)
+
+
 def migrate_snapshot_layout(ws) -> dict:
     """Migrate legacy flat snapshots/ files into snapshots/results/ and snapshots/specs/.
 
     Protected by WorkspaceLock. Safe, two-pass, idempotent, and fail-closed.
     """
     with tokens.WorkspaceLock(ws.private):
-        if _reparse_link(ws.private):
-            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-        snaps = os.path.abspath(os.path.join(ws.private, "snapshots"))
-        if os.path.lexists(snaps):
-            if _reparse_link(snaps) or not os.path.isdir(snaps):
-                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-
-        results_dir = os.path.join(snaps, "results")
-        specs_dir = os.path.join(snaps, "specs")
-
-        # Refuse pre-existing reparse points or non-directories before planning
-        for d in (results_dir, specs_dir):
-            if os.path.lexists(d) and (_reparse_link(d) or not os.path.isdir(d)):
-                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-
-        if not os.path.lexists(snaps):
-            return {"migrated": False, "results": [], "specs": []}
-
-        # Pass 1: Read-only validation & planning. Strictly no filesystem mutation occurs in this pass.
-        plan = []
-        planned_targets: dict[str, bytes] = {}
-        for name in sorted(list_names(snaps)):
-            if name in ("results", "specs"):
-                continue
-            old_path = os.path.join(snaps, name)
-            if _reparse_link(old_path):
-                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-            if os.path.isdir(old_path):
-                continue
-            if not name.endswith(".json"):
-                continue
-
-            content = read_checked(old_path, root=ws.private)
-            try:
-                doc = json.loads(content.decode("utf-8-sig"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} has unparseable JSON")
-            if not isinstance(doc, dict):
-                raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} is not a JSON object")
-
-            # Content shape inspection:
-            # Query specs have "queries" as a list and must carry the .spec.json suffix.
-            # Results have "queries" as a dict and "refreshed" as str or null.
-            if is_snapshot_spec_doc(doc):
-                if not name.endswith(".spec.json"):
-                    raise PbzError("CORRUPT_STATE", f"spec-shaped legacy file {name} lacks .spec.json suffix")
-                base = name[:-10]
-                kind = "spec"
-                target = os.path.join(specs_dir, base + ".json")
-            elif is_snapshot_result_doc(doc):
-                kind = "result"
-                base = name[:-5]
-                target = os.path.join(results_dir, base + ".json")
-            else:
-                raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} has unrecognized shape")
-
-            try:
-                _validate_snapshot_name(base)
-            except PbzError:
-                raise PbzError("CORRUPT_STATE", f"legacy snapshot file {name} resolves to invalid name {base}")
-
-            if _reparse_link(target):
-                raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-
-            # Intra-plan and on-disk collision detection
-            if target in planned_targets:
-                if planned_targets[target] != content:
-                    raise PbzError("CONFLICT", f"snapshot migration conflict for target {os.path.basename(target)}")
-                plan.append((old_path, target, kind, base, content, True))
-            else:
-                planned_targets[target] = content
-                if os.path.lexists(target):
-                    existing = read_checked(target, root=ws.private)
-                    if existing != content:
-                        raise PbzError("CONFLICT", f"snapshot migration conflict for {name}")
-                    plan.append((old_path, target, kind, base, content, True))
-                else:
-                    plan.append((old_path, target, kind, base, content, False))
-
-        # Pass 2: Execution. Destination directories are created ONLY after Pass 1 validation succeeds.
-        if not plan:
-            return {"migrated": False, "results": [], "specs": []}
-
-        os.makedirs(results_dir, exist_ok=True)
-        os.makedirs(specs_dir, exist_ok=True)
-        if _reparse_link(results_dir) or _reparse_link(specs_dir):
-            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
-
-        migrated_results = []
-        migrated_specs = []
-        for old_path, target, kind, base, content, already_exists in plan:
-            if not already_exists:
-                replace_bytes(target, content, root=ws.private)
-            remove_file(old_path, root=ws.private)
-            if kind == "result":
-                migrated_results.append(base)
-            else:
-                migrated_specs.append(base)
-
-        return {
-            "migrated": bool(migrated_results or migrated_specs),
-            "results": sorted(migrated_results),
-            "specs": sorted(migrated_specs),
-        }
+        plan = _plan_snapshot_layout(ws)
+        return _execute_snapshot_layout(ws, plan, revalidate=False)
 
 
 _SNAPSHOT_ID = re.compile(r"\A[A-Za-z0-9_.:/\- ]{1,128}\Z")
@@ -2102,3 +2169,798 @@ def _classify_flat_pair(ws, name):
                 "CORRUPT_STATE", f"legacy snapshot spec for {name} is malformed"
             )
     return {"result": result_present, "spec": spec_present}
+
+
+# ---------------------------------------------------------------------------
+# Legacy adoption, file-only recovery, and rollback readout (S1 C3).
+# The library entry points here serve the human-only snapshot subcommands;
+# the CLI layer owns the HUMAN_ONLY gate and the typed confirmations.
+# ---------------------------------------------------------------------------
+
+_ADOPT_CLAIM_FIELDS = {"version", "target_name", "target_id", "adoption_id"}
+
+
+def _adopt_claim_path(ws):
+    return os.path.join(ws.private, "snapshots", "pending", "adopt-claim.json")
+
+
+def _read_adopt_claim(ws):
+    """(status, claim): status is 'absent', 'ok', or 'unverifiable'."""
+    path = _adopt_claim_path(ws)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return "absent", None
+    except OSError as error:
+        raise PbzError("LOCAL_STATE_UNAVAILABLE", f"adoption claim cannot be inspected: {error}") from error
+    try:
+        raw = read_checked(path, root=ws.private)
+    except PbzError:
+        return "unverifiable", None
+    except OSError:
+        return "unverifiable", None
+    try:
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return "unverifiable", None
+    if not isinstance(doc, dict) or not _ADOPT_CLAIM_FIELDS.issubset(doc):
+        return "unverifiable", None
+    if not identity.verify_doc(ws, doc):
+        return "unverifiable", None
+    return "ok", {field: value for field, value in doc.items() if field != "hmac"}
+
+
+def _write_adopt_claim(ws, claim) -> None:
+    signed = identity.sign_doc(ws, claim)
+    data = (json.dumps(signed, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    os.makedirs(os.path.dirname(_adopt_claim_path(ws)), exist_ok=True)
+    _durable_replace_bytes(_adopt_claim_path(ws), data, root=ws.private)
+
+
+def _clear_adopt_claim(ws) -> None:
+    try:
+        os.unlink(_adopt_claim_path(ws))
+    except FileNotFoundError:
+        pass
+
+
+def _stamped_bytes(doc, project_id) -> bytes:
+    # The stamped representation is deterministic for a given source
+    # document: the parsed document with project_id set, serialized the
+    # same way the adapter serializes stamped pair documents elsewhere.
+    stamped = dict(doc)
+    stamped["project_id"] = project_id
+    return json.dumps(stamped).encode("utf-8")
+
+
+def _hash_bytes(data) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+
+def _read_bytes_or_none(path, root):
+    """File bytes, or None when the file is proven absent. Absence is
+    established by lstat first: read_checked refuses a missing file with
+    UNSAFE_PATH, so absence is never inferred from a failed read."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise PbzError("LOCAL_STATE_UNAVAILABLE", f"snapshot state cannot be inspected: {error}") from error
+    return read_checked(path, root=root)
+
+
+def _adopt_journal_path(ws, project_id, name):
+    return os.path.join(ws.private, "snapshots", "projects", project_id, "pending", name + ".adopt.json")
+
+
+def _write_adopt_journal(ws, project_id, journal) -> None:
+    path = _adopt_journal_path(ws, project_id, journal["name"])
+    data = (json.dumps(journal, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    _snapshot_write(path, data, ".pbz-adopt-")
+
+
+def _read_adopt_journal(ws, project_id, name):
+    path = _adopt_journal_path(ws, project_id, name)
+    raw = _read_bytes_or_none(path, ws.private)
+    if raw is None:
+        return None
+    try:
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        raise PbzError("CORRUPT_STATE", f"adoption journal for {name} is unparseable") from error
+    fields = {"version", "name", "target_id", "adoption_id", "state", "unit",
+              "source_hashes", "expected_hashes", "dest_pre", "dest_pre_satisfied"}
+    if not isinstance(doc, dict) or not fields.issubset(doc) or doc.get("version") != 1 \
+            or doc.get("target_id") != project_id or doc.get("name") != name \
+            or doc.get("state") not in ("PLANNED", "COPIES_WRITTEN", "DONE") \
+            or not isinstance(doc.get("unit"), list) or not doc["unit"] \
+            or not all(isinstance(kind, str) for kind in doc["unit"]) \
+            or not set(doc["unit"]) <= {"result", "spec"}:
+        raise PbzError("CORRUPT_STATE", f"adoption journal for {name} is malformed")
+    for field in ("source_hashes", "expected_hashes", "dest_pre", "dest_pre_satisfied"):
+        mapping = doc.get(field)
+        if not isinstance(mapping, dict) or not set(doc["unit"]) <= set(mapping):
+            raise PbzError("CORRUPT_STATE", f"adoption journal for {name} is malformed")
+    if not all(isinstance(value, bool) for value in doc["dest_pre_satisfied"].values()):
+        raise PbzError("CORRUPT_STATE", f"adoption journal for {name} is malformed")
+    return doc
+
+
+def _list_adopt_journals(ws, project_id) -> list[str]:
+    directory = os.path.join(ws.private, "snapshots", "projects", project_id, "pending")
+    try:
+        entries = os.listdir(directory)
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise PbzError("LOCAL_STATE_UNAVAILABLE", f"adoption journals cannot be listed: {error}") from error
+    return sorted(entry[:-len(".adopt.json")] for entry in entries if entry.endswith(".adopt.json"))
+
+
+def _flat_pair_paths(ws, name):
+    return {
+        "result": _snapshot_result_path(ws, name, namespaced=True),
+        "spec": _snapshot_spec_path(ws, name),
+        "journal": os.path.join(ws.private, "snapshots", "pending", name + ".journal.json"),
+    }
+
+
+def _post_normalization_flat(ws, layout_plan):
+    """The flat pair inventory as it will stand after the approved layout
+    normalization executes: name -> {result: bytes|None, spec: bytes|None,
+    journal: bool}."""
+    inventory: dict[str, dict] = {}
+
+    def entry_for(name):
+        return inventory.setdefault(name, {"result": None, "spec": None, "journal": False})
+
+    results_dir = os.path.join(ws.private, "snapshots", "results")
+    specs_dir = os.path.join(ws.private, "snapshots", "specs")
+    for directory, kind in ((results_dir, "result"), (specs_dir, "spec")):
+        try:
+            entries = os.listdir(directory)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise PbzError("LOCAL_STATE_UNAVAILABLE", f"flat snapshot directory {directory} cannot be listed: {error}") from error
+        for entry in entries:
+            if entry.endswith(".json"):
+                path = os.path.join(directory, entry)
+                entry_for(entry[:-5])[kind] = read_checked(path, root=ws.private)
+    pending_dir = os.path.join(ws.private, "snapshots", "pending")
+    try:
+        entries = os.listdir(pending_dir)
+    except FileNotFoundError:
+        entries = []
+    except OSError as error:
+        raise PbzError("LOCAL_STATE_UNAVAILABLE", f"flat snapshot directory {pending_dir} cannot be listed: {error}") from error
+    for entry in entries:
+        if entry.endswith(".journal.json"):
+            entry_for(entry[:-len(".journal.json")])["journal"] = True
+    for _old, _target, kind, base, content, _exists in layout_plan:
+        entry_for(base)[kind] = content
+    return inventory
+
+
+def _plan_adoption(ws, target, target_id, exclude) -> dict:
+    """The read-only adoption plan for one target (canonical sequence step
+    2): the layout normalization listing as step 0 plus one entry per flat
+    name. target_id is the bound id, or the proposed id for a new target."""
+    layout = _plan_snapshot_layout(ws)
+    inventory = _post_normalization_flat(ws, layout)
+    names = []
+    foreign_stamped = []
+    for name in sorted(inventory):
+        if name in exclude:
+            names.append({"name": name, "status": "excluded"})
+            continue
+        unit_data = inventory[name]
+        if unit_data["journal"]:
+            names.append({"name": name, "status": "blocked-journal",
+                          "remedy": "pbz snapshot recover-legacy --name " + name})
+            continue
+        target_journal = os.path.join(ws.private, "snapshots", "projects", target_id,
+                                      "pending", name + ".journal.json")
+        if _inspected_present(target_journal):
+            names.append({"name": name, "status": "blocked-journal",
+                          "remedy": "pbz snapshot recover-pair --project " + target.name + " " + name})
+            continue
+        unit = [kind for kind in ("result", "spec") if unit_data[kind] is not None]
+        if not unit:
+            continue
+        entry = {"name": name, "status": "adoptable", "unit": unit,
+                 "source_hashes": {}, "expected_hashes": {}, "dest_pre": {}, "dest_pre_satisfied": {}}
+        conflict = False
+        for kind in unit:
+            raw = unit_data[kind]
+            try:
+                doc = json.loads(raw.decode("utf-8-sig"))
+            except (UnicodeDecodeError, ValueError, RecursionError) as error:
+                raise PbzError("CORRUPT_STATE", f"flat snapshot {kind} for {name} is unparseable; adoption changes nothing") from error
+            if not isinstance(doc, dict):
+                raise PbzError("CORRUPT_STATE", f"flat snapshot {kind} for {name} is not a snapshot document; adoption changes nothing")
+            if kind == "result" and not is_snapshot_result_doc(doc):
+                raise PbzError("CORRUPT_STATE", f"flat snapshot result for {name} does not have the snapshot result shape; adoption changes nothing")
+            if kind == "spec" and not is_snapshot_spec_doc(doc):
+                raise PbzError("CORRUPT_STATE", f"flat snapshot spec for {name} does not have the snapshot spec shape; adoption changes nothing")
+            stamp = doc.get("project_id")
+            if stamp is not None and stamp != target_id and name not in foreign_stamped:
+                foreign_stamped.append(name)
+            entry["source_hashes"][kind] = _hash_bytes(raw)
+            stamped = _stamped_bytes(doc, target_id)
+            entry["expected_hashes"][kind] = _hash_bytes(stamped)
+            if kind == "result":
+                dest = _snapshot_result_path(ws, name, namespaced=True, project_id=target_id)
+            else:
+                dest = _snapshot_spec_path(ws, name, project_id=target_id)
+            dest_raw = _read_bytes_or_none(dest, ws.private)
+            dest_hash = _hash_bytes(dest_raw) if dest_raw is not None else None
+            entry["dest_pre"][kind] = dest_hash
+            entry["dest_pre_satisfied"][kind] = dest_hash == entry["expected_hashes"][kind]
+            if dest_hash is not None and not entry["dest_pre_satisfied"][kind]:
+                conflict = True
+        if conflict:
+            entry["status"] = "conflict"
+        elif all(entry["dest_pre_satisfied"].values()):
+            entry["status"] = "already-adopted"
+        names.append(entry)
+    normalization = [
+        {"source": os.path.basename(old), "target": os.path.relpath(target_path, ws.private),
+         "kind": kind, "name": base, "sha256": _hash_bytes(content)}
+        for old, target_path, kind, base, content, _exists in layout
+    ]
+    plan = {"target": target.name, "target_id": target_id,
+            "normalization": normalization, "names": names,
+            "foreign_stamped": foreign_stamped}
+    return plan, layout
+
+
+def _remove_flat_original(ws, name, kind, expected_hash) -> bool:
+    """Remove one flat original after re-verifying its hash. Returns False
+    when the original is already gone (a completed sub-step of a crash)."""
+    path = _flat_pair_paths(ws, name)[kind]
+    raw = _read_bytes_or_none(path, ws.private)
+    if raw is None:
+        return False
+    if _hash_bytes(raw) != expected_hash:
+        raise PbzError("ADOPTION_RECOVERY_BLOCKED", f"flat {kind} for {name} changed before removal; nothing further was deleted")
+    remove_file(path, root=ws.private)
+    return True
+
+
+def _verify_published_destinations(ws, journal) -> None:
+    """Every published destination half must still hash to the journal's
+    expected stamped hash before any flat original is removed."""
+    name = journal["name"]
+    target_id = journal["target_id"]
+    for kind in journal["unit"]:
+        dest = _snapshot_result_path(ws, name, namespaced=True, project_id=target_id) if kind == "result" \
+            else _snapshot_spec_path(ws, name, project_id=target_id)
+        raw = _read_bytes_or_none(dest, ws.private)
+        if raw is None or _hash_bytes(raw) != journal["expected_hashes"][kind]:
+            raise PbzError("ADOPTION_RECOVERY_BLOCKED", f"adopted {kind} for {name} does not verify against the adoption journal; no original was removed")
+
+
+def _finish_adoption_name(ws, journal) -> None:
+    """From verified published copies: remove the flat originals, advance
+    the journal to DONE, and delete it."""
+    _verify_published_destinations(ws, journal)
+    name = journal["name"]
+    for kind in journal["unit"]:
+        _remove_flat_original(ws, name, kind, journal["source_hashes"][kind])
+    journal = dict(journal, state="DONE")
+    _write_adopt_journal(ws, journal["target_id"], journal)
+    os.unlink(_adopt_journal_path(ws, journal["target_id"], name))
+
+
+def _settle_adoption_journal(ws, journal) -> str:
+    """Settle one adoption journal under the transition table. Returns
+    'completed', 'restart' (nothing published; the name re-enters fresh
+    planning), or 'blocked'."""
+    name = journal["name"]
+    target_id = journal["target_id"]
+    unit = journal["unit"]
+
+    def dest_hash(kind):
+        if kind == "result":
+            path = _snapshot_result_path(ws, name, namespaced=True, project_id=target_id)
+        else:
+            path = _snapshot_spec_path(ws, name, project_id=target_id)
+        raw = _read_bytes_or_none(path, ws.private)
+        return _hash_bytes(raw) if raw is not None else None
+
+    def source_hash(kind):
+        path = _flat_pair_paths(ws, name)[kind]
+        raw = _read_bytes_or_none(path, ws.private)
+        return _hash_bytes(raw) if raw is not None else None
+
+    current = {kind: dest_hash(kind) for kind in unit}
+    for kind in unit:
+        if current[kind] is not None and current[kind] != journal["dest_pre"][kind] \
+                and current[kind] != journal["expected_hashes"][kind]:
+            return "blocked"
+    if journal["state"] == "DONE":
+        os.unlink(_adopt_journal_path(ws, target_id, name))
+        return "completed"
+    if journal["state"] == "COPIES_WRITTEN":
+        for kind in unit:
+            if current[kind] != journal["expected_hashes"][kind]:
+                # A copy that verified before the state advanced no longer
+                # verifies: external interference. Delete nothing further.
+                return "blocked"
+        try:
+            _finish_adoption_name(ws, journal)
+        except PbzError as error:
+            if error.code == "ADOPTION_RECOVERY_BLOCKED":
+                return "blocked"
+            raise
+        return "completed"
+
+    # PLANNED: classify publication progress per the observable test.
+    published = [kind for kind in unit
+                 if current[kind] == journal["expected_hashes"][kind] and not journal["dest_pre_satisfied"][kind]]
+    satisfied = [kind for kind in unit if current[kind] == journal["expected_hashes"][kind]]
+    if len(satisfied) == len(unit):
+        journal = dict(journal, state="COPIES_WRITTEN")
+        _write_adopt_journal(ws, target_id, journal)
+        try:
+            _finish_adoption_name(ws, journal)
+        except PbzError as error:
+            if error.code == "ADOPTION_RECOVERY_BLOCKED":
+                return "blocked"
+            raise
+        return "completed"
+    if published:
+        # Complete publication of the pending halves, spec first.
+        for kind in ("spec", "result"):
+            if kind not in unit or current[kind] == journal["expected_hashes"][kind]:
+                continue
+            staged = os.path.join(ws.private, "snapshots", "projects", target_id, "pending", name + ".adopt-" + kind)
+            raw = _read_bytes_or_none(staged, ws.private)
+            data = raw if raw is not None and _hash_bytes(raw) == journal["expected_hashes"][kind] else None
+            if data is None:
+                if source_hash(kind) != journal["source_hashes"][kind]:
+                    return "blocked"
+                raw_source = read_checked(_flat_pair_paths(ws, name)[kind], root=ws.private)
+                doc = json.loads(raw_source.decode("utf-8-sig"))
+                data = _stamped_bytes(doc, target_id)
+                if _hash_bytes(data) != journal["expected_hashes"][kind]:
+                    return "blocked"
+                _durable_replace_bytes(staged, data, root=ws.private)
+            dest = _snapshot_result_path(ws, name, namespaced=True, project_id=target_id) if kind == "result" \
+                else _snapshot_spec_path(ws, name, project_id=target_id)
+            os.replace(staged, dest)
+            _snapshot_sync_dir(os.path.dirname(dest))
+        journal = dict(journal, state="COPIES_WRITTEN")
+        _write_adopt_journal(ws, target_id, journal)
+        try:
+            _finish_adoption_name(ws, journal)
+        except PbzError as error:
+            if error.code == "ADOPTION_RECOVERY_BLOCKED":
+                return "blocked"
+            raise
+        return "completed"
+
+    # Nothing published: verify the flat originals, discard this adoption's
+    # own staging artifacts (exact-hash proof only), and restart the name.
+    for kind in unit:
+        if source_hash(kind) != journal["source_hashes"][kind]:
+            return "blocked"
+    for kind in unit:
+        staged = os.path.join(ws.private, "snapshots", "projects", target_id, "pending", name + ".adopt-" + kind)
+        raw = _read_bytes_or_none(staged, ws.private)
+        if raw is None:
+            continue
+        if _hash_bytes(raw) != journal["expected_hashes"][kind]:
+            return "blocked"
+        os.unlink(staged)
+    os.unlink(_adopt_journal_path(ws, target_id, name))
+    return "restart"
+
+
+def _adopt_one_name(ws, target_id, adoption_id, entry) -> str:
+    """Move one planned name into the target namespace under both pair
+    locks. Returns 'adopted', 'already-adopted', or 'conflict'."""
+    name = entry["name"]
+    flat_pair = _SnapshotPair(ws, name)
+    target_pair = _SnapshotPair(ws, name, project_id=target_id)
+    with flat_pair.locked("save"):
+        with target_pair.locked("save"):
+            # Locked revalidation: the plan's hashes must still hold.
+            for kind in entry["unit"]:
+                raw = _read_bytes_or_none(_flat_pair_paths(ws, name)[kind], ws.private)
+                if raw is None or _hash_bytes(raw) != entry["source_hashes"][kind]:
+                    return "conflict"
+                dest = target_pair.result if kind == "result" else target_pair.spec
+                dest_raw = _read_bytes_or_none(dest, ws.private)
+                dest_hash = _hash_bytes(dest_raw) if dest_raw is not None else None
+                if dest_hash != entry["dest_pre"][kind]:
+                    return "conflict"
+            if _inspected_present(os.path.join(target_pair.pending, name + ".journal.json")):
+                return "blocked"
+            journal = {
+                "version": 1, "name": name, "target_id": target_id,
+                "adoption_id": adoption_id, "state": "PLANNED",
+                "unit": entry["unit"],
+                "source_hashes": entry["source_hashes"],
+                "expected_hashes": entry["expected_hashes"],
+                "dest_pre": entry["dest_pre"],
+                "dest_pre_satisfied": entry["dest_pre_satisfied"],
+            }
+            _write_adopt_journal(ws, target_id, journal)
+            pending = os.path.join(ws.private, "snapshots", "projects", target_id, "pending")
+            for kind in entry["unit"]:
+                if entry["dest_pre_satisfied"][kind]:
+                    continue
+                raw = read_checked(_flat_pair_paths(ws, name)[kind], root=ws.private)
+                doc = json.loads(raw.decode("utf-8-sig"))
+                data = _stamped_bytes(doc, target_id)
+                if _hash_bytes(data) != entry["expected_hashes"][kind]:
+                    raise PbzError("CORRUPT_STATE", f"stamped copy for {name} does not match the approved plan")
+                _durable_replace_bytes(os.path.join(pending, name + ".adopt-" + kind), data, root=ws.private)
+            for kind in ("spec", "result"):
+                if kind not in entry["unit"] or entry["dest_pre_satisfied"][kind]:
+                    continue
+                staged = os.path.join(pending, name + ".adopt-" + kind)
+                dest = target_pair.spec if kind == "spec" else target_pair.result
+                os.replace(staged, dest)
+                _snapshot_sync_dir(os.path.dirname(dest))
+            _verify_published_destinations(ws, journal)
+            journal = dict(journal, state="COPIES_WRITTEN")
+            _write_adopt_journal(ws, target_id, journal)
+            _finish_adoption_name(ws, journal)
+            return "adopted"
+
+
+def adopt_legacy(ws, target, *, exclude=frozenset(), confirm_fn) -> dict:
+    """adopt-legacy: the canonical adoption sequence of the approved
+    design, steps 1 to 8. confirm_fn receives the plan and must return
+    True before the claim (the first write) is set."""
+    with identity.identity_lock(ws):
+        claim_status, claim = _read_adopt_claim(ws)
+        if claim_status == "unverifiable":
+            # The claim itself is unreadable, but adoption journals settle
+            # from their own recorded state: finish what a previous,
+            # owner-confirmed adoption started, then refuse. Once no
+            # journal remains, --cancel-claim can clear the dead claim.
+            resolution = identity.resolve(ws, target, apply=False)
+            settled_names = []
+            if resolution.project_id is not None:
+                target_id = resolution.project_id
+                _ensure_project_namespace(ws, target_id)
+                guard = _acquire_project_guard(ws, target_id, mode="shared")
+                try:
+                    for name in _list_adopt_journals(ws, target_id):
+                        journal = _read_adopt_journal(ws, target_id, name)
+                        flat_pair = _SnapshotPair(ws, name)
+                        target_pair = _SnapshotPair(ws, name, project_id=target_id)
+                        with flat_pair.locked("save"):
+                            with target_pair.locked("save"):
+                                if _inspected_present(os.path.join(flat_pair.pending, name + ".journal.json")) \
+                                        or _inspected_present(os.path.join(target_pair.pending, name + ".journal.json")):
+                                    continue
+                                if _settle_adoption_journal(ws, journal) == "completed":
+                                    settled_names.append(name)
+                finally:
+                    _snapshot_close_handle(guard)
+            raise PbzError("ADOPTION_CLAIMED", f"the adoption claim cannot be verified; settled {len(settled_names)} adoption journal(s) for {target.name} from their recorded state and started no new adoption; when no journal remains, clear the claim with pbz snapshot adopt-legacy --cancel-claim")
+        resolution = identity.resolve(ws, target, apply=False)
+        bound_id = resolution.project_id
+        if claim is not None:
+            if claim["target_name"] != target.name:
+                raise PbzError("ADOPTION_CLAIMED", f"flat snapshot state is claimed by an adoption for project {claim['target_name']}; only that target's adoption may resume it")
+            adoption_id = claim["adoption_id"]
+            target_id = claim["target_id"]
+            if bound_id is not None and target_id is not None and bound_id != target_id:
+                raise PbzError("ADOPTION_CLAIMED", "the adoption claim names a different identity than the target's current binding")
+            resuming = True
+        else:
+            adoption_id = str(uuid.uuid4())
+            target_id = bound_id if bound_id is not None else str(uuid.uuid4())
+            resuming = False
+
+        # Settlement requires the namespace and its guard, so it runs only
+        # for an already-bound target; a claim taken before binding has no
+        # namespace and therefore no journals to settle, and its binding
+        # step follows the plan confirmation below, as in the canonical
+        # sequence.
+        guard = None
+        settled, blocked = [], []
+        if bound_id is not None:
+            _ensure_project_namespace(ws, target_id)
+            guard = _acquire_project_guard(ws, target_id, mode="shared")
+        try:
+            if bound_id is not None:
+                # Journal-first settlement: every journal of this claim's
+                # adoption settles from its own recorded state, under the
+                # flat and target pair locks, before fresh planning.
+                for name in _list_adopt_journals(ws, target_id):
+                    journal = _read_adopt_journal(ws, target_id, name)
+                    if journal["adoption_id"] != adoption_id:
+                        blocked.append({"name": name, "reason": "foreign adoption journal from an earlier adoption"})
+                        continue
+                    flat_pair = _SnapshotPair(ws, name)
+                    target_pair = _SnapshotPair(ws, name, project_id=target_id)
+                    with flat_pair.locked("save"):
+                        with target_pair.locked("save"):
+                            if _inspected_present(os.path.join(flat_pair.pending, name + ".journal.json")) \
+                                    or _inspected_present(os.path.join(target_pair.pending, name + ".journal.json")):
+                                blocked.append({"name": name, "reason": "an unsettled pair journal blocks settlement of this name"})
+                                continue
+                            outcome = _settle_adoption_journal(ws, journal)
+                    if outcome == "completed":
+                        settled.append(name)
+                    elif outcome == "blocked":
+                        blocked.append({"name": name, "reason": "adoption recovery blocked; see pbz snapshot rollback-check"})
+                    # A "restart" outcome deleted the journal and left the
+                    # flat pair untouched; the name re-enters fresh planning.
+
+            plan, layout = _plan_adoption(ws, target, target_id, exclude)
+            plan["adoption_id"] = adoption_id
+            plan["resuming"] = resuming
+            plan["settled_before_plan"] = settled
+            plan["blocked"] = blocked
+            if plan["foreign_stamped"]:
+                raise PbzError("CORRUPT_STATE", f"flat snapshot documents for {', '.join(plan['foreign_stamped'])} already carry another project's stamp; adoption never re-stamps another project's documents")
+            if not confirm_fn(plan):
+                return {"ok": False, "confirmed": False, "command": "adopt-legacy", "plan": plan}
+
+            if claim is None:
+                _write_adopt_claim(ws, {"version": 1, "target_name": target.name,
+                                        "target_id": target_id, "adoption_id": adoption_id})
+            if bound_id is None:
+                identity.mint_with_id(ws, target, target_id)
+                bound_id = target_id
+                _ensure_project_namespace(ws, target_id)
+                guard = _acquire_project_guard(ws, target_id, mode="shared")
+
+            report = {"ok": True, "confirmed": True, "command": "adopt-legacy",
+                      "target": target.name, "target_id": target_id,
+                      "adopted": list(settled), "conflicts": [], "blocked": list(blocked),
+                      "excluded": sorted(exclude), "partial": False}
+
+            if layout:
+                lock_names = set()
+                for old, _t, _kind, base, _content, _exists in layout:
+                    lock_names.add(base)
+                    filename = os.path.basename(old)
+                    if filename.endswith(".spec.json"):
+                        lock_names.add(filename[:-len(".json")])
+                flat_pairs = [_SnapshotPair(ws, lock_name) for lock_name in sorted(lock_names)]
+                contexts = [pair.locked("save") for pair in flat_pairs]
+                entered = []
+                try:
+                    for context in contexts:
+                        context.__enter__()
+                        entered.append(context)
+                    progress: list = []
+                    try:
+                        with tokens.WorkspaceLock(ws.private):
+                            _execute_snapshot_layout(ws, layout, revalidate=True, progress=progress)
+                    except PbzError as error:
+                        report["normalization"] = {"completed": [base for _o, _t, _k, base in progress],
+                                                   "failed": error.code}
+                        report["partial"] = True
+                        return report
+                finally:
+                    for context in reversed(entered):
+                        context.__exit__(None, None, None)
+
+            blocked_names = {entry["name"] for entry in blocked}
+            settled_names = set(settled)
+            journal_names = set(_list_adopt_journals(ws, target_id))
+            for entry in plan["names"]:
+                name = entry["name"]
+                if entry["status"] == "excluded":
+                    continue
+                if name in settled_names and entry["status"] == "already-adopted":
+                    # Settled from its journal in this run; the plan entry
+                    # only reflects the state settlement produced.
+                    continue
+                if name in blocked_names or name in journal_names:
+                    if not any(item["name"] == name for item in report["blocked"]):
+                        report["blocked"].append({"name": name, "reason": "an adoption journal for this name is unresolved"})
+                    continue
+                if entry["status"] == "blocked-journal":
+                    report["blocked"].append({"name": name, "reason": entry["remedy"]})
+                    continue
+                if entry["status"] == "conflict":
+                    report["conflicts"].append(name)
+                    continue
+                outcome = _adopt_one_name(ws, target_id, adoption_id, entry)
+                if outcome == "conflict":
+                    report["conflicts"].append(name)
+                elif outcome == "blocked":
+                    report["blocked"].append({"name": name, "reason": "an unsettled pair journal blocks this name; see pbz snapshot rollback-check"})
+                else:
+                    report["adopted"].append(name)
+        finally:
+            if guard is not None:
+                _snapshot_close_handle(guard)
+
+        remaining = _list_adopt_journals(ws, target_id)
+        unresolved = [name for name in remaining
+                      if _read_adopt_journal(ws, target_id, name)["adoption_id"] == adoption_id]
+        if unresolved:
+            report["partial"] = True
+            already = {entry["name"] for entry in report["blocked"]}
+            report["blocked"].extend({"name": name, "reason": "adoption journal unresolved"}
+                                      for name in unresolved if name not in already)
+        else:
+            _clear_adopt_claim(ws)
+            report["claim_released"] = True
+        report["partial"] = report["partial"] or bool(report["blocked"]) or bool(report["conflicts"])
+        return report
+
+
+def _adopt_journal_names_anywhere(ws, project_id) -> list[str]:
+    """Adoption journal names for one identity in the active namespace
+    and, when the namespace was quarantined, in quarantine."""
+    names = list(_list_adopt_journals(ws, project_id))
+    pending = os.path.join(ws.private, "snapshots", "quarantine", project_id, "pending")
+    try:
+        entries = os.listdir(pending)
+    except FileNotFoundError:
+        entries = []
+    except OSError as error:
+        raise PbzError("LOCAL_STATE_UNAVAILABLE", f"quarantined namespace {project_id} cannot be listed: {error}") from error
+    names.extend(entry[:-len(".adopt.json")] for entry in entries if entry.endswith(".adopt.json"))
+    return sorted(set(names))
+
+
+def cancel_adoption_claim(ws) -> dict:
+    """adopt-legacy --cancel-claim: release the claim when no adoption
+    journal for it remains unresolved. The target stays bound."""
+    with identity.identity_lock(ws):
+        claim_status, claim = _read_adopt_claim(ws)
+        if claim_status == "absent":
+            return {"ok": True, "command": "adopt-legacy --cancel-claim", "claim": None}
+        if claim_status == "unverifiable":
+            outstanding = []
+            for project_id in sorted(identity.namespace_ids(ws) | identity.quarantine_ids(ws)):
+                outstanding.extend(f"{project_id}/{name}"
+                                   for name in _adopt_journal_names_anywhere(ws, project_id))
+            if outstanding:
+                raise PbzError("ADOPTION_CLAIMED", f"the adoption claim cannot be verified and adoption journals remain ({', '.join(outstanding)}); re-run pbz snapshot adopt-legacy for the target to settle them, then cancel")
+            _clear_adopt_claim(ws)
+            return {"ok": True, "command": "adopt-legacy --cancel-claim",
+                    "claim": "unverifiable claim cleared; no adoption journals were outstanding"}
+        target_id = claim["target_id"]
+        unresolved = []
+        if target_id is not None:
+            for name in _adopt_journal_names_anywhere(ws, target_id):
+                active = _read_adopt_journal(ws, target_id, name)
+                if active is not None and active["adoption_id"] == claim["adoption_id"]:
+                    unresolved.append(name)
+                raw = _read_bytes_or_none(os.path.join(
+                    ws.private, "snapshots", "quarantine", target_id, "pending", name + ".adopt.json"), ws.private)
+                if raw is not None:
+                    try:
+                        doc = json.loads(raw.decode("utf-8-sig"))
+                    except (UnicodeDecodeError, ValueError, RecursionError):
+                        doc = None
+                    required = {"version", "name", "target_id", "adoption_id", "state", "unit",
+                                "source_hashes", "expected_hashes", "dest_pre", "dest_pre_satisfied"}
+                    if not isinstance(doc, dict) or not required.issubset(doc) \
+                            or not isinstance(doc.get("adoption_id"), str) or not doc["adoption_id"] \
+                            or doc.get("target_id") != target_id or doc.get("name") != name:
+                        # Ownership of the quarantined copy cannot be
+                        # established; the claim stays until it can.
+                        unresolved.append(name + " (quarantined journal unreadable)")
+                    elif doc["adoption_id"] == claim["adoption_id"]:
+                        unresolved.append(name)
+        if unresolved:
+            raise PbzError("ADOPTION_CLAIMED", f"cancellation refused: adoption journals remain unresolved for {', '.join(unresolved)}; re-run pbz snapshot adopt-legacy --project {claim['target_name']} to settle them")
+        _clear_adopt_claim(ws)
+        return {"ok": True, "command": "adopt-legacy --cancel-claim",
+                "claim": claim, "target_stays_bound": target_id}
+
+
+def recover_legacy(ws, name) -> dict:
+    """recover-legacy: settle one flat pair journal with compare-mode
+    recovery. No engine, no port, no budget; binds nothing."""
+    _validate_snapshot_name(name)
+    with identity.identity_lock(ws):
+        pair = _SnapshotPair(ws, name)
+        with pair.locked("compare"):
+            pair.validate_transient()
+            if not _inspected_present(pair.journal):
+                return {"ok": True, "command": "recover-legacy", "name": name, "journal": None}
+            journal = pair.read_journal()
+            pair.recover("compare")
+            return {"ok": True, "command": "recover-legacy", "name": name,
+                    "journal": journal.get("state") if journal else None, "settled": True}
+
+
+def recover_pair(ws, target, name) -> dict:
+    """recover-pair: ordinary pair recovery inside one project's
+    namespace, with no capability ping and no engine contact."""
+    _validate_snapshot_name(name)
+    resolution = identity.resolve(ws, target, apply=False)
+    if resolution.project_id is None:
+        raise PbzError("PROJECT_IDENTITY_UNBOUND", f"project {target.name} has no bound identity; there is no namespace to recover in")
+    project_id = resolution.project_id
+    pair = _SnapshotPair(ws, name, project_id=project_id)
+    guard = _acquire_project_guard(ws, project_id, mode="shared")
+    try:
+        anchors = identity.discover_anchors(ws)
+        registry = identity.load_registry(ws)
+        record = (registry or {}).get(project_id)
+        if anchors.get(target.name.lower()) != project_id or record is None \
+                or record["status"] != "bound" or record["name"] != target.name:
+            raise PbzError("PROJECT_IDENTITY_CHANGED", f"project {target.name} no longer resolves to identity {project_id}")
+        with pair.locked("compare"):
+            # No ADOPTION_IN_PROGRESS refusal here: recover-pair is the
+            # remedy that unblocks an adoption settlement waiting on this
+            # pair journal, and adoption revalidates every byte it
+            # publishes, so settling the pair first cannot be raced into
+            # a wrong adoption outcome. (Ordinary save and compare do
+            # refuse while an adoption journal exists.)
+            pair.validate_transient()
+            if not _inspected_present(pair.journal):
+                return {"ok": True, "command": "recover-pair", "name": name, "journal": None}
+            journal = pair.read_journal()
+            pair.recover("compare")
+            return {"ok": True, "command": "recover-pair", "name": name,
+                    "journal": journal.get("state") if journal else None, "settled": True}
+    finally:
+        _snapshot_close_handle(guard)
+
+
+def rollback_check(ws) -> dict:
+    """rollback-check: read-only unsettled-state readout for the private
+    store this invocation resolved. Changes nothing."""
+    def _listdir(directory):
+        try:
+            return sorted(os.listdir(directory)), False
+        except FileNotFoundError:
+            return [], False
+        except OSError:
+            return [], True
+
+    flat = {"store": "flat", "pair_journals": [], "adoption_journals": []}
+    pending_dir = os.path.join(ws.private, "snapshots", "pending")
+    entries, unreadable = _listdir(pending_dir)
+    if unreadable:
+        flat["unreadable"] = True
+    for entry in entries:
+        if entry.endswith(".journal.json"):
+            name = entry[:-len(".journal.json")]
+            try:
+                doc = _load_snapshot_json(ws, os.path.join(pending_dir, entry))
+                flat["pair_journals"].append({"name": name, "state": doc.get("state") if isinstance(doc, dict) else None})
+            except PbzError:
+                flat["pair_journals"].append({"name": name, "state": "unreadable"})
+    stores = [flat]
+    store_ids = [(project_id, False) for project_id in sorted(identity.namespace_ids(ws))]
+    store_ids += [(project_id, True) for project_id in sorted(identity.quarantine_ids(ws))]
+    for project_id, in_quarantine in store_ids:
+        base = os.path.join(ws.private, "snapshots", "quarantine" if in_quarantine else "projects", project_id, "pending")
+        store = {"store": project_id, "quarantined": in_quarantine, "pair_journals": [], "adoption_journals": []}
+        entries, unreadable = _listdir(base)
+        if unreadable:
+            store["unreadable"] = True
+        for entry in entries:
+            if entry.endswith(".journal.json") and not entry.endswith(".adopt.json"):
+                name = entry[:-len(".journal.json")]
+                try:
+                    doc = _load_snapshot_json(ws, os.path.join(base, entry))
+                    store["pair_journals"].append({"name": name, "state": doc.get("state") if isinstance(doc, dict) else None})
+                except PbzError:
+                    store["pair_journals"].append({"name": name, "state": "unreadable"})
+            elif entry.endswith(".adopt.json"):
+                store["adoption_journals"].append(entry[:-len(".adopt.json")])
+        stores.append(store)
+    claim_status, claim = _read_adopt_claim(ws)
+    intent_present = os.path.lexists(identity.repair_intent_path(ws))
+    unsettled = any(store["pair_journals"] or store["adoption_journals"] or store.get("unreadable") for store in stores)
+    return {
+        "ok": True, "command": "rollback-check",
+        "private_root": os.path.abspath(ws.private),
+        "stores": stores,
+        "adoption_claim": claim if claim_status == "ok" else ({"unverifiable": True} if claim_status == "unverifiable" else None),
+        "repair_intent_present": intent_present,
+        "passes": not unsettled and claim_status == "absent",
+    }
