@@ -1307,6 +1307,12 @@ class EmbeddedRowConstructorTests(unittest.TestCase):
             ("q", 'Table.FromList({}, null, {"Amount", "Name"}, 12345)', ("12345",), 1),
             ("r", '#table({"Amount"}, {{731}}', ("731",), 1),
             ("s", 'DATATABLE("Amount", DOUBLE, {{731}}', ("731",), 1),
+            ("t", '#table({"Amount"}, {{[731}})', ("731",), 1),
+            ("u", '#table({"Amount"}, {{731]}})', ("731",), 1),
+            ("v", 'Table.FromRows({{731]}}, {"Amount"})', ("731",), 1),
+            ("w", '#table({"Amount"}, {{({731)}}})', ("731",), 1),
+            ("x", 'Table.FromRows({{731}}, , {"Amount"})', ("731",), 1),
+            ("y", '#table(, {{731}})', ("731",), 1),
             ("extraValues", 'Table.FromList({731}, null, {"Amount"}, null, 5)', (), 0),
         )
         for shape, expr, spellings, payload_count in cases:
@@ -1478,6 +1484,16 @@ class EmbeddedRowConstructorTests(unittest.TestCase):
                 source = self._m3_source("Events", self.EVENTS, expr)
                 output, _ = self._m3_tok(source, model)
                 self.assertNotIn("12345", output)
+
+    def test_bare_function_reference_binds(self):
+        model = self._m3_events()
+        expr = '#table({"Amount", "Kind"}, {{731, Table.FromRows}})'
+        output = self._m3_roundtrip(self._m3_source("Events", self.EVENTS, expr), model)
+        line = self._m3_source_line(output)
+        self.assertNotIn("731", line)
+        self.assertNotIn("«payload:", line)
+        self.assertIn("«Events[Amount]#1»", line)
+        self.assertIn("Table.FromRows", line)
 
     def test_contextual_ownership_binder(self):
         model = self._m3_events()
