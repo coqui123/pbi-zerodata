@@ -14,7 +14,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import desktop, dpapi, lexers, policy as policy_mod, tmdl, tokens
+from . import desktop, dpapi, identity, lexers, policy as policy_mod, tmdl, tokens
 from .classify import Classifier
 from .common import (
     PbzError,
@@ -943,10 +943,15 @@ def _validate_snapshot_name(name: str) -> None:
         raise PbzError("BAD_REQUEST", "snapshot name must be a single path segment")
 
 
-def _snapshot_spec_path(ws, name: str) -> str:
+def _snapshot_spec_path(ws, name: str, project_id=None) -> str:
     """One path segment under the private snapshots/specs directory. No .., separator, or absolute name."""
+    if project_id is not None and not identity.is_uuid(project_id):
+        raise PbzError("BAD_REQUEST", "project identity is invalid")
     _validate_snapshot_name(name)
-    root = os.path.abspath(os.path.join(ws.private, "snapshots", "specs"))
+    if project_id is None:
+        root = os.path.abspath(os.path.join(ws.private, "snapshots", "specs"))
+    else:
+        root = os.path.abspath(os.path.join(ws.private, "snapshots", "projects", project_id, "specs"))
     path = os.path.abspath(os.path.join(root, name + ".json"))
     if os.path.dirname(path) != root:
         raise PbzError("BAD_REQUEST", "snapshot name must be a single path segment")
@@ -1126,10 +1131,80 @@ def _preflight_snapshot_save(ws, name: str) -> None:
             raise PbzError("CORRUPT_STATE", "snapshot path is not a file")
 
 
-def _snapshot_result_path(ws, name: str, *, namespaced: bool) -> str:
+def _preflight_snapshot_workspace(ws):
+    root = os.path.join(ws.private, "snapshots")
+    projects = os.path.join(root, "projects")
+    for path in (ws.private, root, projects):
+        if _reparse_link(path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    for path in (root, projects):
+        if os.path.lexists(path) and not os.path.isdir(path):
+            raise PbzError("CORRUPT_STATE", f"snapshot directory is not a directory: {path}")
+    if os.path.lexists(ws.private) and not os.path.isdir(ws.private):
+        raise PbzError("CORRUPT_STATE", "snapshot directory is not a directory")
+
+
+def _preflight_snapshot_project(ws, name, project_id):
+    pair = _SnapshotPair(ws, name, project_id)
+    snaps_projects = os.path.join(ws.private, "snapshots", "projects")
+    directories = (snaps_projects, pair.root, os.path.dirname(pair.spec), os.path.dirname(pair.result), pair.pending)
+    named = (pair.spec, pair.result, pair.lock, _project_guard_path(ws, project_id))
+    for path in (*directories, *named):
+        if _reparse_link(path):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    for path in directories:
+        if os.path.lexists(path) and not os.path.isdir(path):
+            raise PbzError("CORRUPT_STATE", "snapshot directory is not a directory")
+    for path in named:
+        if os.path.lexists(path) and not os.path.isfile(path):
+            raise PbzError("CORRUPT_STATE", "snapshot path is not a file")
+
+
+def _project_guard_path(ws, project_id):
+    return os.path.join(ws.private, "snapshots", "projects", project_id + ".guard")
+
+
+def _ensure_project_namespace(ws, project_id):
+    try:
+        _ensure_project_namespace_inner(ws, project_id)
+    except OSError as error:
+        raise PbzError("LOCAL_STATE_UNAVAILABLE", f"project namespace is unavailable: {error}") from error
+
+
+def _ensure_project_namespace_inner(ws, project_id):
+    pair_root = os.path.join(ws.private, "snapshots", "projects", project_id)
+    for directory in (os.path.join(ws.private, "snapshots"),
+                      os.path.join(ws.private, "snapshots", "projects"), pair_root,
+                      os.path.join(pair_root, "results"), os.path.join(pair_root, "specs"),
+                      os.path.join(pair_root, "pending")):
+        if _reparse_link(directory):
+            raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+        _snapshot_mkdir(directory)
+    guard = _project_guard_path(ws, project_id)
+    if _reparse_link(guard):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    if not os.path.lexists(guard):
+        fd = os.open(guard, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+        _snapshot_sync_dir(os.path.dirname(guard))
+
+
+def _acquire_project_guard(ws, project_id, mode="shared"):
+    try:
+        return _snapshot_open_lock(_project_guard_path(ws, project_id), False, mode=mode)
+    except OSError as error:
+        raise PbzError("LOCAL_STATE_UNAVAILABLE", f"project guard is unavailable: {error}") from error
+
+
+def _snapshot_result_path(ws, name: str, *, namespaced: bool, project_id=None) -> str:
     """Result path for one snapshot name. Does not create the directory."""
+    if project_id is not None and not identity.is_uuid(project_id):
+        raise PbzError("BAD_REQUEST", "project identity is invalid")
     _validate_snapshot_name(name)
-    base = os.path.join(ws.private, "snapshots", "results") if namespaced else os.path.join(ws.private, "snapshots")
+    if project_id is not None:
+        base = os.path.join(ws.private, "snapshots", "projects", project_id, "results")
+    else:
+        base = os.path.join(ws.private, "snapshots", "results") if namespaced else os.path.join(ws.private, "snapshots")
     root = os.path.abspath(base)
     path = os.path.abspath(os.path.join(root, name + ".json"))
     if os.path.dirname(path) != root:
@@ -1148,13 +1223,30 @@ def _load_snapshot_json(ws, path: str):
         raise PbzError("CORRUPT_STATE", "snapshot baseline is unreadable") from None
 
 
-def _require_usable_baseline(ws, name: str) -> None:
+def _doc_project_stamp(doc):
+    return doc.get("project_id") if isinstance(doc, dict) else None
+
+
+def _require_project_stamp(doc, project_id, what):
+    if _doc_project_stamp(doc) != project_id:
+        raise PbzError("CORRUPT_STATE", f"snapshot {what} belongs to a different project")
+
+
+def _require_usable_baseline(ws, name: str, project_id=None) -> None:
     """Fail closed when this name's baseline cannot be read. Other files are ignored.
 
     A namespaced result wins and is never replaced by a legacy file. A missing
     baseline is left for the engine. A spec-shaped legacy file is not a result
     and is left in place for the existing engine behavior.
     """
+    if project_id is not None:
+        path = _snapshot_result_path(ws, name, namespaced=True, project_id=project_id)
+        if _inspected_present(path):
+            doc = _load_snapshot_json(ws, path)
+            if not is_snapshot_result_doc(doc):
+                raise PbzError("CORRUPT_STATE", "snapshot baseline is not a result document")
+            _require_project_stamp(doc, project_id, "baseline")
+        return
     namespaced = _snapshot_result_path(ws, name, namespaced=True)
     if os.path.lexists(namespaced):
         if not is_snapshot_result_doc(_load_snapshot_json(ws, namespaced)):
@@ -1236,7 +1328,50 @@ def _snapshot_optional_hash(path):
         return None
 
 
-def _snapshot_open_lock(path, readonly):
+def _snapshot_open_lock(path, readonly=False, *, mode=None):
+    if mode in ("shared", "try_shared", "try_exclusive"):
+        exclusive = mode == "try_exclusive"
+        if os.name != "nt":
+            import fcntl
+
+            if exclusive:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            else:
+                # Shared acquisition only reads: the guard file is created by
+                # the identity step before any shared use.
+                fd = os.open(path, os.O_RDONLY)
+            flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            if mode != "shared":
+                flags |= fcntl.LOCK_NB
+            try:
+                fcntl.flock(fd, flags)
+            except BaseException as error:
+                os.close(fd)
+                if mode != "shared" and isinstance(error, BlockingIOError):
+                    return None
+                raise
+            return fd
+
+        import ctypes
+        from ctypes import wintypes as w
+
+        create = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+        create.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.c_void_p,
+                           w.DWORD, w.DWORD, w.HANDLE]
+        create.restype = w.HANDLE
+        invalid = ctypes.c_void_p(-1).value
+        while True:
+            handle = create(path, 0xC0000000 if exclusive else 0x80000000,
+                            0 if exclusive else 1, None, 4, 0x80, None)
+            if handle != invalid:
+                return handle
+            error = ctypes.get_last_error()
+            if error != 32:  # ERROR_SHARING_VIOLATION
+                raise ctypes.WinError(error)
+            if mode != "shared":
+                return None
+            time.sleep(0.02)
+
     if os.name == "nt":
         import ctypes
         from ctypes import wintypes as w
@@ -1282,11 +1417,17 @@ _SNAPSHOT_JOURNAL_ANNOTATIONS = ("superseding", "result_foreign")
 
 
 class _SnapshotPair:
-    def __init__(self, ws, name):
+    def __init__(self, ws, name, project_id=None):
         self.name = name
-        self.result = _snapshot_result_path(ws, name, namespaced=True)
-        self.spec = _snapshot_spec_path(ws, name)
-        self.root = os.path.dirname(os.path.dirname(self.result))
+        self.project_id = project_id
+        self.result = _snapshot_result_path(ws, name, namespaced=True, project_id=project_id)
+        self.spec = _snapshot_spec_path(ws, name, project_id)
+        if project_id is None:
+            self.root = os.path.dirname(os.path.dirname(self.result))
+            self.journal_fields = _SNAPSHOT_JOURNAL_FIELDS
+        else:
+            self.root = os.path.join(ws.private, "snapshots", "projects", project_id)
+            self.journal_fields = _SNAPSHOT_JOURNAL_FIELDS + ("project_id", "name")
         self.pending = os.path.join(self.root, "pending")
         self.lock = os.path.join(self.pending, name + ".lock")
         self.journal = os.path.join(self.pending, name + ".journal.json")
@@ -1365,7 +1506,9 @@ class _SnapshotPair:
             raise _snapshot_recovery_error() from error
 
     def write_journal(self, journal):
-        ordered = {key: journal[key] for key in _SNAPSHOT_JOURNAL_FIELDS}
+        if self.project_id is not None:
+            journal = {**journal, "version": 2, "project_id": self.project_id, "name": self.name}
+        ordered = {key: journal[key] for key in self.journal_fields}
         ordered.update((key, journal[key]) for key in _SNAPSHOT_JOURNAL_ANNOTATIONS if key in journal)
         _snapshot_write(self.journal, json.dumps(ordered).encode(), self.name + ".journal.")
 
@@ -1380,7 +1523,7 @@ class _SnapshotPair:
             return None
         except (OSError, ValueError, RecursionError) as error:
             raise PbzError("CORRUPT_STATE", "unreadable snapshot journal") from error
-        if not _valid_snapshot_journal(journal):
+        if not _valid_snapshot_journal(journal, project_id=self.project_id, name=self.name):
             raise PbzError("CORRUPT_STATE", "invalid snapshot journal")
         return journal
 
@@ -1389,11 +1532,25 @@ class _SnapshotPair:
             data = Path(self.staged).read_bytes()
         except OSError:
             return None
-        return data if hashlib.sha256(data).hexdigest() == journal["staged_spec"] else None
+        if hashlib.sha256(data).hexdigest() != journal["staged_spec"]:
+            return None
+        if self.project_id is not None:
+            self._require_spec_stamp(data, "staged snapshot spec")
+        return data
+
+    def _require_spec_stamp(self, data, what):
+        try:
+            doc = json.loads(data.decode("utf-8-sig"))
+        except (ValueError, RecursionError):
+            doc = None
+        if _doc_project_stamp(doc) != self.project_id:
+            raise PbzError("CORRUPT_STATE", f"{what} belongs to a different project")
 
     def complete(self, journal, data):
         if data is None:
             raise _snapshot_recovery_error()
+        if self.project_id is not None:
+            self._require_spec_stamp(data, "snapshot spec")
         new_pair = journal["new_result"], journal["staged_spec"]
         try:
             _snapshot_mkdir(os.path.dirname(self.spec))
@@ -1492,12 +1649,17 @@ class _SnapshotPair:
             raise _snapshot_recovery_error(note) from cause
 
 
-def _valid_snapshot_journal(journal):
+def _valid_snapshot_journal(journal, project_id=None, name=None):
     fields = set(_SNAPSHOT_JOURNAL_FIELDS)
+    version = 1
+    if project_id is not None:
+        fields.update(("project_id", "name"))
+        version = 2
     annotations = set(_SNAPSHOT_JOURNAL_ANNOTATIONS)
     if (not isinstance(journal, dict) or not fields <= journal.keys()
             or journal.keys() - fields - annotations
-            or type(journal["version"]) is not int or journal["version"] != 1
+            or type(journal["version"]) is not int or journal["version"] != version
+            or (project_id is not None and (journal["project_id"] != project_id or journal["name"] != name))
             or type(journal["before_coherent"]) is not bool
             or any(journal[key] is not True for key in annotations & journal.keys())):
         return False
@@ -1513,7 +1675,7 @@ def _valid_snapshot_journal(journal):
                  or (journal["state"] == "RESULT_PUBLISHED" and valid_hash(journal["new_result"]))))
 
 
-def _snapshot_request(ws, project, name, raw_queries):
+def _snapshot_request(ws, project, name, raw_queries, project_id):
     tm = tokens.TokenMap(ws.private)
     queries = []
     for q in raw_queries:
@@ -1522,7 +1684,7 @@ def _snapshot_request(ws, project, name, raw_queries):
             raise PbzError("BAD_REQUEST", "unknown token in query " + q["id"])
         queries.append({"id": q["id"], "dax": dax, "keys": q.get("keys", [])})
     return {"private_dir": ws.private, "port": desktop.require_port(project),
-            "name": name, "queries": queries}
+            "name": name, "queries": queries, "project_id": project_id}
 
 
 def _snapshot_budget(verb):
@@ -1534,11 +1696,20 @@ def _snapshot_engine_error(res):
     return PbzError(_class_of(res.get("class"), _PY_CLASS) or "ENGINE_UNAVAILABLE")
 
 
-def _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, before):
+class _StampMismatch(Exception):
+    """Carries a CORRUPT_STATE stamp failure out of the save success block
+    without widening its recovery conversion to unrelated failures."""
+
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
+def _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, before, *, guard_handle=None):
     verb = "snapshot-save"
     superseding = journal is not None
     try:
-        request = _snapshot_request(ws, project, pair.name, raw_queries)
+        request = _snapshot_request(ws, project, pair.name, raw_queries, pair.project_id)
         data = json.dumps(spec).encode()
     except Exception as error:
         if superseding:
@@ -1548,7 +1719,7 @@ def _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, b
     if not superseding:
         before = pair.hashes()
     candidate = {
-        "version": 1, "state": "PREPARED", "before_result": before[0],
+        "version": 2 if pair.project_id else 1, "state": "PREPARED", "before_result": before[0],
         "before_spec": before[1], "before_coherent": not superseding,
         "staged_spec": hashlib.sha256(data).hexdigest(), "new_result": None,
     }
@@ -1587,10 +1758,18 @@ def _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, b
         except (OSError, PbzError) as error:
             raise _snapshot_recovery_error() from error
 
-    inheritance = ({"inherit_handles": (handle,), "kill_on_close_job": job}
-                   if os.name == "nt" else {"pass_fds": (handle,)})
+    handles = (handle,) if guard_handle is None else (handle, guard_handle)
+    inheritance = ({"inherit_handles": handles, "kill_on_close_job": job}
+                   if os.name == "nt" else {"pass_fds": handles})
     res = engine_call(verb, request, timeout=1800, **inheritance)
     state = res.get("payload_state")
+    if res.get("ok") and pair.project_id and res.get("project_id") != pair.project_id:
+        error = PbzError("ENGINE_UNAVAILABLE", "engine response project_id does not match the selected project")
+        if state not in ("not_sent", "may_have_been_sent"):
+            raise _snapshot_recovery_error(str(error)) from error
+        pair.finish_refusal(journal, before, error, superseding=superseding,
+                            self_flag=self_flag, never_wrote=state == "not_sent")
+        raise error
     succeeded = res.get("ok") and any(isinstance(q, dict) and q.get("result") == "SAVED"
                                       for q in res.get("queries") or [])
     if not succeeded:
@@ -1604,11 +1783,31 @@ def _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, b
             raise error
     else:
         try:
-            new_result = _snapshot_hash(pair.result, sync=True)
+            if pair.project_id:
+                raw = read_checked(pair.result, root=ws.private)
+                try:
+                    doc = json.loads(raw.decode("utf-8-sig"))
+                except (UnicodeDecodeError, ValueError, RecursionError) as error:
+                    raise PbzError("CORRUPT_STATE", "snapshot baseline is unreadable") from error
+                try:
+                    if not is_snapshot_result_doc(doc):
+                        raise PbzError("CORRUPT_STATE", "snapshot baseline is not a result document")
+                    _require_project_stamp(doc, pair.project_id, "baseline")
+                except PbzError as stamp_error:
+                    raise _StampMismatch(stamp_error) from stamp_error
+                new_result = _snapshot_hash(pair.result, sync=True)
+                if new_result != hashlib.sha256(raw).hexdigest():
+                    raise PbzError("RECOVERY_REQUIRED", "snapshot baseline changed while its stamp was being verified")
+            else:
+                new_result = _snapshot_hash(pair.result, sync=True)
             _snapshot_sync_dir(os.path.dirname(pair.result))
             _snapshot_sync_dir(pair.root)
             if superseding:
                 pair.stage(data)
+        except _StampMismatch as marked:
+            # The just-published result is not this project's document. The
+            # journal is not advanced; recovery arbitrates the pair.
+            raise marked.error
         except (OSError, PbzError) as error:
             refusal = _snapshot_recovery_error()
             if superseding and self_flag:
@@ -1624,34 +1823,123 @@ def _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, b
     return {**{key: value for key, value in res.items() if key != "payload_state"}, "verb": verb}
 
 
+def _resolve_selected_project(ws, project):
+    if project is None:
+        return ws.project(None)
+    if os.path.normcase(os.path.abspath(project.root)) != os.path.normcase(os.path.abspath(ws.root)):
+        raise PbzError("BAD_REQUEST", "project does not belong to this workspace")
+    return ws.project(project.name)
+
+
+def _snapshot_with_notes(res, notes):
+    if notes:
+        extra = "; ".join(notes)
+        res = {**res, "note": (res["note"] + "; " + extra) if res.get("note") else extra}
+    return res
+
+
 def snapshot(ws, project, action: str, name: str, spec: dict | None) -> dict:
+    # Step 1: selection.
     if action not in ("save", "compare"):
         raise PbzError("BAD_REQUEST", f"unknown snapshot action {action}")
     _validate_snapshot_name(name)
+    project = _resolve_selected_project(ws, project)
+    # Step 2: name and query-list validation.
     raw_queries = None if action == "compare" and spec is None else _snapshot_query_list(spec)
-    _preflight_snapshot_save(ws, name)
-    pair = _SnapshotPair(ws, name)
-    job = create_kill_on_close_job() if action == "save" and os.name == "nt" else None
+    # Step 3: every read-only refusal, before any engine contact.
+    _preflight_snapshot_workspace(ws)
+    planned = identity.resolve(ws, project, apply=False)
+    project_id = planned.project_id
+    pair = _SnapshotPair(ws, name, project_id) if project_id else None
+    if pair is not None:
+        _preflight_snapshot_project(ws, name, project_id)
+        _check_pair_readonly(ws, pair)
+    ns_spec_missing = pair is None or not os.path.lexists(pair.spec)
+    flat = _classify_flat_pair(ws, name)
+    journal_present = pair is not None and os.path.lexists(pair.journal)
+    if action == "compare" and spec is None and ns_spec_missing and not journal_present:
+        if flat["result"] or flat["spec"]:
+            raise PbzError("LEGACY_BASELINE_UNADOPTED", "a legacy snapshot pair with this name has not been adopted; run pbz snapshot adopt-legacy --project " + project.name)
+        raise PbzError("BAD_REQUEST", "--spec required")
+    if (action == "compare" and not journal_present and flat["result"]
+            and not (pair is not None and os.path.lexists(pair.result))):
+        # A settled pair with no namespaced result while a flat result exists
+        # is legacy-only; refuse before the ping, the identity writes and the
+        # pair lock. The step 6 recheck covers races; a journaled pair is
+        # arbitrated by recovery instead.
+        raise PbzError("LEGACY_BASELINE_UNADOPTED", "a legacy snapshot baseline with this name has not been adopted; run pbz snapshot adopt-legacy --project " + project.name)
+    # Step 4: engine capability gate. The ping carries no private_dir.
+    ping = engine_call("ping", {})
+    if not ping.get("ok"):
+        raise _snapshot_engine_error(ping)
+    if ping.get("snapshot_layout") != "project-v1":
+        raise PbzError("ENGINE_VERSION", "the pbz engine does not support project-scoped snapshots; upgrade the engine")
+    # Step 5: identity writes under the workspace identity lock.
+    notes = []
+    with identity.identity_lock(ws):
+        current = identity.resolve(ws, project, apply=False)
+        if planned.project_id is not None and current.project_id != planned.project_id:
+            raise PbzError("PROJECT_IDENTITY_CHANGED", "the project identity changed during the operation")
+        applied = identity.resolve(ws, project, apply=True)
+        if planned.project_id is not None and applied.project_id != planned.project_id:
+            raise PbzError("PROJECT_IDENTITY_CHANGED", "the project identity changed during the operation")
+        project_id = applied.project_id
+        _ensure_project_namespace(ws, project_id)
+    if applied.action == "refresh":
+        notes.append(f"project identity {project_id} now recorded under name {project.name}")
+        if applied.orphan_marked:
+            notes.append(f"identity {applied.orphan_marked[0]} (recorded name {applied.orphan_marked[1]}) marked orphan")
+    if pair is None or pair.project_id != project_id:
+        pair = _SnapshotPair(ws, name, project_id)
+        _preflight_snapshot_project(ws, name, project_id)
+        _check_pair_readonly(ws, pair)
+    # Step 6: guard, pair lock, revalidation, recovery, dispatch.
+    job = create_kill_on_close_job() if os.name == "nt" else None
     try:
-        with pair.locked(action) as handle:
-            pair.validate_transient()
-            journal, before = pair.recover(action)
-            if action == "save":
-                return _save_snapshot(ws, project, pair, raw_queries, spec, handle, job, journal, before)
-            if raw_queries is None:
-                spec = saved_spec(ws, name)
-                if spec is None:
-                    raise PbzError("BAD_REQUEST", "--spec required")
-                raw_queries = _snapshot_query_list(spec)
-            _require_usable_baseline(ws, name)
-            request = _snapshot_request(ws, project, name, raw_queries)
-            verb = "snapshot-compare"
-            if not spend(ws, "snapshot_queries", len(raw_queries)):
-                return _snapshot_budget(verb)
-            res = engine_call(verb, request, timeout=1800)
-            if not res.get("ok"):
-                raise _snapshot_engine_error(res)
-            return {**res, "verb": verb}
+        guard = _acquire_project_guard(ws, project_id, "shared")
+        try:
+            with pair.locked(action) as handle:
+                current = identity.resolve(ws, project, apply=False)
+                if current.project_id != project_id:
+                    raise PbzError("PROJECT_IDENTITY_CHANGED", "the project identity changed during the operation")
+                _check_pair_readonly(ws, pair)
+                pair.validate_transient()
+                journal, before = pair.recover(action)
+                # Reclassify under the lock: a flat pair published after the
+                # step 3 classification governs the locked decision points.
+                flat = _classify_flat_pair(ws, name)
+                if action == "save":
+                    stamped_spec = {**spec, "project_id": project_id}
+                    res = _save_snapshot(ws, project, pair, raw_queries, stamped_spec, handle, job, journal, before, guard_handle=guard)
+                    if flat["result"] or flat["spec"]:
+                        notes.append("a legacy snapshot pair with this name remains unadopted")
+                    return _snapshot_with_notes(res, notes)
+                if raw_queries is None:
+                    saved = saved_spec_for_project(ws, name, project_id)
+                    if saved is None:
+                        if flat["result"] or flat["spec"]:
+                            raise PbzError("LEGACY_BASELINE_UNADOPTED", "a legacy snapshot pair with this name has not been adopted; run pbz snapshot adopt-legacy --project " + project.name)
+                        raise PbzError("BAD_REQUEST", "--spec required")
+                    raw_queries = _snapshot_query_list(saved)
+                _require_usable_baseline(ws, name, project_id)
+                if not os.path.lexists(pair.result) and flat["result"]:
+                    raise PbzError("LEGACY_BASELINE_UNADOPTED", "a legacy snapshot baseline with this name has not been adopted; run pbz snapshot adopt-legacy --project " + project.name)
+                request = _snapshot_request(ws, project, name, raw_queries, project_id)
+                verb = "snapshot-compare"
+                if not spend(ws, "snapshot_queries", len(raw_queries)):
+                    return _snapshot_with_notes(_snapshot_budget(verb), notes)
+                inheritance = ({"inherit_handles": (guard,), "kill_on_close_job": job}
+                               if os.name == "nt" else {"pass_fds": (guard,)})
+                res = engine_call(verb, request, timeout=1800, **inheritance)
+                if not res.get("ok"):
+                    raise _snapshot_engine_error(res)
+                if res.get("project_id") != project_id:
+                    raise PbzError("ENGINE_UNAVAILABLE", "engine response project_id does not match the selected project")
+                out = {key: value for key, value in res.items() if key != "payload_state"}
+                out["verb"] = verb
+                return _snapshot_with_notes(out, notes)
+        finally:
+            _snapshot_close_handle(guard)
     finally:
         if job is not None:
             _snapshot_close_handle(job)
@@ -1683,3 +1971,134 @@ def saved_spec(ws, name: str) -> dict | None:
     except (OSError, ValueError):
         return None
     return None
+
+
+def saved_spec_for_project(ws, name, project_id):
+    try:
+        path = _snapshot_spec_path(ws, name, project_id)
+    except PbzError:
+        return None
+    try:
+        if os.path.lexists(path):
+            doc = json.loads(read_checked(path, root=ws.private).decode("utf-8-sig"))
+            if is_snapshot_spec_doc(doc):
+                _require_project_stamp(doc, project_id, "spec")
+                return doc
+    except PbzError:
+        raise
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _load_pair_doc(path):
+    """Read one pair document for the read-only usability check. Unlike
+    _load_snapshot_json this tolerates a hard-linked pair file (the pair
+    machinery handles linked staged and spec files safely); symlinks and
+    junctions are still refused, and unreadable or unparseable bytes are
+    CORRUPT_STATE, mirroring _load_snapshot_json's error surface."""
+    if _reparse_link(path):
+        raise PbzError("UNSAFE_PATH", "refusing to write through a link")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        return json.loads(raw.decode("utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+        raise PbzError("CORRUPT_STATE", "snapshot baseline is unreadable") from None
+
+
+def _inspected_present(path):
+    """True when path exists; only a proven absence reads as missing."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise PbzError("LOCAL_STATE_UNAVAILABLE", f"snapshot state cannot be inspected: {error}") from error
+    return True
+
+
+def _check_pair_readonly(ws, pair):
+    pair.validate_transient()
+    journal_present = _inspected_present(pair.journal)
+    if journal_present:
+        pair.read_journal()
+    if not journal_present:
+        # A journaled pair is arbitrated by recovery under the pair lock; the
+        # content checks judge only a settled pair.
+        if _inspected_present(pair.result):
+            doc = _load_pair_doc(pair.result)
+            if not is_snapshot_result_doc(doc):
+                raise PbzError("CORRUPT_STATE", "snapshot baseline is not a result document")
+            if pair.project_id:
+                _require_project_stamp(doc, pair.project_id, "baseline")
+        if _inspected_present(pair.spec):
+            doc = _load_pair_doc(pair.spec)
+            if not is_snapshot_spec_doc(doc):
+                raise PbzError("CORRUPT_STATE", "snapshot spec is not a spec document")
+            if pair.project_id:
+                _require_project_stamp(doc, pair.project_id, "spec")
+    adopt = os.path.join(pair.pending, pair.name + ".adopt.json")
+    if _inspected_present(adopt):
+        raise PbzError("ADOPTION_IN_PROGRESS", "snapshot adoption is in progress for this name; re-run pbz snapshot adopt-legacy to complete it")
+
+
+# Classify the requested name's four flat candidates by shape per the S1 table.
+# Flat documents are never used as a baseline or spec.
+_FLAT_ABSENT = object()
+
+
+def _flat_candidate(ws, path, name, kind):
+    """Load one flat candidate document, or _FLAT_ABSENT when it is absent.
+
+    Existence is probed with lstat: a candidate the process cannot inspect
+    refuses instead of reading as absent, and a dangling link still reaches
+    the loader, which refuses it as a link. A present document whose JSON
+    value is null is returned as None and reaches shape validation.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return _FLAT_ABSENT
+    except OSError as error:
+        raise PbzError("LOCAL_STATE_UNAVAILABLE", f"legacy snapshot {kind} for {name} cannot be inspected: {error}") from error
+    try:
+        return _load_snapshot_json(ws, path)
+    except OSError as error:
+        raise PbzError("CORRUPT_STATE", f"legacy snapshot {kind} for {name} is unreadable") from error
+
+
+def _classify_flat_pair(ws, name):
+    result_present = False
+    for path, prelayout in (
+        (_snapshot_result_path(ws, name, namespaced=True), False),
+        (_snapshot_result_path(ws, name, namespaced=False), True),
+    ):
+        doc = _flat_candidate(ws, path, name, "result")
+        if doc is _FLAT_ABSENT:
+            continue
+        if is_snapshot_result_doc(doc):
+            result_present = True
+        elif is_snapshot_spec_doc(doc) and prelayout and name.endswith(".spec"):
+            continue
+        else:
+            raise PbzError(
+                "CORRUPT_STATE", f"legacy snapshot result for {name} is malformed"
+            )
+    spec_present = False
+    for path, legacy in (
+        (_snapshot_spec_path(ws, name), False),
+        (_legacy_snapshot_spec_path(ws, name), True),
+    ):
+        doc = _flat_candidate(ws, path, name, "spec")
+        if doc is _FLAT_ABSENT:
+            continue
+        if is_snapshot_spec_doc(doc):
+            spec_present = True
+        elif is_snapshot_result_doc(doc) and legacy:
+            continue
+        else:
+            raise PbzError(
+                "CORRUPT_STATE", f"legacy snapshot spec for {name} is malformed"
+            )
+    return {"result": result_present, "spec": spec_present}
