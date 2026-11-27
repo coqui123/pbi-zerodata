@@ -8,4 +8,8 @@
   <ItemGroup>
     <Compile Include="../DepsCollect.cs" Link="DepsCollect.cs" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="tmdl\**" />
+    <None Remove="tmdl\**" />
+  </ItemGroup>
 </Project>

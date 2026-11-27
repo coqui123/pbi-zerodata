@@ -1,6 +1,4 @@
 using System.Collections.Concurrent;
-using System.Globalization;
-using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Microsoft.AnalysisServices.Tabular;
@@ -397,33 +395,8 @@ public static class TmdlValidate
         }
     }
 
-    const string Reserved = "\\/:*?\"<>|%";
-
     /// <summary>TMDL file naming: characters invalid in file names (and '%') become %XX.</summary>
-    public static string EncodeName(string name)
-    {
-        var sb = new StringBuilder();
-        foreach (char c in name)
-        {
-            if (c < 0x20 || Reserved.IndexOf(c) >= 0) sb.Append('%').Append(((int)c).ToString("X2", CultureInfo.InvariantCulture));
-            else sb.Append(c);
-        }
-        return sb.ToString();
-    }
+    public static string EncodeName(string name) => TmdlNameCodec.EncodeName(name);
 
-    public static string DecodeName(string fileName)
-    {
-        var sb = new StringBuilder();
-        for (int i = 0; i < fileName.Length; i++)
-        {
-            if (fileName[i] == '%' && i + 2 < fileName.Length &&
-                int.TryParse(fileName.AsSpan(i + 1, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int code))
-            {
-                sb.Append((char)code);
-                i += 2;
-            }
-            else sb.Append(fileName[i]);
-        }
-        return sb.ToString();
-    }
+    public static string DecodeName(string fileName) => TmdlNameCodec.DecodeName(fileName);
 }
