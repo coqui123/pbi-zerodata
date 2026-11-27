@@ -140,7 +140,7 @@ the column set `dynamic` (the source schema is not visible to pbz). Problem code
 With the project open in Desktop, pbz-engine reads `DISCOVER_CALC_DEPENDENCY` (object identity
 columns only, names checked against the model) and pbz compares measure and column edges.
 `engine_only` edges are parser misses; `pbz_only` edges are usually unpushed mirror edits. The
-engine knows nothing about reports, so it never decides what is unused.
+engine knows nothing about reports, so it never decides what is unused. The comparison reports INCOMPLETE instead of MATCH or DIFF when the engine inventory was truncated at the raw-row cap or the engine did not report completeness.
 
 ## Source lineage and impact
 

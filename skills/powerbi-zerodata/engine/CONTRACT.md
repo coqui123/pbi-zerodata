@@ -256,6 +256,7 @@ ref_type, ref_table, ref_object], ...]}` from `$SYSTEM.DISCOVER_CALC_DEPENDENCY`
 `EXPRESSION`, `REFERENCED_EXPRESSION` and `QUERY` columns (formula text) are never selected. Each name
 must equal a TMSCHEMA object name (table, column, measure, hierarchy, partition, relationship) or it
 becomes `"?"`; each type must match `^[A-Z_]{1,40}$` or it becomes `"?"`. Duplicate rows are dropped.
+The raw row stream is capped at 200000 rows before deduplication, with a one-row lookahead: the response also carries `truncated`, which is true exactly when the raw stream was not exhausted within the cap. The edge list is a complete inventory only when `truncated` is `false`; a consumer must not treat a truncated inventory, or one whose producer did not report `truncated` at all, as complete.
 Used by `pbz unused --verify-engine` to cross-check the metadata parser; never the primary source.
 
 ## v1.3 addition: `synth-query`

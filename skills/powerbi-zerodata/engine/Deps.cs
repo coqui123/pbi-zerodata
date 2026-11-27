@@ -10,6 +10,7 @@ namespace PbzEngine;
 /// REFERENCED_EXPRESSION and QUERY columns (formula text, which can hold literals) are never selected.
 /// Every name must equal a TMSCHEMA object name (table, column, measure, hierarchy, partition,
 /// relationship), else it is replaced by "?"; object types must match ^[A-Z_]{1,40}$, else "?".
+/// The raw stream is capped before deduplication (DepsCollect.Cap); the response reports truncated when the stream was not exhausted within the cap.
 /// </summary>
 public static class Deps
 {
@@ -40,16 +41,8 @@ public static class Deps
             return TypeRe.IsMatch(s) ? s : "?";
         }
 
-        var edges = new JsonArray();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var r in conn.Rows(Statement, 200000))
-        {
-            var row = new[] { Type(r[0]), Name(r[1]), Name(r[2]), Type(r[3]), Name(r[4]), Name(r[5]) };
-            if (!seen.Add(string.Join("\u0001", row))) continue;
-            var a = new JsonArray();
-            foreach (var cell in row) a.Add(cell);
-            edges.Add(a);
-        }
-        return Ctx.Ok("deps", new JsonObject { ["edges"] = edges });
+        var raw = conn.Rows(Statement, DepsCollect.Cap + 1);
+        var (edges, truncated) = DepsCollect.Collect(raw, DepsCollect.Cap, Name, Type);
+        return Ctx.Ok("deps", new JsonObject { ["edges"] = edges, ["truncated"] = truncated });
     }
 }
