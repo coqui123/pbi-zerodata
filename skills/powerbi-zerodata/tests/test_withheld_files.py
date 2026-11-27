@@ -366,6 +366,7 @@ class WithholdUnknownTests(unittest.TestCase):
             "Canary.Report/definition/bookmarks/bookmarks.json",
             "Canary.Report/definition/bookmarks/B1.bookmark.json",
             self.THEME,
+            "Canary.Report/StaticResources/SharedResources/Theme.json",
             "Canary.Report/StaticResources/SharedResources/BaseThemes/CY26SU09.json",
         ):
             with self.subTest(rel=rel):
@@ -401,6 +402,45 @@ class WithholdUnknownTests(unittest.TestCase):
         self.assertIs(entry["lossy"], True)
         self.assertIsNone(entry["mirror"])
         self.assertTrue(os.path.exists(Path(self.ws.mirror, self.TABLE)))
+
+    def test_base_only_orphan_removed_on_pull(self):
+        # Clean pull first, so a manifest exists with no entry for PATH_A.
+        self.assertEqual(mirror.pull(self.ws, self.project)["result"], "PULLED")
+        self.assertNotIn(self.PATH_A, self._manifest()["files"])
+        orphan = self._rows(self.STR_A).encode("utf-8")
+        base = Path(mirror.base_dir(self.ws, self.project), self.PATH_A)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_bytes(orphan)
+        # Plain pull sweeps the untracked base copy at the unsupported path.
+        self.assertEqual(mirror.pull(self.ws, self.project)["result"], "PULLED")
+        self.assertFalse(os.path.exists(base))
+        mine = Path(self.ws.mirror, self.PATH_A)
+        mine.parent.mkdir(parents=True, exist_ok=True)
+        mine.write_bytes(b"{}\n")
+        rendered = json.dumps(mirror.diff(self.ws, self.project, patch=True))
+        self.assertNotIn(self.STR_A, rendered)
+        self.assertNotIn(self.NUM, rendered)
+
+    def test_base_only_orphan_removed_on_rebase_with_agent_file(self):
+        self.assertEqual(mirror.pull(self.ws, self.project)["result"], "PULLED")
+        self.assertNotIn(self.PATH_A, self._manifest()["files"])
+        orphan = self._rows(self.STR_A).encode("utf-8")
+        base = Path(mirror.base_dir(self.ws, self.project), self.PATH_A)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_bytes(orphan)
+        agent = b'{"agent": "SYNTH-AGENT-LINE-2W7Q"}\n'
+        mine = Path(self.ws.mirror, self.PATH_A)
+        mine.parent.mkdir(parents=True, exist_ok=True)
+        mine.write_bytes(agent)
+        result = mirror.pull(self.ws, self.project, rebase=True)
+        self.assertEqual(result["result"], "PULLED")
+        self.assertEqual(mine.read_bytes(), agent)
+        self.assertFalse(os.path.exists(base))
+        self.assertNotIn(self.PATH_A, self._manifest()["files"])
+        rendered = json.dumps(mirror.diff(self.ws, self.project, patch=True))
+        self.assertIn("SYNTH-AGENT-LINE-2W7Q", rendered)
+        self.assertNotIn(self.STR_A, rendered)
+        self.assertNotIn(self.NUM, rendered)
 
 
 if __name__ == "__main__":
