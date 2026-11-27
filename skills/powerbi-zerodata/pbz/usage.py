@@ -27,6 +27,12 @@ STATES = ("used", "used_external", "locked", "used_by_unused", "unused", "unknow
 UNSEEN = ["service reports", "Excel / Analyze in Excel", "paginated reports", "composite models",
           "dataflows and notebooks"]
 
+# Edge extensions available to prove a retained table lies on a directed filter path.
+# Read from this global at call time; tests patch it.
+_PATH_REASON_BUDGET = 50000
+_FILTER_PATH_DEFINITE = "active filter path between used tables"
+_FILTER_PATH_MANUAL = "possible filter path between used tables: filter direction does not propagate as modeled; manual review before removal"
+
 
 def key(kind: str, table: str, name: str, report: str = "") -> tuple:
     base = (kind, (table or "").lower(), (name or "") if kind == "m_query" else (name or "").lower())
@@ -161,6 +167,8 @@ class Graph:
                     self.lock(k, "date table key")
                     locked |= self.closure([k]) - used - ext
                     changed = True
+            if _retain_filter_paths(self, alive, locked, used, ext):
+                changed = True
         for k, o in self.objects.items():
             if k in used:
                 self.state[k] = "used"
@@ -236,6 +244,229 @@ class Graph:
         if hits:
             return hits
         return [k for k, o in self.objects.items() if o.name.lower() == low and o.kind != "relationship"]
+
+
+# ---------------------------------------------------------------- filter-path retention
+
+
+def _active_relationship_graphs(graph):
+    """Undirected and directed table graphs of active relationships.
+
+    Filter flow is `to_table -> from_table`, plus `from_table -> to_table` when `both` is truthy.
+    Self-loops are dropped. Parallel edges collapse.
+    """
+    undirected, directed = {}, {}
+    for obj in graph.objects.values():
+        if obj.kind != "relationship" or not obj.extra.get("active", True):
+            continue
+        from_table = key("table", "", obj.extra["from_table"])
+        to_table = key("table", "", obj.extra["to_table"])
+        if from_table == to_table:
+            continue
+        undirected.setdefault(from_table, set()).add(to_table)
+        undirected.setdefault(to_table, set()).add(from_table)
+        directed.setdefault(to_table, set()).add(from_table)
+        if obj.extra.get("both"):
+            directed.setdefault(from_table, set()).add(to_table)
+    return undirected, directed
+
+
+def _biconnected_blocks(adj):
+    """Vertex sets of the biconnected components. `adj` maps a vertex to sorted neighbors."""
+    disc, low, parent = {}, {}, {}
+    time = 0
+    edge_stack = []
+    blocks = []
+    for start in sorted(adj):
+        if start in disc:
+            continue
+        time += 1
+        disc[start] = low[start] = time
+        parent[start] = None
+        stack = [(start, 0)]
+        while stack:
+            u, ei = stack[-1]
+            neighbors = adj[u]
+            if ei < len(neighbors):
+                stack[-1] = (u, ei + 1)
+                v = neighbors[ei]
+                if v not in disc:
+                    parent[v] = u
+                    time += 1
+                    disc[v] = low[v] = time
+                    edge_stack.append((u, v))
+                    stack.append((v, 0))
+                elif v != parent[u] and disc[v] < disc[u]:
+                    edge_stack.append((u, v))
+                    if disc[v] < low[u]:
+                        low[u] = disc[v]
+            else:
+                stack.pop()
+                p = parent[u]
+                if p is None:
+                    continue
+                if low[u] < low[p]:
+                    low[p] = low[u]
+                if low[u] >= disc[p]:
+                    verts = set()
+                    while edge_stack:
+                        a, b = edge_stack.pop()
+                        verts.add(a)
+                        verts.add(b)
+                        if (a, b) == (p, u):
+                            break
+                    if verts:
+                        blocks.append(verts)
+    return blocks
+
+
+def _tables_on_alive_subtree(blocks, alive_tables):
+    """Non-alive vertices of blocks on the block-cut subtree spanning `alive_tables`."""
+    if not blocks:
+        return set()
+    membership = {}
+    for index, block in enumerate(blocks):
+        for vertex in block:
+            membership.setdefault(vertex, []).append(index)
+    cuts = {vertex for vertex, indexes in membership.items() if len(indexes) > 1}
+    tree = {}
+    terminals = set()
+
+    def link(a, b):
+        tree.setdefault(a, set()).add(b)
+        tree.setdefault(b, set()).add(a)
+
+    for index, block in enumerate(blocks):
+        block_node = ("b", index)
+        tree.setdefault(block_node, set())
+        alive_noncut = False
+        for vertex in block:
+            if vertex in cuts:
+                link(block_node, ("c", vertex))
+            elif vertex in alive_tables:
+                alive_noncut = True
+        if alive_noncut:
+            terminals.add(block_node)
+    for vertex in cuts:
+        if vertex in alive_tables:
+            terminals.add(("c", vertex))
+    if not terminals:
+        return set()
+    while True:
+        leaves = [node for node, neis in tree.items() if node not in terminals and len(neis) <= 1]
+        if not leaves:
+            break
+        for node in leaves:
+            for other in tree[node]:
+                tree[other].discard(node)
+            del tree[node]
+    retained = set()
+    for node in tree:
+        if node[0] != "b":
+            continue
+        for vertex in blocks[node[1]]:
+            if vertex not in alive_tables:
+                retained.add(vertex)
+    return retained
+
+
+def _definite_filter_tables(directed, alive_tables):
+    """Tables that sit strictly inside a simple directed path between two alive tables.
+
+    One budget for the whole search, read from `_PATH_REASON_BUDGET` now. An extension is one
+    step to a vertex not on the current path. Reaching another alive table marks the interior
+    and does not end the path. The search stops once the budget cannot pay for the next extension.
+    """
+    budget = _PATH_REASON_BUDGET
+    adj = {node: sorted(neis) for node, neis in directed.items()}
+    definite = set()
+    alive = set(alive_tables)
+    if budget <= 0:
+        return definite
+    for start in sorted(alive):
+        path = [start]
+        on_path = {start}
+        stack = [0]
+        exhausted = False
+        while stack:
+            node = path[-1]
+            neighbors = adj.get(node, ())
+            index = stack[-1]
+            if index >= len(neighbors):
+                stack.pop()
+                on_path.remove(path.pop())
+                continue
+            stack[-1] = index + 1
+            nxt = neighbors[index]
+            if nxt in on_path:
+                continue
+            if budget <= 0:
+                exhausted = True
+                break
+            budget -= 1
+            path.append(nxt)
+            on_path.add(nxt)
+            stack.append(0)
+            if nxt in alive and nxt != start:
+                definite.update(path[1:-1])
+            if budget <= 0:
+                exhausted = True
+                break
+        if exhausted:
+            break
+    return definite
+
+
+def _components(undirected):
+    seen = set()
+    for start in sorted(undirected):
+        if start in seen:
+            continue
+        comp = []
+        stack = [start]
+        seen.add(start)
+        while stack:
+            node = stack.pop()
+            comp.append(node)
+            for other in undirected[node]:
+                if other not in seen:
+                    seen.add(other)
+                    stack.append(other)
+        yield comp
+
+
+def _retain_filter_paths(graph, alive, locked, used, ext):
+    """Lock non-alive tables on the active-filter block-cut between alive tables.
+
+    `alive` is the fixpoint snapshot from the start of this iteration. A table already in it is
+    left untouched, so an earlier reason is never revised. `locked` grows in place.
+    """
+    snapshot = set(alive)
+    alive_tables = {k for k in snapshot if k in graph.objects and graph.objects[k].kind == "table"}
+    undirected, directed = _active_relationship_graphs(graph)
+    retained = set()
+    for comp in _components(undirected):
+        alive_here = alive_tables.intersection(comp)
+        if len(alive_here) < 2:
+            continue
+        sub = {node: sorted(undirected[node]) for node in comp}
+        retained |= _tables_on_alive_subtree(_biconnected_blocks(sub), alive_here)
+    retained = {table for table in retained if table not in snapshot and table in graph.objects
+                and graph.objects[table].kind == "table"}
+    if not retained:
+        return False
+    definite = _definite_filter_tables(directed, alive_tables)
+    added = False
+    for table in sorted(retained):
+        reason = _FILTER_PATH_DEFINITE if table in definite else _FILTER_PATH_MANUAL
+        previous = list(graph.locks.get(table, ()))
+        graph.lock(table, reason)
+        if graph.locks.get(table, ()) != previous:
+            added = True
+    extra_locked = graph.closure(retained) - used - ext
+    grew = bool(extra_locked - locked)
+    locked |= extra_locked
+    return grew or added
 
 
 # ---------------------------------------------------------------- build
