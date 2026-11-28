@@ -915,6 +915,840 @@ class GitHookTests(unittest.TestCase):
         self.assertEqual(before, self.snapshot())
 
 
+def load_catalog():
+    spec = importlib.util.spec_from_file_location(
+        'pbz_catalog', os.path.join(SKILL, 'install', 'build_visual_catalog.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class InstallerEntryPointTests(unittest.TestCase):
+    def setUp(self):
+        from contextlib import ExitStack
+
+        scope = self.enterContext(ExitStack())
+        self.root = Path(scope.enter_context(tempfile.TemporaryDirectory()))
+        self.inst = load_installer()
+        self.settings = self.root / 'settings.json'
+        self.hooks = self.root / 'hooks.json'
+        self.claude = self.root / 'claude.json'
+        self.codex = self.root / 'config.toml'
+        self.record = Path(str(self.settings) + '.pbz-owned.json')
+        self.journal = Path(str(self.settings) + '.pbz-txn.json')
+        for name, value in dict(CANON=SKILL, LINKS=[], RULE_FILES=[],
+                                CLAUDE_SETTINGS=str(self.settings), CODEX_HOOKS=str(self.hooks),
+                                CLAUDE_JSON=str(self.claude), CODEX_CONFIG=str(self.codex)).items():
+            scope.enter_context(patch.object(self.inst, name, value))
+
+    def _run(self, *args):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        output = StringIO()
+        with patch.object(sys, 'argv', ['install.py', *args]), redirect_stdout(output):
+            try:
+                code = self.inst.main()
+            except (Exception, SystemExit) as error:
+                code = f'raised {type(error).__name__}: {error}'
+        return code, output.getvalue()
+
+    def _snapshot(self):
+        return {path.relative_to(self.root):
+                ('link', os.readlink(path)) if path.is_symlink() else
+                ('dir', None) if path.is_dir() else ('file', path.read_bytes())
+                for path in self.root.rglob('*')}
+
+    def _refuse(self, args, *names):
+        before = self._snapshot()
+        code, output = self._run(*args)
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self._snapshot(), before, 'refusal must precede mutations')
+        self.assertIn('REFUSE', output)
+        for name in names:
+            self.assertIn(str(name), output)
+        return output
+
+    def test_r10_1_unknown_tokens(self):
+        for token in ('--whatif', '--bogus', 'stray'):
+            with self.subTest(token=token), tempfile.TemporaryDirectory(dir=self.root) as tmp:
+                with patch.object(self.inst, 'CLAUDE_SETTINGS', str(Path(tmp, 'settings.json'))), \
+                     patch.object(self.inst, 'CODEX_HOOKS', str(Path(tmp, 'hooks.json'))):
+                    output = self._refuse((token,), token)
+                for flag in ('--what-if', '--uninstall', '--mcp', '--report-json'):
+                    self.assertIn(flag, output)
+
+    def test_r10_1_documented_invocations(self):
+        before = self._snapshot()
+        self.assertEqual(self._run('--what-if', '--mcp')[0], 0)
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self._run('--mcp')[0], 0)
+        self.assertEqual(self._run('--uninstall')[0], 0)
+
+    def _settings(self, uninstall=False):
+        return self.inst.settings_step(str(self.settings), 'claude', False, uninstall, denies=True)
+
+    def test_r10_2_interrupted_install(self):
+        user = {'permissions': {'deny': ['Read(user-only)']}}
+        self.settings.write_text(json.dumps(user), encoding='utf-8')
+        save = self.inst.save_json
+
+        def interrupt(path, data, what_if):
+            if str(path) == str(self.record):
+                raise KeyboardInterrupt('before ownership save')
+            return save(path, data, what_if)
+
+        with patch.object(self.inst, 'save_json', side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            self._settings()
+        code, output = self._run('--uninstall')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.inst.load_json(str(self.settings)), user,
+                         'uninstall must remove interrupted-install hooks and denies only')
+        self.assertFalse(self.record.exists())
+        self.assertFalse(self.journal.exists())
+
+    def test_r10_2_interrupted_uninstall(self):
+        self.settings.write_bytes(b'{"permissions":{"deny":["Read(user-only)"]}}')
+        self._settings()
+        self._settings(True)
+        self._settings()
+        expected = (self.settings.read_bytes(), self.record.read_bytes())
+        remove = os.remove
+
+        def interrupt(path, *args, **kwargs):
+            if str(path) == str(self.record):
+                raise KeyboardInterrupt('before ownership removal')
+            return remove(path, *args, **kwargs)
+
+        with patch.object(self.inst.os, 'remove', side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            self._settings(True)
+        self._settings()
+        self.assertEqual((self.settings.read_bytes(), self.record.read_bytes()), expected,
+                         'reinstall must reproduce uninterrupted settings and ownership bytes')
+        self.assertFalse(self.journal.exists())
+
+    def _journal(self, settings, record, observed, target=None):
+        import base64
+
+        def image(contents):
+            return None if contents is None else base64.b64encode(contents).decode('ascii')
+
+        target = target or self.settings
+        journal = Path(str(target) + '.pbz-txn.json')
+        data = {'version': 1,
+                'settings': dict(zip(('before', 'after'), map(image, settings))),
+                'record': dict(zip(('before', 'after'), map(image, record)))}
+        journal.write_text(json.dumps(data), encoding='utf-8')
+        for path, contents in zip((target, Path(str(target) + '.pbz-owned.json')), observed):
+            if contents is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(contents)
+        return data
+
+    def _recover(self, boundary):
+        self.settings.write_bytes(b'{"permissions":{"deny":["Read(user-only)"]}}')
+        before = self.settings.read_bytes()
+        self._settings()
+        after, record = self.settings.read_bytes(), self.record.read_bytes()
+        observed = (before, None) if boundary == 'journal' else (after, record)
+        self._journal((after if boundary == 'record-only' else before, after), (None, record), observed)
+        snapshot = self._snapshot()
+        code, output = self._run('--what-if')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self._snapshot(), snapshot)
+        preview = output
+        code, output = self._run()
+        self.assertEqual(code, 0, output)
+        self.assertFalse(self.journal.exists(), 'reconciliation must retire the journal')
+        self.assertEqual((self.settings.read_bytes(), self.record.read_bytes()), (after, record))
+        self.assertRegex(preview.lower(), r'would[^\n]*reconcil|planned[^\n]*reconcil')
+
+    def test_r10_2_after_journal_write(self):
+        self._recover('journal')
+
+    def test_r10_2_after_record_write(self):
+        self._recover('record')
+
+    def test_r10_2_completed_record_only_pair(self):
+        self._recover('record-only')
+
+    def test_r10_2_unreachable_pair(self):
+        self._journal((b'{}', b'{"x":1}'), (None, b'{}'), (b'{}', b'{}'))
+        self._refuse(('--what-if',), self.journal)
+
+    def test_r10_2_recovery_instructions(self):
+        self._journal((b'{}', b'{"x":1}'), (None, b'{}'), (b'{"user":1}', None))
+        output = self._refuse(('--uninstall',), self.settings).lower()
+        for wording in (r'preserv|cop(y|ies)', r'before', r'after', r'null',
+                        r'verif', r'(delet|remov).*journal', r're.appl'):
+            self.assertRegex(output, wording)
+
+    def test_r10_2_edited_settings_image(self):
+        self._journal((b'{}', b'{"x":1}'), (None, b'{}'), (b'{"edited":1}', None))
+        self._refuse(('--uninstall',), self.settings)
+
+    def test_r10_2_edited_record_image(self):
+        self._journal((b'{}', b'{"x":1}'), (None, b'{}'), (b'{"x":1}', b'{"edited":1}'))
+        self._refuse(('--uninstall',), self.record)
+
+    def test_r10_2_corrupt_journal(self):
+        self.journal.write_bytes(b'{')
+        output = self._refuse((), self.journal).lower()
+        for wording in (r'preserv|cop(y|ies)', r'aside', r'ownership.*unknown'):
+            self.assertRegex(output, wording)
+
+    def test_r10_2_invalid_journal_images(self):
+        for reason in ('version', 'missing image', 'base64'):
+            with self.subTest(reason=reason):
+                data = self._journal((None, b'{}'), (None, b'{}'), (None, None))
+                if reason == 'version':
+                    data['version'] = 2
+                elif reason == 'missing image':
+                    del data['settings']['after']
+                else:
+                    data['settings']['after'] = '***'
+                self.journal.write_text(json.dumps(data), encoding='utf-8')
+                self._refuse((), self.journal)
+
+    def test_r10_2_user_denies_survive_cycle(self):
+        rules = ['Read(user-only)', self.inst.DENY_RULES[0]]
+        user = {'permissions': {'deny': rules}}
+        self.settings.write_text(json.dumps(user), encoding='utf-8')
+        self._settings()
+        self.assertEqual(self.inst.load_json(str(self.settings))['permissions']['deny'][:2], rules)
+        self._settings(True)
+        self.assertEqual(self.inst.load_json(str(self.settings)), user)
+
+    def _entry(self, **fields):
+        return {'type': 'stdio', 'command': self.inst.python_exe(),
+                'args': self.inst.mcp_args(), 'env': {}, **fields}
+
+    def _claude_conflict(self, servers, wording=''):
+        for uninstall in (False, True):
+            with self.subTest(uninstall=uninstall):
+                before = json.dumps({'mcpServers': servers})
+                merged, reason = self.inst.merge_claude_mcp(json.loads(before), uninstall)
+                self.assertEqual(json.dumps(merged), before, reason)
+                self.assertTrue(reason.startswith('SKIP'), reason)
+                self.assertIn('mcpServers.pbz' if isinstance(servers, dict) else 'mcpServers', reason)
+                self.assertIn(wording, reason)
+
+    def test_r10_3_foreign_claude_installation(self):
+        self._claude_conflict({'pbz': self._entry(args=['-I', '/other/pbz/cli.py', 'mcp'])}, 'not ours')
+
+    def test_r10_3_extra_claude_arguments(self):
+        self._claude_conflict({'pbz': self._entry(args=[*self.inst.mcp_args(), '--extra'])}, 'not ours')
+
+    def test_r10_3_custom_claude_env(self):
+        self._claude_conflict({'pbz': self._entry(env={'HOST_OPTION': 'fixture'})})
+
+    def test_r10_3_non_dict_claude_servers(self):
+        self._claude_conflict(['host'])
+
+    def test_r10_3_non_dict_claude_entry(self):
+        self._claude_conflict({'pbz': 'host'})
+
+    def test_r10_3_string_claude_env(self):
+        self._claude_conflict({'pbz': self._entry(env='host')})
+
+    def test_r10_3_extra_claude_key(self):
+        self._claude_conflict({'pbz': self._entry(host_owned=True)})
+
+    def test_r10_3_case_changed_path(self):
+        args = self.inst.mcp_args()
+        args[1] = args[1].replace('/pbz/', '/PBZ/')
+        self._claude_conflict({'pbz': self._entry(args=args)}, 'not ours')
+
+    def _block(self, header='mcp_servers.pbz', command=None, args=None):
+        command = self.inst.python_exe() if command is None else command
+        args = self.inst.mcp_args() if args is None else args
+        return f'[{header}]\ncommand = {json.dumps(command)}\nargs = {json.dumps(args)}\n'
+
+    def _codex_conflict(self, original, wording=''):
+        for uninstall in (False, True):
+            with self.subTest(uninstall=uninstall):
+                text, reason = self.inst.merge_codex_toml(original, uninstall)
+                self.assertEqual(text, original, reason)
+                self.assertTrue(reason.startswith('SKIP'), reason)
+                self.assertIn('mcp_servers.pbz', reason)
+                self.assertIn(wording, reason)
+
+    def test_r10_3_extra_codex_arguments(self):
+        self._codex_conflict(self._block(args=[*self.inst.mcp_args(), '--extra']), 'not ours')
+
+    def test_r10_3_codex_env(self):
+        self._codex_conflict(self._block() + '[mcp_servers.pbz.env]\nHOST = "fixture"\n')
+
+    def test_r10_3_extra_codex_key(self):
+        self._codex_conflict(self._block() + 'host_owned = true\n')
+
+    def test_r10_3_foreign_codex_installation(self):
+        self._codex_conflict(self._block(args=['-I', '/other/pbz/cli.py', 'mcp']), 'not ours')
+
+    def _removed(self, original, unrelated=''):
+        import tomllib
+
+        text, reason = self.inst.merge_codex_toml(original, True)
+        self.assertEqual(reason, 'removed')
+        self.assertEqual(text, unrelated, 'removal must preserve unrelated TOML bytes')
+        self.assertEqual(tomllib.loads(text), tomllib.loads(unrelated))
+
+    def test_r10_4_quoted_parent_uninstall(self):
+        for header in ('"mcp_servers".pbz', "'mcp_servers'.pbz"):
+            with self.subTest(header=header):
+                self._removed(self._block(header))
+
+    def test_r10_4_quoted_parent_updates_in_place(self):
+        import tomllib
+
+        for header in ('"mcp_servers".pbz', "'mcp_servers'.pbz"):
+            with self.subTest(header=header):
+                unrelated = '[host]\nvalue = 1\n'
+                text, reason = self.inst.merge_codex_toml(self._block(header, 'stale-python') + unrelated, False)
+                self.assertEqual(reason, 'updated')
+                self.assertTrue(text.endswith(unrelated))
+                self.assertEqual(tomllib.loads(text), {
+                    'host': {'value': 1},
+                    'mcp_servers': {'pbz': {'command': self.inst.python_exe(), 'args': self.inst.mcp_args()}},
+                })
+
+    def test_r10_4_multiline_string(self):
+        unrelated = '[host]\ntext = """\n[mcp_servers.pbz]\nkeep this text\n"""\n'
+        self._removed(unrelated + self._block(), unrelated)
+
+    def test_r10_4_quoted_child_uninstall(self):
+        self._removed(self._block('mcp_servers."pbz"'))
+
+    def test_r10_4_noncontiguous_subtable(self):
+        self._codex_conflict(self._block() + '[host]\nx = 1\n[mcp_servers.pbz.env]\nX = "host"\n')
+
+    def test_r10_4_inline_registration(self):
+        fields = f'command = "python", args = {json.dumps(self.inst.mcp_args())}'
+        self._codex_conflict('[mcp_servers]\npbz = {' + fields + '}\n', 'cannot be located')
+
+    def test_r10_4_dotted_registration(self):
+        import tomllib
+
+        args = self.inst.mcp_args()
+        text = f'[mcp_servers]\npbz.command = "python"\npbz.args = {json.dumps(args)}\n'
+        self.assertEqual(tomllib.loads(text)['mcp_servers']['pbz'], {'command': 'python', 'args': args})
+        self._codex_conflict(text, 'cannot be located')
+
+    def test_r10_4_multiline_array(self):
+        unrelated = '[host]\nvalues = [\n  [1, 2],\n  [3],\n]\n'
+        self._removed(unrelated + self._block(), unrelated)
+
+    def test_r10_6_malformed_claude_preflight(self):
+        self.claude.write_bytes(b'{')
+        self._refuse(('--mcp',), self.claude)
+
+    def test_r10_6_bad_second_ownership_record(self):
+        record = Path(str(self.hooks) + '.pbz-owned.json')
+        record.write_bytes(b'{')
+        self._refuse((), record)
+
+    def test_r10_6_combined_preflight_problems(self):
+        rule = self.root / 'rules.md'
+        rule.write_text(self.inst.BEGIN, encoding='utf-8')
+        self.codex.write_bytes(b'invalid = [\n')
+        with patch.object(self.inst, 'RULE_FILES', [str(rule)]):
+            output = self._refuse(('--mcp',), self.codex, rule)
+        self.assertIn('markers', output)
+
+    def test_r10_6_second_target_divergence(self):
+        self._journal((b'{}', b'{"x":1}'), (None, b'{}'), (b'{"host":1}', None), self.hooks)
+        self._refuse((), str(self.hooks) + '.pbz-txn.json')
+
+    def test_r10_6_uninstall_bad_toml(self):
+        self.assertEqual(self._run('--mcp')[0], 0)
+        self.codex.write_bytes(b'invalid = [\n')
+        self._refuse(('--uninstall',), self.codex)
+
+    def test_r10_6_settings_merge_conflict(self):
+        self.hooks.write_bytes(b'{"hooks":{"PreToolUse":{"host_owned":true}}}')
+        self._refuse((), self.hooks)
+
+    def test_r10_8_spaced_paths(self):
+        python = str(self.root / 'python directory' / 'python3')
+        canon = str(self.root / 'skill directory')
+        guard = str(Path(canon, 'pbz', 'guard.py'))
+        if os.name == 'nt':
+            python, guard = python.replace('\\', '/'), guard.replace('\\', '/')
+        with patch.object(self.inst, 'python_exe', return_value=python), patch.object(self.inst, 'CANON', canon):
+            try:
+                command = self.inst.hook_cmd('claude')
+            except SystemExit as error:
+                self.fail(f'safe spaced paths must be quoted: {error}')
+            self.assertEqual(command, f'"{python}" -I -S "{guard}" --agent claude')
+            self.assertTrue(self.inst.is_ours({'hooks': [{'command': command}]}))
+
+    def test_r10_8_legacy_unicode_uninstall(self):
+        canon = str(self.root / 'skill-é')
+        python = self.inst.python_exe()
+        guard = str(Path(canon, 'pbz', 'guard.py')).replace(os.sep, '/')
+        child = {'type': 'command', 'command': f'{python} -I -S {guard} --agent claude', 'timeout': 15}
+        settings = {'hooks': {'PreToolUse': [{'matcher': '.*', 'hooks': [child]}]}}
+        record = {'hooks': {'container': True, 'events': ['PreToolUse'],
+                            'additions': [{'event': 'PreToolUse', 'child': child,
+                                           'shell': {'matcher': '.*', 'hooks': []}}]}}
+        self.settings.write_text(json.dumps(settings), encoding='utf-8')
+        self.record.write_text(json.dumps(record), encoding='utf-8')
+        with patch.object(self.inst, 'CANON', canon), patch.object(self.inst, 'python_exe', return_value=python):
+            code, output = self._run('--uninstall')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.inst.load_json(str(self.settings)), {})
+        self.assertFalse(self.record.exists())
+
+    def test_r10_8_refused_characters(self):
+        for char in ('$', '`', '%', ';', '"', '\n', ',', '&', '|', '<', '>', '^', "'", '=', '#', '[', ']', 'é'):
+            with self.subTest(char=char), patch.object(self.inst, 'python_exe', return_value=f'/p{char}y/python3'):
+                with self.assertRaisesRegex(SystemExit, 'hook command would need quoting'):
+                    self.inst.hook_cmd('claude')
+
+    def test_r10_8_refused_backslashes(self):
+        for path in (r'\\server\share\python3', 'python3\\'):
+            with self.subTest(path=path), patch.object(self.inst, 'python_exe', return_value=path):
+                with self.assertRaisesRegex(SystemExit, 'hook command would need quoting'):
+                    self.inst.hook_cmd('claude')
+
+    def test_r10_8_parentheses_quoted(self):
+        path = '/opt/(local)/python3'
+        with patch.object(self.inst, 'python_exe', return_value=path):
+            self.assertTrue(self.inst.hook_cmd('claude').startswith(f'"{path}" -I -S '))
+
+    def test_r10_9_owned_junction_what_if(self):
+        target = self.root / 'skill'
+        target.mkdir()
+        link = self.root / 'linked-skill'
+        if os.name == 'posix':
+            link.symlink_to(target, target_is_directory=True)
+        else:
+            # An existing directory exercises the same realpath ownership check on Windows.
+            link = target
+        before = self._snapshot()
+        with patch.object(self.inst, 'SKILL', str(target)), patch.object(self.inst, 'LINKS', [str(link)]):
+            code, output = self._run('--what-if', '--uninstall')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self._snapshot(), before)
+        self.assertIn(f'would remove {link}', output)
+
+    def _mklink_failure(self, error, *details):
+        link = self.root / 'profile' / 'skills' / 'pbz'
+        link.parent.mkdir(parents=True)
+        with patch.object(self.inst, 'LINKS', [str(link)]), \
+             patch.object(self.inst.subprocess, 'run', side_effect=error) as run:
+            code, output = self._run()
+        run.assert_called_once()
+        self.assertEqual(code, 1, output)
+        self.assertIn('FAILED', output)
+        for detail in (*details, str(link)):
+            self.assertIn(detail, output)
+        return output
+
+    def test_r10_9_mklink_nonzero_exit(self):
+        error = subprocess.CalledProcessError(23, ['cmd'], output=b'other output', stderr=b'junction denied')
+        output = self._mklink_failure(error, os.path.realpath(SKILL), '23', 'junction denied')
+        self.assertNotIn('other output', output)
+
+    def test_r10_9_missing_cmd_executable(self):
+        self._mklink_failure(FileNotFoundError(2, 'No such file or directory', 'cmd'), 'cmd')
+
+    def test_r10_9_ownership_record_only(self):
+        self._settings()
+        before = self.settings.read_bytes()
+        self.record.unlink()
+        code, output = self._run()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.settings.read_bytes(), before)
+        self.assertTrue(self.record.exists())
+        self.assertIn(f'ownership record -> {self.settings}', output)
+
+    def _report(self, args, exit_code, result):
+        code, output = self._run(*args, '--report-json')
+        self.assertEqual(code, exit_code, output)
+        try:
+            report = json.loads(output)
+        except ValueError as error:
+            self.fail(f'stdout must contain one JSON object: {error}; output={output!r}')
+        self.assertIsInstance(report, dict)
+        self.assertEqual(set(report), {'operations', 'result', 'errors'})
+        self.assertEqual(report['result'], result)
+        self.assertIsInstance(report['errors'], list)
+        self.assertIsInstance(report['operations'], list)
+        for operation in report['operations']:
+            self.assertEqual(set(operation), {'step', 'state', 'detail'})
+            self.assertIn(operation['state'], {'planned', 'changed', 'unchanged', 'removed',
+                                                'absent', 'conflict', 'failed'})
+        return report
+
+    def _operation(self, report, state, *fragments):
+        for operation in report['operations']:
+            if operation['state'] == state and all(fragment in str(operation) for fragment in fragments):
+                return operation
+        self.fail(f'expected {state} operation containing {fragments!r}: {report!r}')
+
+    def test_r10_9_what_if_settings_report(self):
+        before = self._snapshot()
+        code, output = self._run('--what-if')
+        self.assertEqual(code, 0, output)
+        self.assertIn(f'hooks + deny rules -> {self.settings}', output)
+        report = self._report(('--what-if',), 0, 'ok')
+        self._operation(report, 'planned', self.settings.name)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_r10_9_foreign_registration_uninstall(self):
+        text = json.dumps({'mcpServers': {'pbz': self._entry(args=['-I', '/other/pbz/cli.py', 'mcp'])}})
+        self.claude.write_bytes(text.encode())
+        report = self._report(('--uninstall',), 1, 'conflict')
+        self.assertEqual(self.claude.read_bytes(), text.encode())
+        self._operation(report, 'conflict', 'mcpServers.pbz')
+
+    def test_r10_9_json_success(self):
+        report = self._report(('--mcp',), 0, 'ok')
+        settings = self._operation(report, 'changed', self.settings.name)
+        registration = self._operation(report, 'changed', 'mcpServers.pbz')
+        self.assertNotEqual(settings['step'], registration['step'])
+        self.assertEqual(report['errors'], [])
+
+    def test_r10_9_json_fatal_preflight(self):
+        self.claude.write_bytes(b'{')
+        before = self._snapshot()
+        report = self._report(('--mcp',), 1, 'conflict')
+        self._operation(report, 'conflict', self.claude.name)
+        self.assertIn(self.claude.name, str(report['errors']))
+        self.assertEqual(self._snapshot(), before)
+
+    def test_r10_9_json_unknown_argument(self):
+        before = self._snapshot()
+        report = self._report(('--bogus',), 1, 'conflict')
+        self.assertEqual(report['operations'], [])
+        self.assertIn('--bogus', str(report['errors']))
+        self.assertEqual(self._snapshot(), before)
+        code, output = self._run('--report-json', '--bogus')
+        self.assertEqual(code, 1, output)
+        self.assertEqual(json.loads(output), report)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_r10_9_json_apply_conflict_retains_completed_operation(self):
+        step = self.inst.settings_step
+
+        def conflict(path, *args, **kwargs):
+            if path == str(self.hooks):
+                raise self.inst.InstallConflict(f'{path}: concurrent edit')
+            return step(path, *args, **kwargs)
+
+        with patch.object(self.inst, 'settings_step', side_effect=conflict):
+            report = self._report((), 1, 'conflict')
+        self._operation(report, 'changed', self.settings.name)
+        self.assertIn('concurrent edit', str(report['errors']))
+
+    def test_r10_9_json_failed_operation_takes_precedence(self):
+        first = self.root / 'first-link'
+        second = self.root / 'second-link'
+        foreign = {'mcpServers': {'pbz': self._entry(args=['-I', '/other/pbz/cli.py', 'mcp'])}}
+        self.claude.write_text(json.dumps(foreign), encoding='utf-8')
+
+        def mklink(command, **kwargs):
+            if command[-2] == str(second):
+                raise subprocess.CalledProcessError(23, command, stderr=b'junction denied')
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(self.inst, 'LINKS', [str(first), str(second)]), \
+             patch.object(self.inst.subprocess, 'run', side_effect=mklink):
+            report = self._report(('--mcp',), 1, 'failed')
+        self._operation(report, 'changed', first.name)
+        self._operation(report, 'failed', second.name, '23', 'junction denied')
+
+    def test_r10_9_json_unexpected_exception(self):
+        with patch.object(self.inst, 'settings_step', side_effect=OSError('injected apply error')):
+            report = self._report((), 1, 'failed')
+        self.assertIn('OSError', str(report['errors']))
+        self.assertIn('injected apply error', str(report['errors']))
+
+    def test_r10_9_json_path_refusal(self):
+        path = '/unsafe%path with spaces/python3'
+        before = self._snapshot()
+        with patch.object(self.inst, 'python_exe', return_value=path):
+            report = self._report((), 1, 'conflict')
+        self.assertIn(path, str(report['errors']))
+        self.assertEqual(self._snapshot(), before)
+
+    if os.name == 'posix':
+        def _launcher(self, directory='tree', with_cli=True):
+            tree = self.root / directory
+            launcher = tree / 'bin' / 'pbz'
+            launcher.parent.mkdir(parents=True)
+            shutil.copyfile(Path(SKILL, 'bin', 'pbz'), launcher)
+            launcher.chmod(0o755)
+            if with_cli:
+                cli = tree / 'pbz' / 'cli.py'
+                cli.parent.mkdir()
+                cli.write_text('import json, sys\nprint(json.dumps(sys.argv[1:]))\nraise SystemExit(3)\n',
+                               encoding='utf-8')
+            return launcher
+
+        def _bash(self):
+            bash = shutil.which('bash')
+            self.assertIsNotNone(bash, 'POSIX launcher tests require bash')
+            return bash
+
+        def _launch(self, args, path=None):
+            env = {**os.environ}
+            if path is not None:
+                env['PATH'] = str(path)
+            return subprocess.run(args, cwd=self.root, env=env, text=True, capture_output=True, timeout=10)
+
+        def _launcher_error(self, result, code):
+            self.assertEqual(result.returncode, code, result.stderr)
+            self.assertTrue(result.stderr.startswith('pbz launcher:'), result.stderr)
+            self.assertEqual(result.stdout, '')
+
+        def test_r10_7_missing_cli(self):
+            launcher = self._launcher(with_cli=False)
+            result = self._launch([self._bash(), str(launcher)])
+            self._launcher_error(result, 1)
+            self.assertIn('pbz/cli.py', result.stderr)
+            self.assertIn(str(launcher.parent), result.stderr)
+
+        def test_r10_7_missing_python(self):
+            launcher = self._launcher()
+            empty = self.root / 'empty'
+            empty.mkdir()
+            result = self._launch([self._bash(), str(launcher)], empty)
+            self._launcher_error(result, 127)
+            self.assertIn('python', result.stderr.lower())
+
+        def test_r10_7_portable_readlink(self):
+            launcher = self._launcher()
+            link = self.root / 'linked-pbz'
+            link.symlink_to(launcher.relative_to(self.root))
+            tools = self.root / 'tools'
+            tools.mkdir()
+            readlink = shutil.which('readlink')
+            dirname = shutil.which('dirname')
+            self.assertIsNotNone(readlink)
+            self.assertIsNotNone(dirname)
+            (tools / 'python3').symlink_to(sys.executable)
+            (tools / 'dirname').symlink_to(dirname)
+            stub = tools / 'readlink'
+            import shlex
+
+            stub.write_text(f'#!{self._bash()}\n'
+                            f'[[ $# == 1 ]] || exit 64\nexec {shlex.quote(readlink)} "$1"\n',
+                            encoding='utf-8')
+            stub.chmod(0o755)
+            self._forwarded(self._launch([self._bash(), str(link), 'space argument'], tools), ['space argument'])
+
+        def _forwarded(self, result, args):
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertEqual(json.loads(result.stdout), args)
+
+        def test_r10_7_invocation_forms(self):
+            launcher = self._launcher()
+            spaced = self._launcher('tree with spaces')
+            link = self.root / 'linked-pbz'
+            link.symlink_to(launcher.relative_to(self.root))
+            arguments = ['mcp', 'space argument', '', '$literal', 'a"b']
+            for command in ([str(launcher)], [str(link)], ['./tree/bin/pbz'],
+                            [self._bash(), '-c', 'exec pbz "$@"', 'bash'], [str(spaced)]):
+                with self.subTest(command=command):
+                    self._forwarded(self._launch(command + arguments,
+                                                 f'{launcher.parent}{os.pathsep}{os.environ["PATH"]}'), arguments)
+
+        def _source_launcher(self, launcher, zero, path=None):
+            return self._launch([self._bash(), '-c', '. "$1" "$2"', str(zero), str(launcher), 'forwarded'], path)
+
+        def test_r10_7_resolver_cycle(self):
+            launcher = self._launcher()
+            first, second = self.root / 'cycle-a', self.root / 'cycle-b'
+            first.symlink_to(second.name)
+            second.symlink_to(first.name)
+            self._launcher_error(self._source_launcher(launcher, first), 1)
+
+        def test_r10_7_resolver_dangling(self):
+            launcher = self._launcher()
+            dangling = self.root / 'dangling'
+            dangling.symlink_to('missing')
+            self._launcher_error(self._source_launcher(launcher, dangling), 1)
+
+        def test_r10_7_resolver_bare_name(self):
+            launcher = self._launcher()
+            path = f'{launcher.parent}{os.pathsep}{os.environ["PATH"]}'
+            self._forwarded(self._source_launcher(launcher, 'pbz', path), ['forwarded'])
+            self._launcher_error(self._source_launcher(launcher, 'missing-pbz', path), 1)
+
+        def test_r10_8_posix_hook_round_trip(self):
+            for name in ('skill with spaces', r'skill\interior'):
+                with self.subTest(name=name):
+                    canon = self.root / name
+                    guard = canon / 'pbz' / 'guard.py'
+                    guard.parent.mkdir(parents=True)
+                    guard.write_text('import json, sys\nprint(json.dumps(sys.argv))\n', encoding='utf-8')
+                    with patch.object(self.inst, 'CANON', str(canon)):
+                        try:
+                            command = self.inst.hook_cmd('claude')
+                        except SystemExit as error:
+                            self.fail(f'representable guard path refused: {error}')
+                    result = self._launch([self._bash(), '-c', command])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), [str(guard), '--agent', 'claude'])
+
+
+class CatalogBuilderTests(unittest.TestCase):
+    def setUp(self):
+        from contextlib import ExitStack
+
+        scope = self.enterContext(ExitStack())
+        root = Path(scope.enter_context(tempfile.TemporaryDirectory()))
+        self.catalog = load_catalog()
+        self.package = root / 'package.json'
+        self.data = root / 'data'
+        self.data.mkdir()
+        self.package.write_bytes(b'{"version":"1.0.0"}')
+        (self.data / 'capabilities.json').write_bytes(b'{"fixture":{}}')
+        (self.data / 'vco-capabilities.json').write_bytes(b'{}')
+        (self.data / 'instance-selectors.json').write_bytes(b'{}')
+        self.outputs = (root / 'visuals.json', root / 'visual-objects.json')
+        for name, value in zip(('PKG', 'OUT', 'OUT_OBJECTS'), (root, *self.outputs)):
+            scope.enter_context(patch.object(self.catalog, name, str(value)))
+
+    def _run(self, *args):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        output = StringIO()
+        with patch.object(sys, 'argv', ['build_visual_catalog.py', *args]), redirect_stdout(output):
+            try:
+                code = self.catalog.main()
+            except (Exception, SystemExit) as error:
+                code = f'raised {type(error).__name__}: {error}'
+        try:
+            report = json.loads(output.getvalue())
+        except ValueError:
+            report = output.getvalue()
+        return code, report
+
+    def _seed(self):
+        code, report = self._run()
+        self.assertEqual(code, 0, report)
+
+    def _bytes(self):
+        return tuple(path.read_bytes() if path.exists() else None for path in self.outputs)
+
+    def _input_error(self, filename, *args):
+        self._seed()
+        before = self._bytes()
+        self.package.write_bytes(b'{"version":"2.0.0"}')
+        (self.data / filename).write_bytes(b'{')
+        code, report = self._run(*args)
+        self.assertEqual(self._bytes(), before, 'invalid input must leave both outputs byte-identical')
+        self.assertEqual(code, 1, report)
+        self.assertEqual(set(report), {'error'})
+        self.assertIn(filename, report['error'])
+
+    def test_r10_5_malformed_instance_selectors(self):
+        self._input_error('instance-selectors.json')
+
+    def test_r10_5_malformed_vco(self):
+        self._input_error('vco-capabilities.json')
+
+    def test_r10_11_check_malformed_input(self):
+        self._input_error('instance-selectors.json', '--check')
+
+    def _assert_paths(self, report, key, *paths):
+        self.assertIsInstance(report, dict)
+        self.assertIn(key, report)
+        self.assertEqual([Path(name).name for name in report[key]], [path.name for path in paths])
+
+    def test_r10_5_publish_failure_then_check_mixed_generation(self):
+        self._seed()
+        first, second = self.outputs
+        before = self._bytes()
+        listing = set(second.parent.iterdir())
+        self.package.write_bytes(b'{"version":"2.0.0"}')
+        replace = os.replace
+
+        def fail_second(source, destination, *args, **kwargs):
+            if Path(destination) == second:
+                raise OSError('injected publish failure')
+            return replace(source, destination, *args, **kwargs)
+
+        with patch.object(os, 'replace', side_effect=fail_second):
+            code, report = self._run()
+        self.assertEqual(code, 1, report)
+        self.assertEqual(set(report), {'error', 'output'})
+        self.assertIn('publish', report['error'].lower())
+        self.assertEqual(Path(report['output']).name, second.name)
+        self.assertEqual(set(second.parent.iterdir()), listing, 'failed publication must clean its temp file')
+        mixed = self._bytes()
+        self.assertNotEqual(mixed[0], before[0])
+        self.assertEqual(mixed[1], before[1])
+        code, report = self._run('--check')
+        self.assertEqual(code, 1, report)
+        self._assert_paths(report, 'stale', second)
+        self.assertEqual(self._bytes(), mixed)
+
+    def _old_mtimes(self):
+        for path in self.outputs:
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        return self._mtimes()
+
+    def _mtimes(self):
+        return tuple(path.stat().st_mtime_ns if path.exists() else None for path in self.outputs)
+
+    def test_r10_10_identical_run_does_not_rewrite(self):
+        self._seed()
+        before = self._old_mtimes()
+        code, report = self._run()
+        self.assertEqual(code, 0, report)
+        self.assertEqual(self._mtimes(), before, 'identical outputs must retain their mtimes')
+        self._assert_paths(report, 'written')
+        self._assert_paths(report, 'unchanged', *self.outputs)
+
+    def _check(self, exit_code, stale):
+        before, mtimes = self._bytes(), self._mtimes()
+        code, report = self._run('--check')
+        self.assertEqual(self._bytes(), before, '--check must leave both artifact bytes unchanged')
+        self.assertEqual(self._mtimes(), mtimes, '--check must never rewrite an artifact')
+        self.assertEqual(code, exit_code, report)
+        self.assertNotIn('written', report)
+        self.assertNotIn('error', report)
+        self.assertIn('checked', report)
+        self._assert_paths(report, 'stale', *stale)
+
+    def test_r10_11_check_writes_nothing(self):
+        self._seed()
+        self._old_mtimes()
+        self._check(0, ())
+
+    def test_r10_11_check_fresh_report(self):
+        self._seed()
+        code, report = self._run('--check')
+        self.assertEqual(code, 0, report)
+        self._assert_paths(report, 'checked', *self.outputs)
+        self.assertNotIn('written', report)
+
+    def test_r10_11_check_stale(self):
+        self._seed()
+        self.outputs[1].write_bytes(b'{}')
+        self._check(1, (self.outputs[1],))
+
+    def test_r10_11_check_missing(self):
+        self._seed()
+        self.outputs[0].unlink()
+        self._check(1, (self.outputs[0],))
+
+    def test_r10_11_unknown_argument(self):
+        self._seed()
+        before = self._bytes()
+        self.package.write_bytes(b'{"version":"2.0.0"}')
+        code, report = self._run('--bogus')
+        self.assertEqual(self._bytes(), before, 'unknown arguments must leave both artifacts unchanged')
+        self.assertEqual(code, 1, report)
+        self.assertIn('--bogus', report['error'])
+
+
 def main() -> int:
     fails: list[str] = []
 
