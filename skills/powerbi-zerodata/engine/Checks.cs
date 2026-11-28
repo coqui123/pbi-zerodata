@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Numerics;
 using System.Text.Json.Nodes;
 
 namespace PbzEngine;
@@ -276,11 +277,12 @@ public static class Checks
         string left = Expr(chk, "left");
         string right = Expr(chk, "right");
         double tol = Tol(chk);
+        double absTol = AbsTol(chk);
         var by = J.StrList(chk, "by") ?? new List<string>();
         if (by.Count == 0)
         {
             var row = conn.Row1("EVALUATE ROW(\"l\", " + Dax.Calc(left, where) + ", \"r\", " + Dax.Calc(right, where) + ")");
-            res["status"] = ValuesEqual(row[0], row[1], tol) ? "PASS" : "FAIL";
+            res["status"] = ValuesEqual(row[0], row[1], tol, absTol) ? "PASS" : "FAIL";
             return;
         }
         var cols = by.Select(b => conn.Meta.ResolveColumn(b)).ToList();
@@ -294,7 +296,7 @@ public static class Checks
             index.Snapshot();
             group = GroupFactory(index, by, cols, reveal, allow, vault);
         }
-        var aggregate = new EqualAggregate(cols.Count, tol, group);
+        var aggregate = new EqualAggregate(cols.Count, tol, group, absTol);
         conn.VisitRows(q, aggregate.Accept);
         aggregate.Write(res);
     }
@@ -304,6 +306,7 @@ public static class Checks
     {
         readonly int columns;
         readonly double tolerance;
+        readonly double absTol;
         readonly Func<object?[], JsonObject>? group;
         readonly List<(string Text, JsonObject Group)> sample = new();
         public long RowsConsumed { get; private set; }
@@ -312,16 +315,20 @@ public static class Checks
         public int PeakRetainedGroups { get; private set; }
 
         public EqualAggregate(int columns, double tolerance, Func<object?[], JsonObject>? group)
+            : this(columns, tolerance, group, 0) { }
+
+        public EqualAggregate(int columns, double tolerance, Func<object?[], JsonObject>? group, double absTol)
         {
             this.columns = columns;
             this.tolerance = tolerance;
             this.group = group;
+            this.absTol = absTol;
         }
 
         public void Accept(object?[] row)
         {
             RowsConsumed++;
-            if (ValuesEqual(row[columns], row[columns + 1], tolerance)) return;
+            if (ValuesEqual(row[columns], row[columns + 1], tolerance, absTol)) return;
             Failures++;
             if (group == null) return;
             var g = group(row);
@@ -352,6 +359,7 @@ public static class Checks
     {
         string expr = Expr(chk, "expr");
         double tol = Tol(chk);
+        double absTol = AbsTol(chk);
         var by = J.StrList(chk, "by") ?? new List<string>();
         if (by.Count == 0) throw new BadRequestException("additive needs by");
         var cols = by.Select(b => conn.Meta.ResolveColumn(b)).ToList();
@@ -359,7 +367,7 @@ public static class Checks
         var aggregate = new AdditiveAggregate(cols.Count);
         conn.VisitRows("EVALUATE " + Dax.CalcTable(
             "SUMMARIZECOLUMNS(" + string.Join(", ", cols.Select(c => c.Ref)) + ", \"__pbz_v\", " + expr + ")", where), aggregate.Accept);
-        aggregate.Write(res, total, tol);
+        aggregate.Write(res, total, tol, absTol);
     }
 
     public sealed class AdditiveAggregate
@@ -378,12 +386,16 @@ public static class Checks
             sum += Norm.ToDouble(v);
             any = true;
         }
-        public void Write(JsonObject result, object? total, double tol)
+        public void Write(JsonObject result, object? total, double tol) => Write(result, total, tol, 0);
+        public void Write(JsonObject result, object? total, double tol, double absTol)
         {
             if (total == null && !any) { result["status"] = "EMPTY"; return; }
             if (total != null && !Norm.IsNumeric(total))
                 throw new EngineException(ErrorClass.TYPE_MISMATCH, "additive needs a numeric total");
-            result["status"] = NumEqual(total == null ? 0 : Norm.ToDouble(total), sum, tol) ? "PASS" : "FAIL";
+            // A positive absTol decides on the original total, never on its double conversion.
+            bool equal = absTol > 0 ? ExactWithin(total ?? 0, sum, tol, absTol)
+                : NumEqual(total == null ? 0 : Norm.ToDouble(total), sum, tol);
+            result["status"] = equal ? "PASS" : "FAIL";
         }
     }
 
@@ -494,11 +506,15 @@ public static class Checks
     }
 
     /// <summary>BLANK equals BLANK only; numbers within relative tolerance; others by value.</summary>
-    public static bool ValuesEqual(object? a, object? b, double tol)
+    public static bool ValuesEqual(object? a, object? b, double tol) => ValuesEqual(a, b, tol, 0);
+
+    /// <summary>As the three-argument form when absTol is 0; a positive absTol compares numbers exactly (ExactWithin).</summary>
+    public static bool ValuesEqual(object? a, object? b, double tol, double absTol)
     {
         if (a == null || b == null) return a == null && b == null;
         if (Norm.IsNumeric(a) && Norm.IsNumeric(b))
         {
+            if (absTol > 0) return ExactWithin(a, b, tol, absTol);
             if (tol == 0) return ExactNumEqual(a, b);
             return NumEqual(Norm.ToDouble(a), Norm.ToDouble(b), tol);
         }
@@ -510,6 +526,7 @@ public static class Checks
 
     static bool IsIntegerType(object v) => v is long or int or short or sbyte or byte or ulong or uint or ushort;
     static bool IsExactType(object v) => IsIntegerType(v) || v is decimal;
+    static bool IsNonFinite(object v) => v is double d ? !double.IsFinite(d) : v is float f && !float.IsFinite(f);
 
     static bool ExactNumEqual(object a, object b)
     {
@@ -539,14 +556,66 @@ public static class Checks
             return (double)(long)d == d && (long)d == l;
         }
 
+        // A decimal against a double or float: exact rational equality, never the double conversion.
+        if (a is decimal || b is decimal)
+        {
+            if (double.IsInfinity(da) || double.IsInfinity(db)) return false;
+            var (an, ad) = Rational(a);
+            var (bn, bd) = Rational(b);
+            return an * bd == bn * ad;
+        }
         return da == db;
     }
 
-    static bool NumEqual(double a, double b, double tol)
+    static bool NumEqual(double a, double b, double tol, double absTol = 0)
     {
         if (a == b) return true;
         if (double.IsNaN(a) || double.IsNaN(b)) return false;
+        if (double.IsInfinity(a) || double.IsInfinity(b)) return false;
+        if (absTol > 0) return ExactWithin(a, b, tol, absTol);
         return Math.Abs(a - b) <= tol * Math.Max(Math.Abs(a), Math.Abs(b));
+    }
+
+    /// <summary>
+    /// Exact tolerance test on the original values. NaN matches nothing and an infinity matches only the same
+    /// infinity; otherwise the values, tol and absTol are exact rationals and |A - B| must be at most
+    /// max(tol * max(|A|, |B|), absTol).
+    /// </summary>
+    static bool ExactWithin(object a, object b, double tol, double absTol)
+    {
+        if (IsNonFinite(a) || IsNonFinite(b)) return IsNonFinite(a) && IsNonFinite(b) && Norm.ToDouble(a) == Norm.ToDouble(b);
+        var (an, ad) = Rational(a);
+        var (bn, bd) = Rational(b);
+        var (tn, td) = Rational(tol);
+        var (sn, sd) = Rational(absTol);
+        // Over the common denominator ad * bd, A is x and B is y.
+        var x = an * bd;
+        var y = bn * ad;
+        var diff = BigInteger.Abs(x - y);
+        return diff * td <= tn * BigInteger.Max(BigInteger.Abs(x), BigInteger.Abs(y)) || diff * sd <= sn * ad * bd;
+    }
+
+    /// <summary>Exact Num / Den with a positive Den: integers and decimals by decimal.GetBits, double and float by IEEE 754 bits.</summary>
+    static (BigInteger Num, BigInteger Den) Rational(object v)
+    {
+        if (!IsExactType(v)) return Rational(Norm.ToDouble(v));
+        int[] bits = decimal.GetBits(Convert.ToDecimal(v, CultureInfo.InvariantCulture));
+        var mantissa = ((BigInteger)(uint)bits[2] << 64) | ((BigInteger)(uint)bits[1] << 32) | (uint)bits[0];
+        return (bits[3] < 0 ? -mantissa : mantissa, BigInteger.Pow(10, (bits[3] >> 16) & 0xFF));
+    }
+
+    static (BigInteger Num, BigInteger Den) Rational(double d)
+    {
+        if (!double.IsFinite(d)) throw new ArgumentOutOfRangeException(nameof(d), "a nonfinite value has no rational form");
+        long bits = BitConverter.DoubleToInt64Bits(d);
+        int exponent = (int)((bits >> 52) & 0x7FF);
+        BigInteger mantissa = bits & 0xFFFFFFFFFFFFFL;
+        // Subnormals have no implicit leading bit and share the lowest exponent.
+        if (exponent == 0) exponent = 1;
+        else mantissa += BigInteger.One << 52;
+        if (bits < 0) mantissa = -mantissa;
+        exponent -= 1075;
+        return exponent >= 0 ? (mantissa << exponent, BigInteger.One) : (mantissa, BigInteger.One << -exponent);
     }
 
     static double Tol(JsonObject chk)
@@ -554,6 +623,13 @@ public static class Checks
         double tol = J.Num(chk, "tol") ?? DefaultTol;
         if (double.IsNaN(tol) || tol < 0 || tol > 1) throw new BadRequestException("tol must be between 0 and 1");
         return tol;
+    }
+
+    static double AbsTol(JsonObject chk)
+    {
+        double absTol = J.Num(chk, "abs_tol") ?? 0;
+        if (!double.IsFinite(absTol) || absTol < 0) throw new BadRequestException("abs_tol must be finite and not negative");
+        return absTol;
     }
 
     static string Expr(JsonObject chk, string field)

@@ -382,6 +382,112 @@ foreach (var pair in new[] {
     ("EVALUATE {\"a b\"}", "EVALUATE {\"ab\"}", false),
     ("EVALUATE {'a b'[x]}", "EVALUATE {'ab'[x]}", false)
 }) Assert((Normalize(pair.Item1) == Normalize(pair.Item2)) == pair.Item3, "query normalization: " + pair.Item1);
+// PKG-T1-03: numeric comparison semantics (E02-1, E02-4, E02-5). Collecting checks: one
+// hosted run reports every failing label before the single Assert at the end of the block.
+var t103Failures = new List<string>();
+void T103(bool ok, string label) { if (!ok) t103Failures.Add(label); }
+// E02-1: unequal infinities are rejected before relative-tolerance arithmetic.
+T103(!Checks.ValuesEqual(1.0, double.PositiveInfinity, 0.5), "E02-1: finite vs +Infinity tol 0.5 inequality");
+T103(!Checks.ValuesEqual(double.PositiveInfinity, 1.0, 0.5), "E02-1: +Infinity vs finite tol 0.5 inequality");
+T103(!Checks.ValuesEqual(double.PositiveInfinity, double.NegativeInfinity, 0.5), "E02-1: +Infinity vs -Infinity tol 0.5 inequality");
+T103(!Checks.ValuesEqual(double.NegativeInfinity, double.PositiveInfinity, 0.5), "E02-1: -Infinity vs +Infinity tol 0.5 inequality");
+T103(Checks.ValuesEqual(double.PositiveInfinity, double.PositiveInfinity, 0.5), "E02-1: +Infinity identity tol 0.5");
+T103(Checks.ValuesEqual(double.NegativeInfinity, double.NegativeInfinity, 0.5), "E02-1: -Infinity identity tol 0.5");
+T103(Checks.ValuesEqual(double.PositiveInfinity, double.PositiveInfinity, 0.0), "E02-1: +Infinity identity tol 0");
+T103(Checks.ValuesEqual(double.NegativeInfinity, double.NegativeInfinity, 0.0), "E02-1: -Infinity identity tol 0");
+T103(!Checks.ValuesEqual(double.NaN, double.NaN, 0.5), "E02-1: NaN vs NaN tol 0.5 inequality");
+T103(!Checks.ValuesEqual(double.NaN, 1.0, 0.5), "E02-1: NaN vs finite tol 0.5 inequality");
+// E02-4: zero-tolerance decimal-versus-floating comparison is genuinely exact.
+T103(!Checks.ValuesEqual(9007199254740993m, 9007199254740992.0, 0.0), "E02-4: decimal vs double 2^53 inequality");
+T103(!Checks.ValuesEqual(9007199254740992.0, 9007199254740993m, 0.0), "E02-4: double vs decimal 2^53 inequality");
+T103(Checks.ValuesEqual(9007199254740992m, 9007199254740992.0, 0.0), "E02-4: decimal vs double 2^53 exact identity");
+T103(Checks.ValuesEqual(9007199254740992.0, 9007199254740992m, 0.0), "E02-4: double vs decimal 2^53 exact identity");
+T103(Checks.ValuesEqual(1.5m, 1.5, 0.0), "E02-4: 1.5m vs 1.5 identity");
+T103(Checks.ValuesEqual(0.5m, 0.5, 0.0), "E02-4: 0.5m vs 0.5 identity");
+T103(!Checks.ValuesEqual(0.1m, 0.1, 0.0), "E02-4: 0.1m vs 0.1 double inequality");
+T103(!Checks.ValuesEqual(0.10000000149011612m, 0.1f, 0.0), "E02-4: decimal vs float 0.1 inequality");
+T103(!Checks.ValuesEqual(0.1f, 0.10000000149011612m, 0.0), "E02-4: float vs decimal 0.1 inequality");
+T103(Checks.ValuesEqual(1.5m, 1.5f, 0.0), "E02-4: 1.5m vs 1.5f identity");
+T103(Checks.ValuesEqual(0.5m, 0.5f, 0.0), "E02-4: 0.5m vs 0.5f identity");
+// Exact-branch boundaries: subnormals and signed zero against decimal zero.
+T103(!Checks.ValuesEqual(double.Epsilon, 0m, 0.0), "E02-4: subnormal vs decimal zero inequality");
+T103(!Checks.ValuesEqual(0m, double.Epsilon, 0.0), "E02-4: decimal zero vs subnormal inequality");
+T103(!Checks.ValuesEqual(-double.Epsilon, 0m, 0.0), "E02-4: negative subnormal vs decimal zero inequality");
+T103(!Checks.ValuesEqual(0m, -double.Epsilon, 0.0), "E02-4: decimal zero vs negative subnormal inequality");
+T103(Checks.ValuesEqual(0m, 0.0, 0.0), "E02-4: decimal zero vs +0.0 identity");
+T103(Checks.ValuesEqual(0m, -0.0, 0.0), "E02-4: decimal zero vs -0.0 identity");
+T103(Checks.ValuesEqual(0.0, 0m, 0.0), "E02-4: +0.0 vs decimal zero identity");
+T103(Checks.ValuesEqual(-0.0, 0m, 0.0), "E02-4: -0.0 vs decimal zero identity");
+// E02-5: optional abs_tol, probed by reflection so this commit compiles on the base and
+// fails by assertion: the four-argument ValuesEqual overload, the AbsTol reader, the
+// EqualAggregate four-argument constructor, the AdditiveAggregate.Write four-argument
+// overload.
+var ve4 = typeof(Checks).GetMethod("ValuesEqual", new[] { typeof(object), typeof(object), typeof(double), typeof(double) });
+bool? VE4(object? a, object? b, double tol, double absTol) =>
+    ve4 == null ? null : (bool)ve4.Invoke(null, new object?[] { a, b, tol, absTol })!;
+T103(VE4(0.0, 1e-12, 0.0, 1e-9) == true, "E02-5: 0 vs 1e-12 at abs_tol 1e-9 equality");
+T103(VE4(0.0, 1e-6, 0.0, 1e-9) == false, "E02-5: 0 vs 1e-6 at abs_tol 1e-9 inequality");
+T103(VE4(9007199254740993m, 9007199254740992.0, 0.0, 0.5) == false, "E02-5: decimal vs double 2^53 at abs_tol 0.5 inequality");
+T103(VE4(9007199254740992.0, 9007199254740993m, 0.0, 0.5) == false, "E02-5: double vs decimal 2^53 at abs_tol 0.5 inequality");
+T103(VE4(9007199254740993m, 9007199254740992.0, 0.0, 1.0) == true, "E02-5: decimal vs double 2^53 at abs_tol 1.0 equality");
+T103(VE4(9007199254740993L, 9007199254740992L, 0.0, 0.5) == false, "E02-5: int64 pair at abs_tol 0.5 inequality");
+T103(VE4(double.PositiveInfinity, 1.0, 0.0, 1e308) == false, "E02-5: +Infinity vs finite at abs_tol 1e308 inequality");
+T103(VE4(double.PositiveInfinity, double.PositiveInfinity, 0.0, 0.5) == true, "E02-5: +Infinity identity at abs_tol 0.5");
+T103(Checks.ValuesEqual(9007199254740993m, 9007199254740992.0, 1e-18), "E02-5: 2^53 pair tol 1e-18 without abs_tol equality");
+T103(VE4(9007199254740993m, 9007199254740992.0, 1e-18, 0.5) == false, "E02-5: 2^53 pair tol 1e-18 at abs_tol 0.5 inequality (exact path disclosure)");
+// Absent-versus-zero equivalence: the three-argument outcome equals the absTol 0 outcome.
+T103(Checks.ValuesEqual(1.0, double.PositiveInfinity, 0.5) == VE4(1.0, double.PositiveInfinity, 0.5, 0.0), "E02-5: absent vs zero equivalence, E02-1 pair");
+T103(Checks.ValuesEqual(9007199254740993m, 9007199254740992.0, 0.0) == VE4(9007199254740993m, 9007199254740992.0, 0.0, 0.0), "E02-5: absent vs zero equivalence, E02-4 pair");
+T103(Checks.ValuesEqual(100.0, 100.01, 0.01) == VE4(100.0, 100.01, 0.01, 0.0), "E02-5: absent vs zero equivalence, control pair");
+var absTolReader = typeof(Checks).GetMethod("AbsTol", BindingFlags.NonPublic | BindingFlags.Static);
+double? ReadAbsTol(JsonObject chk)
+{
+    if (absTolReader == null) return null;
+    try { return (double)absTolReader.Invoke(null, new object?[] { chk })!; }
+    catch (TargetInvocationException) { return null; }
+}
+bool AbsTolRejects(JsonObject chk)
+{
+    if (absTolReader == null) return false;
+    try { absTolReader.Invoke(null, new object?[] { chk }); return false; }
+    catch (TargetInvocationException ex) { return ex.InnerException is BadRequestException; }
+}
+T103(ReadAbsTol(new JsonObject()) == 0.0, "E02-5: AbsTol reader absent field returns 0");
+T103(ReadAbsTol(new JsonObject { ["abs_tol"] = 0.25 }) == 0.25, "E02-5: AbsTol reader returns supplied value");
+T103(AbsTolRejects(new JsonObject { ["abs_tol"] = -1.0 }), "E02-5: AbsTol reader rejects negative");
+T103(AbsTolRejects(new JsonObject { ["abs_tol"] = double.NaN }), "E02-5: AbsTol reader rejects NaN");
+T103(AbsTolRejects(new JsonObject { ["abs_tol"] = double.PositiveInfinity }), "E02-5: AbsTol reader rejects +Infinity");
+var eqCtor = typeof(Checks.EqualAggregate).GetConstructor(new[] { typeof(int), typeof(double), typeof(Func<object?[], JsonObject>), typeof(double) });
+T103(eqCtor != null, "E02-5: EqualAggregate four-argument constructor exists");
+if (eqCtor != null)
+{
+    var grouped = (Checks.EqualAggregate)eqCtor.Invoke(new object?[] { 1, 0.0, null, 1e-9 });
+    grouped.Accept(new object?[] { "g", 0.0, 1e-12 });
+    T103((string?)Result(grouped)["status"] == "PASS", "E02-5: EqualAggregate grouped 0 vs 1e-12 at abs_tol 1e-9 PASS");
+}
+var write4 = typeof(Checks.AdditiveAggregate).GetMethod("Write", new[] { typeof(JsonObject), typeof(object), typeof(double), typeof(double) });
+T103(write4 != null, "E02-5: AdditiveAggregate.Write four-argument overload exists");
+if (write4 != null)
+{
+    var additive = new Checks.AdditiveAggregate(0);
+    additive.Accept(new object?[] { 1e-12 });
+    var nearResult = new JsonObject();
+    write4.Invoke(additive, new object?[] { nearResult, (object?)0.0, 0.0, 1e-9 });
+    T103((string?)nearResult["status"] == "PASS", "E02-5: AdditiveAggregate total 0 vs sum 1e-12 at abs_tol 1e-9 PASS");
+    var big = new Checks.AdditiveAggregate(0);
+    big.Accept(new object?[] { 9007199254740992.0 });
+    var failResult = new JsonObject();
+    write4.Invoke(big, new object?[] { failResult, (object?)9007199254740993m, 0.0, 0.5 });
+    T103((string?)failResult["status"] == "FAIL", "E02-5: AdditiveAggregate total 2^53+1 vs sum 2^53 at abs_tol 0.5 FAIL");
+    var passResult = new JsonObject();
+    write4.Invoke(big, new object?[] { passResult, (object?)9007199254740993m, 0.0, 1.0 });
+    T103((string?)passResult["status"] == "PASS", "E02-5: AdditiveAggregate total 2^53+1 vs sum 2^53 at abs_tol 1.0 PASS");
+}
+// Class level (outcome 4): the shared failure class in forms not identical to any single
+// finding's reproduction.
+T103(!Checks.ValuesEqual(2.5, double.NegativeInfinity, 0.75), "class: 2.5 vs -Infinity tol 0.75 inequality");
+T103(!Checks.ValuesEqual(0.1m, 0.1, 0.0), "class: 0.1m vs 0.1 double inequality");
+Assert(t103Failures.Count == 0, "PKG-T1-03 failures: " + string.Join("; ", t103Failures));
 // PR 4a: exact int64 and tol == 0 assertions on Checks.ValuesEqual
 Assert(!Checks.ValuesEqual(9007199254740993L, 9007199254740992L, 0.0), "exact int64 tol=0 inequality");
 Assert(Checks.ValuesEqual(9007199254740993L, 9007199254740993L, 0.0), "exact int64 tol=0 identity");
@@ -418,8 +524,8 @@ Assert(!Checks.ValuesEqual(9007199254740994L, 9007199254740993m, 0.0), "long vs 
 Assert(!Checks.ValuesEqual(9007199254740993m, 9007199254740994L, 0.0), "decimal vs long 2^53+1 inequality");
 Assert(!Checks.ValuesEqual(9007199254740993m, 9007199254740992m, 0.0), "decimal vs decimal 2^53 inequality");
 Assert(Checks.ValuesEqual(9007199254740993m, 9007199254740993m, 0.0), "decimal vs decimal 2^53 identity");
-Assert(Checks.ValuesEqual(9007199254740993m, 9007199254740992.0, 0.0), "decimal vs double double-precision fallback identity");
-Assert(Checks.ValuesEqual(9007199254740992.0, 9007199254740993m, 0.0), "double vs decimal double-precision fallback identity");
+Assert(!Checks.ValuesEqual(9007199254740993m, 9007199254740992.0, 0.0), "decimal vs double exact inequality");
+Assert(!Checks.ValuesEqual(9007199254740992.0, 9007199254740993m, 0.0), "double vs decimal exact inequality");
 Assert(!Checks.ValuesEqual(1L, 1.000000000000000000001m, 0.0), "long vs decimal fractional inequality");
 Assert(!Checks.ValuesEqual(1.000000000000000000001m, 1L, 0.0), "decimal vs long fractional inequality");
 Assert(Checks.ValuesEqual(0.0, -0.0, 0.0), "signed zero float identity");
