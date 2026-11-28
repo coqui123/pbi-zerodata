@@ -1757,7 +1757,8 @@ def main() -> int:
             fails.append(msg)
 
     suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(cls)
-                                for cls in (OutputBudgetTests, GitHookTests, InstallerTransactionTests)])
+                                for cls in (OutputBudgetTests, GitHookTests, InstallerTransactionTests,
+                                            InstallerEntryPointTests, CatalogBuilderTests)])
     check(unittest.TextTestRunner().run(suite).wasSuccessful(), "budget / git hook fixtures")
     tmp = tempfile.mkdtemp(prefix="pbzmcp-")
     root = os.path.join(tmp, "ws")
