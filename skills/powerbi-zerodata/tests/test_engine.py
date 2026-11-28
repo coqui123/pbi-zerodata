@@ -640,6 +640,135 @@ def test_offline(env: Env, tmp: Path) -> None:
     r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(tmp / "nope")}, "tmdl-no-folder")
     expect("tmdl missing folder -> BAD_REQUEST", r and r["class"] == "BAD_REQUEST", r)
 
+    # tmdl-validate: inventory parity cases (P2 commit 1)
+    from _junction import make_junction
+
+    def copy_model(name: str) -> Path:
+        d = tmp / name
+        shutil.copytree(MODEL_DEF, d)
+        return d
+
+    def expect_surface(label: str, r, valid: bool, error_pairs: list, missing: list, orphans: list) -> None:
+        resp = r or {}
+        errors = resp.get("errors")
+        pairs = [(e.get("file"), e.get("class")) for e in errors] if isinstance(errors, list) else None
+        expect(label,
+               resp.get("ok") is True and resp.get("valid") is valid and pairs == error_pairs
+               and resp.get("missing_refs") == missing and resp.get("orphan_files") == orphans, r)
+
+    def expect_rejection(label: str, r, cls: str) -> None:
+        resp = r or {}
+        expect(label,
+               resp.get("ok") is False and resp.get("verb") == "tmdl-validate" and resp.get("class") == cls
+               and "valid" not in resp and "errors" not in resp
+               and "missing_refs" not in resp and "orphan_files" not in resp, r)
+
+    def append_refs(path: Path, *refs: str) -> None:
+        text = path.read_text("utf-8")
+        if not text.endswith("\n"):
+            text += "\n"
+        path.write_text(text + "".join(f"{ref}\n" for ref in refs), "utf-8")
+
+    d = copy_model("c2")
+    append_refs(d / "model.tmdl", "ref table Ghost", "ref role 'Ghost Role'")
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c2")
+    expect_surface("tmdl-parity-c2", r, False, [], ["tables/Ghost.tmdl", "roles/Ghost Role.tmdl"], [])
+
+    d = copy_model("c3")
+    (d / "tables/Person.tmdl").rename(d / "tables/person.tmdl")
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c3")
+    expect_surface("tmdl-parity-c3", r, True, [], [], [])
+
+    d = copy_model("c4")
+    shutil.copyfile(d / "roles/Canary Reader.tmdl", d / "roles/Canary%20Reader.tmdl")
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c4")
+    expect_surface("tmdl-parity-c4", r, False, [("roles/Canary%20Reader.tmdl", "SYNTAX")], [], [])
+
+    d = copy_model("c5")
+    model = d / "model.tmdl"
+    lines = model.read_text("utf-8").splitlines(keepends=True)
+    model.write_text("".join(line for line in lines if line.strip() not in {
+        "ref table Notes", "ref role 'Canary Reader'",
+    }), "utf-8")
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c5")
+    expect_surface("tmdl-parity-c5", r, True, [], [], ["tables/Notes.tmdl", "roles/Canary Reader.tmdl"])
+
+    d = copy_model("c6")
+    person = (d / "tables/Person.tmdl").read_bytes()
+    (d / "tables/b.tmdl").write_bytes(person.replace(b"table Person", b"table b", 1))
+    (d / "tables/C.tmdl").write_bytes(person.replace(b"table Person", b"table C", 1))
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c6")
+    expect_surface("tmdl-parity-c6", r, False, [("tables/b.tmdl", "SYNTAX")], [], ["tables/C.tmdl", "tables/b.tmdl"])
+
+    d = copy_model("c7")
+    (d / "model.tmdl").unlink()
+    append_refs(d / "database.tmdl", "ref model X")
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c7")
+    expect_surface("tmdl-parity-c7", r, False, [], ["model.tmdl"], [
+        "tables/DimDate.tmdl", "tables/ExceptionType.tmdl", "tables/Hours.tmdl",
+        "tables/Notes.tmdl", "tables/Person.tmdl", "tables/Project.tmdl", "roles/Canary Reader.tmdl",
+    ])
+
+    d = copy_model("c8")
+    append_refs(d / "model.tmdl", "ref table Ghost", "ref table Ghost", "ref table ghost")
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c8")
+    expect_surface("tmdl-parity-c8", r, False, [], ["tables/Ghost.tmdl", "tables/ghost.tmdl"], [])
+
+    d = copy_model("c9")
+    append_refs(d / "model.tmdl", "ref table 'A/B'")
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c9")
+    expect_surface("tmdl-parity-c9", r, False, [], ["tables/A%2FB.tmdl"], [])
+
+    d = copy_model("c10")
+    append_refs(d / "model.tmdl", "ref perspective X")
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c10")
+    expect_surface("tmdl-parity-c10", r, False, [], ["perspectives/X.tmdl"], [])
+
+    d = copy_model("c11")
+    append_refs(d / "model.tmdl", "ref gadget Gizmo", "ref Table Gadget")
+    person = (d / "tables/Person.tmdl").read_bytes()
+    (d / "tables/Gadget.tmdl").write_bytes(person.replace(b"table Person", b"table Gadget", 1))
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c11")
+    expect_surface("tmdl-parity-c11", r, False, [("model.tmdl", "SYNTAX")], [], ["tables/Gadget.tmdl"])
+
+    def gen_model(name: str, refs: list[str]) -> Path:
+        d = copy_model(name)
+        src = (MODEL_DEF / "tables" / "Person.tmdl").read_text("utf-8")
+        for i in range(400):
+            body = src.replace("table Person", f"table T{i:04d}", 1)
+            (d / "tables" / f"T{i:04d}.tmdl").write_text(body, "utf-8")
+        text = (d / "model.tmdl").read_text("utf-8")
+        if not text.endswith("\n"):
+            text += "\n"
+        text += "".join(f"ref table {n}\n" for n in refs)
+        (d / "model.tmdl").write_text(text, "utf-8")
+        return d
+
+    d = gen_model("c12a", [f"T{i:04d}" for i in range(400)])
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c12a")
+    expect_surface("tmdl-parity-c12a", r, False, [("tables/T0000.tmdl", "SYNTAX")], [], [])
+
+    d = gen_model("c12b", [f"T{i:04d}" for i in range(200)] + [f"A{i:04d}" for i in range(200)])
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c12b")
+    expect_surface("tmdl-parity-c12b", r, False, [("tables/T0000.tmdl", "SYNTAX")],
+                   [f"tables/A{i:04d}.tmdl" for i in range(200)],
+                   [f"tables/T{i:04d}.tmdl" for i in range(200, 400)])
+
+    d = gen_model("c12c", [f"T{i:04d}" for i in range(400)])
+    for i in range(200, 400):
+        (d / "tables" / f"T{i:04d}.tmdl").unlink()
+    r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c12c")
+    expect_surface("tmdl-parity-c12c", r, False, [("tables/T0000.tmdl", "SYNTAX")], [f"tables/T{i:04d}.tmdl" for i in range(200, 400)], [])
+
+    # Copy-stage control: CopyTree refuses links before Inventory runs.
+    d = copy_model("c13")
+    (d / "tables").rename(tmp / "c13-real-tables")
+    if make_junction(None, str(d / "tables"), str(tmp / "c13-real-tables")):
+        r = engine("tmdl-validate", {"private_dir": str(env.pd), "folder": str(d)}, "tmdl-parity-c13")
+        expect_rejection("tmdl-parity-c13: junction in tables refused at copy stage", r, "OTHER")
+    else:
+        print("SKIP tmdl-parity-c13: creating a junction is unavailable")
+
     # perf / refresh / memory contract shapes (no Desktop)
     perf_ok = {
         "ok": True, "verb": "perf", "timing": "BANDED", "duration_band": "100_500MS",

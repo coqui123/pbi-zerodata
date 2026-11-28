@@ -1,6 +1,4 @@
 using System.Collections.Concurrent;
-using System.Globalization;
-using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Microsoft.AnalysisServices.Tabular;
@@ -329,6 +327,17 @@ public static class TmdlValidate
     {
         var refs = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         foreach (var k in RefDirs.Keys) refs[k] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var indexes = new Dictionary<string, TmdlDirIndex>(StringComparer.Ordinal);
+        TmdlDirIndex IndexFor(string dir)
+        {
+            if (!indexes.TryGetValue(dir, out var index))
+            {
+                index = TmdlDirIndex.Build(Path.Combine(folder, dir),
+                    p => Directory.EnumerateFiles(p, "*.tmdl"), LinkGuard.Refuse, Directory.Exists);
+                indexes.Add(dir, index);
+            }
+            return index;
+        }
         var missing = new List<string>();
         foreach (var top in new[] { "model.tmdl", "database.tmdl" })
         {
@@ -348,36 +357,19 @@ public static class TmdlValidate
                 }
                 if (!RefDirs.TryGetValue(kind, out var dir)) continue;
                 refs[kind].Add(name);
-                if (FindFile(folder, dir, name) == null) missing.Add(dir + "/" + EncodeName(name) + ".tmdl");
+                if (IndexFor(dir).Find(name) == null) missing.Add(dir + "/" + EncodeName(name) + ".tmdl");
             }
         }
         var orphans = new List<string>();
         foreach (var (kind, dir) in RefDirs)
         {
-            string d = Path.Combine(folder, dir);
-            LinkGuard.Refuse(d);
-            if (!Directory.Exists(d)) continue;
-            foreach (var f in Directory.EnumerateFiles(d, "*.tmdl").OrderBy(x => x, StringComparer.Ordinal))
+            foreach (var f in IndexFor(dir).Entries.OrderBy(x => x, StringComparer.Ordinal))
             {
-                LinkGuard.Refuse(f);
                 string objName = DecodeName(Path.GetFileNameWithoutExtension(f));
                 if (!refs[kind].Contains(objName)) orphans.Add(dir + "/" + Path.GetFileName(f));
             }
         }
         return (missing.Distinct().ToList(), orphans);
-    }
-
-    static string? FindFile(string folder, string dir, string name)
-    {
-        string d = Path.Combine(folder, dir);
-        LinkGuard.Refuse(d);
-        if (!Directory.Exists(d)) return null;
-        foreach (var f in Directory.EnumerateFiles(d, "*.tmdl"))
-        {
-            LinkGuard.Refuse(f);
-            if (string.Equals(DecodeName(Path.GetFileNameWithoutExtension(f)), name, StringComparison.OrdinalIgnoreCase)) return f;
-        }
-        return null;
     }
 
     static IEnumerable<string> TmdlFiles(string folder)
@@ -397,33 +389,8 @@ public static class TmdlValidate
         }
     }
 
-    const string Reserved = "\\/:*?\"<>|%";
-
     /// <summary>TMDL file naming: characters invalid in file names (and '%') become %XX.</summary>
-    public static string EncodeName(string name)
-    {
-        var sb = new StringBuilder();
-        foreach (char c in name)
-        {
-            if (c < 0x20 || Reserved.IndexOf(c) >= 0) sb.Append('%').Append(((int)c).ToString("X2", CultureInfo.InvariantCulture));
-            else sb.Append(c);
-        }
-        return sb.ToString();
-    }
+    public static string EncodeName(string name) => TmdlNameCodec.EncodeName(name);
 
-    public static string DecodeName(string fileName)
-    {
-        var sb = new StringBuilder();
-        for (int i = 0; i < fileName.Length; i++)
-        {
-            if (fileName[i] == '%' && i + 2 < fileName.Length &&
-                int.TryParse(fileName.AsSpan(i + 1, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int code))
-            {
-                sb.Append((char)code);
-                i += 2;
-            }
-            else sb.Append(fileName[i]);
-        }
-        return sb.ToString();
-    }
+    public static string DecodeName(string fileName) => TmdlNameCodec.DecodeName(fileName);
 }
